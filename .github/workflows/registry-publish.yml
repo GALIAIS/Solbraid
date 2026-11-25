@@ -1,0 +1,43 @@
+name: Solbraid Community Registry Auto Publish
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "registry/submissions/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish-registry-index:
+    name: Publish Approved Submissions to registry.json
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Re-audit and Rebuild registry.json
+        env:
+          SOLBRAID_REVIEWER_API_URL: ${{ secrets.SOLBRAID_REVIEWER_API_URL }}
+          SOLBRAID_REVIEWER_API_KEY: ${{ secrets.SOLBRAID_REVIEWER_API_KEY }}
+          SOLBRAID_REVIEWER_MODEL: ${{ vars.SOLBRAID_REVIEWER_MODEL || 'gpt-4o-mini' }}
+          SOLBRAID_REVIEWER_WIRE: ${{ vars.SOLBRAID_REVIEWER_WIRE || 'openai' }}
+          SOLBRAID_REQUIRE_LLM: ${{ vars.SOLBRAID_REQUIRE_LLM || '0' }}
+        run: node registry/publish-index.mjs
+
+      - name: Commit Published Catalog
+        run: |
+          git config user.name "solbraid-registry-bot"
+          git config user.email "bot@solbraid.local"
+          git add registry/
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(registry): publish AI-approved community resources"
+            git push
+          fi

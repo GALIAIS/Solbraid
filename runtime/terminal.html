@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+  <link rel="stylesheet" href="terminal-xterm.css">
+  <style>
+    html, body {
+      height: 100%; width: 100%; margin: 0; padding: 0; overflow: hidden;
+      background: #0b0e14;
+      -webkit-tap-highlight-color: transparent;
+      touch-action: pan-y;
+    }
+    #terminal {
+      position: fixed; inset: 0; width: 100%; height: 100%;
+      box-sizing: border-box;
+      padding: 8px 10px 6px 10px;
+    }
+    .xterm { width: 100%; height: 100%; }
+    .xterm-viewport {
+      overscroll-behavior: contain;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(148, 163, 184, 0.28) transparent;
+    }
+    .xterm-viewport::-webkit-scrollbar { width: 4px; }
+    .xterm-viewport::-webkit-scrollbar-thumb {
+      background: rgba(148, 163, 184, 0.28);
+      border-radius: 99px;
+    }
+    .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+    .xterm-rows { font-variant-ligatures: none; }
+  </style>
+  <title>Solbraid Terminal</title>
+</head>
+<body>
+  <div id="terminal" role="application" aria-label="交互终端"></div>
+  <script src="terminal-xterm.js"></script>
+  <script src="terminal-fit.js"></script>
+  <script src="terminal-client.js"></script>
+</body>
+</html>

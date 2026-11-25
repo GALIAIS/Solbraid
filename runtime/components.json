@@ -1,0 +1,236 @@
+{
+  "formatVersion": 1,
+  "engines": {
+    "codex": "0.171.0-alpha.13",
+    "claude": "2.1.328",
+    "antigravity": "1.5.15"
+  },
+  "sources": {
+    "codexDeb": "chatgpt_26.1117.41037_amd64.deb",
+    "claudeDeb": "claude-desktop_6.28899.2_amd64.deb"
+  },
+  "sdk": {
+    "version": "0.3.328",
+    "archive": "claude-agent-sdk-0.3.328.tgz",
+    "sha512": "YcOWlpXVm7etPjPVrvSJEfynDksMiG11zvEybSBnk1EVWji6rSjU75HbbhJ8XPEB2ECEwRRP597Udu6IWMtsDw=="
+  },
+  "plan": {
+    "version": "0.41.0",
+    "archive": "official-plan-0.41.0.tgz",
+    "sha256": "00db35367a7c07c371cf222fa7c7f2a8ccf14e54f9dd262ba3d4cc705380c5bf"
+  },
+  "terminal": [
+    {"name":"@xterm/xterm","version":"6.0.0","archive":"xterm-6.0.0.tgz","sha512":"TQwDdQGtwwDt+2cgKDLn0IRaSxYu1tSUjgKarSDkUM0ZNiSRXFpjxEsvc/Zgc5kq5omJ+V0a8/kIM2WD3sMOYg==","files":{"lib/xterm.js":"terminal-xterm.js","css/xterm.css":"terminal-xterm.css","LICENSE":"terminal-LICENSE.txt"}},
+    {"name":"@xterm/addon-fit","version":"0.11.0","archive":"xterm-addon-fit-0.11.0.tgz","sha512":"jYcgT6xtVYhnhgxh3QgYDnnNMYTcf8ElbxxFzX0IZo+vabQqSPAjC3c1wJrKB5E19VwQei89QCiZZP86DCPF7g==","files":{"lib/addon-fit.js":"terminal-fit.js"}},
+    {"name":"@xterm/headless","version":"6.0.0","archive":"xterm-headless-6.0.0.tgz","sha512":"5Yj1QINYCyzrZtf8OFIHi47iQtI+0qYFPHmouEfG8dHNxbZ9Tb9YGSuLcsEwj9Z+OL75GJqPyJbyoFer80a2Hw==","files":{"lib-headless/xterm-headless.js":"terminal-headless.cjs"}},
+    {"name":"@xterm/addon-serialize","version":"0.14.0","archive":"xterm-addon-serialize-0.14.0.tgz","sha512":"uteyTU1EkrQa2Ux6P/uFl2fzmXI46jy5uoQMKEOM0fKTyiW7cSn0WrFenHm5vO5uEXX/GpwW/FgILvv3r0WbkA==","files":{"lib/addon-serialize.js":"terminal-serialize.cjs"}}
+  ],
+  "runtimeFiles": [
+    "prepare-vm-runtime.sh",
+    "prepare-proot-runtime.sh",
+    "prepare-installer-tools.sh",
+    "installer-tool.sh",
+    "sync-hot-runtime.sh",
+    "sync-hot-runtime-proot.sh",
+    "run-linux.sh",
+    "run-proot.sh",
+    "launch-engine.sh",
+    "launch-engine-proot.sh",
+    "launch-claude.sh",
+    "launch-claude-proot.sh",
+    "launch-gateway.sh",
+    "launch-gateway-proot.sh",
+    "launch-agent-hub.sh",
+    "launch-agent-hub-proot.sh",
+    "claude-host.mjs",
+    "delegate-mcp.mjs",
+    "provider-gateway.mjs",
+    "provider-translators.mjs",
+    "usage-ledger.mjs",
+    "agent-hub.mjs",
+    "acp-driver.mjs",
+    "cli-bridge-driver.mjs",
+    "dev-tools-hub.mjs",
+    "terminal-hub.mjs",
+    "cli-components.mjs",
+    "terminal.html",
+    "terminal-client.js",
+    "artifact-viewer.html",
+    "artifact-latex.js",
+    "artifact-mermaid.js",
+    "artifact-renderer.js",
+    "extension-sync.mjs",
+    "plugin-kernel.mjs",
+    "plugin-builtins.mjs",
+    "ai-reviewer.mjs",
+    "community-registry.mjs",
+    "download-network.mjs",
+    "env-ssh-hub.mjs",
+    "worktree-manager.mjs",
+    "guest-mux.mjs"
+  ],
+  "native": {
+    "arm64-v8a": [
+      {"name":"libbin_antigravity.so","size":256660144,"sha256":"497580a779b155268c4aa8f491b75e3b0034d4d0ba05c762582e7d97222396b0","source":"offline"},
+      {
+        "name": "libpayload_tools.so",
+        "size": 684374,
+        "sha256": "7d5c19ddcf159550d62fbd1ebda4273a177ed2963ef6ae342574dba2901025e0",
+        "source": "offline"
+      },
+      {
+        "name": "libbin_claude.so",
+        "size": 371844536,
+        "sha256": "307f8bada27b37db7553fac75e86004e3dbff5a931ffc611b54fe710ce1eb521",
+        "source": "offline"
+      },
+      {
+        "name": "libbin_codex_code_mode_host.so",
+        "size": 72280416,
+        "sha256": "2b92bf024aaa5afa6fefc37175800ab2434afe6d497ee788deda3ddd7eaa3413",
+        "source": "offline"
+      },
+      {
+        "name": "libbin_codex.so",
+        "size": 309141912,
+        "sha256": "d962adf4d8815a6b2113408ebe65dc3a5646c95ce1c18b3cd2c3f7c85b86a1fc",
+        "source": "offline"
+      },
+      {
+        "name": "libbin_node.so",
+        "size": 117532552,
+        "sha256": "f15053488b3c49d16eb4b0da25593b459a79839248381f6aa61a876bcce54966",
+        "source": "offline"
+      },
+      {
+        "name": "libbin_rg.so",
+        "size": 4506992,
+        "sha256": "e36d0eb52e70696bdf1781392722e05a21bb91d3b7b762ef5ec20e5df2ec687b",
+        "source": "offline"
+      },
+      {
+        "name": "libpayload_npm.so",
+        "size": 2907300,
+        "sha256": "44293ebaa1afeaaf833a812bf026aceb0ff627dd4b06c9339c876b61478e3648",
+        "source": "offline"
+      },
+      {
+        "name": "libpayload_rootfs.so",
+        "size": 53924928,
+        "sha256": "90649f58d507d82f5975e6dee9b529b4ee2a5a8bc91812c6ad4391ac37b73565",
+        "source": "offline"
+      },
+      {
+        "name": "libandroid-shmem.so",
+        "size": 14432,
+        "sha256": "84475798e07c8174dbbfaec70a827fdb02f19ffa69a589380c13e7507fd0e731",
+        "source": "jniLibs"
+      },
+      {
+        "name": "libproot-loader.so",
+        "size": 18136,
+        "sha256": "1da54355333cca3fb6ee10e3b82a24df24fb230c99241ce83809bf9e240609b5",
+        "source": "jniLibs"
+      },
+      {
+        "name": "libproot-loader32.so",
+        "size": 6244,
+        "sha256": "c429996fee730e1a4fe12625b22dab5a5bc2847a4cae274d36fd4a19cd8299a8",
+        "source": "jniLibs"
+      },
+      {
+        "name": "libproot.so",
+        "size": 259832,
+        "sha256": "aad737c5b546ee7471f133be90ef20f765aa98a303522557ceed3dff76605085",
+        "source": "jniLibs"
+      },
+      {
+        "name": "libtalloc.so",
+        "size": 33592,
+        "sha256": "160d39bc0d7ed946f22310d1d6f20addda21b02b0972dffe929fe49951543941",
+        "source": "jniLibs"
+      }
+    ],
+    "x86_64": [
+      {"name":"libbin_antigravity.so","size":273879752,"sha256":"7b004d26c3fdea25a7c9d456de4bfaccef4be1e4cc7fd6db628859c5c941fa2d","source":"offline"},
+      {
+        "name": "libpayload_tools.so",
+        "size": 692548,
+        "sha256": "99205223b6f5d31684745bc30124c6ab85f98d7ad4dea29051fccf8644879c41",
+        "source": "offline"
+      },
+      {
+        "name": "libbin_claude.so",
+        "size": 373019152,
+        "sha256": "a982d38030b97e750848add2cbb2df6d9a70d5544a22ca9b216a349ba25865e8",
+        "source": "offline"
+      },
+      {
+        "name": "libbin_codex_code_mode_host.so",
+        "size": 70072856,
+        "sha256": "0f3217107d529c4206c3ad2f6a96132955b120be32fd7fbd9b5e52ddbcdcc840",
+        "source": "offline"
+      },
+      {
+        "name": "libbin_codex.so",
+        "size": 315250104,
+        "sha256": "63279cf1860a285495fa0bad3c40f5eb38c3487f7425adb603bcbd49175fcaf8",
+        "source": "offline"
+      },
+      {
+        "name": "libbin_node.so",
+        "size": 126951512,
+        "sha256": "acbe4b8d9153b841ed0697cbfc4f93e767386620edb745ab9358306c0a6f31aa",
+        "source": "offline"
+      },
+      {
+        "name": "libbin_rg.so",
+        "size": 5408904,
+        "sha256": "e62198eb19b136b88c330af83647b5a962cb99b6b1f066758568f12de1974849",
+        "source": "offline"
+      },
+      {
+        "name": "libpayload_npm.so",
+        "size": 2907300,
+        "sha256": "44293ebaa1afeaaf833a812bf026aceb0ff627dd4b06c9339c876b61478e3648",
+        "source": "offline"
+      },
+      {
+        "name": "libpayload_rootfs.so",
+        "size": 55248283,
+        "sha256": "00b138319d403925ec7613bdee15ffa564c14824be1bbceeade292b1a91435b7",
+        "source": "offline"
+      },
+      {
+        "name": "libandroid-shmem.so",
+        "size": 14368,
+        "sha256": "092926060298acd3778e6239033d7aef1280dcb59aebe021a3719612e6a3465f",
+        "source": "jniLibs"
+      },
+      {
+        "name": "libproot-loader.so",
+        "size": 18368,
+        "sha256": "a836b0569c84b1661333d16bacf6b396ff08fea816a5c936a82e08ddeeca8341",
+        "source": "jniLibs"
+      },
+      {
+        "name": "libproot-loader32.so",
+        "size": 6036,
+        "sha256": "fd5b394aa0801619e293b76fe6e830a3beb363aed4fa4b9a5a41f1388a0cb9b9",
+        "source": "jniLibs"
+      },
+      {
+        "name": "libproot.so",
+        "size": 277144,
+        "sha256": "08926a2164a54a4f7d8d4e64320fd4791e664906851600fd64491463b409a2d2",
+        "source": "jniLibs"
+      },
+      {
+        "name": "libtalloc.so",
+        "size": 32536,
+        "sha256": "7354442094c5363639cc87e1126e9298442a2546dd2a0699972f74d263901da2",
+        "source": "jniLibs"
+      }
+    ]
+  }
+}

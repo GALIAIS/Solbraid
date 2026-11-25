@@ -1,0 +1,9 @@
+/.gradle/
+/.kotlin/
+/**/build/
+/local.properties
+/downloads/
+/vendor/
+/.agent-notes/
+*.iml
+/.idea/
