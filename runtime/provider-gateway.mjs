@@ -1,5 +1,7 @@
+import fs from "node:fs";
 import http from "node:http";
-import {isIP} from "node:net";
+import net, {isIP} from "node:net";
+import path from "node:path";
 import {randomBytes, timingSafeEqual} from "node:crypto";
 import {
   responsesToChatRequest, responsesToAnthropicRequest, responsesToGeminiRequest,
@@ -16,6 +18,114 @@ if (typeof process.getuid === "function" && process.getuid() === 0) throw new Er
 const MAX_RPC = 8 * 1024 * 1024;
 const MAX_HTTP = 32 * 1024 * 1024;
 const PROTOCOLS = new Set(["openai_responses", "openai_chat", "anthropic_messages", "google_gemini"]);
+const PLUGIN_PROTOCOL_RE = /^plugin:([a-z0-9][a-z0-9._-]{1,47})$/i;
+
+function callPluginCtlBridge(action, params = {}) {
+  const home = process.env.HOME || "/home/agent";
+  const socketPath = process.env.SOLBRAID_PLUGIN_CTL_SOCKET || path.join(home, ".galiais", "run", "plugin-ctl.sock");
+  let token = process.env.SOLBRAID_PLUGIN_CTL_TOKEN || "";
+  if (!token) {
+    try { token = fs.readFileSync(path.join(home, ".galiais", "run", "plugin-ctl.token"), "utf8").trim(); } catch {}
+  }
+  if (!token) return Promise.reject(new Error("插件控制通道未就绪，无法调用插件协议转换器"));
+  return new Promise((resolve, reject) => {
+    const conn = net.createConnection(socketPath);
+    let buf = "";
+    let settled = false;
+    const finish = (err, val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      conn.destroy();
+      if (err) reject(err); else resolve(val);
+    };
+    const timer = setTimeout(() => finish(new Error("插件协议转换调用超时")), 8_000);
+    conn.setEncoding("utf8");
+    conn.once("connect", () => conn.write(JSON.stringify({token, action, params}) + "\n"));
+    conn.on("data", chunk => {
+      buf += chunk;
+      if (buf.length > 4 * 1024 * 1024) { finish(new Error("插件协议转换响应过大")); return; }
+      const nl = buf.indexOf("\n");
+      if (nl < 0) return;
+      try {
+        const reply = JSON.parse(buf.slice(0, nl));
+        if (reply?.ok) finish(null, reply.data);
+        else finish(new Error(reply?.error || "插件协议转换失败"));
+      } catch { finish(new Error("插件协议转换返回格式无效")); }
+    });
+    conn.once("error", err => finish(err));
+    conn.once("close", () => finish(new Error("插件控制通道连接已关闭")));
+  });
+}
+
+async function runPluginProtocolUpstream(provider, target, ingressBody, route, signal) {
+  const m = PLUGIN_PROTOCOL_RE.exec(String(target.protocol || ""));
+  if (!m) throw new Error(`无效插件协议：${target.protocol}`);
+  const translatorId = m[1].toLowerCase();
+  let translated;
+  try {
+    translated = await callPluginCtlBridge("translateRequest", {
+      translatorId,
+      request: ingressBody,
+      context: {baseUrl: target.baseUrl, route, model: ingressBody?.model || ""},
+    });
+  } catch (err) {
+    const raw = err?.message || String(err);
+    const wrapped = new Error(`插件协议「plugin:${translatorId}」不可用（所属插件可能已卸载、停用或处于安全模式）：${raw}`);
+    wrapped.isFailover = true;
+    wrapped.status = 503;
+    throw wrapped;
+  }
+  const url = translated?.url
+    ? validateUrl(translated.url, true)
+    : joinUrl(target.baseUrl, translated?.path || "/chat/completions", provider.queryParams);
+  const reqBody = translated?.body !== undefined ? translated.body : translated;
+  const extraHeaders = translated?.headers && typeof translated.headers === "object" ? translated.headers : {};
+  const upstream = await fetchWithKeyPool(provider, url, reqBody, extraHeaders, signal);
+  return {translatorId, upstream};
+}
+
+function extractTranslatedText(out) {
+  if (typeof out === "string") return out;
+  if (!out || typeof out !== "object") return "";
+  if (typeof out.text === "string") return out.text;
+  if (typeof out.output_text === "string") return out.output_text;
+  if (typeof out.choices?.[0]?.message?.content === "string") return out.choices[0].message.content;
+  if (Array.isArray(out.content)) {
+    const joined = out.content.filter(b => b?.type === "text" && typeof b.text === "string").map(b => b.text).join("");
+    if (joined) return joined;
+  }
+  return "";
+}
+
+function writeSynthesizedResponsesSse(res, model, text) {
+  const respId = `resp_plug_${randomBytes(6).toString("hex")}`;
+  const msgId = `msg_plug_${randomBytes(6).toString("hex")}`;
+  const sendEv = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  res.writeHead(200, {"Content-Type": "text/event-stream", "Cache-Control": "no-cache"});
+  sendEv("response.created", {type: "response.created", response: {id: respId, status: "in_progress", model, output: []}});
+  sendEv("response.output_item.added", {type: "response.output_item.added", output_index: 0, item: {id: msgId, type: "message", status: "in_progress", role: "assistant", content: []}});
+  sendEv("response.content_part.added", {type: "response.content_part.added", item_id: msgId, output_index: 0, content_index: 0, part: {type: "output_text", text: "", annotations: []}});
+  if (text) sendEv("response.output_text.delta", {type: "response.output_text.delta", item_id: msgId, output_index: 0, content_index: 0, delta: text});
+  sendEv("response.output_text.done", {type: "response.output_text.done", item_id: msgId, output_index: 0, content_index: 0, text});
+  const finalItem = {id: msgId, type: "message", status: "completed", role: "assistant", content: [{type: "output_text", text, annotations: []}]};
+  sendEv("response.output_item.done", {type: "response.output_item.done", output_index: 0, item: finalItem});
+  sendEv("response.completed", {type: "response.completed", response: {id: respId, status: "completed", model, output: [finalItem]}});
+  res.end();
+}
+
+function writeSynthesizedAnthropicSse(res, model, text) {
+  const msgId = `msg_plug_${randomBytes(6).toString("hex")}`;
+  const sendEv = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  res.writeHead(200, {"Content-Type": "text/event-stream", "Cache-Control": "no-cache"});
+  sendEv("message_start", {type: "message_start", message: {id: msgId, type: "message", role: "assistant", model, content: [], stop_reason: null, usage: {input_tokens: 0, output_tokens: 0}}});
+  sendEv("content_block_start", {type: "content_block_start", index: 0, content_block: {type: "text", text: ""}});
+  if (text) sendEv("content_block_delta", {type: "content_block_delta", index: 0, delta: {type: "text_delta", text}});
+  sendEv("content_block_stop", {type: "content_block_stop", index: 0});
+  sendEv("message_delta", {type: "message_delta", delta: {stop_reason: "end_turn", stop_sequence: null}, usage: {output_tokens: Math.max(1, Math.ceil(text.length / 3))}});
+  sendEv("message_stop", {type: "message_stop"});
+  res.end();
+}
 const AUTH_MODES = new Set(["bearer", "x-api-key", "x-goog-api-key", "api-key", "none"]);
 const AUTH_HEADER_KEYS = new Set(["authorization", "x-api-key", "x-goog-api-key", "api-key"]);
 
@@ -115,7 +225,9 @@ function normalizeProvider(raw) {
   if (!raw || typeof raw !== "object") throw new Error("Invalid provider");
   const id = String(raw.id ?? "");
   if (!/^[a-z0-9_-]{1,64}$/i.test(id)) throw new Error("Invalid provider id");
-  if (!PROTOCOLS.has(raw.protocol)) throw new Error("Unsupported protocol: " + raw.protocol);
+  if (!PROTOCOLS.has(raw.protocol) && !PLUGIN_PROTOCOL_RE.test(String(raw.protocol || ""))) {
+    throw new Error("Unsupported protocol: " + raw.protocol);
+  }
   const authMode = AUTH_MODES.has(raw.authMode) ? raw.authMode : "bearer";
   const baseUrl = validateUrl(raw.baseUrl, true);
   const headers = {};
@@ -649,6 +761,23 @@ async function handleCompatibleIngress(provider, route, subPath, body, req, res,
   const desired = route === "gemini" ? "google_gemini" : "openai_chat";
   const target = resolveNativeTarget(provider, desired);
 
+  if (PLUGIN_PROTOCOL_RE.test(String(target.protocol || ""))) {
+    const {translatorId, upstream: plugUp} = await runPluginProtocolUpstream(provider, target, body, route, signal);
+    if (!plugUp.ok) { const err = await readErrorText(plugUp); failOrSend(res, route, plugUp.status, err, meta, startedAt, allowFailover); return; }
+    const rawText = await plugUp.text();
+    let parsedUp = rawText;
+    try { parsedUp = JSON.parse(rawText); } catch {}
+    const out = await callPluginCtlBridge("translateResponse", {
+      translatorId,
+      response: parsedUp,
+      context: {route, model, stream},
+    });
+    void recordUsageEvent({...meta, ms: Date.now() - startedAt, status: 200});
+    res.writeHead(200, {"Content-Type": "application/json"});
+    res.end(typeof out === "string" ? out : JSON.stringify(out));
+    return;
+  }
+
   let upstream;
   if (route === "openai-chat" && target.protocol === "openai_chat") {
     upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/chat/completions", provider.queryParams), body, {}, signal, {stripStreamOptions: true});
@@ -746,6 +875,18 @@ async function handleCompatibleResponsesCompact(provider, target, body, res, sig
     summaryText = Array.isArray(data.content) ? data.content.filter(b => b?.type === "text").map(b => b.text).join("\n") : "";
     inTok = (data.usage?.input_tokens || 0) + (data.usage?.cache_read_input_tokens || 0) + (data.usage?.cache_creation_input_tokens || 0);
     outTok = data.usage?.output_tokens || 0;
+  } else if (PLUGIN_PROTOCOL_RE.test(String(target.protocol || ""))) {
+    const {translatorId, upstream: plugUp} = await runPluginProtocolUpstream(provider, target, compactReqBody, "openai-responses-compact", signal);
+    if (!plugUp.ok) { const err = await readErrorText(plugUp); failOrSend(res, "openai", plugUp.status, err, meta, startedAt, allowFailover); return; }
+    const rawText = await plugUp.text();
+    let parsedUp = rawText;
+    try { parsedUp = JSON.parse(rawText); } catch {}
+    const out = await callPluginCtlBridge("translateResponse", {
+      translatorId,
+      response: parsedUp,
+      context: {route: "openai-responses-compact", model: modelName, stream: false},
+    });
+    summaryText = extractTranslatedText(out);
   } else {
     const {req: gemReq} = responsesToGeminiRequest(compactReqBody);
     delete gemReq.tools;
@@ -809,6 +950,27 @@ async function handleCodexIngress(provider, subPath, body, req, res, signal, req
   }
   if (subPath !== "/responses") { sendError(res, "openai", 404, "Unknown Codex endpoint"); return; }
 
+  if (PLUGIN_PROTOCOL_RE.test(String(target.protocol || ""))) {
+    const {translatorId, upstream: plugUp} = await runPluginProtocolUpstream(provider, target, body, "openai-responses", signal);
+    if (!plugUp.ok) { const err = await readErrorText(plugUp); failOrSend(res, "openai", plugUp.status, err, meta, startedAt, allowFailover); return; }
+    const rawText = await plugUp.text();
+    let parsedUp = rawText;
+    try { parsedUp = JSON.parse(rawText); } catch {}
+    const out = await callPluginCtlBridge("translateResponse", {
+      translatorId,
+      response: parsedUp,
+      context: {route: "openai-responses", model: body.model || "", stream: body.stream !== false},
+    });
+    void recordUsageEvent({...meta, ms: Date.now() - startedAt, status: 200});
+    if (body.stream !== false) {
+      writeSynthesizedResponsesSse(res, body.model || "", extractTranslatedText(out));
+    } else {
+      res.writeHead(200, {"Content-Type": "application/json"});
+      res.end(typeof out === "string" ? out : JSON.stringify(out));
+    }
+    return;
+  }
+
   if (target.protocol === "openai_responses") {
     const upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/responses", provider.queryParams), body, {Accept: "text/event-stream"}, signal);
     if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, "openai", upstream.status, err, meta, startedAt, allowFailover); return; }
@@ -862,6 +1024,31 @@ async function handleClaudeIngress(provider, subPath, query, body, req, res, sig
     return;
   }
   if (subPath !== "/v1/messages" && subPath !== "/messages") { sendError(res, "anthropic", 404, "Unknown Anthropic endpoint"); return; }
+
+  if (PLUGIN_PROTOCOL_RE.test(String(target.protocol || ""))) {
+    const {translatorId, upstream: plugUp} = await runPluginProtocolUpstream(provider, target, body, "anthropic", signal);
+    if (!plugUp.ok) { const err = await readErrorText(plugUp); failOrSend(res, "anthropic", plugUp.status, err, meta, startedAt, allowFailover); return; }
+    const rawText = await plugUp.text();
+    let parsedUp = rawText;
+    try { parsedUp = JSON.parse(rawText); } catch {}
+    const out = await callPluginCtlBridge("translateResponse", {
+      translatorId,
+      response: parsedUp,
+      context: {route: "anthropic", model: body.model || "", stream: body.stream === true},
+    });
+    void recordUsageEvent({...meta, ms: Date.now() - startedAt, status: 200});
+    if (body.stream === true) {
+      writeSynthesizedAnthropicSse(res, body.model || "", extractTranslatedText(out));
+    } else {
+      const txt = extractTranslatedText(out);
+      const payload = (out && typeof out === "object" && Array.isArray(out.content))
+        ? out
+        : {id: `msg_plug_${randomBytes(6).toString("hex")}`, type: "message", role: "assistant", model: body.model || "", content: [{type: "text", text: txt}], stop_reason: "end_turn", usage: {input_tokens: 0, output_tokens: Math.max(1, Math.ceil(txt.length / 3))}};
+      res.writeHead(200, {"Content-Type": "application/json"});
+      res.end(JSON.stringify(payload));
+    }
+    return;
+  }
 
   if (target.protocol === "anthropic_messages") {
     const extra = {"anthropic-version": req.headers["anthropic-version"] || "2023-06-01", Accept: "text/event-stream"};
@@ -1000,6 +1187,20 @@ async function handleHttp(req, res) {
 }
 
 async function fetchModels(provider) {
+  const plugMatch = PLUGIN_PROTOCOL_RE.exec(String(provider.protocol || ""));
+  if (plugMatch) {
+    const translatorId = plugMatch[1].toLowerCase();
+    let activeList;
+    try {
+      activeList = await callPluginCtlBridge("list", {});
+    } catch (err) {
+      throw new Error(`无法检查插件协议「plugin:${translatorId}」状态：${err?.message || err}`);
+    }
+    const found = Array.isArray(activeList?.translators) && activeList.translators.some(t => String(t?.id || "").toLowerCase() === translatorId);
+    if (!found) {
+      throw new Error(`插件协议「plugin:${translatorId}」未加载或所属插件已卸载/停用，请先启用对应插件或切换协议`);
+    }
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20000);
   try {
@@ -1062,6 +1263,37 @@ async function pingProviderCompletion(provider, modelHint) {
     if (!model) throw new Error("请先填写或获取至少 1 个模型 ID 再进行推理实测");
     const mapped = resolveMappedModel(provider, model);
     const target = resolveNativeTarget(provider, provider.protocol);
+    if (PLUGIN_PROTOCOL_RE.test(String(target.protocol || ""))) {
+      const {translatorId, upstream: plugUp} = await runPluginProtocolUpstream(
+        provider,
+        target,
+        {model: mapped, max_tokens: 16, stream: false, messages: [{role: "user", content: "Reply OK"}]},
+        "ping",
+        controller.signal,
+      );
+      const ttftMs = Date.now() - started;
+      if (!plugUp.ok) throw new Error(`HTTP ${plugUp.status}: ${await readErrorText(plugUp)}`);
+      const raw = await plugUp.text();
+      let parsedUp = raw;
+      try { parsedUp = JSON.parse(raw); } catch {}
+      const translated = await callPluginCtlBridge("translateResponse", {
+        translatorId,
+        response: parsedUp,
+        context: {route: "ping", model: mapped, stream: false},
+      });
+      const latencyMs = Date.now() - started;
+      const preview = extractTranslatedText(translated) || "OK";
+      return {
+        ok: true,
+        status: plugUp.status,
+        model,
+        mappedModel: mapped,
+        protocol: target.protocol,
+        ttftMs,
+        latencyMs,
+        preview: String(preview).trim().replace(/\s+/g, " ").slice(0, 60),
+      };
+    }
     let resp;
     if (target.protocol === "anthropic_messages") {
       resp = await fetchWithKeyPool(

@@ -308,6 +308,149 @@ data class HostPluginLog(
     val message: String,
 )
 
+data class HostPluginComposerAction(
+    val pluginId: String,
+    val id: String,
+    val label: String,
+    val description: String = "",
+    val command: String? = null,
+    val panelId: String? = null,
+) {
+    companion object {
+        fun fromJson(obj: JSONObject, fallbackPluginId: String = "") = HostPluginComposerAction(
+            pluginId = obj.optString("pluginId", fallbackPluginId),
+            id = obj.optString("id"),
+            label = obj.optString("label", obj.optString("id")),
+            description = obj.optString("description"),
+            command = obj.str("command"),
+            panelId = obj.str("panelId"),
+        )
+    }
+}
+
+data class HostPluginSourceSnapshot(
+    val id: String,
+    val pluginId: String,
+    val version: String = "0.0.0",
+    val createdAt: Long = 0L,
+    val note: String = "",
+    val fileCount: Int = 0,
+) {
+    companion object {
+        fun fromJson(obj: JSONObject) = HostPluginSourceSnapshot(
+            id = obj.optString("id"),
+            pluginId = obj.optString("pluginId"),
+            version = obj.optString("version", "0.0.0"),
+            createdAt = obj.optLong("createdAt", 0L),
+            note = obj.optString("note"),
+            fileCount = obj.optInt("fileCount", 0),
+        )
+    }
+}
+
+data class HostPluginSurface(
+    val pluginId: String,
+    val id: String,
+    val title: String,
+    val description: String = "",
+) {
+    companion object {
+        fun fromJson(obj: JSONObject, fallbackPluginId: String = "") = HostPluginSurface(
+            pluginId = obj.optString("pluginId", fallbackPluginId),
+            id = obj.optString("id"),
+            title = obj.optString("title", obj.optString("id")),
+            description = obj.optString("description"),
+        )
+    }
+}
+
+data class HostPluginUiSlot(
+    val pluginId: String,
+    val id: String,
+    val slot: String, // 21 slots: nav.tab, global.overlay, *.replace, home/chat/files/ssh/terminal/settings/studio.*
+    val label: String = "",
+    val description: String = "",
+    val badge: String = "",
+    val surfaceId: String? = null,
+    val panelId: String? = null,
+    val command: String? = null,
+    val hasRender: Boolean = false,
+    val routes: List<String> = emptyList(),
+    val alignment: String = "bottomEnd",
+    val offsetX: Int = 0,
+    val offsetY: Int = 0,
+    val draggable: Boolean = true,
+    val displayMode: String = "",
+) {
+    fun matchesRoute(currentRoute: String): Boolean {
+        if (routes.isEmpty()) return true
+        val norm = currentRoute.trim().lowercase()
+        return routes.any { raw ->
+            val r = raw.trim().lowercase()
+            r == "*" || r == norm || (r.endsWith("*") && norm.startsWith(r.removeSuffix("*")))
+        }
+    }
+
+    companion object {
+        fun fromJson(obj: JSONObject, fallbackPluginId: String = "") = HostPluginUiSlot(
+            pluginId = obj.optString("pluginId", fallbackPluginId),
+            id = obj.optString("id"),
+            slot = obj.optString("slot"),
+            label = obj.optString("label"),
+            description = obj.optString("description"),
+            badge = obj.optString("badge"),
+            surfaceId = obj.str("surfaceId"),
+            panelId = obj.str("panelId"),
+            command = obj.str("command"),
+            hasRender = obj.optBoolean("hasRender", false),
+            routes = obj.arr("routes").strings(),
+            alignment = obj.optString("alignment", "bottomEnd"),
+            offsetX = obj.optInt("offsetX", 0),
+            offsetY = obj.optInt("offsetY", 0),
+            draggable = obj.optBoolean("draggable", obj.optString("slot") == "global.overlay"),
+            displayMode = obj.optString("displayMode", ""),
+        )
+    }
+}
+
+data class HostPluginTranslator(
+    val pluginId: String,
+    val id: String,
+    val name: String,
+    val description: String = "",
+    val baseProtocol: String = "openai_chat",
+) {
+    companion object {
+        fun fromJson(obj: JSONObject, fallbackPluginId: String = "") = HostPluginTranslator(
+            pluginId = obj.optString("pluginId", fallbackPluginId),
+            id = obj.optString("id"),
+            name = obj.optString("name", obj.optString("id")),
+            description = obj.optString("description"),
+            baseProtocol = obj.optString("baseProtocol", "openai_chat"),
+        )
+    }
+}
+
+data class HostPluginSduiPayload(
+    val pluginId: String,
+    val surfaceId: String,
+    val title: String,
+    val subtitle: String = "",
+    val nodes: List<JSONObject> = emptyList(),
+    val hidden: Boolean = false,
+) {
+    companion object {
+        fun fromJson(obj: JSONObject) = HostPluginSduiPayload(
+            pluginId = obj.optString("pluginId"),
+            surfaceId = obj.optString("surfaceId", obj.optString("slotId")),
+            title = obj.optString("title"),
+            subtitle = obj.optString("subtitle"),
+            nodes = obj.arr("nodes").objects(),
+            hidden = obj.optBoolean("hidden", false),
+        )
+    }
+}
+
 data class HostPluginInfo(
     val id: String,
     val name: String,
@@ -315,11 +458,13 @@ data class HostPluginInfo(
     val description: String,
     val author: String = "Solbraid",
     val kind: String = "local", // "core" | "builtin" | "community" | "local"
+    val overriddenBuiltin: Boolean = false,
     val executionTier: String = "trusted-in-process",
     val status: String = "disabled", // "active" | "disabled" | "failed" | "incompatible" | "invalid" | "safe_mode_skipped"
     val enabled: Boolean = false,
     val error: String? = null,
     val dirPath: String = "",
+    val snapshotCount: Int = 0,
     val requiredCapabilities: List<String> = emptyList(),
     val optionalCapabilities: List<String> = emptyList(),
     val grantedCapabilities: List<String> = emptyList(),
@@ -327,30 +472,38 @@ data class HostPluginInfo(
     val settingsValues: JSONObject = JSONObject(),
     val commands: List<HostPluginCommand> = emptyList(),
     val panels: List<HostPluginPanel> = emptyList(),
+    val surfaces: List<HostPluginSurface> = emptyList(),
+    val uiSlots: List<HostPluginUiSlot> = emptyList(),
+    val composerActions: List<HostPluginComposerAction> = emptyList(),
+    val translators: List<HostPluginTranslator> = emptyList(),
     val services: List<String> = emptyList(),
     val recentLogs: List<HostPluginLog> = emptyList(),
 ) {
     val isCore: Boolean get() = kind == "core"
-    val isRemovable: Boolean get() = kind == "local" || kind == "community"
+    val isWorkerIsolated: Boolean get() = executionTier == "worker-isolated"
+    val isRemovable: Boolean get() = (kind == "local" || kind == "community") && !overriddenBuiltin
 
     companion object {
         fun fromJson(obj: JSONObject): HostPluginInfo {
+            val id = obj.optString("id")
             val caps = obj.optJSONObject("capabilities")
             val schemaObj = obj.optJSONObject("settingsSchema")
             val fields = if (schemaObj != null) parseElicitationSchema(JSONObject().put("schema", schemaObj)) else emptyList()
             val settingsObj = obj.optJSONObject("settings") ?: JSONObject()
             return HostPluginInfo(
-                id = obj.optString("id"),
-                name = obj.optString("name", obj.optString("id")),
+                id = id,
+                name = obj.optString("name", id),
                 version = obj.optString("version", "1.0.0"),
                 description = obj.optString("description"),
                 author = obj.optString("author", "Solbraid"),
                 kind = obj.optString("kind", "local"),
+                overriddenBuiltin = obj.optBoolean("overriddenBuiltin", false),
                 executionTier = obj.optString("executionTier", "trusted-in-process"),
                 status = obj.optString("status", "disabled"),
                 enabled = obj.optBoolean("enabled", false),
                 error = obj.str("error"),
                 dirPath = obj.optString("dirPath"),
+                snapshotCount = obj.optInt("snapshotCount", 0),
                 requiredCapabilities = caps?.arr("required")?.strings().orEmpty(),
                 optionalCapabilities = caps?.arr("optional")?.strings().orEmpty(),
                 grantedCapabilities = obj.arr("grantedCapabilities").strings(),
@@ -370,6 +523,18 @@ data class HostPluginInfo(
                         description = p.optString("description"),
                     )
                 }.filter { it.id.isNotBlank() },
+                surfaces = obj.arr("surfaces").objects().map { s ->
+                    HostPluginSurface.fromJson(s, id)
+                }.filter { it.id.isNotBlank() },
+                uiSlots = obj.arr("uiSlots").objects().map { u ->
+                    HostPluginUiSlot.fromJson(u, id)
+                }.filter { it.id.isNotBlank() },
+                composerActions = obj.arr("composerActions").objects().map { a ->
+                    HostPluginComposerAction.fromJson(a, id)
+                }.filter { it.id.isNotBlank() },
+                translators = obj.arr("translators").objects().map { t ->
+                    HostPluginTranslator.fromJson(t, id)
+                }.filter { it.id.isNotBlank() },
                 services = obj.arr("services").strings(),
                 recentLogs = obj.arr("recentLogs").objects().map { l ->
                     HostPluginLog(
@@ -388,6 +553,7 @@ data class HostAgentDriver(
     val name: String,
     val protocol: String,
     val builtin: Boolean = false,
+    val executable: Boolean = false,
     val description: String = "",
     val pluginId: String = "",
 )
@@ -397,9 +563,15 @@ data class HostPluginSnapshot(
     val generationSeq: Int = 0,
     val safeMode: Boolean = false,
     val hasLastKnownGood: Boolean = false,
+    val agentControlAvailable: Boolean = false,
     val executionTier: String = "trusted-in-process",
     val pluginsRoot: String = "",
+    val studioOverrides: List<String> = emptyList(),
     val drivers: List<HostAgentDriver> = emptyList(),
+    val translators: List<HostPluginTranslator> = emptyList(),
+    val surfaces: List<HostPluginSurface> = emptyList(),
+    val uiSlots: List<HostPluginUiSlot> = emptyList(),
+    val composerActions: List<HostPluginComposerAction> = emptyList(),
     val plugins: List<HostPluginInfo> = emptyList(),
 ) {
     val corePlugins: List<HostPluginInfo> get() = plugins.filter { it.isCore }
@@ -412,17 +584,32 @@ data class HostPluginSnapshot(
             generationSeq = obj.optInt("generationSeq", 0),
             safeMode = obj.optBoolean("safeMode", false),
             hasLastKnownGood = obj.optBoolean("hasLastKnownGood", false),
+            agentControlAvailable = obj.optBoolean("agentControlAvailable", false),
             executionTier = obj.optJSONObject("hostDescriptor")?.optString("executionTier", "trusted-in-process") ?: "trusted-in-process",
             pluginsRoot = obj.optString("pluginsRoot"),
+            studioOverrides = obj.arr("studioOverrides").strings(),
             drivers = obj.arr("drivers").objects().map { d ->
                 HostAgentDriver(
                     id = d.optString("id"),
                     name = d.optString("name", d.optString("id")),
                     protocol = d.optString("protocol", "acp"),
                     builtin = d.optBoolean("builtin", false),
+                    executable = d.optBoolean("executable", false),
                     description = d.optString("description"),
                     pluginId = d.optString("pluginId"),
                 )
+            }.filter { it.id.isNotBlank() },
+            translators = obj.arr("translators").objects().map { t ->
+                HostPluginTranslator.fromJson(t)
+            }.filter { it.id.isNotBlank() },
+            surfaces = obj.arr("surfaces").objects().map { s ->
+                HostPluginSurface.fromJson(s)
+            }.filter { it.id.isNotBlank() },
+            uiSlots = obj.arr("uiSlots").objects().map { u ->
+                HostPluginUiSlot.fromJson(u)
+            }.filter { it.id.isNotBlank() },
+            composerActions = obj.arr("composerActions").objects().map { a ->
+                HostPluginComposerAction.fromJson(a)
             }.filter { it.id.isNotBlank() },
             plugins = obj.arr("plugins").objects().map(HostPluginInfo::fromJson),
         )

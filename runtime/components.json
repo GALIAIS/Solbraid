@@ -62,6 +62,8 @@
     "extension-sync.mjs",
     "plugin-kernel.mjs",
     "plugin-builtins.mjs",
+    "plugin-mcp.mjs",
+    "plugin-worker-host.mjs",
     "ai-reviewer.mjs",
     "community-registry.mjs",
     "download-network.mjs",

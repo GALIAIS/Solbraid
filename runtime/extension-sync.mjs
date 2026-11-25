@@ -3,6 +3,7 @@
 // Claude Code (query mcpServers & ~/.claude/skills) 及全部外部 ACP / CLI Agent。
 import fs from "node:fs/promises";
 import path from "node:path";
+import {fileURLToPath} from "node:url";
 import {execFile, spawn} from "node:child_process";
 import {promisify} from "node:util";
 import {randomUUID} from "node:crypto";
@@ -10,8 +11,11 @@ import {readDownloadNetwork, downloadEnvironment, githubDownloadUrl, redactNetwo
 import {loadEffectiveUserEnv} from "./env-ssh-hub.mjs";
 
 const execFileAsync = promisify(execFile);
+const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PLUGIN_MCP_SCRIPT = path.join(THIS_DIR, "plugin-mcp.mjs");
 const HOME = process.env.HOME || "/home/agent";
 export const EXT_ROOT = path.join(HOME, ".galiais", "extensions");
+const BUILTIN_SKILLS_DIR = path.join(EXT_ROOT, "builtin-skills");
 const REGISTRY_FILE = path.join(EXT_ROOT, "registry.json");
 const SECRETS_FILE = path.join(EXT_ROOT, "runtime-secrets.json");
 const SKILLS_DIR = path.join(EXT_ROOT, "skills");
@@ -54,7 +58,9 @@ function tomlString(v) {
 
 async function readJsonSafe(file, fallback) {
   try {
-    return JSON.parse(await fs.readFile(file, "utf8"));
+    const raw = await fs.readFile(file, "utf8");
+    if (!raw.trim()) return fallback;
+    return JSON.parse(raw);
   } catch (err) {
     if (err.code === "ENOENT") return fallback;
     throw err;
@@ -145,6 +151,22 @@ async function resolveEffectiveServers(registry, secrets, agentId, cwd) {
       if (val !== undefined && val !== null && String(val).length > 0) headers[k] = String(val);
     }
     out.push({...srv, resolvedEnv: env, resolvedHeaders: headers});
+  }
+  // 自动向三大引擎暴露 Solbraid 内置插件自进化运维 MCP（免手动配置）
+  const hasPluginMcp = await fs.stat(PLUGIN_MCP_SCRIPT).then(s => s.isFile()).catch(() => false);
+  if (hasPluginMcp && !out.some(s => s.id === "plugin_ctl")) {
+    out.push({
+      id: "plugin_ctl",
+      name: "Solbraid 插件自进化运维",
+      transport: "stdio",
+      command: process.execPath,
+      args: [PLUGIN_MCP_SCRIPT],
+      scope: "global",
+      targets: ["all"],
+      enabled: true,
+      resolvedEnv: {HOME},
+      resolvedHeaders: {},
+    });
   }
   return out;
 }
@@ -417,12 +439,63 @@ async function syncAllHooks(registry) {
   return {codexHooks: c1, antigravityHooks: c2, claudeHooks: c3};
 }
 
+const BUILTIN_PLUGIN_SDK_SKILL = `---
+name: solbraid-plugin-sdk
+description: Solbraid Host 插件微内核开发与自进化升级指南（Phase 4 全能力版）。当用户要求创建、修改、升级、调试或回滚 Solbraid 程序插件、命令、WebView 面板、原生 Compose SDUI 界面、多槽位挂载、自定义 Agent 驱动、协议转换器或工作台渲染器时使用。
+---
+
+# Solbraid Host 插件自进化开发与升级指南（20 能力 · 14 MCP 工具）
+
+## 1. 标准自进化闭环（必须按序执行）
+1. **查现状**：\`solbraid_plugin_list\` 查看全部插件、SDUI 页面、UI 槽位、动态驱动、协议转换器与 Studio 覆写；\`solbraid_plugin_read\` 读取目标源码。
+2. **预检门禁**：\`solbraid_plugin_validate\`（校验非核心红线、Manifest、路径安全、14 条静态安全规则、\`node --check\`）。
+3. **原子热升级**：\`solbraid_plugin_apply\`（自动归档快照 → 原子写入 → 单插件增量热载 → 激活失败自动回滚；支持覆写非 \`core\` 内置插件）。
+4. **受控装依赖（可选）**：如插件需第三方包，声明 \`deps.npm\` 后调用 \`solbraid_plugin_install_deps\`（强制 \`--ignore-scripts\`）。
+5. **现场烟测**：
+   - \`solbraid_plugin_test\`（\`command | panel | rpc\`）
+   - \`solbraid_plugin_test_sdui\`（校验并预览原生 Compose SDUI AST）
+   - \`solbraid_plugin_test_driver\`（烟测动态 \`agent.driver\` 或 \`provider.translator\`）
+   - \`solbraid_plugin_logs\` 核查运行日志无异常。
+6. **工作台热覆写**：调用 \`solbraid_studio_override\`（\`list | read | apply | rollback | reset\`）安全升级离线渲染器。
+7. **一键回滚**：\`solbraid_plugin_snapshots\` + \`solbraid_plugin_rollback\`（覆写内置插件可传 \`restoreBuiltin: true\`）。
+
+## 2. 安全边界与隔离执行层
+- 7 个 \`kind: "core"\` 核心服务严格锁定，严禁覆写或停用。
+- 推荐为含复杂计算或不受信任逻辑的插件在 Manifest 中设置 \`"executionTier": "worker-isolated"\`，运行于独立 \`worker_threads\`，超时或死循环将被宿主强杀，绝不卡死主进程。
+- 禁止在插件代码中使用 \`child_process\`、\`eval\`、\`new Function\`、越界路径访问。
+
+## 3. 20 项宿主能力与常用 SDK 接口
+- 全部能力：\`host.info\`、\`log\`、\`lifecycle\`、\`storage.local\`、\`settings.schema\`、\`commands\`、\`rpc\`、\`events.observe\`、\`ui.panel\`、\`ui.composerAction\`、\`ui.sdui\`、\`ui.slot\`、\`hooks.prompt\`、\`services.provide\`、\`services.consume\`、\`workspace.read\`、\`workspace.write\`、\`agent.driver\`、\`provider.translator\`、\`deps.npm\`。
+- **原生 Compose SDUI（零 WebView）**：
+  - \`ctx.ui.registerSurface({id, title, description, render: async ({cwd, params}) => ({title, subtitle, nodes: [...]})})\`
+  - 节点类型：\`column | row | flow | card | section | divider | spacer | text | badge | metric | progress | kv | code | list | button | toggle | input\`
+  - 动作类型：\`{type: "rpc", method, params}\`、\`{type: "command", command, args}\`、\`{type: "panel", panelId}\`、\`{type: "surface", surfaceId, fullScreen?}\`、\`{type: "navigate", route: "plugin://<pluginId>/<surfaceId>"}\`、\`{type: "prompt", text}\`、\`{type: "copy", text}\`、\`{type: "refresh"}\`
+- **全应用 21 个原生 UI 槽位（默认零占位，有插件才渲染）**：\`ctx.ui.registerSlot({id, slot, label, badge?, surfaceId?, panelId?, command?, render?, routes?, alignment?, offsetX?, offsetY?, draggable?, displayMode?})\`
+  - **全局自由悬浮层（任意页面 × 任意坐标 × 可手势拖拽）**：\`"global.overlay"\`（\`routes\`: \`["*"]\` 或 \`["home","chat","files","ssh","terminal","settings"]\`；\`alignment\`: 九宫格 \`topStart..bottomEnd\`；\`offsetX/offsetY\`；\`draggable: true\`；\`displayMode: "pill"|"fab"|"card"\`）
+  - **底部导航动态 Tab**：\`"nav.tab"\`（最多 2 个独立整页原生 SDUI/面板 Tab）
+  - **整页可接管槽位（带一键切回原版安全条）**：\`"home.replace"\`、\`"chat.replace"\`、\`"files.replace"\`、\`"ssh.replace"\`、\`"settings.replace"\`
+  - **首页**：\`"home.topbar"\`、\`"home.banner"\`、\`"home.footer"\`
+  - **聊天页**：\`"chat.topbar"\`、\`"chat.banner"\`、\`"chat.composerBar"\`、\`"chat.messageFooter"\`
+  - **文件与终端**：\`"files.toolbar"\`、\`"files.banner"\`、\`"ssh.toolbar"\`、\`"ssh.banner"\`、\`"terminal.toolbar"\`
+  - **设置与工作台**：\`"settings.section"\`、\`"studio.toolbar"\`
+- **动态可执行 Agent 驱动**：\`ctx.drivers.register({id, name, protocol: "plugin-driver", listModels, execute: async ({prompt, cwd, emitChunk, emitThought, emitTool, emitPlan}) => ({text})})\`
+- **热插拔 LLM 协议转换器**：\`ctx.providers.registerTranslator({id, name, baseProtocol, toUpstream: (req, ctx) => ({path, headers, body}), fromUpstream: (res, ctx) => ...})\`（在服务商中以 \`protocol: "plugin:<id>"\` 挂载）
+- **其他常用**：\`ctx.commands.register\`、\`ctx.panels.register\`、\`ctx.composer.registerAction\`、\`ctx.hooks.onBeforePrompt / onAfterResponse\`、\`ctx.rpc.register\`、\`ctx.storage\`、\`ctx.workspace\`。
+`;
+
+async function ensureBuiltinPluginSdkSkill() {
+  const dir = path.join(BUILTIN_SKILLS_DIR, "plugin-sdk");
+  await writeAtomic(path.join(dir, "SKILL.md"), BUILTIN_PLUGIN_SDK_SKILL, 0o644);
+  return {safeId: "plugin-sdk", dirPath: dir};
+}
+
 async function syncSkillSymlinks(registry) {
   const enabledPluginIds = new Set((registry.plugins || []).filter(p => p && p.enabled !== false).map(p => p.id));
   const skills = (registry.skills || []).filter(s => s && s.enabled !== false && (!s.pluginId || enabledPluginIds.has(s.pluginId)));
-  const codexEntries = [];
-  const claudeEntries = [];
-  const agyEntries = [];
+  const sdkSkill = await ensureBuiltinPluginSdkSkill().catch(() => null);
+  const codexEntries = sdkSkill ? [sdkSkill] : [];
+  const claudeEntries = sdkSkill ? [sdkSkill] : [];
+  const agyEntries = sdkSkill ? [sdkSkill] : [];
   for (const sk of skills) {
     if (!sk.dirPath) continue;
     const safeId = sanitizeId(sk.id);

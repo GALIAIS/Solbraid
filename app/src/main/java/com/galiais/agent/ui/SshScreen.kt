@@ -82,6 +82,8 @@ fun SshScreen(
     var showImportKey by remember { mutableStateOf(false) }
     var showKnownHosts by remember { mutableStateOf(false) }
     var passphraseKey by remember { mutableStateOf<String?>(null) }
+    var openingPluginSurface by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var openingPluginPanel by remember { mutableStateOf<Pair<String, com.galiais.agent.engine.ChatArtifact>?>(null) }
     val testingIds = remember { mutableStateMapOf<String, Boolean>() }
     val busyTunnelIds = remember { mutableStateMapOf<String, Boolean>() }
 
@@ -103,6 +105,13 @@ fun SshScreen(
                 Text("主机簿 · 隧道 · SFTP · 多密钥", style = MaterialTheme.typography.labelSmall, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             if (runtime.ready) {
+                PluginSlotActionBar(
+                    app = app,
+                    slotName = "ssh.toolbar",
+                    cwd = settings.defaultCwd,
+                    onOpenSurface = { pid, sid -> openingPluginSurface = pid to sid },
+                    onOpenPanel = { pid, art -> openingPluginPanel = pid to art },
+                )
                 TagPill("本地终端", fg = G.ink, bg = G.surfaceSubtle, border = G.border, onClick = { onOpenTerminal(settings.defaultCwd, null) })
             }
             TagPill("环境中心", fg = G.accent, bg = G.accentContainer, onClick = onOpenEnvironmentHub)
@@ -144,6 +153,14 @@ fun SshScreen(
                     }
                 }
             }
+
+            PluginSlotBannerColumn(
+                app = app,
+                slotName = "ssh.banner",
+                cwd = settings.defaultCwd,
+                onOpenSurface = { pid, sid -> openingPluginSurface = pid to sid },
+                onOpenPanel = { pid, art -> openingPluginPanel = pid to art },
+            )
 
             SegmentedPillBar(
                 options = listOf(
@@ -491,4 +508,12 @@ fun SshScreen(
             },
         )
     }
+    PluginSlotOverlayHost(
+        app = app,
+        cwd = settings.defaultCwd,
+        openingSurface = openingPluginSurface,
+        openingPanel = openingPluginPanel,
+        onOpenSurface = { openingPluginSurface = it },
+        onOpenPanel = { openingPluginPanel = it },
+    )
 }

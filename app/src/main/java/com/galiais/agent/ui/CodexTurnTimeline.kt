@@ -1277,6 +1277,24 @@ private fun TurnFooterActionBar(
                 }
             }
         }
+        val pluginFooter = LocalPluginMessageFooter.current
+        if (!copyText.isNullOrBlank() && pluginFooter != null) {
+            pluginFooter.first.take(2).forEach { slot ->
+                Row(
+                    modifier = Modifier
+                        .clip(D.shape(8.dp))
+                        .clickable(role = Role.Button) {
+                            pluginFooter.second(slot, TimelineItem.AgentMessage("turn-footer", copyText))
+                        }
+                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Icon(GaliaisIcons.Sparkles, contentDescription = null, tint = G.accent, modifier = Modifier.size(13.dp))
+                    Text(slot.label.ifBlank { slot.id }, style = MaterialTheme.typography.labelSmall, color = G.accent, maxLines = 1)
+                }
+            }
+        }
     }
 }
 

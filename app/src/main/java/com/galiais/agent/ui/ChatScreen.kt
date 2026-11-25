@@ -197,6 +197,8 @@ fun ChatScreen(
     var showLatexScratchpad by remember { mutableStateOf(false) }
     var showExpandedComposer by remember { mutableStateOf(false) }
     var studioArtifact by remember { mutableStateOf<ChatArtifact?>(null) }
+    var studioPluginId by remember { mutableStateOf<String?>(null) }
+    var openingPluginSurface by remember { mutableStateOf<Pair<String, String>?>(null) }
     val initialSnapshot = remember(key) { app.conversations.state(key) }
     val initialScrollIndex = remember(key) {
         if (initialSnapshot?.loaded == true && initialSnapshot.items.isNotEmpty()) {
@@ -412,6 +414,46 @@ fun ChatScreen(
     }
 
     val pluginCommands = remember(extRegistry, hostPlugins) { app.extensions.activePluginSlashCommands() }
+    val pluginComposerActions = remember(hostPlugins) { app.extensions.activePluginComposerActions() }
+    val pluginTopBarSlots = remember(hostPlugins) { app.extensions.activePluginUiSlots("chat.topbar") }
+    val pluginMessageFooterSlots = remember(hostPlugins) { app.extensions.activePluginUiSlots("chat.messageFooter") }
+
+    fun triggerPluginUiSlot(slot: com.galiais.agent.engine.HostPluginUiSlot, extraArg: String = "") {
+        scope.launch {
+            try {
+                when {
+                    !slot.surfaceId.isNullOrBlank() -> openingPluginSurface = slot.pluginId to slot.surfaceId
+                    !slot.panelId.isNullOrBlank() -> {
+                        val art = app.extensions.renderHostPluginPanel(slot.pluginId, slot.panelId, cwd)
+                        studioPluginId = slot.pluginId
+                        studioArtifact = art
+                    }
+                    !slot.command.isNullOrBlank() -> {
+                        val res = app.extensions.runHostPluginCommand(slot.pluginId, slot.command, args = extraArg, cwd = cwd, sessionId = key.id)
+                        when (res.kind) {
+                            "prompt" -> if (res.prompt.isNotBlank()) replaceDraft("${res.prompt} ")
+                            "artifact" -> if (res.content.isNotBlank()) {
+                                val artKind = ArtifactKind.fromMimeOrLang(res.artifactKind, res.artifactKind)
+                                studioPluginId = slot.pluginId
+                                studioArtifact = ChatArtifact(
+                                    id = "hostcmd:${slot.pluginId}:${slot.command}",
+                                    identifier = "hostcmd-${slot.pluginId}-${slot.command}",
+                                    title = res.title.ifBlank { slot.label.ifBlank { "/${slot.command}" } },
+                                    kind = artKind,
+                                    language = artKind.extension,
+                                    content = res.content,
+                                )
+                            }
+                            else -> app.conversations.notify(res.message.ifBlank { "${slot.label.ifBlank { slot.id }} 已执行" })
+                        }
+                    }
+                    else -> app.conversations.notify("插件槽位未绑定页面、面板或命令")
+                }
+            } catch (e: Exception) {
+                app.conversations.notify("执行插件槽位动作失败：${e.message}")
+            }
+        }
+    }
     val allSlashCommands = remember(key.engine, dynamicCommands, pluginCommands) {
         val builtIn = builtInSlashCommands(key.engine)
         val seen = builtIn.map { it.name }.toMutableSet()
@@ -568,6 +610,7 @@ fun ChatScreen(
                                     "prompt" -> if (res.prompt.isNotBlank()) replaceDraft("${res.prompt} ")
                                     "artifact" -> if (res.content.isNotBlank()) {
                                         val artKind = ArtifactKind.fromMimeOrLang(res.artifactKind, res.artifactKind)
+                                        studioPluginId = parts[0]
                                         studioArtifact = ChatArtifact(
                                             id = "hostcmd:${parts[0]}:${parts[1]}",
                                             identifier = "hostcmd-${parts[0]}-${parts[1]}",
@@ -689,6 +732,14 @@ fun ChatScreen(
                                 Icon(GaliaisIcons.FileDiff, contentDescription = null, tint = G.accent, modifier = Modifier.size(13.dp))
                                 Text(diffPillLabel, style = MaterialTheme.typography.labelSmall, color = G.accent, fontWeight = FontWeight.SemiBold, maxLines = 1)
                             }
+                        }
+                        pluginTopBarSlots.take(2).forEach { slot ->
+                            TagPill(
+                                text = slot.badge.ifBlank { slot.label.ifBlank { slot.id } },
+                                fg = G.accent,
+                                bg = G.accentContainer,
+                                onClick = { triggerPluginUiSlot(slot) },
+                            )
                         }
                         IconButton(onClick = { showInfo = true }) {
                             Icon(GaliaisIcons.MoreHoriz, contentDescription = "更多操作", tint = G.inkMuted, modifier = Modifier.size(21.dp))
@@ -848,9 +899,22 @@ fun ChatScreen(
                 animationSpec = tween(100),
                 label = "chatListReveal",
             )
+            // 聊天页顶部原生 SDUI 槽位（无插件挂载时零占位）
+            PluginSlotBannerColumn(
+                app = app,
+                slotName = "chat.banner",
+                cwd = cwd,
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                onOpenSurface = { pid, sid -> openingPluginSurface = pid to sid },
+                onOpenPanel = { pid, art -> studioPluginId = pid; studioArtifact = art },
+                onInjectPrompt = { txt -> replaceDraft(if (draft.isBlank()) txt else "$draft\n$txt") },
+            )
             // 单容器浮层架构：消息列表延伸至底部透明输入框后方，/ 与 @ 悬浮窗叠加于列表之上不挤压 LazyColumn 重排。
             Box(Modifier.weight(1f).fillMaxWidth()) {
-                CompositionLocalProvider(LocalFileLinkHandler provides openFileLink) {
+                CompositionLocalProvider(
+                    LocalFileLinkHandler provides openFileLink,
+                    LocalPluginMessageFooter provides (pluginMessageFooterSlots to { slot, msg -> triggerPluginUiSlot(slot, msg.text) }),
+                ) {
                 LazyColumn(
                     modifier = Modifier.fillMaxSize().graphicsLayer { alpha = listRevealAlpha }.nestedScroll(userScrollDetector),
                     state = list,
@@ -1152,7 +1216,10 @@ fun ChatScreen(
                                 .navigationBarsPadding()
                                 .padding(start = 10.dp, end = 10.dp, top = 2.dp, bottom = 6.dp),
                         ) {
-                val inputEnabled = runtime.ready && state?.loaded == true && !needsTrust
+                val pluginDriverMissing = remember(key.engine.id, hostPlugins) {
+                    AgentCatalog.find(key.engine.id) == null && !app.conversations.hub.isInstalled(key.engine.id)
+                }
+                val inputEnabled = runtime.ready && state?.loaded == true && !needsTrust && !pluginDriverMissing
                 val isRunning = state?.running == true
                 val canSteerMode = inputEnabled && isRunning && key.engine == EngineKind.CODEX && state.activeTurnId != null
                 val fieldEnabled = inputEnabled && (!isRunning || canSteerMode)
@@ -1168,6 +1235,18 @@ fun ChatScreen(
                     animationSpec = tween(180),
                     label = "composerBorder",
                 )
+                Column(Modifier.fillMaxWidth()) {
+                PluginSlotActionBar(
+                    app = app,
+                    slotName = "chat.composerBar",
+                    cwd = cwd,
+                    sessionId = key.id,
+                    scrollable = true,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                    onOpenSurface = { pid, sid -> openingPluginSurface = pid to sid },
+                    onOpenPanel = { pid, art -> studioPluginId = pid; studioArtifact = art },
+                    onInjectPrompt = { txt -> replaceDraft(if (draft.isBlank()) txt else "$draft\n$txt") },
+                )
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
                     shape = D.composerShape,
@@ -1176,6 +1255,20 @@ fun ChatScreen(
                     shadowElevation = if (G.dark || D.material) 0.dp else 2.dp,
                 ) {
                     Column(Modifier.padding(start = 14.dp, end = 10.dp, top = 9.dp, bottom = 7.dp)) {
+                        if (pluginDriverMissing) {
+                            Surface(
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                                shape = D.shape(10.dp),
+                                color = G.warningTint,
+                            ) {
+                                Text(
+                                    "插件驱动「${key.engine.label}」已卸载、停用或处于安全模式，当前为只读模式；可继续浏览、导出或删除此会话。",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = G.warning,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                                )
+                            }
+                        }
                         if (attachments.isNotEmpty()) {
                             Row(
                                 modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(bottom = 8.dp),
@@ -1252,6 +1345,7 @@ fun ChatScreen(
                             if (draft.isEmpty()) {
                                 Text(
                                     when {
+                                        pluginDriverMissing -> "插件驱动未加载（只读历史模式）"
                                         canSteerMode -> "补充指令，调整当前任务…"
                                         isRunning -> "${key.engine.label} 正在工作…"
                                         else -> "和 ${key.engine.label} 一起工作"
@@ -1387,6 +1481,59 @@ fun ChatScreen(
                                                     icon = GaliaisIcons.Layers,
                                                     onClick = { attachMenu = false; showArtifactsDrawer = true },
                                                 )
+                                            }
+                                            if (idle && pluginComposerActions.isNotEmpty()) {
+                                                Hairline(Modifier.padding(vertical = 2.dp))
+                                                Text(
+                                                    "插件快捷动作",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = G.inkMuted,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 2.dp),
+                                                )
+                                                pluginComposerActions.take(6).forEach { act ->
+                                                    GaliaisMenuRow(
+                                                        title = act.label,
+                                                        subtitle = act.description.ifBlank { "来自插件 ${act.pluginId}" },
+                                                        icon = GaliaisIcons.Sparkles,
+                                                        onClick = {
+                                                            attachMenu = false
+                                                            scope.launch {
+                                                                try {
+                                                                    when {
+                                                                        !act.panelId.isNullOrBlank() -> {
+                                                                            val art = app.extensions.renderHostPluginPanel(act.pluginId, act.panelId, cwd)
+                                                                            studioPluginId = act.pluginId
+                                                                            studioArtifact = art
+                                                                        }
+                                                                        !act.command.isNullOrBlank() -> {
+                                                                            val res = app.extensions.runHostPluginCommand(act.pluginId, act.command, cwd = cwd, sessionId = key.id)
+                                                                            when (res.kind) {
+                                                                                "prompt" -> if (res.prompt.isNotBlank()) replaceDraft("${res.prompt} ")
+                                                                                "artifact" -> if (res.content.isNotBlank()) {
+                                                                                    val artKind = ArtifactKind.fromMimeOrLang(res.artifactKind, res.artifactKind)
+                                                                                    studioPluginId = act.pluginId
+                                                                                    studioArtifact = ChatArtifact(
+                                                                                        id = "hostcmd:${act.pluginId}:${act.command}",
+                                                                                        identifier = "hostcmd-${act.pluginId}-${act.command}",
+                                                                                        title = res.title.ifBlank { act.label },
+                                                                                        kind = artKind,
+                                                                                        language = artKind.extension,
+                                                                                        content = res.content,
+                                                                                    )
+                                                                                }
+                                                                                else -> app.conversations.notify(res.message.ifBlank { "${act.label} 已执行" })
+                                                                            }
+                                                                        }
+                                                                        else -> app.conversations.notify("插件动作未绑定面板或命令")
+                                                                    }
+                                                                } catch (e: Exception) {
+                                                                    app.conversations.notify("执行插件动作失败：${e.message}")
+                                                                }
+                                                            }
+                                                        },
+                                                    )
+                                                }
                                             }
                                             Hairline(Modifier.padding(vertical = 2.dp))
                                             GaliaisMenuRow(
@@ -1784,6 +1931,7 @@ fun ChatScreen(
                         }
                     }
                 }
+                }
             }
                     }
                 }
@@ -2018,16 +2166,43 @@ fun ChatScreen(
             onDismiss = { showLatexScratchpad = false },
         )
     }
+    openingPluginSurface?.let { (pid, sid) ->
+        PluginSduiSheet(
+            app = app,
+            pluginId = pid,
+            surfaceId = sid,
+            cwd = cwd,
+            onOpenPanel = { panelPid, art ->
+                openingPluginSurface = null
+                studioPluginId = panelPid
+                studioArtifact = art
+            },
+            onOpenSurface = { nextPid, nextSid ->
+                openingPluginSurface = nextPid to nextSid
+            },
+            onInjectPrompt = { text ->
+                replaceDraft(if (draft.isBlank()) text else "$draft\n$text")
+            },
+            onDismiss = { openingPluginSurface = null },
+        )
+    }
     studioArtifact?.let { active ->
         val merged = remember(conversationArtifacts, active) {
             if (conversationArtifacts.any { it.id == active.id }) conversationArtifacts else conversationArtifacts + active
+        }
+        val resolvedPluginId = studioPluginId?.takeIf {
+            active.id.startsWith("hostpanel:$it:") || active.id.startsWith("hostcmd:$it:")
         }
         ArtifactStudioSheet(
             app = app,
             artifacts = merged,
             initialArtifactId = active.id,
             cwd = cwd,
-            onDismiss = { studioArtifact = null },
+            pluginId = resolvedPluginId,
+            onDismiss = {
+                studioArtifact = null
+                studioPluginId = null
+            },
         )
     }
 }

@@ -150,8 +150,11 @@ export function scanStaticSecurity(rawBundle) {
         if (!cleanRel || cleanRel.startsWith("/") || cleanRel.split("/").includes("..")) {
           pushFinding("PATH_TRAVERSAL", "critical", "插件文件路径存在目录穿越", `plugin.file:${rel}`, cleanRel);
         }
-        if (/\b(?:from\s+["'](?:node:)?fs(?:\/promises)?["']|require\s*\(\s*["'](?:node:)?fs)/.test(String(code || "")) && !caps.has("workspace.read")) {
-          pushFinding("UNDECLARED_FS", "high", "插件未声明 workspace.read 却直接导入文件系统模块", `plugin.file:${rel}`, "违反最小权限原则");
+        if (/\b(?:from\s+["'](?:node:)?fs(?:\/promises)?["']|require\s*\(\s*["'](?:node:)?fs)/.test(String(code || "")) && !caps.has("workspace.read") && !caps.has("workspace.write")) {
+          pushFinding("UNDECLARED_FS", "high", "插件未声明 workspace.read / workspace.write 却直接导入文件系统模块", `plugin.file:${rel}`, "违反最小权限原则");
+        }
+        if (/\b(?:from\s+["'](?:node:)?(?:worker_threads|cluster|vm|inspector|v8|module)["']|require\s*\(\s*["'](?:node:)?(?:worker_threads|cluster|vm|inspector|v8|module)["']|import\s*\(\s*["'](?:node:)?(?:worker_threads|cluster|vm|inspector|v8|module)["'])/.test(String(code || ""))) {
+          pushFinding("FORBIDDEN_NODE_BUILTIN", "critical", "禁止插件导入可绕过沙箱或无限派生的 Node 核心模块", `plugin.file:${rel}`, "禁止导入 worker_threads / cluster / vm / inspector / v8 / module");
         }
       }
     }

@@ -29,7 +29,7 @@ class DelegationCoordinator(private val repo: ConversationRepository) {
             !repo.settings.state.value.delegationEnabled -> "用户已在设置中关闭跨 Agent 委派"
             parent == null -> "委派请求缺少来源会话"
             target == from -> "不能将任务委派给自身引擎"
-            AgentCatalog.find(target.id) == null -> "目标 Agent 不存在：${target.id}"
+            AgentCatalog.find(target.id) == null && !repo.hub.isInstalled(target.id) -> "目标 Agent 不存在：${target.id}"
             task.isBlank() || task.length > 20_000 -> "委派任务描述无效"
             parent in active -> "该会话已有一个委派正在执行"
             else -> null

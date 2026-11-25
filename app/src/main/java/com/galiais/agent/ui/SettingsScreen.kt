@@ -17,6 +17,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
@@ -38,6 +41,8 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
     val envConfig by app.envSsh.envConfig.collectAsState()
     val sshHosts by app.envSsh.sshHosts.collectAsState()
     val activeTunnels by app.envSsh.activeTunnels.collectAsState()
+    var openingPluginSurface by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var openingPluginPanel by remember { mutableStateOf<Pair<String, com.galiais.agent.engine.ChatArtifact>?>(null) }
 
     val installedAgents = AgentCatalog.all().filter { it.preinstalled || hubStatuses[it.id]?.installed == true }
     val agentsSummary = buildString {
@@ -236,6 +241,14 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                 )
             }
 
+            PluginSlotBannerColumn(
+                app = app,
+                slotName = "settings.section",
+                cwd = settings.defaultCwd,
+                onOpenSurface = { pid, sid -> openingPluginSurface = pid to sid },
+                onOpenPanel = { pid, art -> openingPluginPanel = pid to art },
+            )
+
             SectionLabel("其他")
             CrispCard(padding = PaddingValues(0.dp)) {
                 SettingsNavRow(
@@ -251,4 +264,12 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
             Spacer(Modifier.height(20.dp))
         }
     }
+    PluginSlotOverlayHost(
+        app = app,
+        cwd = settings.defaultCwd,
+        openingSurface = openingPluginSurface,
+        openingPanel = openingPluginPanel,
+        onOpenSurface = { openingPluginSurface = it },
+        onOpenPanel = { openingPluginPanel = it },
+    )
 }

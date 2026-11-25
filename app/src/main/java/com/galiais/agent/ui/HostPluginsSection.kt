@@ -35,6 +35,7 @@ import com.galiais.agent.GaliaisApplication
 import com.galiais.agent.engine.ChatArtifact
 import com.galiais.agent.engine.HostPluginInfo
 import com.galiais.agent.engine.HostPluginSnapshot
+import com.galiais.agent.engine.HostPluginSourceSnapshot
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -55,8 +56,12 @@ fun HostPluginsSection(
     var editingSettings by remember { mutableStateOf<HostPluginInfo?>(null) }
     var editingGrants by remember { mutableStateOf<HostPluginInfo?>(null) }
     var viewingLogs by remember { mutableStateOf<HostPluginInfo?>(null) }
+    var viewingSnapshots by remember { mutableStateOf<HostPluginInfo?>(null) }
+    var snapshotList by remember { mutableStateOf<List<HostPluginSourceSnapshot>>(emptyList()) }
+    var loadingSnapshots by remember { mutableStateOf(false) }
     var creatingLocal by remember { mutableStateOf(false) }
     var openingPanel by remember { mutableStateOf<Pair<String, ChatArtifact>?>(null) }
+    var openingSurface by remember { mutableStateOf<Pair<String, String>?>(null) }
 
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel("Solbraid 插件内核（Host Microkernel）")
@@ -66,7 +71,10 @@ fun HostPluginsSection(
 
     CrispCard(padding = PaddingValues(14.dp)) {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
                 Text(
                     "运行代际 ${hostPlugins.generationId.ifBlank { "未启动" }}",
                     style = MaterialTheme.typography.titleSmall,
@@ -78,12 +86,45 @@ fun HostPluginsSection(
                     fg = if (hostPlugins.safeMode) G.warning else G.success,
                     bg = if (hostPlugins.safeMode) G.warningTint else G.successTint,
                 )
+                if (hostPlugins.agentControlAvailable) {
+                    TagPill(
+                        text = "Agent 自进化 MCP 已连接",
+                        fg = G.accent,
+                        bg = G.accentContainer,
+                    )
+                }
+                if (hostPlugins.studioOverrides.isNotEmpty()) {
+                    TagPill(
+                        text = "工作台热覆写 (${hostPlugins.studioOverrides.size})",
+                        fg = G.warning,
+                        bg = G.warningTint,
+                    )
+                }
             }
             Text(
-                "同进程受信任微内核（Capability 协商 · 故障隔离 · 逆序释放），支持在聊天中输入插件 `/` 指令或打开独立面板。",
+                "微内核双执行层（同进程受信任 + Worker 线程强杀隔离 · 20 项能力 · 14 工具 MCP），支持 Agent 热升级插件、渲染原生 Compose SDUI、扩展动态驱动/协议转换及热覆写工作台。",
                 style = MaterialTheme.typography.bodySmall,
                 color = G.inkMuted,
             )
+            if (hostPlugins.studioOverrides.isNotEmpty()) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    hostPlugins.studioOverrides.forEach { fileName ->
+                        TagPill(
+                            text = "重置 $fileName",
+                            fg = G.warning,
+                            bg = G.warningTint,
+                            onClick = {
+                                scope.launch {
+                                    onBusy("正在恢复原版 $fileName…")
+                                    try { app.extensions.resetStudioOverride(fileName) }
+                                    catch (e: Exception) { app.conversations.notify("重置失败：${e.message}") }
+                                    finally { onBusy(null) }
+                                }
+                            },
+                        )
+                    }
+                }
+            }
             SettingsToggleRow(
                 title = "安全模式（Safe Mode）",
                 subtitle = "仅启动 ${hostPlugins.corePlugins.size.coerceAtLeast(1)} 个核心内核服务，跳过所有扩展插件以快速排障",
@@ -148,6 +189,12 @@ fun HostPluginsSection(
                                 Text(plugin.name, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
                                 TagPill("v${plugin.version}", fg = G.inkMuted, bg = G.surfaceSubtle)
                                 TagPill(kindLabel, fg = G.inkMuted, bg = G.surfaceSubtle)
+                                if (plugin.overriddenBuiltin) {
+                                    TagPill("已覆写内置", fg = G.warning, bg = G.warningTint)
+                                }
+                                if (plugin.isWorkerIsolated) {
+                                    TagPill("线程隔离", fg = G.success, bg = G.successTint)
+                                }
                                 TagPill(statusLabel, fg = statusFg, bg = statusBg)
                             }
                             if (plugin.description.isNotBlank()) {
@@ -171,6 +218,32 @@ fun HostPluginsSection(
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         if (plugin.commands.isNotEmpty()) {
                             TagPill(plugin.commands.joinToString(" ") { "/${it.name}" }, fg = G.accent, bg = G.accentContainer)
+                        }
+                        if (plugin.composerActions.isNotEmpty()) {
+                            TagPill("输入栏 +${plugin.composerActions.size}", fg = G.accent, bg = G.accentContainer)
+                        }
+                        if (plugin.uiSlots.isNotEmpty()) {
+                            TagPill("槽位 +${plugin.uiSlots.size}", fg = G.accent, bg = G.accentContainer)
+                        }
+                        if (plugin.status == "active") {
+                            plugin.surfaces.forEach { surface ->
+                                TagPill(
+                                    text = "原生：${surface.title}",
+                                    fg = G.success,
+                                    bg = G.successTint,
+                                    onClick = { openingSurface = plugin.id to surface.id },
+                                )
+                            }
+                        }
+                        plugin.translators.forEach { tr ->
+                            TagPill("协议：${tr.name}", fg = G.inkMuted, bg = G.surfaceSubtle)
+                        }
+                        hostPlugins.drivers.filter { it.pluginId == plugin.id }.forEach { drv ->
+                            TagPill(
+                                text = if (drv.executable) "动态驱动：${drv.name}" else "驱动：${drv.name}",
+                                fg = G.accent,
+                                bg = G.accentContainer,
+                            )
                         }
                         if (plugin.requiredCapabilities.isNotEmpty() || plugin.optionalCapabilities.isNotEmpty()) {
                             TagPill(
@@ -204,6 +277,38 @@ fun HostPluginsSection(
                                     },
                                 )
                             }
+                        }
+                        if (runtimeReady && !hostPlugins.safeMode) {
+                            TagPill("热载", fg = G.inkMuted, bg = G.surfaceSubtle, onClick = {
+                                scope.launch {
+                                    onBusy("正在热载 ${plugin.name}…")
+                                    try { app.extensions.reloadSingleHostPlugin(plugin.id) }
+                                    catch (e: Exception) { app.conversations.notify("热载失败：${e.message}") }
+                                    finally { onBusy(null) }
+                                }
+                            })
+                        }
+                        if (plugin.snapshotCount > 0) {
+                            TagPill("快照 (${plugin.snapshotCount})", fg = G.accent, bg = G.accentContainer, onClick = {
+                                viewingSnapshots = plugin
+                                snapshotList = emptyList()
+                                loadingSnapshots = true
+                                scope.launch {
+                                    try { snapshotList = app.extensions.listHostPluginSnapshots(plugin.id) }
+                                    catch (e: Exception) { app.conversations.notify("读取快照失败：${e.message}") }
+                                    finally { loadingSnapshots = false }
+                                }
+                            })
+                        }
+                        if (plugin.overriddenBuiltin) {
+                            TagPill("恢复原版", fg = G.warning, bg = G.warningTint, onClick = {
+                                scope.launch {
+                                    onBusy("正在恢复原版内置插件…")
+                                    try { app.extensions.restoreBuiltinHostPlugin(plugin.id) }
+                                    catch (e: Exception) { app.conversations.notify("恢复失败：${e.message}") }
+                                    finally { onBusy(null) }
+                                }
+                            })
                         }
                         TagPill("日志 (${plugin.recentLogs.size})", fg = G.inkMuted, bg = G.surfaceSubtle, onClick = { viewingLogs = plugin })
                         if (plugin.isRemovable) {
@@ -379,6 +484,85 @@ fun HostPluginsSection(
         )
     }
 
+    viewingSnapshots?.let { plugin ->
+        val fmt = remember { SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()) }
+        GaliaisSheet(onDismissRequest = { viewingSnapshots = null }) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp)
+                    .padding(bottom = 22.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text("${plugin.name} · 源码快照", style = MaterialTheme.typography.titleLarge, color = G.ink)
+                Text("每次由 Agent 升级或覆写前均会自动归档完整源码快照，可一键回滚至任意历史版本。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                if (loadingSnapshots) {
+                    Text("正在读取快照记录…", style = MaterialTheme.typography.bodySmall, color = G.inkSubtle)
+                } else if (snapshotList.isEmpty()) {
+                    Text("暂无可回滚的历史快照", style = MaterialTheme.typography.bodySmall, color = G.inkSubtle)
+                } else {
+                    CrispCard(padding = PaddingValues(0.dp)) {
+                        snapshotList.forEachIndexed { idx, snap ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        Text("v${snap.version}", style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
+                                        Text(
+                                            if (snap.createdAt > 0L) fmt.format(Date(snap.createdAt)) else snap.id,
+                                            fontFamily = Mono,
+                                            fontSize = 11.sp,
+                                            color = G.inkMuted,
+                                        )
+                                        TagPill("${snap.fileCount} 文件", fg = G.inkMuted, bg = G.surfaceSubtle)
+                                    }
+                                    if (snap.note.isNotBlank()) {
+                                        Text(snap.note, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                                    }
+                                }
+                                SecondaryPillButton("回滚", enabled = runtimeReady, onClick = {
+                                    viewingSnapshots = null
+                                    scope.launch {
+                                        onBusy("正在回滚 ${plugin.name} 至 v${snap.version}…")
+                                        try { app.extensions.rollbackHostPluginSnapshot(plugin.id, snap.id) }
+                                        catch (e: Exception) { app.conversations.notify("回滚失败：${e.message}") }
+                                        finally { onBusy(null) }
+                                    }
+                                })
+                            }
+                            if (idx < snapshotList.lastIndex) Hairline()
+                        }
+                    }
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    SecondaryPillButton("关闭", onClick = { viewingSnapshots = null })
+                }
+            }
+        }
+    }
+
+    openingSurface?.let { (pid, sid) ->
+        PluginSduiSheet(
+            app = app,
+            pluginId = pid,
+            surfaceId = sid,
+            cwd = defaultCwd,
+            onOpenPanel = { panelPid, art ->
+                openingSurface = null
+                openingPanel = panelPid to art
+            },
+            onOpenSurface = { nextPid, nextSid ->
+                openingSurface = nextPid to nextSid
+            },
+            onDismiss = { openingSurface = null },
+        )
+    }
+
     openingPanel?.let { (pid, artifact) ->
         ArtifactStudioSheet(
             app = app,
@@ -408,13 +592,20 @@ private fun HostPluginGrantsSheet(
             "commands" to "向聊天输入框注册 `/` 快捷命令",
             "settings.schema" to "声明原生 JSON Schema 配置页",
             "ui.panel" to "渲染隔离 WebView 交互看板",
+            "ui.composerAction" to "向聊天输入栏 `+` 菜单注册一键快捷动作",
+            "ui.sdui" to "渲染声明式原生 Jetpack Compose SDUI 界面（零 WebView）",
+            "ui.slot" to "挂载首页横幅、聊天顶栏、消息底栏或工作台工具栏原生槽位",
+            "hooks.prompt" to "在发送前与回复后挂载可隔离的 Prompt/响应钩子",
             "workspace.read" to "只读扫描工作区目录与文件内容",
+            "workspace.write" to "在工作区目录内安全写入与更新文件（受限路径）",
             "storage.local" to "256KB 配额隔离本地持久化存储",
             "events.observe" to "订阅只读不可变会话观测事件",
             "rpc" to "暴露限定命名空间 plugin.<id>.* RPC 方法",
             "services.provide" to "向内核服务总线提供服务",
             "services.consume" to "消费核心内核总线暴露的服务",
-            "agent.driver" to "注册外部或自定义 Agent 驱动协议",
+            "agent.driver" to "注册可执行动态流式 Agent 驱动引擎",
+            "provider.translator" to "注册热插拔自定义 LLM API 协议转换器",
+            "deps.npm" to "受控安装插件专属第三方 npm 依赖（强制 --ignore-scripts）",
         )
     }
     GaliaisSheet(onDismissRequest = onDismiss) {

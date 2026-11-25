@@ -127,6 +127,9 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
                             try { extensions.syncNow() }
                             catch (cancel: CancellationException) { throw cancel }
                             catch (error: Exception) { Log.w("GALIAIS", "同步扩展中心失败", error); notify("扩展同步失败：${error.message}") }
+                            try { extensions.refreshHostPlugins() }
+                            catch (cancel: CancellationException) { throw cancel }
+                            catch (error: Exception) { Log.w("GALIAIS", "拉取 Host 插件快照失败", error) }
                             try { superAgent.loadPersisted() } catch (error: Exception) { Log.w("GALIAIS", "恢复工单失败", error) }
                             refresh().join()
                         } finally {
@@ -223,16 +226,9 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
     fun refresh() = scope.launch {
         loadingFlow.value = true
         try {
-            val allAdapters = buildList<EngineAdapter> {
-                add(codex)
-                add(claude)
-                if (runtime.hubAvailable) {
-                    AgentCatalog.external().forEach { add(hub.adapterFor(it.engineKind)) }
-                }
-            }
-            for (engine in allAdapters) {
+            for (engine in listOf<EngineAdapter>(codex, claude)) {
                 val listed = try { engine.list() } catch (error: Exception) {
-                    if (engine.kind.id in setOf("codex", "claude")) notify("${engine.kind.label} 会话列表读取失败：${error.message}")
+                    notify("${engine.kind.label} 会话列表读取失败：${error.message}")
                     continue
                 }
                 val current = conversationsFlow.value
@@ -243,6 +239,22 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
                         ?: initialState(summary).copy(running = summary.running)
                 }
                 conversationsFlow.value = merged
+            }
+            if (runtime.hubAvailable) {
+                val hubListed = try { hub.listAllSessions() } catch (_: Exception) { null }
+                if (hubListed != null) {
+                    val keepKeys = hubListed.map { it.key }.toSet()
+                    val current = conversationsFlow.value
+                    val merged = current.filterKeys { k ->
+                        k.engine == EngineKind.CODEX || k.engine == EngineKind.CLAUDE || k in keepKeys
+                    }.toMutableMap()
+                    for (summary in hubListed) {
+                        val existing = merged[summary.key]
+                        merged[summary.key] = existing?.copy(summary = summary.copy(parent = summary.parent ?: existing.summary.parent))
+                            ?: initialState(summary).copy(running = summary.running)
+                    }
+                    conversationsFlow.value = merged
+                }
             }
         } finally {
             loadingFlow.value = false
@@ -864,6 +876,9 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
     fun delete(key: ConversationKey) = launchOperation("删除失败") {
         adapter(key.engine).delete(key)
         settings.removeConversationOptions(key)
+        arenaGroupsFlow.value = arenaGroupsFlow.value
+            .mapValues { (_, list) -> list.filterNot { it == key } }
+            .filterValues { it.size >= 2 }
         remove(key)
     }
 

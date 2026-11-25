@@ -300,7 +300,15 @@ fun EngineLabel(engine: EngineKind, modifier: Modifier = Modifier) {
         horizontalArrangement = Arrangement.spacedBy(5.5.dp),
     ) {
         AgentAppIcon(engine = engine, size = 15.dp)
-        Text(engine.label, style = MaterialTheme.typography.labelSmall, color = fg, fontWeight = FontWeight.SemiBold)
+        Text(
+            engine.label,
+            style = MaterialTheme.typography.labelSmall,
+            color = fg,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            softWrap = false,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 

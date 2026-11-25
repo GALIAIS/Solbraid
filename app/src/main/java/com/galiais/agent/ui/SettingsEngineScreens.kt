@@ -95,6 +95,11 @@ private val claudeAliases = listOf(
 fun ProvidersSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBack: () -> Unit) {
     val runtime by app.runtime.snapshot.collectAsState()
     val settings by app.settings.state.collectAsState()
+    val hostPlugins by app.extensions.hostPlugins.collectAsState()
+    val activePluginProtocols = remember(hostPlugins) {
+        if (hostPlugins.safeMode) emptySet()
+        else hostPlugins.translators.map { "plugin:${it.id.lowercase()}" }.toSet()
+    }
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboard.current
     var activeTab by rememberSaveable { mutableStateOf("providers") } // "providers" | "groups"
@@ -251,9 +256,12 @@ fun ProvidersSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                                         if (group.strategy == "round_robin") {
                                             TagPill("${t.weight}x", fg = G.inkMuted, bg = G.surfaceSubtle)
                                         }
+                                        val missingPluginProto = p != null && p.customProtocolId.startsWith("plugin:") &&
+                                            p.customProtocolId.lowercase() !in activePluginProtocols
                                         when {
                                             p == null -> TagPill("已删除", fg = G.danger, bg = G.dangerTint)
                                             !p.enabled -> TagPill("已停用", fg = G.warning, bg = G.warningTint)
+                                            missingPluginProto -> TagPill("插件协议未加载", fg = G.warning, bg = G.warningTint)
                                             missingKey -> TagPill("缺密钥", fg = G.warning, bg = G.warningTint)
                                         }
                                     }
@@ -306,6 +314,11 @@ fun ProvidersSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                             )
                             if (!provider.enabled) {
                                 TagPill("已停用", fg = G.inkSubtle, bg = G.surfaceSubtle)
+                            }
+                            val missingPluginProto = provider.customProtocolId.startsWith("plugin:") &&
+                                provider.customProtocolId.lowercase() !in activePluginProtocols
+                            if (missingPluginProto) {
+                                TagPill("插件协议未加载", fg = G.warning, bg = G.warningTint)
                             }
                             provider.billingLabel().takeIf { it.isNotBlank() }?.let { b ->
                                 TagPill(b, fg = if (provider.billingKind == "plan") G.accent else if (provider.billingKind == "free") G.success else G.inkMuted, bg = G.surfaceSubtle)

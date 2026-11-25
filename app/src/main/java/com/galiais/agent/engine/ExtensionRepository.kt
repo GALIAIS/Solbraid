@@ -28,6 +28,7 @@ class ExtensionRepository(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val syncMutex = Mutex()
     private val skillMutex = Mutex()
+    private val hostPluginsMutex = Mutex()
 
     private val registryFlow = MutableStateFlow(ExtensionRegistry.fromJson(settings.extensionRegistryJson()))
     val registry: StateFlow<ExtensionRegistry> = registryFlow.asStateFlow()
@@ -316,14 +317,38 @@ class ExtensionRepository(
         return (fromHost + fromPacks).distinctBy { it.name }
     }
 
+    /** 汇总所有已激活 Host 插件注册到聊天输入框 `+` 菜单的快捷动作（安全模式下隐藏）。 */
+    fun activePluginComposerActions(): List<HostPluginComposerAction> {
+        val snap = hostPluginsFlow.value
+        if (snap.safeMode) return emptyList()
+        return snap.plugins
+            .filter { it.status == "active" }
+            .flatMap { it.composerActions }
+            .distinctBy { "${it.pluginId}:${it.id}" }
+    }
+
+    /** 按原生槽位名过滤已激活插件的 UI 挂载项（安全模式下隐藏）。 */
+    fun activePluginUiSlots(slotName: String): List<HostPluginUiSlot> {
+        val snap = hostPluginsFlow.value
+        if (snap.safeMode) return emptyList()
+        return snap.plugins
+            .filter { it.status == "active" }
+            .flatMap { it.uiSlots }
+            .filter { it.slot == slotName }
+            .distinctBy { "${it.pluginId}:${it.id}" }
+    }
+
     // ── Solbraid Host 插件微内核管理（Generation / 安全模式 / Schema 设置 / WebView 面板） ──
 
-    suspend fun refreshHostPlugins(): HostPluginSnapshot {
-        if (!runtime.hubAvailable) return hostPluginsFlow.value
+    suspend fun refreshHostPlugins(): HostPluginSnapshot = hostPluginsMutex.withLock {
+        if (!runtime.hubAvailable) return@withLock hostPluginsFlow.value
         val res = runtime.hubRequest("plugins/list", JSONObject(), timeoutMs = 12_000)
         val snap = HostPluginSnapshot.fromJson(res)
-        hostPluginsFlow.value = snap
-        return snap
+        val prev = hostPluginsFlow.value
+        if (prev.generationId.isEmpty() || snap.generationSeq >= prev.generationSeq || snap.generationId != prev.generationId) {
+            hostPluginsFlow.value = snap
+        }
+        hostPluginsFlow.value
     }
 
     suspend fun toggleHostPlugin(pluginId: String, enabled: Boolean): HostPluginSnapshot {
@@ -546,6 +571,45 @@ class ExtensionRepository(
         return snap
     }
 
+    suspend fun reloadSingleHostPlugin(pluginId: String): HostPluginSnapshot {
+        check(runtime.hubAvailable) { "运行环境未就绪" }
+        val res = runtime.hubRequest("plugins/reloadPlugin", jsonOf("pluginId" to pluginId), timeoutMs = 15_000)
+        val snapObj = res.optJSONObject("snapshot")
+        val snap = if (snapObj != null) HostPluginSnapshot.fromJson(snapObj) else refreshHostPlugins()
+        hostPluginsFlow.value = snap
+        onNotify("已增量热载插件：$pluginId")
+        return snap
+    }
+
+    suspend fun listHostPluginSnapshots(pluginId: String): List<HostPluginSourceSnapshot> {
+        check(runtime.hubAvailable) { "运行环境未就绪" }
+        val res = runtime.hubRequest("plugins/snapshots", jsonOf("pluginId" to pluginId), timeoutMs = 12_000)
+        return res.arr("snapshots").objects().map(HostPluginSourceSnapshot::fromJson)
+    }
+
+    suspend fun rollbackHostPluginSnapshot(pluginId: String, snapshotId: String? = null): HostPluginSnapshot {
+        check(runtime.hubAvailable) { "运行环境未就绪" }
+        val params = jsonOf("pluginId" to pluginId)
+        if (!snapshotId.isNullOrBlank()) params.put("snapshotId", snapshotId)
+        val res = runtime.hubRequest("plugins/rollbackSnapshot", params, timeoutMs = 15_000)
+        val snapObj = res.optJSONObject("snapshot")
+        val snap = if (snapObj != null) HostPluginSnapshot.fromJson(snapObj) else refreshHostPlugins()
+        hostPluginsFlow.value = snap
+        val restored = res.optString("restoredVersion")
+        onNotify(if (restored.isNotBlank()) "已回滚插件源码至 v$restored" else "已回滚插件源码快照")
+        return snap
+    }
+
+    suspend fun restoreBuiltinHostPlugin(pluginId: String): HostPluginSnapshot {
+        check(runtime.hubAvailable) { "运行环境未就绪" }
+        val res = runtime.hubRequest("plugins/restoreBuiltin", jsonOf("pluginId" to pluginId), timeoutMs = 15_000)
+        val snapObj = res.optJSONObject("snapshot")
+        val snap = if (snapObj != null) HostPluginSnapshot.fromJson(snapObj) else refreshHostPlugins()
+        hostPluginsFlow.value = snap
+        onNotify("已恢复原版内置插件")
+        return snap
+    }
+
     suspend fun createLocalHostPlugin(id: String, name: String, description: String): HostPluginSnapshot {
         check(runtime.hubAvailable) { "运行环境未就绪" }
         val res = runtime.hubRequest(
@@ -589,6 +653,53 @@ class ExtensionRepository(
             artifactKind = res.optString("artifactKind", "html"),
             content = res.optString("content"),
         )
+    }
+
+    suspend fun renderHostPluginSurface(
+        pluginId: String,
+        surfaceId: String,
+        cwd: String? = null,
+        params: JSONObject = JSONObject(),
+    ): HostPluginSduiPayload {
+        check(runtime.hubAvailable) { "运行环境未就绪" }
+        val res = runtime.hubRequest(
+            "plugins/renderSurface",
+            jsonOf(
+                "pluginId" to pluginId,
+                "surfaceId" to surfaceId,
+                "cwd" to (cwd ?: settings.state.value.defaultCwd),
+                "params" to params,
+            ),
+            timeoutMs = 15_000,
+        )
+        return HostPluginSduiPayload.fromJson(res)
+    }
+
+    suspend fun renderHostPluginSlot(
+        pluginId: String,
+        slotId: String,
+        cwd: String? = null,
+        context: JSONObject = JSONObject(),
+    ): HostPluginSduiPayload {
+        check(runtime.hubAvailable) { "运行环境未就绪" }
+        val res = runtime.hubRequest(
+            "plugins/renderSlot",
+            jsonOf(
+                "pluginId" to pluginId,
+                "slotId" to slotId,
+                "cwd" to (cwd ?: settings.state.value.defaultCwd),
+                "context" to context,
+            ),
+            timeoutMs = 12_000,
+        )
+        return HostPluginSduiPayload.fromJson(res)
+    }
+
+    suspend fun resetStudioOverride(fileName: String) {
+        check(runtime.hubAvailable) { "运行环境未就绪" }
+        runtime.hubRequest("plugins/studioOverride", jsonOf("action" to "reset", "fileName" to fileName), timeoutMs = 10_000)
+        refreshHostPlugins()
+        onNotify("已恢复原版工作台资源：$fileName")
     }
 
     suspend fun renderHostPluginPanel(pluginId: String, panelId: String, cwd: String? = null): ChatArtifact {

@@ -102,10 +102,38 @@ fun ConversationListScreen(
     val loading by app.conversations.loading.collectAsState()
     val initialSyncDone by app.conversations.initialSyncDone.collectAsState()
     val settings by app.settings.state.collectAsState()
+    val hostPlugins by app.extensions.hostPlugins.collectAsState()
     var creating by remember { mutableStateOf<PendingCreate?>(null) }
     var addingProject by remember { mutableStateOf(false) }
     var showArchived by remember { mutableStateOf(false) }
     var showSuperAgentBoard by remember { mutableStateOf(false) }
+    var openingPluginSurface by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var openingPluginPanel by remember { mutableStateOf<Pair<String, com.galiais.agent.engine.ChatArtifact>?>(null) }
+    val homeBannerSlots = remember(hostPlugins) { app.extensions.activePluginUiSlots("home.banner") }
+    val homeFooterSlots = remember(hostPlugins) { app.extensions.activePluginUiSlots("home.footer") }
+    var homeBannerRefreshSeq by remember { mutableStateOf(0) }
+    var visibleHomeBanners by remember { mutableStateOf<List<Triple<String, String, com.galiais.agent.engine.HostPluginSduiPayload>>>(emptyList()) }
+    var visibleHomeFooters by remember { mutableStateOf<List<Triple<String, String, com.galiais.agent.engine.HostPluginSduiPayload>>>(emptyList()) }
+    LaunchedEffect(runtime.ready, homeBannerSlots, hostPlugins.generationId, settings.defaultCwd, homeBannerRefreshSeq) {
+        if (!runtime.ready || homeBannerSlots.isEmpty()) {
+            visibleHomeBanners = emptyList()
+            return@LaunchedEffect
+        }
+        visibleHomeBanners = homeBannerSlots.mapNotNull { slot ->
+            val p = runCatching { app.extensions.renderHostPluginSlot(slot.pluginId, slot.id, settings.defaultCwd) }.getOrNull()
+            if (p != null && !p.hidden && p.nodes.isNotEmpty()) Triple(slot.pluginId, slot.id, p) else null
+        }
+    }
+    LaunchedEffect(runtime.ready, homeFooterSlots, hostPlugins.generationId, settings.defaultCwd, homeBannerRefreshSeq) {
+        if (!runtime.ready || homeFooterSlots.isEmpty()) {
+            visibleHomeFooters = emptyList()
+            return@LaunchedEffect
+        }
+        visibleHomeFooters = homeFooterSlots.mapNotNull { slot ->
+            val p = runCatching { app.extensions.renderHostPluginSlot(slot.pluginId, slot.id, settings.defaultCwd) }.getOrNull()
+            if (p != null && !p.hidden && p.nodes.isNotEmpty()) Triple(slot.pluginId, slot.id, p) else null
+        }
+    }
     var exportingDir by remember { mutableStateOf<String?>(null) }
     var searching by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
@@ -194,6 +222,13 @@ fun ConversationListScreen(
                     )
                 }
                 if (runtime.ready) {
+                    PluginSlotActionBar(
+                        app = app,
+                        slotName = "home.topbar",
+                        cwd = settings.defaultCwd,
+                        onOpenSurface = { pid, sid -> openingPluginSurface = pid to sid },
+                        onOpenPanel = { pid, art -> openingPluginPanel = pid to art },
+                    )
                     val activeTickets = tickets.count { it.active }
                     val needsAct = tickets.any { it.stage.needsAttention }
                     TagPill(
@@ -258,6 +293,18 @@ fun ConversationListScreen(
                             onOpenBoard = { showSuperAgentBoard = true },
                         )
                     }
+                }
+                items(visibleHomeBanners, key = { "home-slot-${it.first}-${it.second}" }) { (pid, sid, payload) ->
+                    PluginSduiBannerCard(
+                        app = app,
+                        pluginId = pid,
+                        slotId = sid,
+                        payload = payload,
+                        cwd = settings.defaultCwd,
+                        onOpenSurface = { p, s -> openingPluginSurface = p to s },
+                        onOpenPanel = { p, art -> openingPluginPanel = p to art },
+                        onRefresh = { homeBannerRefreshSeq += 1 },
+                    )
                 }
                 if (!runtime.ready) {
                     item {
@@ -429,6 +476,20 @@ fun ConversationListScreen(
                         }
                     }
                 }
+                if (visibleHomeFooters.isNotEmpty()) {
+                    items(visibleHomeFooters, key = { "home-footer:${it.first}:${it.second}" }) { (pid, sid, payload) ->
+                        PluginSduiBannerCard(
+                            app = app,
+                            pluginId = pid,
+                            slotId = sid,
+                            payload = payload,
+                            cwd = settings.defaultCwd,
+                            onOpenSurface = { p, s -> openingPluginSurface = p to s },
+                            onOpenPanel = { p, art -> openingPluginPanel = p to art },
+                            onRefresh = { homeBannerRefreshSeq += 1 },
+                        )
+                    }
+                }
             }
         }
 
@@ -479,6 +540,30 @@ fun ConversationListScreen(
             defaultCwd = settings.defaultCwd,
             onOpenConversation = open,
             onDismiss = { showSuperAgentBoard = false },
+        )
+    }
+    openingPluginSurface?.let { (pid, sid) ->
+        PluginSduiSheet(
+            app = app,
+            pluginId = pid,
+            surfaceId = sid,
+            cwd = settings.defaultCwd,
+            onOpenPanel = { panelPid, art ->
+                openingPluginSurface = null
+                openingPluginPanel = panelPid to art
+            },
+            onOpenSurface = { nextPid, nextSid -> openingPluginSurface = nextPid to nextSid },
+            onDismiss = { openingPluginSurface = null },
+        )
+    }
+    openingPluginPanel?.let { (pid, art) ->
+        ArtifactStudioSheet(
+            app = app,
+            artifacts = listOf(art),
+            initialArtifactId = art.id,
+            cwd = settings.defaultCwd,
+            pluginId = pid,
+            onDismiss = { openingPluginPanel = null },
         )
     }
 }
@@ -849,12 +934,22 @@ private fun NewConversationSheet(
 ) {
     val settings by app.settings.state.collectAsState()
     val hubStatuses by app.conversations.hub.statuses.collectAsState()
-    val installedAgents = remember(settings.customAgents, hubStatuses, initial.engine) {
-        val list = AgentCatalog.all().filter { it.preinstalled || hubStatuses[it.id]?.installed == true }.map { it.engineKind }
+    val hostPlugins by app.extensions.hostPlugins.collectAsState()
+    val installedAgents = remember(settings.customAgents, hubStatuses, hostPlugins, initial.engine) {
+        val builtins = AgentCatalog.all().filter { it.preinstalled || hubStatuses[it.id]?.installed == true }.map { it.engineKind }
+        val pluginDrivers = if (hostPlugins.safeMode) emptyList() else hostPlugins.drivers
+            .filter { it.executable && builtins.none { b -> b.id == it.id } }
+            .map { EngineKind(it.id, it.name) }
+        val list = builtins + pluginDrivers
         if (initial.engine != null && initial.engine !in list) list + initial.engine else list
     }
     val startEngine = initial.engine ?: EngineKind.CODEX
     var engine by remember { mutableStateOf(startEngine) }
+    LaunchedEffect(installedAgents) {
+        if (engine !in installedAgents) {
+            engine = installedAgents.firstOrNull() ?: EngineKind.CODEX
+        }
+    }
     var providerId by remember(startEngine, settings.codexProviderId, settings.claudeProviderId, settings.agentProviders) {
         mutableStateOf(settings.defaultProviderIdFor(startEngine))
     }
@@ -992,7 +1087,7 @@ private fun NewConversationSheet(
                             selectableProviders.forEach { p ->
                                 GaliaisMenuRow(
                                     title = p.name,
-                                    subtitle = if (p.isRoutingGroup) "多服务商路由组" else p.protocol.shortLabel,
+                                    subtitle = if (p.isRoutingGroup) "多服务商路由组" else p.displayTypeBadge(),
                                     selected = providerId == p.id,
                                     onClick = {
                                         providerId = p.id

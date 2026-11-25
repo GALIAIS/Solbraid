@@ -63,6 +63,7 @@ import androidx.compose.ui.unit.sp
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
+import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.galiais.agent.GaliaisApplication
@@ -126,6 +127,12 @@ fun GaliaisApp(app: GaliaisApplication) {
         safeNavigate("chat/${key.route}")
     }
     var tab by rememberSaveable { mutableIntStateOf(0) }
+    val hostPlugins by app.extensions.hostPlugins.collectAsState()
+    val navTabSlots = remember(hostPlugins) { app.extensions.activePluginUiSlots("nav.tab").take(2) }
+    val extraNavLabels = remember(navTabSlots) { navTabSlots.map { it.label.take(4) } }
+    LaunchedEffect(navTabSlots.size) {
+        if (tab >= 4 + navTabSlots.size) tab = 0
+    }
     var pendingCreate by remember { mutableStateOf<PendingCreate?>(null) }
     var pendingAddProject by remember { mutableStateOf(false) }
     var pendingBrowseDir by remember { mutableStateOf<String?>(null) }
@@ -135,7 +142,34 @@ fun GaliaisApp(app: GaliaisApplication) {
         safeNavigate("terminal")
     }
 
-    CompositionLocalProvider(LocalRenderPrefs provides settings) {
+    val navBackStackEntry by navigation.currentBackStackEntryAsState()
+    val currentLogicalRoute = remember(navBackStackEntry?.destination?.route, tab) {
+        val raw = navBackStackEntry?.destination?.route ?: "home"
+        when {
+            raw == "home" -> when (tab) {
+                0 -> "home"
+                1 -> "ssh"
+                2 -> "files"
+                3 -> "settings"
+                else -> "nav.tab"
+            }
+            raw.startsWith("chat/") -> "chat"
+            raw == "terminal" -> "terminal"
+            raw.startsWith("plugin/") -> "plugin"
+            raw.startsWith("settings/") -> "settings"
+            else -> raw
+        }
+    }
+    val openPluginFullPage: (String, String) -> Unit = { pid, sid ->
+        val ep = java.net.URLEncoder.encode(pid, "UTF-8").replace("+", "%20")
+        val es = java.net.URLEncoder.encode(sid, "UTF-8").replace("+", "%20")
+        safeNavigate("plugin/$ep/$es")
+    }
+
+    CompositionLocalProvider(
+        LocalRenderPrefs provides settings,
+        LocalPluginNavigator provides openPluginFullPage,
+    ) {
     Box(Modifier.fillMaxSize().background(G.canvas)) {
         NavHost(
             navController = navigation,
@@ -160,6 +194,7 @@ fun GaliaisApp(app: GaliaisApplication) {
                                 pendingAddProject = true
                                 tab = 0
                             },
+                            extraTabLabels = extraNavLabels,
                         )
                     },
                 ) { padding ->
@@ -167,50 +202,78 @@ fun GaliaisApp(app: GaliaisApplication) {
                     Crossfade(targetState = tab, animationSpec = tween(140), label = "homeTabs") { currentTab ->
                         tabStateHolder.SaveableStateProvider(currentTab) {
                             when (currentTab) {
-                                0 -> ConversationListScreen(
-                                    app = app,
-                                    modifier = modifier,
-                                    open = openConversation,
-                                    pendingCreate = pendingCreate,
-                                    onConsumePendingCreate = { pendingCreate = null },
-                                    pendingAddProject = pendingAddProject,
-                                    onConsumePendingAddProject = { pendingAddProject = false },
-                                    onOpenDirectory = { dir -> pendingBrowseDir = dir; tab = 2 },
-                                )
-                                1 -> SshScreen(
-                                    app = app,
-                                    modifier = modifier,
-                                    onOpenEnvironmentHub = { safeNavigate("settings/env") },
-                                    onOpenTerminal = { dir, host -> openTerminal(dir, host, null) },
-                                )
-                                2 -> FilesScreen(
-                                    app = app,
-                                    modifier = modifier,
-                                    requestedPath = pendingBrowseDir,
-                                    onConsumeRequestedPath = { pendingBrowseDir = null },
-                                    onOpenSsh = { tab = 1 },
-                                    onOpenTerminal = { dir, onClosed -> openTerminal(dir, null, onClosed) },
-                                    onUseDirectory = { cwd ->
-                                        app.settings.addProject(cwd)
-                                        app.settings.setDefaultCwd(cwd)
-                                        app.conversations.notify("已添加到项目并设为默认目录：$cwd")
-                                        tab = 0
-                                    },
-                                    onReferenceFile = { cwd, file ->
-                                        app.settings.addProject(cwd)
-                                        app.settings.setDefaultCwd(cwd)
-                                        pendingCreate = PendingCreate(cwd, file)
-                                        tab = 0
-                                    },
-                                )
-                                else -> SettingsScreen(
-                                    app = app,
-                                    modifier = modifier,
-                                    onNavigate = { route ->
-                                        if (route == "tab/ssh") tab = 1
-                                        else safeNavigate(route)
-                                    },
-                                )
+                                0 -> PluginPageTakeoverHost(app = app, replaceSlotName = "home.replace", cwd = settings.defaultCwd, modifier = modifier) {
+                                    ConversationListScreen(
+                                        app = app,
+                                        modifier = modifier,
+                                        open = openConversation,
+                                        pendingCreate = pendingCreate,
+                                        onConsumePendingCreate = { pendingCreate = null },
+                                        pendingAddProject = pendingAddProject,
+                                        onConsumePendingAddProject = { pendingAddProject = false },
+                                        onOpenDirectory = { dir -> pendingBrowseDir = dir; tab = 2 },
+                                    )
+                                }
+                                1 -> PluginPageTakeoverHost(app = app, replaceSlotName = "ssh.replace", cwd = settings.defaultCwd, modifier = modifier) {
+                                    SshScreen(
+                                        app = app,
+                                        modifier = modifier,
+                                        onOpenEnvironmentHub = { safeNavigate("settings/env") },
+                                        onOpenTerminal = { dir, host -> openTerminal(dir, host, null) },
+                                    )
+                                }
+                                2 -> PluginPageTakeoverHost(app = app, replaceSlotName = "files.replace", cwd = settings.defaultCwd, modifier = modifier) {
+                                    FilesScreen(
+                                        app = app,
+                                        modifier = modifier,
+                                        requestedPath = pendingBrowseDir,
+                                        onConsumeRequestedPath = { pendingBrowseDir = null },
+                                        onOpenSsh = { tab = 1 },
+                                        onOpenTerminal = { dir, onClosed -> openTerminal(dir, null, onClosed) },
+                                        onUseDirectory = { cwd ->
+                                            app.settings.addProject(cwd)
+                                            app.settings.setDefaultCwd(cwd)
+                                            app.conversations.notify("已添加到项目并设为默认目录：$cwd")
+                                            tab = 0
+                                        },
+                                        onReferenceFile = { cwd, file ->
+                                            app.settings.addProject(cwd)
+                                            app.settings.setDefaultCwd(cwd)
+                                            pendingCreate = PendingCreate(cwd, file)
+                                            tab = 0
+                                        },
+                                    )
+                                }
+                                3 -> PluginPageTakeoverHost(app = app, replaceSlotName = "settings.replace", cwd = settings.defaultCwd, modifier = modifier) {
+                                    SettingsScreen(
+                                        app = app,
+                                        modifier = modifier,
+                                        onNavigate = { route ->
+                                            if (route == "tab/ssh") tab = 1
+                                            else safeNavigate(route)
+                                        },
+                                    )
+                                }
+                                else -> {
+                                    val dynSlot = navTabSlots.getOrNull(currentTab - 4)
+                                    if (dynSlot != null) {
+                                        PluginFullTabScreen(
+                                            app = app,
+                                            slot = dynSlot,
+                                            cwd = settings.defaultCwd,
+                                            modifier = modifier,
+                                        )
+                                    } else {
+                                        SettingsScreen(
+                                            app = app,
+                                            modifier = modifier,
+                                            onNavigate = { route ->
+                                                if (route == "tab/ssh") tab = 1
+                                                else safeNavigate(route)
+                                            },
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -272,6 +335,24 @@ fun GaliaisApp(app: GaliaisApplication) {
             }
 
             composable(
+                route = "plugin/{pluginId}/{surfaceId}",
+                arguments = listOf(
+                    navArgument("pluginId") { type = NavType.StringType },
+                    navArgument("surfaceId") { type = NavType.StringType },
+                ),
+            ) { entry ->
+                val pid = ConversationKey.decodeRouteId(entry.arguments!!.getString("pluginId")!!)
+                val sid = ConversationKey.decodeRouteId(entry.arguments!!.getString("surfaceId")!!)
+                PluginFullPageRouteScreen(
+                    app = app,
+                    pluginId = pid,
+                    surfaceId = sid,
+                    cwd = settings.defaultCwd,
+                    onBack = ::safePopBack,
+                )
+            }
+
+            composable(
                 route = "chat/{engine}/{id}",
                 arguments = listOf(navArgument("engine") { type = NavType.StringType }, navArgument("id") { type = NavType.StringType }),
                 enterTransition = {
@@ -295,26 +376,39 @@ fun GaliaisApp(app: GaliaisApplication) {
                     EngineKind.of(entry.arguments!!.getString("engine")!!),
                     ConversationKey.decodeRouteId(entry.arguments!!.getString("id")!!),
                 )
-                ChatScreen(
+                PluginPageTakeoverHost(
                     app = app,
-                    key = key,
-                    snackbar = snackbar,
+                    replaceSlotName = "chat.replace",
+                    cwd = app.conversations.state(key)?.summary?.cwd ?: settings.defaultCwd,
                     onBack = ::safePopBack,
-                    onOpenConversation = openConversation,
-                    onReplaceConversation = { nextKey ->
-                        navigation.navigate("chat/${nextKey.route}") {
-                            popUpTo("chat/${key.route}") { inclusive = true }
-                            launchSingleTop = true
-                        }
-                    },
-                    onOpenDirectory = { dir ->
-                        pendingBrowseDir = dir
-                        tab = 2
-                        navigation.popBackStack("home", inclusive = false)
-                    },
-                )
+                ) {
+                    ChatScreen(
+                        app = app,
+                        key = key,
+                        snackbar = snackbar,
+                        onBack = ::safePopBack,
+                        onOpenConversation = openConversation,
+                        onReplaceConversation = { nextKey ->
+                            navigation.navigate("chat/${nextKey.route}") {
+                                popUpTo("chat/${key.route}") { inclusive = true }
+                                launchSingleTop = true
+                            }
+                        },
+                        onOpenDirectory = { dir ->
+                            pendingBrowseDir = dir
+                            tab = 2
+                            navigation.popBackStack("home", inclusive = false)
+                        },
+                    )
+                }
             }
         }
+        // 方案 A：全局自由定位 / 可拖拽悬浮层（无插件注册时零节点、零触摸拦截）
+        PluginGlobalOverlayLayer(
+            app = app,
+            currentRoute = currentLogicalRoute,
+            cwd = settings.defaultCwd,
+        )
     }
     }
 }
@@ -326,11 +420,16 @@ fun GaliaisBottomBar(
     onSelect: (Int) -> Unit,
     onQuickCreate: (() -> Unit)? = null,
     previewOnly: Boolean = false,
+    extraTabLabels: List<String> = emptyList(),
 ) {
     val g = G
     val d = D
+    val allTabs = remember(extraTabLabels) {
+        if (extraTabLabels.isEmpty()) tabs
+        else tabs + extraTabLabels.map { Tab(it, GaliaisIcons.Sparkles) }
+    }
     val navPadMod = if (previewOnly) Modifier else Modifier.navigationBarsPadding()
-    val safeIndex = selectedIndex.coerceIn(0, tabs.lastIndex)
+    val safeIndex = selectedIndex.coerceIn(0, allTabs.lastIndex)
     val slideSpec = spring<androidx.compose.ui.unit.Dp>(dampingRatio = 0.9f, stiffness = 700f)
 
     when (d.navBarStyle) {
@@ -344,7 +443,7 @@ fun GaliaisBottomBar(
                         .then(navPadMod)
                         .padding(horizontal = 8.dp, vertical = 10.dp),
                 ) {
-                    val slotW = maxWidth / tabs.size
+                    val slotW = maxWidth / allTabs.size
                     val pillW = 60.dp.coerceAtMost((slotW - 8.dp).coerceAtLeast(36.dp))
                     val pillX by animateDpAsState(slotW * safeIndex + (slotW - pillW) / 2, slideSpec, label = "m3Pill")
                     Box(
@@ -356,7 +455,7 @@ fun GaliaisBottomBar(
                             .background(g.accentContainer),
                     )
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        tabs.forEachIndexed { index, item ->
+                        allTabs.forEachIndexed { index, item ->
                             val active = safeIndex == index
                             val interaction = remember { MutableInteractionSource() }
                             Column(
@@ -401,7 +500,7 @@ fun GaliaisBottomBar(
                     shadowElevation = if (g.dark) 2.dp else 3.dp,
                 ) {
                     BoxWithConstraints(Modifier.fillMaxWidth().height(54.dp)) {
-                        val slotW = maxWidth / tabs.size
+                        val slotW = maxWidth / allTabs.size
                         val slotX by animateDpAsState(slotW * safeIndex, slideSpec, label = "hwSlot")
                         Box(
                             modifier = Modifier
@@ -421,7 +520,7 @@ fun GaliaisBottomBar(
                             )
                         }
                         Row(Modifier.fillMaxSize()) {
-                            tabs.forEachIndexed { index, item ->
+                            allTabs.forEachIndexed { index, item ->
                                 val active = safeIndex == index
                                 val interaction = remember { MutableInteractionSource() }
                                 if (index > 0) {
@@ -467,6 +566,7 @@ fun GaliaisBottomBar(
                 FloatingDockTrack(
                     selectedIndex = safeIndex,
                     onSelect = onSelect,
+                    tabItems = allTabs,
                     modifier = Modifier.weight(1f),
                 )
                 Surface(
@@ -490,7 +590,7 @@ fun GaliaisBottomBar(
                     BoxWithConstraints(
                         modifier = Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 10.dp, vertical = 8.dp),
                     ) {
-                        val slotW = maxWidth / tabs.size
+                        val slotW = maxWidth / allTabs.size
                         val slotX by animateDpAsState(slotW * safeIndex, slideSpec, label = "edPill")
                         Box(
                             modifier = Modifier
@@ -501,7 +601,7 @@ fun GaliaisBottomBar(
                                 .background(g.surfaceSubtle),
                         )
                         Row(Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
-                            tabs.forEachIndexed { index, item ->
+                            allTabs.forEachIndexed { index, item ->
                                 val active = safeIndex == index
                                 val interaction = remember { MutableInteractionSource() }
                                 Box(
@@ -543,6 +643,7 @@ fun GaliaisBottomBar(
                 FloatingDockTrack(
                     selectedIndex = safeIndex,
                     onSelect = onSelect,
+                    tabItems = allTabs,
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
@@ -554,6 +655,7 @@ fun GaliaisBottomBar(
 private fun FloatingDockTrack(
     selectedIndex: Int,
     onSelect: (Int) -> Unit,
+    tabItems: List<Tab> = tabs,
     modifier: Modifier = Modifier,
 ) {
     val g = G
@@ -565,7 +667,7 @@ private fun FloatingDockTrack(
         shadowElevation = if (g.dark) 6.dp else 8.dp,
     ) {
         BoxWithConstraints(modifier = Modifier.fillMaxWidth().padding(4.dp).height(46.dp)) {
-            val slotW = maxWidth / tabs.size
+            val slotW = maxWidth / tabItems.size
             val pillX by animateDpAsState(
                 targetValue = slotW * selectedIndex,
                 animationSpec = spring(dampingRatio = 0.9f, stiffness = 700f),
@@ -583,7 +685,7 @@ private fun FloatingDockTrack(
                 modifier = Modifier.fillMaxSize(),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                tabs.forEachIndexed { index, item ->
+                tabItems.forEachIndexed { index, item ->
                     val active = selectedIndex == index
                     val interaction = remember { MutableInteractionSource() }
                     Column(

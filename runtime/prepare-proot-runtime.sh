@@ -63,7 +63,7 @@ if test -e "$skills/openai-plan" || test -L "$skills/openai-plan"; then
 fi
 ln -sfn "/opt/galiais-codex/official-plan-$PLAN_VERSION/skills/plan" "$skills/openai-plan"
 mkdir -p "$root/opt/galiais-codex/android"
-for name in components.json claude-host.mjs delegate-mcp.mjs provider-gateway.mjs provider-translators.mjs usage-ledger.mjs agent-hub.mjs acp-driver.mjs cli-bridge-driver.mjs dev-tools-hub.mjs terminal-hub.mjs cli-components.mjs terminal-headless.cjs terminal-serialize.cjs extension-sync.mjs plugin-kernel.mjs plugin-builtins.mjs ai-reviewer.mjs community-registry.mjs download-network.mjs env-ssh-hub.mjs worktree-manager.mjs guest-mux.mjs; do
+for name in components.json claude-host.mjs delegate-mcp.mjs provider-gateway.mjs provider-translators.mjs usage-ledger.mjs agent-hub.mjs acp-driver.mjs cli-bridge-driver.mjs dev-tools-hub.mjs terminal-hub.mjs cli-components.mjs terminal-headless.cjs terminal-serialize.cjs extension-sync.mjs plugin-kernel.mjs plugin-builtins.mjs plugin-mcp.mjs plugin-worker-host.mjs ai-reviewer.mjs community-registry.mjs download-network.mjs env-ssh-hub.mjs worktree-manager.mjs guest-mux.mjs; do
     cp "$source/$name" "$root/opt/galiais-codex/android/$name.next"
     chmod 644 "$root/opt/galiais-codex/android/$name.next"
     mv "$root/opt/galiais-codex/android/$name.next" "$root/opt/galiais-codex/android/$name"

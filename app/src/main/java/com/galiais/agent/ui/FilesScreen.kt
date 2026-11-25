@@ -108,6 +108,8 @@ fun FilesScreen(
     var showGit by remember { mutableStateOf(false) }
     var showPreview by remember { mutableStateOf(false) }
     var showHeaderMore by remember { mutableStateOf(false) }
+    var openingPluginSurface by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var openingPluginPanel by remember { mutableStateOf<Pair<String, ChatArtifact>?>(null) }
     var reload by remember { mutableIntStateOf(0) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -504,7 +506,23 @@ fun FilesScreen(
             })
             TagPill("新建文件", fg = G.ink, bg = G.surface, border = G.borderStrong, onClick = { creatingFile = true })
             TagPill("新建文件夹", fg = G.ink, bg = G.surface, border = G.borderStrong, onClick = { creatingDir = true })
+            PluginSlotActionBar(
+                app = app,
+                slotName = "files.toolbar",
+                cwd = path,
+                onOpenSurface = { pid, sid -> openingPluginSurface = pid to sid },
+                onOpenPanel = { pid, art -> openingPluginPanel = pid to art },
+            )
         }
+
+        PluginSlotBannerColumn(
+            app = app,
+            slotName = "files.banner",
+            cwd = path,
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp),
+            onOpenSurface = { pid, sid -> openingPluginSurface = pid to sid },
+            onOpenPanel = { pid, art -> openingPluginPanel = pid to art },
+        )
 
         error?.let {
             Surface(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp), shape = D.shape(10.dp), color = G.dangerTint) {
@@ -632,6 +650,14 @@ fun FilesScreen(
         )
     }
 
+    PluginSlotOverlayHost(
+        app = app,
+        cwd = path,
+        openingSurface = openingPluginSurface,
+        openingPanel = openingPluginPanel,
+        onOpenSurface = { openingPluginSurface = it },
+        onOpenPanel = { openingPluginPanel = it },
+    )
     if (showGit) GitOverviewSheet(files, path, onNotify = app.conversations::notify, onDismiss = { showGit = false; reload++ })
     if (showPreview) LivePreviewSheet(app, onDismiss = { showPreview = false })
     studioTarget?.let { (art, filePath) ->

@@ -13,7 +13,7 @@ import * as extSync from "./extension-sync.mjs";
 import * as worktreeMgr from "./worktree-manager.mjs";
 import * as envSsh from "./env-ssh-hub.mjs";
 import * as usageLedger from "./usage-ledger.mjs";
-import {PluginKernel} from "./plugin-kernel.mjs";
+import {PluginKernel, startPluginControlServer} from "./plugin-kernel.mjs";
 import {registerBuiltinHostPlugins} from "./plugin-builtins.mjs";
 import {CommunityRegistryClient} from "./community-registry.mjs";
 import {normalizeDownloadNetwork, saveDownloadNetwork, downloadEnvironment, githubDownloadUrl, redactNetworkText} from "./download-network.mjs";
@@ -36,7 +36,7 @@ const MAXIMUM_FRAME = 8 * 1024 * 1024 - 1024;
 const SESSION_MUTATIONS = new Set(["sessions/prompt", "sessions/delete", "sessions/rename", "sessions/setModel", "sessions/setMode", "sessions/setConfigOption", "sessions/setProvider"]);
 const NPM_PACKAGE = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*(?:@[a-zA-Z0-9._~^+*-]+)?$/;
 
-if (process.getuid() === 0) throw new Error("Agent Hub must not run as root");
+if (typeof process.getuid === "function" && process.getuid() === 0) throw new Error("Agent Hub must not run as root");
 
 let initialized = false;
 let closing = false;
@@ -257,11 +257,24 @@ function updateInstallProgress(id, phase, step) {
   notify("agents/installProgress", {agentId:id, installation, error:installationFailures.get(id) || null});
 }
 
+const SAFE_AGENT_ID_RE = /^[a-z0-9][a-z0-9._-]{0,47}$/;
+
+function validateAgentId(agentId) {
+  if (typeof agentId !== "string" || !SAFE_AGENT_ID_RE.test(agentId) || agentId.includes("..")) {
+    throw new Error("Agent 标识无效");
+  }
+  return agentId;
+}
+
 function sessionFile(agentId, sessionId) {
-  if (!/^[a-z0-9][a-z0-9_-]{0,47}$/.test(agentId) || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(sessionId)) {
+  validateAgentId(agentId);
+  if (typeof sessionId !== "string" || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(sessionId)) {
     throw new Error("会话标识无效");
   }
-  return path.join(SESSIONS_ROOT, agentId, `${sessionId}.json`);
+  const resolved = path.resolve(SESSIONS_ROOT, agentId, `${sessionId}.json`);
+  const rootPrefix = path.resolve(SESSIONS_ROOT) + path.sep;
+  if (!resolved.startsWith(rootPrefix)) throw new Error("会话路径越界");
+  return resolved;
 }
 
 async function saveSession(record) {
@@ -1030,11 +1043,30 @@ setInterval(() => {
   }
 }, 60_000).unref();
 
-function requireManifest(agentId) {
-  if (typeof agentId !== "string" || !/^[a-z0-9][a-z0-9_-]{0,47}$/.test(agentId)) throw new Error("Agent 标识无效");
+function resolveManifestOrNull(agentId) {
+  validateAgentId(agentId);
   const m = manifests.get(agentId);
-  if (!m) throw new Error(`未注册的 Agent：${agentId}`);
-  return m;
+  if (m) return m;
+  const plugDrv = pluginKernel?.drivers?.get(agentId);
+  if (plugDrv && plugDrv.executable) {
+    return {
+      id: plugDrv.id,
+      name: plugDrv.name,
+      protocol: "plugin-driver",
+      driverId: plugDrv.id,
+      pluginId: plugDrv.pluginId,
+      preinstalled: true,
+      description: plugDrv.description || "",
+    };
+  }
+  return null;
+}
+
+function requireManifest(agentId, actionLabel = "") {
+  const m = resolveManifestOrNull(agentId);
+  if (m) return m;
+  const suffix = actionLabel ? `，无法${actionLabel}` : "";
+  throw new Error(`Agent 或插件驱动「${agentId}」已卸载、停用或处于安全模式${suffix}（历史会话仍可浏览、导出或删除）`);
 }
 
 const devTools = createDevToolsHub({
@@ -1044,6 +1076,7 @@ const devTools = createDevToolsHub({
 
 const communityRegistry = new CommunityRegistryClient({home: HOME});
 const pluginKernel = new PluginKernel({home: HOME, onNotify: notify});
+let pluginControlServer = null;
 registerBuiltinHostPlugins(pluginKernel, {
   agentRuntime: {
     listManifests: () => [...manifests.keys()],
@@ -1875,10 +1908,10 @@ async function handleRequest(method, params = {}) {
     finally { packageOperation = null; }
   }
   if (!SESSION_MUTATIONS.has(method)) return dispatchRequest(method, params);
-  requireManifest(params.agentId);
+  validateAgentId(params.agentId);
   sessionFile(params.agentId, params.sessionId);
   const key = `${params.agentId}:${params.sessionId}`;
-  if (busySessions.has(key)) throw new Error("该会话正在处理请求，请先等待完成或中断");
+  if (method !== "sessions/delete" && busySessions.has(key)) throw new Error("该会话正在处理请求，请先等待完成或中断");
   busySessions.add(key);
   try { return await dispatchRequest(method, params); }
   finally { busySessions.delete(key); }
@@ -1889,6 +1922,14 @@ async function dispatchRequest(method, params = {}) {
     await initialUserEnvReady;
     if (!pluginKernel.generationId) {
       await pluginKernel.boot();
+    }
+    if (!pluginControlServer) {
+      try {
+        const ctlOpts = process.env.SOLBRAID_PLUGIN_CTL_SOCKET ? {socketPath: process.env.SOLBRAID_PLUGIN_CTL_SOCKET} : {};
+        pluginControlServer = await startPluginControlServer(pluginKernel, ctlOpts);
+      } catch (ctlErr) {
+        console.error("插件控制通道启动失败：", ctlErr?.message || ctlErr);
+      }
     }
     initialized = true;
     return {version: "guap-1.0", protocols: ["acp", "ndjson", "exec-stream"], pluginGeneration: pluginKernel.generationId};
@@ -2021,23 +2062,41 @@ async function dispatchRequest(method, params = {}) {
 
     case "sessions/list": {
       const agentId = params.agentId;
-      if (agentId) requireManifest(agentId);
+      if (agentId) validateAgentId(agentId);
+      const pluginDriverIds = [...pluginKernel.drivers.values()].filter(d => d.executable).map(d => d.id);
+      const diskAgentIds = [];
+      if (!agentId) {
+        try {
+          const entries = await fs.readdir(SESSIONS_ROOT, {withFileTypes: true});
+          for (const e of entries) {
+            if (e.isDirectory() && SAFE_AGENT_ID_RE.test(e.name) && !e.name.includes("..")) {
+              diskAgentIds.push(e.name);
+            }
+          }
+        } catch {}
+      }
+      const allIds = [...new Set([...manifests.keys(), ...pluginDriverIds, ...diskAgentIds])];
       const all = agentId
         ? await listStoredSessions(agentId)
-        : (await Promise.all([...manifests.keys()].map(id => listStoredSessions(id)))).flat();
+        : (await Promise.all(allIds.map(id => listStoredSessions(id)))).flat();
       return {
-        sessions: all.map(s => ({
-          agentId: s.agentId,
-          id: s.id,
-          title: s.title || "新会话",
-          preview: s.preview || "",
-          cwd: s.cwd || path.join(HOME, "workspace"),
-          updatedAt: s.updatedAt || Date.now(),
-          model: s.model || null,
-          mode: s.mode || null,
-          providerId: s.providerId || null,
-          running: activeTurns.has(`${s.agentId}:${s.id}`),
-        })),
+        sessions: all.map(s => {
+          const resolved = resolveManifestOrNull(s.agentId);
+          return {
+            agentId: s.agentId,
+            driverName: s.driverName || resolved?.name || null,
+            driverAvailable: Boolean(resolved),
+            id: s.id,
+            title: s.title || "新会话",
+            preview: s.preview || "",
+            cwd: s.cwd || path.join(HOME, "workspace"),
+            updatedAt: s.updatedAt || Date.now(),
+            model: s.model || null,
+            mode: s.mode || null,
+            providerId: s.providerId || null,
+            running: activeTurns.has(`${s.agentId}:${s.id}`),
+          };
+        }),
       };
     }
 
@@ -2115,12 +2174,21 @@ async function dispatchRequest(method, params = {}) {
             const cfgRes = await drv.setConfigOption(remoteSessionId, "thought_level", desiredEffort).catch(() => null);
             if (Array.isArray(cfgRes?.configOptions)) configOptions = cfgRes.configOptions;
           }
+        } else if (m.protocol === "plugin-driver") {
+          const rawModels = await pluginKernel.listPluginDriverModels(m.driverId || m.id).catch(() => []);
+          availableModels = (Array.isArray(rawModels) ? rawModels : []).map(item =>
+            typeof item === "string" ? {modelId: item, name: item} : {modelId: String(item.id || item.modelId || ""), name: String(item.label || item.name || item.id || "")},
+          ).filter(item => item.modelId);
+          currentModel = params.model || availableModels[0]?.modelId || null;
+          defaultModel = currentModel;
+          currentMode = requestedMode || "default";
         } else if (useAgyStreamJson) {
           currentMode = requestedMode || "default";
           if (params.model) currentModel = splitAgyModelEffort(params.model).baseId;
         }
         const record = {
           agentId: m.id,
+          driverName: m.name || m.id,
           id,
           remoteSessionId,
           title: "新会话",
@@ -2151,22 +2219,31 @@ async function dispatchRequest(method, params = {}) {
     }
 
     case "sessions/load": {
-      const m = requireManifest(params.agentId);
-      const record = await loadStoredSession(m.id, params.sessionId);
+      const agentId = validateAgentId(params.agentId);
+      const m = resolveManifestOrNull(agentId);
+      const record = await loadStoredSession(agentId, params.sessionId);
       if (!record) throw new Error("会话不存在");
       let brainPlans = [];
-      if (m.id === "antigravity" && record.remoteSessionId) {
+      if (agentId === "antigravity" && record.remoteSessionId) {
         const existingPaths = new Set(
           (record.messages || []).filter(msg => msg.role === "plan" && msg.filePath).map(msg => msg.filePath),
         );
         const found = await collectSessionBrainPlans(record.remoteSessionId).catch(() => []);
         brainPlans = found.filter(p => !existingPaths.has(p.path));
       }
-      return {session: {...record, running: activeTurns.has(`${m.id}:${record.id}`), brainPlans}};
+      return {
+        session: {
+          ...record,
+          driverName: record.driverName || m?.name || null,
+          driverAvailable: Boolean(m),
+          running: activeTurns.has(`${agentId}:${record.id}`),
+          brainPlans,
+        },
+      };
     }
 
     case "sessions/prompt": {
-      const m = requireManifest(params.agentId);
+      const m = requireManifest(params.agentId, "继续对话");
       const record = await loadStoredSession(m.id, params.sessionId);
       if (!record) throw new Error("会话不存在");
       if (typeof params.text !== "string") throw new Error("消息内容无效");
@@ -2176,9 +2253,11 @@ async function dispatchRequest(method, params = {}) {
       if (images.length && m.protocol !== "acp") throw new Error("此 CLI 驱动不支持图片输入");
       const sessKey = `${m.id}:${record.id}`;
       if (typeof params.apiKey === "string" && params.apiKey.trim()) sessionApiKeys.set(sessKey, params.apiKey.trim());
-      const drv = await getDriver(m, record.cwd, params.provider || null, record.id, params.apiKey || null, record.launchOpts || null);
+      const drv = m.protocol === "plugin-driver"
+        ? null
+        : await getDriver(m, record.cwd, params.provider || null, record.id, params.apiKey || null, record.launchOpts || null);
       const isAgyStreamJson = drv instanceof AgyStreamJsonDriver;
-      if (m.protocol === "acp" && !isAgyStreamJson) await attachAcpSession(drv, record);
+      if (m.protocol === "acp" && !isAgyStreamJson && drv) await attachAcpSession(drv, record);
       const now = Date.now();
       record.messages.push({id: `user-${now}`, role: "user", text, imageCount: images.length, ts: now});
       if (record.title === "新会话" && text.trim()) {
@@ -2271,7 +2350,73 @@ async function dispatchRequest(method, params = {}) {
           }
           record.pendingContextBridge = false;
         }
-        if (isAgyStreamJson) {
+        const beforeHook = await pluginKernel.runBeforePromptHooks({
+          agentId: m.id,
+          sessionId: record.id,
+          cwd: record.cwd,
+          text: promptTextForDriver,
+        });
+        promptTextForDriver = beforeHook.text;
+        for (const notice of beforeHook.notices) {
+          notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "notice", text: `[插件:${notice.pluginId}] ${notice.message}`, error: false});
+        }
+        if (m.protocol === "plugin-driver") {
+          const driverId = m.driverId || m.id;
+          const res = await pluginKernel.invokePluginDriver({
+            driverId,
+            sessionId: record.id,
+            prompt: promptTextForDriver,
+            cwd: record.cwd,
+            model: record.model,
+            history: (record.messages || []).slice(-16),
+            onEvent: ev => {
+              if (ev?.kind === "chunk" && ev.text) {
+                turn.text += ev.text;
+                if (!turn.firstTokenAt) turn.firstTokenAt = Date.now();
+                turn.lastTokenAt = Date.now();
+                notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "acp-update", update: {sessionUpdate: "agent_message_chunk", content: {type: "text", text: ev.text}}});
+              } else if (ev?.kind === "thought" && ev.text) {
+                if (!turn.currentThought) {
+                  turn.currentThought = {text: "", startedAtMs: Date.now(), completedAtMs: 0};
+                  turn.thoughts.push(turn.currentThought);
+                  turn.timelineOrder.push({type: "thought", ref: turn.currentThought});
+                }
+                turn.currentThought.text += ev.text;
+                notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "acp-update", update: {sessionUpdate: "agent_thought_chunk", content: {type: "text", text: ev.text}}});
+              } else if (ev?.kind === "tool" && ev.tool) {
+                const tid = String(ev.tool.toolCallId || ev.tool.id || `tool-${Date.now()}`);
+                const rec = {
+                  id: tid,
+                  name: String(ev.tool.title || ev.tool.name || "插件工具"),
+                  kind: String(ev.tool.kind || "other"),
+                  command: ev.tool.command ? String(ev.tool.command) : undefined,
+                  cwd: record.cwd,
+                  input: typeof ev.tool.rawInput === "string" ? ev.tool.rawInput : JSON.stringify(ev.tool.rawInput ?? ""),
+                  result: typeof ev.tool.rawOutput === "string" ? ev.tool.rawOutput : "",
+                  status: String(ev.tool.status || "completed"),
+                  ts: Date.now(),
+                };
+                turn.toolMap.set(tid, rec);
+                turn.timelineOrder.push({type: "tool", ref: rec});
+                notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "acp-update", update: {sessionUpdate: "tool_call", ...ev.tool}});
+              } else if (ev?.kind === "plan" && ev.plan) {
+                if (typeof ev.plan.markdown === "string" || typeof ev.plan.text === "string") {
+                  upsertTurnPlan(turn, {
+                    id: String(ev.plan.id || `plan-${Date.now()}`),
+                    title: String(ev.plan.title || "执行计划"),
+                    text: String(ev.plan.markdown || ev.plan.text || ""),
+                    status: String(ev.plan.status || "completed"),
+                    requestFeedback: Boolean(ev.plan.requestFeedback),
+                  });
+                }
+                notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "acp-update", update: {sessionUpdate: "plan", ...ev.plan}});
+              }
+            },
+          });
+          replyText = res.text || turn.text || "";
+          stopReason = res.stopReason || "end_turn";
+          exactUsage = res.usage || null;
+        } else if (isAgyStreamJson) {
           const res = await drv.prompt(record.id, promptTextForDriver, {
             cwd: record.cwd,
             model: record.model,
@@ -2295,10 +2440,10 @@ async function dispatchRequest(method, params = {}) {
           replyText = turn.text;
           exactUsage = res?.usage || null;
         } else {
-          let effectivePrompt = text;
+          let effectivePrompt = promptTextForDriver;
           if (record.messages.length <= 1) {
             const skillIndex = await extSync.buildSkillsPromptIndex(m.id, record.cwd).catch(() => "");
-            if (skillIndex) effectivePrompt = `${skillIndex}\n\n${text}`;
+            if (skillIndex) effectivePrompt = `${skillIndex}\n\n${promptTextForDriver}`;
           }
           const res = await drv.prompt(record.id, effectivePrompt, {
             cwd: record.cwd,
@@ -2494,6 +2639,16 @@ async function dispatchRequest(method, params = {}) {
         const turnDiff = await devTools.captureGitDiff(record.cwd);
         notify("sessions/completed", {agentId: m.id, sessionId: record.id, stopReason, turnDiff, usage: normalizedUsage, contextUsage: finalContextUsage});
         pluginKernel.emitObserve("session.completed", {agentId: m.id, sessionId: record.id, stopReason, cwd: record.cwd});
+        const afterHook = await pluginKernel.runAfterResponseHooks({
+          agentId: m.id,
+          sessionId: record.id,
+          cwd: record.cwd,
+          text: replyText,
+          stopReason,
+        });
+        for (const notice of afterHook.notices) {
+          notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "notice", text: `[插件:${notice.pluginId}] ${notice.message}`, error: false});
+        }
         return {stopReason, text: replyText, turnDiff, usage: normalizedUsage, contextUsage: finalContextUsage};
       } catch (error) {
         stopSessionDriver(key);
@@ -2522,14 +2677,15 @@ async function dispatchRequest(method, params = {}) {
     }
 
     case "sessions/cancel": {
-      const m = requireManifest(params.agentId);
-      const record = await loadStoredSession(m.id, params.sessionId);
-      const key = `${m.id}:${params.sessionId}`;
+      const agentId = validateAgentId(params.agentId);
+      const m = resolveManifestOrNull(agentId);
+      const record = await loadStoredSession(agentId, params.sessionId).catch(() => null);
+      const key = `${agentId}:${params.sessionId}`;
       for (const waiter of pendingClientReqs.values()) {
         if (`${waiter.params.agentId}:${waiter.params.sessionId}` === key) waiter.reject(new Error("用户中断了会话"));
       }
       const drv = drivers.get(key);
-      if (drv) await drv.cancel(m.protocol === "acp" ? (record?.remoteSessionId || params.sessionId) : params.sessionId);
+      if (drv) await drv.cancel(m?.protocol === "acp" ? (record?.remoteSessionId || params.sessionId) : params.sessionId).catch(() => {});
       return {ok: true};
     }
 
@@ -2543,16 +2699,23 @@ async function dispatchRequest(method, params = {}) {
     }
 
     case "sessions/delete": {
-      const key = `${params.agentId}:${params.sessionId}`;
+      const agentId = validateAgentId(params.agentId);
+      const key = `${agentId}:${params.sessionId}`;
+      for (const waiter of pendingClientReqs.values()) {
+        if (`${waiter.params.agentId}:${waiter.params.sessionId}` === key) waiter.reject(new Error("会话已删除"));
+      }
+      activeTurns.delete(key);
       stopSessionDriver(key);
       sessionApiKeys.delete(key);
-      await fs.rm(sessionFile(params.agentId, params.sessionId), {force: true});
+      await fs.rm(sessionFile(agentId, params.sessionId), {force: true});
       sessions.delete(key);
+      // 若该已卸载插件驱动目录下不再有任何残留会话文件，顺带回收空目录
+      await fs.rmdir(path.join(SESSIONS_ROOT, agentId)).catch(() => {});
       return {ok: true};
     }
 
     case "sessions/setModel": {
-      const m = requireManifest(params.agentId);
+      const m = requireManifest(params.agentId, "切换模型");
       const record = await loadStoredSession(m.id, params.sessionId);
       if (!record) throw new Error("会话不存在");
       const previousModel = record.model;
@@ -2576,7 +2739,7 @@ async function dispatchRequest(method, params = {}) {
     }
 
     case "sessions/setMode": {
-      const m = requireManifest(params.agentId);
+      const m = requireManifest(params.agentId, "切换会话模式");
       const record = await loadStoredSession(m.id, params.sessionId);
       if (!record) throw new Error("会话不存在");
       const previousMode = record.mode;
@@ -2596,7 +2759,7 @@ async function dispatchRequest(method, params = {}) {
     }
 
     case "sessions/setConfigOption": {
-      const m = requireManifest(params.agentId);
+      const m = requireManifest(params.agentId, "更新配置项");
       const record = await loadStoredSession(m.id, params.sessionId);
       if (!record) throw new Error("会话不存在");
       const configId = String(params.configId || "").trim();
@@ -2846,6 +3009,41 @@ async function dispatchRequest(method, params = {}) {
       return await pluginKernel.installPluginBundle(params);
     case "plugins/exportBundle":
       return await pluginKernel.exportPluginBundle(params.pluginId);
+    case "plugins/reloadPlugin":
+      return await pluginKernel.reloadPlugin(params.pluginId);
+    case "plugins/readSource":
+      return await pluginKernel.readPluginSource(params.pluginId);
+    case "plugins/validate":
+      return await pluginKernel.validatePluginCandidate(params || {});
+    case "plugins/applySource":
+      return await pluginKernel.applyPluginSourceUpdate(params || {});
+    case "plugins/snapshots":
+      return {snapshots: await pluginKernel.listSourceSnapshots(params.pluginId)};
+    case "plugins/rollbackSnapshot":
+      return await pluginKernel.rollbackSourceSnapshot(params.pluginId, params.snapshotId || null);
+    case "plugins/restoreBuiltin":
+      return await pluginKernel.restoreBuiltinPlugin(params.pluginId);
+    case "plugins/test":
+      return await pluginKernel.testPlugin(params || {});
+    case "plugins/renderSurface":
+      return await pluginKernel.renderSurface(params || {});
+    case "plugins/renderSlot":
+      return await pluginKernel.renderSlot(params || {});
+    case "plugins/testSdui":
+      return await pluginKernel.testPluginSdui(params || {});
+    case "plugins/installDeps":
+      return await pluginKernel.installPluginDependencies(params || {});
+    case "plugins/studioOverride":
+      return await pluginKernel.manageStudioOverride(params || {});
+    case "plugins/testDriver":
+      return await pluginKernel.testPluginDriverOrTranslator(params || {});
+    case "plugins/invokeDriver":
+      return await pluginKernel.invokePluginDriver({
+        ...(params || {}),
+        onEvent: ev => notify("plugins/driverEvent", {driverId: params?.driverId || "", sessionId: params?.sessionId || "", event: ev}),
+      });
+    case "plugins/driverModels":
+      return {models: await pluginKernel.listPluginDriverModels(params.driverId)};
 
     case "registry/getConfig":
       return communityRegistry.sanitizeConfig(await communityRegistry.loadConfig());
@@ -2898,6 +3096,7 @@ rl.on("line", line => {
 function shutdown() {
   if (closing) return;
   closing = true;
+  void pluginControlServer?.close?.().catch(() => {});
   void pluginKernel.dispose().catch(error => console.error("插件内核清理失败：", error.message));
   cliUpdater.close();
   void devTools.closeAll().catch(error => console.error("终端清理失败：", error.message));

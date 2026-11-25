@@ -39,6 +39,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -64,6 +65,7 @@ import com.galiais.agent.engine.ArtifactKind
 import com.galiais.agent.engine.ChatArtifact
 import com.galiais.agent.engine.ConversationKey
 import com.galiais.agent.engine.EngineKind
+import com.galiais.agent.engine.HostPluginUiSlot
 import com.galiais.agent.engine.ItemStatus
 import com.galiais.agent.engine.PlanStep
 import com.galiais.agent.engine.TimelineItem
@@ -72,6 +74,8 @@ import com.galiais.agent.engine.extractArtifactsFromItems
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+
+val LocalPluginMessageFooter = compositionLocalOf<Pair<List<HostPluginUiSlot>, (HostPluginUiSlot, TimelineItem.AgentMessage) -> Unit>?> { null }
 
 @Composable
 fun TimelineItemView(
@@ -500,6 +504,20 @@ internal fun AgentMessageView(
                     ) {
                         Icon(GaliaisIcons.Quote, contentDescription = null, tint = G.inkSubtle, modifier = Modifier.size(13.dp))
                         Text("引用", style = MaterialTheme.typography.labelSmall, color = G.inkSubtle)
+                    }
+                }
+                val pluginFooter = LocalPluginMessageFooter.current
+                pluginFooter?.first?.take(3)?.forEach { slot ->
+                    Row(
+                        modifier = Modifier
+                            .clip(D.shape(6.dp))
+                            .clickable { pluginFooter.second(slot, item) }
+                            .padding(horizontal = 4.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Icon(GaliaisIcons.Sparkles, contentDescription = null, tint = G.accent, modifier = Modifier.size(13.dp))
+                        Text(slot.label.ifBlank { slot.id }, style = MaterialTheme.typography.labelSmall, color = G.accent)
                     }
                 }
             }

@@ -86,7 +86,11 @@ data class CustomProvider(
     val keyPoolCount: Int = 0,
     val anthropicAuthFallback: Boolean = true,
     val enabled: Boolean = true,
+    val customProtocolId: String = "",
 ) {
+    /** 实际下发至 provider-gateway 的协议标识（优先插件自定义协议 `plugin:<id>`）。 */
+    val wireProtocolId: String
+        get() = customProtocolId.trim().takeIf { it.startsWith("plugin:") } ?: protocol.id
     /** 注册到 Codex config.toml [model_providers.<key>] 时的唯一标识。 */
     val codexProviderId: String get() = CODEX_PREFIX + id
     /** 是否为多服务商路由组映射出的虚拟服务商。 */
@@ -94,6 +98,7 @@ data class CustomProvider(
 
     fun supportedProtocolsSummary(): String {
         if (isRoutingGroup) return "路由组"
+        if (customProtocolId.startsWith("plugin:")) return "插件:${customProtocolId.removePrefix("plugin:")}"
         val list = buildList {
             if (responsesUrl.isNotBlank() || protocol == ProviderProtocol.OPENAI_RESPONSES) add("Responses")
             if (chatUrl.isNotBlank() || protocol == ProviderProtocol.OPENAI_CHAT) add("Chat")
@@ -103,7 +108,11 @@ data class CustomProvider(
         return if (list.isEmpty()) protocol.shortLabel else list.joinToString(" · ")
     }
 
-    fun displayTypeBadge(): String = if (isRoutingGroup) "路由组" else protocol.shortLabel
+    fun displayTypeBadge(): String = when {
+        isRoutingGroup -> "路由组"
+        customProtocolId.startsWith("plugin:") -> "插件:${customProtocolId.removePrefix("plugin:")}"
+        else -> protocol.shortLabel
+    }
 
     fun billingLabel(): String = when (billingKind) {
         "plan" -> "订阅套餐"
@@ -115,7 +124,8 @@ data class CustomProvider(
     fun toMetadataJson(): JSONObject = JSONObject()
         .put("id", id)
         .put("name", name)
-        .put("protocol", protocol.id)
+        .put("protocol", wireProtocolId)
+        .put("customProtocolId", customProtocolId)
         .put("baseUrl", baseUrl)
         .put("authMode", authMode.id)
         .put("models", JSONArray(models))
@@ -160,10 +170,12 @@ data class CustomProvider(
             obj.optJSONObject("headers")?.let { h -> h.keys().forEach { k -> headers[k] = h.optString(k) } }
             val queryParams = linkedMapOf<String, String>()
             obj.optJSONObject("queryParams")?.let { q -> q.keys().forEach { k -> queryParams[k] = q.optString(k) } }
+            val rawProto = obj.optString("protocol")
+            val customProto = obj.optString("customProtocolId").ifBlank { if (rawProto.startsWith("plugin:")) rawProto else "" }
             return CustomProvider(
                 id = obj.getString("id"),
                 name = obj.optString("name", obj.getString("id")),
-                protocol = ProviderProtocol.of(obj.optString("protocol")),
+                protocol = ProviderProtocol.of(rawProto),
                 baseUrl = obj.optString("baseUrl"),
                 authMode = ProviderAuthMode.of(obj.optString("authMode")),
                 models = obj.arr("models").strings().filter { it.isNotBlank() }.distinct(),
@@ -183,6 +195,7 @@ data class CustomProvider(
                 keyPoolCount = keyPoolCount.coerceAtLeast(obj.optInt("keyPoolCount", if (hasApiKey) 1 else 0)),
                 anthropicAuthFallback = obj.optBoolean("anthropicAuthFallback", true),
                 enabled = obj.optBoolean("enabled", true),
+                customProtocolId = customProto,
             )
         }
     }

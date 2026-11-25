@@ -114,10 +114,36 @@ class AgentHubController(val repo: ConversationRepository) {
     fun adapterFor(kind: EngineKind): UniversalAgentAdapter =
         adapters.getOrPut(kind.id) { UniversalAgentAdapter(this, kind) }
 
+    suspend fun listAllSessions(): List<ConversationSummary> {
+        if (!runtime.hubAvailable) return emptyList()
+        val res = runtime.hubRequest("sessions/list", JSONObject())
+        val activeDriverNames = repo.extensions.hostPlugins.value.drivers
+            .filter { it.executable && it.id.isNotBlank() }
+            .associate { it.id to it.name.ifBlank { it.id } }
+        return res.arr("sessions").objects().mapNotNull { s ->
+            val agentId = s.str("agentId")?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val id = s.str("id")?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val known = AgentCatalog.find(agentId)
+            val label = known?.name ?: s.str("driverName")?.takeIf { it.isNotBlank() } ?: activeDriverNames[agentId] ?: agentId
+            ConversationSummary(
+                key = ConversationKey(EngineKind(agentId, label), id),
+                title = s.str("title") ?: "新会话",
+                preview = s.optString("preview"),
+                cwd = s.str("cwd") ?: DEFAULT_WORKSPACE,
+                updatedAt = normalizeTime(s.optLong("updatedAt", System.currentTimeMillis())),
+                running = s.optBoolean("running"),
+            )
+        }
+    }
+
     fun isInstalled(agentId: String): Boolean {
-        val m = AgentCatalog.find(agentId) ?: return false
-        if (m.protocol.isNative) return true
-        return statusesFlow.value[agentId]?.let { it.installed && it.error == null && !it.installing } == true
+        val m = AgentCatalog.find(agentId)
+        if (m != null) {
+            if (m.protocol.isNative) return true
+            return statusesFlow.value[agentId]?.let { it.installed && it.error == null && !it.installing } == true
+        }
+        val host = repo.extensions.hostPlugins.value
+        return !host.safeMode && host.drivers.any { it.id == agentId && it.executable }
     }
 
     private fun buildNetworkPayload(override: DownloadNetworkConfig? = null): JSONObject {
@@ -1120,6 +1146,12 @@ class AgentHubController(val repo: ConversationRepository) {
             }
             "tcp/data" -> portForwarder.onRemoteData(params.optString("connId"), params.optString("dataBase64"))
             "tcp/closed" -> portForwarder.onRemoteClosed(params.optString("connId"))
+            "plugins/changed" -> {
+                repo.scope.launch {
+                    runCatching { repo.extensions.refreshHostPlugins() }
+                    runCatching { repo.refresh() }
+                }
+            }
             "agent/event" -> handleAgentEvent(params)
         }
     }
@@ -1782,7 +1814,14 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
     }
 
     override suspend fun delete(key: ConversationKey) {
-        runtime.hubRequest("sessions/delete", jsonOf("agentId" to kind.id, "sessionId" to key.id))
+        try {
+            runtime.hubRequest("sessions/delete", jsonOf("agentId" to kind.id, "sessionId" to key.id))
+        } catch (e: Exception) {
+            val msg = e.message.orEmpty()
+            // 兼容旧版守护进程或已移除插件残留会话：后端已不存在或未注册时允许本地彻底清理，不卡死删除动作
+            val ignorable = "会话不存在" in msg || "未注册的 Agent" in msg || "已卸载" in msg || "ENOENT" in msg
+            if (!ignorable) throw e
+        }
         repo.remove(key)
     }
 

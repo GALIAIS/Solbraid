@@ -131,13 +131,14 @@ export function registerBuiltinHostPlugins(kernel, coreRefs) {
       kind: "builtin",
       capabilities: {
         required: ["commands", "settings.schema", "ui.panel", "workspace.read", "storage.local"],
-        optional: ["events.observe", "rpc"],
+        optional: ["events.observe", "rpc", "ui.composerAction", "ui.sdui", "ui.slot"],
       },
       settingsSchema: {
         type: "object",
         properties: {
           maxDepth: {type: "integer", title: "扫描最大深度", description: "限制目录递归层数（1~4）", default: 2},
           showHidden: {type: "boolean", title: "包含隐藏文件（以 . 开头）", default: false},
+          showHomeCard: {type: "boolean", title: "在首页展示工作区原生概览卡片", description: "启用后将在会话首页顶部挂载实时原生 SDUI 卡片", default: false},
           accentTheme: {
             type: "string",
             title: "看板强调色主题",
@@ -235,6 +236,99 @@ export function registerBuiltinHostPlugins(kernel, coreRefs) {
         title: "工作区体检看板",
         description: "离线统计项目目录结构、语言占比与会话观测计数",
         render: async ({cwd}) => ({title: "工作区体检看板", kind: "html", content: await renderHtml(cwd)}),
+      });
+
+      ctx.composer?.registerAction({
+        id: "workspace-inspect",
+        label: "工作区体检看板",
+        description: "打开插件实时工作区结构与会话统计看板",
+        panelId: "overview",
+      });
+
+      const buildNativeSdui = async cwd => {
+        const cfg = ctx.settings.get();
+        const summary = await scanWorkspaceSummary(cwd, {maxDepth: getDepth(), showHidden: Boolean(cfg.showHidden)});
+        const completedTurns = Number(await ctx.storage.get("completedTurns")) || 0;
+        const extNodes = summary.topExts.map(([ext, cnt]) => ({
+          type: "progress",
+          label: `${ext}（${cnt}）`,
+          value: summary.files > 0 ? cnt / summary.files : 0,
+          tone: "accent",
+        }));
+        const entryBadges = summary.topEntries.slice(0, 12).map(e => ({
+          type: "badge",
+          text: `${e.isDir ? "目录 " : ""}${e.name}`,
+          tone: e.isDir ? "accent" : "muted",
+        }));
+        return {
+          title: "工作区原生概览",
+          subtitle: `${summary.rootDir} · 深度 ≤ ${getDepth()} · ${ctx.host.generationId}`,
+          nodes: [
+            {
+              type: "row",
+              children: [
+                {type: "metric", label: "扫描文件", value: String(summary.files), tone: "accent"},
+                {type: "metric", label: "子目录", value: String(summary.dirs), tone: "ink"},
+                {type: "metric", label: "已完成轮次", value: String(completedTurns), tone: "success"},
+              ],
+            },
+            {
+              type: "card",
+              title: "文件类型分布",
+              children: extNodes.length ? extNodes : [{type: "text", text: "当前目录暂无文件", style: "caption", tone: "muted"}],
+            },
+            {
+              type: "card",
+              title: "顶层条目",
+              children: entryBadges.length ? [{type: "flow", children: entryBadges}] : [{type: "text", text: "空目录", style: "caption", tone: "muted"}],
+            },
+            {
+              type: "row",
+              children: [
+                {type: "button", label: "重新扫描", style: "primary", action: {type: "rpc", method: "summary", params: {cwd: summary.rootDir}}},
+                {type: "button", label: "打开 WebView 看板", style: "secondary", action: {type: "panel", panelId: "overview"}},
+              ],
+            },
+          ],
+        };
+      };
+
+      ctx.ui?.registerSurface?.({
+        id: "native-health",
+        title: "工作区原生概览",
+        description: "原生 Jetpack Compose SDUI 工作区实时统计面板（零 WebView）",
+        render: async ({cwd}) => await buildNativeSdui(cwd),
+      });
+
+      ctx.ui?.registerSlot?.({
+        id: "home-workspace-health",
+        slot: "home.banner",
+        label: "工作区概览",
+        description: "按设置开关在首页挂载原生 SDUI 概览卡",
+        surfaceId: "native-health",
+        render: async ({cwd}) => {
+          if (!ctx.settings.get().showHomeCard) return null;
+          const summary = await scanWorkspaceSummary(cwd, {maxDepth: getDepth(), showHidden: Boolean(ctx.settings.get().showHidden)});
+          return {
+            title: "工作区实时概览",
+            nodes: [
+              {
+                type: "row",
+                children: [
+                  {type: "metric", label: "文件", value: String(summary.files), tone: "accent"},
+                  {type: "metric", label: "目录", value: String(summary.dirs), tone: "ink"},
+                ],
+              },
+              {
+                type: "row",
+                children: [
+                  {type: "button", label: "查看原生详情", style: "primary", action: {type: "surface", surfaceId: "native-health"}},
+                  {type: "button", label: "WebView 看板", style: "secondary", action: {type: "panel", panelId: "overview"}},
+                ],
+              },
+            ],
+          };
+        },
       });
 
       ctx.commands.register("inspect", {

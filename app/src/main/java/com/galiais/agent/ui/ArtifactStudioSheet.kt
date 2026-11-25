@@ -48,6 +48,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -72,6 +73,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.galiais.agent.GaliaisApplication
+import com.galiais.agent.LinuxRuntime
 import com.galiais.agent.engine.ArtifactKind
 import com.galiais.agent.engine.ChatArtifact
 import com.galiais.agent.engine.DEFAULT_LATEX_SCRATCHPAD
@@ -201,6 +203,9 @@ fun ArtifactStudioSheet(
     fun setEditableContent(next: String) {
         if (next == current.content) editedByArtifact.remove(current.id) else editedByArtifact[current.id] = next
     }
+    val hostPlugins by app.extensions.hostPlugins.collectAsState()
+    val studioSlots = remember(hostPlugins) { app.extensions.activePluginUiSlots("studio.toolbar") }
+    var openingSlotSurface by remember { mutableStateOf<Pair<String, String>?>(null) }
     var viewport by remember { mutableStateOf("auto") } // auto / mobile / desktop
     var consoleLogs by remember(current.id) { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
     var showConsole by remember(current.id) { mutableStateOf(false) }
@@ -439,6 +444,22 @@ fun ArtifactStudioSheet(
                                                 val name = uri.lastPathSegment?.takeIf { it in setOf("artifact-viewer.html", "artifact-latex.js", "artifact-mermaid.js", "artifact-renderer.js") }
                                                     ?: return WebResourceResponse("text/plain", "utf-8", 404, "Not Found", emptyMap(), "".byteInputStream())
                                                 val mime = if (name.endsWith(".html")) "text/html" else "application/javascript"
+                                                if (!app.extensions.hostPlugins.value.safeMode) {
+                                                    val overrideStream = runCatching {
+                                                        val rootDir = LinuxRuntime(ctx, app.settings.state.value.runtimeMode ?: com.galiais.agent.engine.RUNTIME_MODE_ROOT).root
+                                                        val overrideDir = java.io.File(rootDir, "home/agent/.galiais/studio-overrides").canonicalFile
+                                                        val candidate = java.io.File(overrideDir, name).canonicalFile
+                                                        if (candidate.path.startsWith(overrideDir.path + java.io.File.separator) &&
+                                                            candidate.isFile &&
+                                                            candidate.length() in 1L..(2L * 1024 * 1024)
+                                                        ) {
+                                                            candidate.inputStream()
+                                                        } else null
+                                                    }.getOrNull()
+                                                    if (overrideStream != null) {
+                                                        return WebResourceResponse(mime, "utf-8", overrideStream)
+                                                    }
+                                                }
                                                 return runCatching {
                                                     WebResourceResponse(mime, "utf-8", ctx.assets.open("galiais/runtime/$name"))
                                                 }.getOrElse {
@@ -644,10 +665,43 @@ fun ArtifactStudioSheet(
                                 }.onFailure { app.conversations.notify("保存失败：${it.message}") }
                             }
                         })
+                        studioSlots.take(3).forEach { slot ->
+                            TagPill(
+                                text = slot.badge.ifBlank { slot.label.ifBlank { slot.id } },
+                                fg = G.accent,
+                                bg = G.accentContainer,
+                                onClick = {
+                                    scope.launch {
+                                        try {
+                                            when {
+                                                !slot.surfaceId.isNullOrBlank() -> openingSlotSurface = slot.pluginId to slot.surfaceId
+                                                !slot.command.isNullOrBlank() -> {
+                                                    val res = app.extensions.runHostPluginCommand(slot.pluginId, slot.command, args = editableContent.take(4096), cwd = cwd)
+                                                    app.conversations.notify(res.message.ifBlank { "${slot.label.ifBlank { slot.id }} 已执行" })
+                                                }
+                                                else -> app.conversations.notify("工具栏槽位未绑定命令或原生页面")
+                                            }
+                                        } catch (e: Exception) {
+                                            app.conversations.notify("插件工具栏动作失败：${e.message}")
+                                        }
+                                    }
+                                },
+                            )
+                        }
                     }
                 }
             }
         }
+    }
+    openingSlotSurface?.let { (pid, sid) ->
+        PluginSduiSheet(
+            app = app,
+            pluginId = pid,
+            surfaceId = sid,
+            cwd = cwd,
+            onOpenSurface = { nextPid, nextSid -> openingSlotSurface = nextPid to nextSid },
+            onDismiss = { openingSlotSurface = null },
+        )
     }
 }
 

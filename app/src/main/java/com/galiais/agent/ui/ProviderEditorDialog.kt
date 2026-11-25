@@ -112,10 +112,13 @@ fun ProviderEditorDialog(
     onSaved: (CustomProvider) -> Unit,
 ) {
     val runtime by app.runtime.snapshot.collectAsState()
+    val hostPlugins by app.extensions.hostPlugins.collectAsState()
+    val pluginTranslators = remember(hostPlugins) { if (hostPlugins.safeMode) emptyList() else hostPlugins.translators }
     val scope = rememberCoroutineScope()
     val id = remember(initial) { initial?.id ?: newProviderId() }
     var name by remember(initial) { mutableStateOf(initial?.name ?: "") }
     var protocol by remember(initial) { mutableStateOf(initial?.protocol ?: ProviderProtocol.OPENAI_CHAT) }
+    var customProtocolId by remember(initial) { mutableStateOf(initial?.customProtocolId ?: "") }
     var baseUrl by remember(initial) { mutableStateOf(initial?.baseUrl ?: ProviderProtocol.OPENAI_CHAT.defaultUrl) }
     var authMode by remember(initial) { mutableStateOf(initial?.authMode ?: ProviderAuthMode.BEARER) }
     var apiKey by remember(initial) { mutableStateOf("") }
@@ -161,8 +164,9 @@ fun ProviderEditorDialog(
     var statusError by remember { mutableStateOf(false) }
     var fetchedModels by remember { mutableStateOf<List<String>?>(null) }
     val activePreset = remember(selectedPresetId) { providerPresets.firstOrNull { it.id == selectedPresetId } }
-    val suggestedProtocol = remember(baseUrl, protocol) {
-        suggestProtocolForUrl(baseUrl)?.takeIf { it != protocol }
+    val suggestedProtocol = remember(baseUrl, protocol, customProtocolId) {
+        if (customProtocolId.startsWith("plugin:")) null
+        else suggestProtocolForUrl(baseUrl)?.takeIf { it != protocol }
     }
 
     fun syncBillingDefaults(kind: String) {
@@ -220,6 +224,7 @@ fun ProviderEditorDialog(
             priceRate = effectiveRate,
             anthropicAuthFallback = true,
             enabled = initial?.enabled ?: true,
+            customProtocolId = customProtocolId,
         )
     }
 
@@ -271,6 +276,7 @@ fun ProviderEditorDialog(
                                     selectedRegionId = preset.regions.firstOrNull()?.id
                                     name = preset.name
                                     protocol = preset.protocol
+                                    customProtocolId = ""
                                     baseUrl = preset.baseUrl
                                     authMode = preset.authMode
                                     chatUrl = if (preset.protocol == ProviderProtocol.OPENAI_CHAT) "" else preset.chatUrl
@@ -305,6 +311,7 @@ fun ProviderEditorDialog(
                                             else -> ProviderProtocol.GOOGLE_GEMINI
                                         }
                                         protocol = nextProto
+                                        customProtocolId = ""
                                         baseUrl = region.responsesUrl.ifBlank { region.chatUrl.ifBlank { region.anthropicUrl.ifBlank { region.geminiUrl } } }
                                         chatUrl = if (nextProto == ProviderProtocol.OPENAI_CHAT) "" else region.chatUrl
                                         responsesUrl = if (nextProto == ProviderProtocol.OPENAI_RESPONSES) "" else region.responsesUrl
@@ -347,7 +354,11 @@ fun ProviderEditorDialog(
                         ) {
                             Column(Modifier.weight(1f)) {
                                 Text("接口协议", style = MaterialTheme.typography.labelSmall, color = G.inkMuted)
-                                Text(protocol.label, style = MaterialTheme.typography.bodyMedium, color = G.ink, fontWeight = FontWeight.Medium)
+                                val activeTranslator = pluginTranslators.firstOrNull { "plugin:${it.id}" == customProtocolId }
+                                val protoLabel = if (customProtocolId.startsWith("plugin:")) {
+                                    "插件协议：${activeTranslator?.name ?: customProtocolId.removePrefix("plugin:")}"
+                                } else protocol.label
+                                Text(protoLabel, style = MaterialTheme.typography.bodyMedium, color = G.ink, fontWeight = FontWeight.Medium)
                             }
                             Icon(GaliaisIcons.ChevronDown, contentDescription = "切换协议", tint = G.inkMuted, modifier = Modifier.size(16.dp))
                         }
@@ -357,20 +368,53 @@ fun ProviderEditorDialog(
                             ProviderProtocol.entries.forEach { item ->
                                 GaliaisMenuRow(
                                     title = item.label,
-                                    selected = protocol == item,
+                                    selected = customProtocolId.isBlank() && protocol == item,
                                     onClick = {
                                         val prevDefault = protocol.defaultUrl
                                         protocol = item
+                                        customProtocolId = ""
                                         if (baseUrl.isBlank() || baseUrl == prevDefault) baseUrl = item.defaultUrl
                                         authMode = item.defaultAuth
                                         protocolMenu = false
                                     },
                                 )
                             }
+                            if (pluginTranslators.isNotEmpty()) {
+                                Hairline(Modifier.padding(vertical = 2.dp))
+                                pluginTranslators.forEach { tr ->
+                                    val wire = "plugin:${tr.id}"
+                                    GaliaisMenuRow(
+                                        title = "插件：${tr.name} ($wire)",
+                                        subtitle = tr.description.ifBlank { "由插件 ${tr.pluginId} 热注册" },
+                                        selected = customProtocolId == wire,
+                                        onClick = {
+                                            customProtocolId = wire
+                                            protocolMenu = false
+                                        },
+                                    )
+                                }
+                            }
                         }
                     }
                 }
-                Text(protocol.hint, style = MaterialTheme.typography.bodySmall, color = G.inkSubtle)
+                val activePluginTranslator = remember(pluginTranslators, customProtocolId) {
+                    pluginTranslators.firstOrNull { "plugin:${it.id}" == customProtocolId }
+                }
+                Text(
+                    if (customProtocolId.startsWith("plugin:")) "通过本地插件控制通道实时翻译 Codex / Claude / 兼容接口协议（$customProtocolId）" else protocol.hint,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = G.inkSubtle,
+                )
+                if (customProtocolId.startsWith("plugin:") && activePluginTranslator == null) {
+                    Surface(Modifier.fillMaxWidth(), shape = D.shape(8.dp), color = G.warningTint) {
+                        Text(
+                            "当前绑定的插件协议（$customProtocolId）未加载，所属插件可能已卸载、停用或处于安全模式；请重新启用对应插件或在上方切换为其他协议。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = G.warning,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                        )
+                    }
+                }
 
                 OutlinedTextField(
                     value = baseUrl,
@@ -392,7 +436,7 @@ fun ProviderEditorDialog(
                     textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
                     modifier = Modifier.fillMaxWidth(),
                 )
-                val endpointPreview = protocol.resolvedEndpointPreview(baseUrl)
+                val endpointPreview = if (customProtocolId.startsWith("plugin:")) "" else protocol.resolvedEndpointPreview(baseUrl)
                 if (endpointPreview.isNotEmpty()) {
                     Surface(Modifier.fillMaxWidth(), shape = D.shape(8.dp), color = G.surfaceSubtle) {
                         Text(
@@ -410,6 +454,7 @@ fun ProviderEditorDialog(
                     Surface(
                         onClick = {
                             protocol = suggested
+                            customProtocolId = ""
                             authMode = suggested.defaultAuth
                         },
                         modifier = Modifier.fillMaxWidth(),

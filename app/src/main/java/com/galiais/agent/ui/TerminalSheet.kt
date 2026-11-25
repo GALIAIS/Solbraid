@@ -147,6 +147,8 @@ fun TerminalSheet(app: GaliaisApplication, cwd: String, sshHost: SshHostConfig? 
     val sshHosts by app.envSsh.sshHosts.collectAsState()
     val appSettings by app.settings.state.collectAsState()
     val runtime by app.runtime.snapshot.collectAsState()
+    var openingPluginSurface by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var openingPluginPanel by remember { mutableStateOf<Pair<String, com.galiais.agent.engine.ChatArtifact>?>(null) }
     val scope = rememberCoroutineScope()
     val view = LocalView.current
     val appWasDark = G.dark
@@ -434,6 +436,15 @@ fun TerminalSheet(app: GaliaisApplication, cwd: String, sshHost: SshHostConfig? 
                         )
                     }
                 }
+
+                PluginSlotActionBar(
+                    app = app,
+                    slotName = "terminal.toolbar",
+                    cwd = selected?.cwd ?: cwd,
+                    darkStyle = true,
+                    onOpenSurface = { pid, sid -> openingPluginSurface = pid to sid },
+                    onOpenPanel = { pid, art -> openingPluginPanel = pid to art },
+                )
 
                 // 新建终端（支持新建当前目录终端、切换项目目录或快速连已保存 SSH 主机）
                 val extraProjects = remember(appSettings.projects, cwd) { appSettings.projects.filter { it != cwd } }
@@ -1086,6 +1097,14 @@ fun TerminalSheet(app: GaliaisApplication, cwd: String, sshHost: SshHostConfig? 
             dismissButton = { TextButton(onClick = { pasteDraft = null }) { Text("取消", color = G.inkMuted) } },
         )
     }
+    PluginSlotOverlayHost(
+        app = app,
+        cwd = selected?.cwd ?: cwd,
+        openingSurface = openingPluginSurface,
+        openingPanel = openingPluginPanel,
+        onOpenSurface = { openingPluginSurface = it },
+        onOpenPanel = { openingPluginPanel = it },
+    )
 }
 
 @Composable
