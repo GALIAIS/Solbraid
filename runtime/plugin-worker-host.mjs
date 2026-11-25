@@ -24,7 +24,6 @@ function runWorkerRuntime(init) {
   const surfaces = new Map();
   const slots = new Map();
   const rpcs = new Map();
-  const hooks = {beforePrompt: [], afterResponse: []};
   const drivers = new Map();
   const translators = new Map();
 
@@ -174,19 +173,23 @@ function runWorkerRuntime(init) {
     });
   }
 
+  const hooks = {beforePrompt: new Map(), afterResponse: new Map()};
+  const activeDriverAborts = new Map();
   if (granted.has("hooks.prompt")) {
     ctx.hooks = Object.freeze({
       onBeforePrompt(fn) {
         if (typeof fn !== "function") return () => {};
-        hooks.beforePrompt.push(fn);
-        parentPort.postMessage({type: "register", kind: "hook", spec: {stage: "beforePrompt"}});
-        return () => { const i = hooks.beforePrompt.indexOf(fn); if (i >= 0) hooks.beforePrompt.splice(i, 1); };
+        const hookId = randomUUID().slice(0, 12);
+        hooks.beforePrompt.set(hookId, fn);
+        parentPort.postMessage({type: "register", kind: "hook", spec: {stage: "beforePrompt", hookId}});
+        return () => { hooks.beforePrompt.delete(hookId); };
       },
       onAfterResponse(fn) {
         if (typeof fn !== "function") return () => {};
-        hooks.afterResponse.push(fn);
-        parentPort.postMessage({type: "register", kind: "hook", spec: {stage: "afterResponse"}});
-        return () => { const i = hooks.afterResponse.indexOf(fn); if (i >= 0) hooks.afterResponse.splice(i, 1); };
+        const hookId = randomUUID().slice(0, 12);
+        hooks.afterResponse.set(hookId, fn);
+        parentPort.postMessage({type: "register", kind: "hook", spec: {stage: "afterResponse", hookId}});
+        return () => { hooks.afterResponse.delete(hookId); };
       },
     });
   }
@@ -224,6 +227,13 @@ function runWorkerRuntime(init) {
   }
 
   parentPort.on("message", async msg => {
+    if (msg?.type === "cancel") {
+      const ac = activeDriverAborts.get(msg.callId);
+      if (ac && !ac.signal.aborted) {
+        ac.abort(new Error(msg.reason || "用户中断了会话"));
+      }
+      return;
+    }
     if (msg?.type === "hostReply") {
       const waiter = pendingHostCalls.get(msg.id);
       if (!waiter) return;
@@ -267,7 +277,10 @@ function runWorkerRuntime(init) {
       } else if (op === "beforePrompt") {
         let text = String(payload.text ?? "");
         const notices = [];
-        for (const fn of hooks.beforePrompt) {
+        const targets = payload.hookId
+          ? (hooks.beforePrompt.has(payload.hookId) ? [hooks.beforePrompt.get(payload.hookId)] : [])
+          : [...hooks.beforePrompt.values()];
+        for (const fn of targets) {
           const r = await Promise.resolve(fn({...payload, text}));
           if (r && typeof r === "object") {
             if (typeof r.text === "string") text = r.text;
@@ -279,7 +292,10 @@ function runWorkerRuntime(init) {
         data = {text, notices};
       } else if (op === "afterResponse") {
         const notices = [];
-        for (const fn of hooks.afterResponse) {
+        const targets = payload.hookId
+          ? (hooks.afterResponse.has(payload.hookId) ? [hooks.afterResponse.get(payload.hookId)] : [])
+          : [...hooks.afterResponse.values()];
+        for (const fn of targets) {
           const r = await Promise.resolve(fn({...payload}));
           if (r && typeof r.notice === "string" && r.notice.trim()) notices.push(r.notice.trim());
         }
@@ -287,14 +303,31 @@ function runWorkerRuntime(init) {
       } else if (op === "invokeDriver") {
         const drv = drivers.get(payload.driverId);
         if (!drv || typeof drv.execute !== "function") throw new Error(`Worker 未注册可执行驱动：${payload.driverId}`);
-        const emit = event => parentPort.postMessage({type: "driverEvent", callId: id, event});
-        data = await Promise.resolve(drv.execute({
-          ...payload.ctx,
-          emitChunk: text => emit({kind: "chunk", text: String(text ?? "")}),
-          emitThought: text => emit({kind: "thought", text: String(text ?? "")}),
-          emitTool: tool => emit({kind: "tool", tool}),
-          emitPlan: plan => emit({kind: "plan", plan}),
-        }));
+        const callAbort = new AbortController();
+        activeDriverAborts.set(id, callAbort);
+        const emit = event => {
+          if (!callAbort.signal.aborted) parentPort.postMessage({type: "driverEvent", callId: id, event});
+        };
+        try {
+          data = await new Promise((resolve, reject) => {
+            const onAbort = () => resolve({text: "", stopReason: "cancelled"});
+            if (callAbort.signal.aborted) { onAbort(); return; }
+            callAbort.signal.addEventListener("abort", onAbort, {once: true});
+            Promise.resolve(drv.execute({
+              ...payload.ctx,
+              signal: callAbort.signal,
+              emitChunk: text => emit({kind: "chunk", text: String(text ?? "")}),
+              emitThought: text => emit({kind: "thought", text: String(text ?? "")}),
+              emitTool: tool => emit({kind: "tool", tool}),
+              emitPlan: plan => emit({kind: "plan", plan}),
+            })).then(
+              v => { callAbort.signal.removeEventListener("abort", onAbort); resolve(v); },
+              e => { callAbort.signal.removeEventListener("abort", onAbort); reject(e); },
+            );
+          });
+        } finally {
+          activeDriverAborts.delete(id);
+        }
       } else if (op === "listDriverModels") {
         const drv = drivers.get(payload.driverId);
         data = typeof drv?.listModels === "function" ? await Promise.resolve(drv.listModels()) : [];
@@ -376,18 +409,40 @@ export function spawnIsolatedPluginWorker({pluginId, entryUrl, hostInfo, granted
   worker.on("error", err => failAll(`插件隔离线程异常：${err?.message || err}`));
   worker.on("exit", code => { if (!dead && code !== 0) failAll(`插件隔离线程异常退出（code=${code}）`); });
 
-  function invoke(op, payload = {}, timeoutMs = DEFAULT_CALL_TIMEOUT_MS, onEvent = null) {
+  function invoke(op, payload = {}, timeoutMs = DEFAULT_CALL_TIMEOUT_MS, onEvent = null, signal = null) {
     if (dead) return Promise.reject(new Error("插件隔离工作线程已终止"));
+    if (signal?.aborted) return Promise.resolve({text: "", stopReason: "cancelled"});
     return new Promise((resolve, reject) => {
       const id = randomUUID();
+      let onAbort = null;
+      const cleanup = () => {
+        clearTimeout(timer);
+        if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+      };
       const timer = setTimeout(() => {
         pending.delete(id);
+        cleanup();
         const msg = `插件 ${pluginId} 执行 ${op} 超时（>${timeoutMs}ms），已强制终止隔离线程`;
         void worker.terminate().catch(() => {});
         failAll(msg);
         reject(new Error(msg));
       }, timeoutMs);
-      pending.set(id, {resolve, reject, timer, onEvent});
+      if (signal) {
+        onAbort = () => {
+          if (!pending.has(id)) return;
+          pending.delete(id);
+          cleanup();
+          try { if (!dead) worker.postMessage({type: "cancel", callId: id, reason: "用户中断了会话"}); } catch {}
+          resolve({text: "", stopReason: "cancelled"});
+        };
+        signal.addEventListener("abort", onAbort, {once: true});
+      }
+      pending.set(id, {
+        resolve: v => { cleanup(); resolve(v); },
+        reject: e => { cleanup(); reject(e); },
+        timer,
+        onEvent,
+      });
       worker.postMessage({type: "invoke", id, op, payload});
     });
   }

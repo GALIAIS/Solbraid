@@ -169,21 +169,29 @@ fun EnvironmentHubScreen(
                     color = G.inkMuted,
                 )
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    PrimaryPillButton(
-                        text = if (syncing) "同步中…" else "立即同步",
-                        enabled = runtime.ready && !syncing,
-                        onClick = {
-                            scope.launch {
-                                try {
-                                    app.envSsh.syncEnvironmentNow(force = true)
-                                    app.conversations.notify("环境配置已同步到 Linux 运行时")
-                                } catch (e: Exception) {
-                                    app.conversations.notify("同步失败：${e.message}")
+                    if (!runtime.ready) {
+                        PrimaryPillButton(
+                            text = if (runtime.busy) "运行环境启动中…" else "立即启动运行环境",
+                            enabled = runtime.bound && !runtime.busy,
+                            onClick = app.runtime::start,
+                        )
+                    } else {
+                        PrimaryPillButton(
+                            text = if (syncing) "同步中…" else "立即同步",
+                            enabled = !syncing,
+                            onClick = {
+                                scope.launch {
+                                    try {
+                                        app.envSsh.syncEnvironmentNow(force = true)
+                                        app.conversations.notify("环境配置已同步到 Linux 运行时")
+                                    } catch (e: Exception) {
+                                        app.conversations.notify("同步失败：${e.message}")
+                                    }
                                 }
-                            }
-                        },
-                    )
-                    SecondaryPillButton("生效环境快照", enabled = runtime.ready, onClick = { showSnapshot = true })
+                            },
+                        )
+                        SecondaryPillButton("生效环境快照", onClick = { showSnapshot = true })
+                    }
                 }
                 syncError?.let { Text("配置尚未生效：$it", style = MaterialTheme.typography.bodySmall, color = G.danger) }
             }
@@ -448,7 +456,17 @@ fun EnvironmentHubScreen(
                                 onClick = if (runtime.ready && !dotEnvLoading && !dotEnvSaving) ({ requestDotEnvRead(selectedDotEnvCwd) }) else null)
                         }
                         if (!runtime.ready) {
-                            Text("请先启动本地运行环境后再读写工作区 .env 文件。", style = MaterialTheme.typography.bodySmall, color = G.warning)
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Text(
+                                    if (runtime.busy) "正在启动本地运行环境，就绪后自动读取 .env…" else "启动本地运行环境后即可直接读写工作区 .env 文件。",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = G.warning,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                if (!runtime.busy && runtime.bound) {
+                                    TagPill("启动环境", fg = G.onAccent, bg = G.accent, onClick = app.runtime::start)
+                                }
+                            }
                         } else {
                             dotEnvError?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
                             OutlinedTextField(

@@ -6,12 +6,31 @@ import {execFile} from "node:child_process";
 import {promisify} from "node:util";
 import {loadMcpServersForClaude} from "./extension-sync.mjs";
 import {loadEffectiveUserEnv} from "./env-ssh-hub.mjs";
-import {resolveCliInstallation} from "./cli-components.mjs";
-const installation = await resolveCliInstallation("claude");
-const sdkDirectory = installation.sdkDirectory;
-const sdk = await import(`${sdkDirectory}/sdk.mjs`);
+import {resolveCliInstallation, bundledCliInstallation} from "./cli-components.mjs";
+let installation = await resolveCliInstallation("claude");
+let sdkDirectory = installation.sdkDirectory;
+let executable = installation.binary;
+let sdk;
+let fallbackWarning = installation.warning || null;
 
-const executable = installation.binary;
+async function loadSdkForInstallation(inst) {
+  return await import(`${inst.sdkDirectory}/sdk.mjs`);
+}
+
+try {
+  sdk = await loadSdkForInstallation(installation);
+} catch (loadErr) {
+  if (!installation.bundled) {
+    const bundledInst = bundledCliInstallation("claude");
+    fallbackWarning = `已更新的 Claude Code SDK (${installation.version}) 加载失败，已自动回退至内置版本 (${bundledInst.version})：${loadErr?.message || loadErr}`;
+    installation = bundledInst;
+    sdkDirectory = installation.sdkDirectory;
+    executable = installation.binary;
+    sdk = await loadSdkForInstallation(installation);
+  } else {
+    throw loadErr;
+  }
+}
 const delegateServer = "/opt/galiais-codex/android/delegate-mcp.mjs";
 const delegateTools = new Set(["mcp__galiais__delegate_to_codex", "mcp__galiais__delegate_to_agent"]);
 const ARTIFACTS_APPEND_PROMPT = [
@@ -186,7 +205,131 @@ function inferCustomContextWindow(model) {
   return 200_000;
 }
 
+function appendStderrTail(session, chunk) {
+  const text = String(chunk ?? "");
+  if (!text) return;
+  const next = (session.stderrTail || "") + text;
+  session.stderrTail = next.length > 4096 ? next.slice(-4096) : next;
+}
+
+function summarizeStderr(raw) {
+  const cleaned = String(raw || "")
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(l => l && !l.includes("CLAUDE_SDK_MCP_SERVERS_ARGV_DEPRECATED"))
+    .slice(-6)
+    .join(" | ");
+  return cleaned.slice(-600);
+}
+
+function withStderrContext(message, stderrTail) {
+  const tail = summarizeStderr(stderrTail);
+  if (!tail || String(message || "").includes(tail)) return String(message || "Claude Code 执行失败");
+  return `${message}（stderr: ${tail}）`;
+}
+
+function buildSessionFingerprint(params, cwd, env, permissionMode, thinkingDisplay) {
+  return JSON.stringify({
+    cwd,
+    customProvider: params.customProvider === true,
+    baseUrl: env.ANTHROPIC_BASE_URL || "",
+    model: params.model ?? "",
+    permissionMode,
+    effort: params.effort ?? null,
+    thinkingDisplay,
+    fastMode: params.fastMode ?? null,
+    allowDelegation: params.allowDelegation === true,
+    promptCacheTtl: params.promptCacheTtl ?? "",
+    commitAttribution: params.commitAttribution !== false,
+    artifactsEnabled: params.artifactsEnabled !== false,
+  });
+}
+
 async function openSession(params) {
+  if (params.trustProject !== true) throw new Error("Confirm that you trust this project before loading its Claude Code configuration");
+  const id = params.resume === undefined ? randomUUID() : uuid(params.resume);
+  if (opening.has(id)) throw new Error("Claude Code 会话正在连接中，请稍候");
+  const cwd = await directory(params.cwd);
+  const userEnv = await loadEffectiveUserEnv(cwd, process.env.PATH || "").catch(() => ({}));
+  const env = {...process.env, ...userEnv, DISABLE_AUTOUPDATER: "1"};
+  if (params.customProvider === true) {
+    // 自定义网关服务商强制隔离宿主 OAuth / AuthToken / 云平台路由变量，防止抢占 ANTHROPIC_API_KEY
+    delete env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+    delete env.CLAUDE_CODE_USE_BEDROCK;
+    delete env.CLAUDE_CODE_USE_VERTEX;
+    delete env.CLAUDE_CODE_USE_FOUNDRY;
+    delete env.ANTHROPIC_CUSTOM_HEADERS;
+  }
+  if (params.apiKey !== undefined) {
+    const key = string(params.apiKey,"API key");
+    if (/[\r\n]/.test(key)) throw new Error("API key contains an invalid newline");
+    env.ANTHROPIC_API_KEY = key;
+  }
+  if (params.oauthToken !== undefined && params.customProvider !== true) {
+    const token = string(params.oauthToken,"OAuth token");
+    if (/[\r\n]/.test(token)) throw new Error("OAuth token contains an invalid newline");
+    env.CLAUDE_CODE_OAUTH_TOKEN = token;
+  }
+  if (params.baseUrl !== undefined) {
+    const endpoint = new URL(string(params.baseUrl,"provider URL"));
+    const localGateway = endpoint.protocol === "http:" && endpoint.hostname === "127.0.0.1";
+    if ((endpoint.protocol !== "https:" && !localGateway) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash)
+      throw new Error("Provider URL must use HTTPS (or local 127.0.0.1 gateway) without embedded credentials or query parameters");
+    let base = endpoint.toString().replace(/\/$/,"");
+    if (localGateway && /^\/anthropic\/[a-z0-9_-]+$/i.test(endpoint.pathname)) {
+      base = `${base}/sid/${encodeURIComponent(id)}`;
+    }
+    env.ANTHROPIC_BASE_URL = base;
+  }
+  if (params.customProvider === true && params.model !== undefined) {
+    const customModel = string(params.model,"model",256);
+    env.ANTHROPIC_MODEL = customModel;
+    env.ANTHROPIC_SMALL_FAST_MODEL = customModel;
+    env.ANTHROPIC_DEFAULT_HAIKU_MODEL = customModel;
+    env.ANTHROPIC_DEFAULT_SONNET_MODEL = customModel;
+    env.ANTHROPIC_DEFAULT_OPUS_MODEL = customModel;
+    // 非 Anthropic 128k 等小窗口模型在自定义服务商下按比例下调自动压缩触发线，确保在真正触顶前自动压缩。
+    if (!env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE) {
+      const inferredWin = inferCustomContextWindow(customModel);
+      if (inferredWin < 200_000) {
+        const pct = Math.max(40, Math.min(82, Math.floor((inferredWin / 200_000) * 85)));
+        env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = String(pct);
+      }
+    }
+  }
+  if (!Object.prototype.hasOwnProperty.call(userEnv, "DISABLE_AUTO_COMPACT")) {
+    delete env.DISABLE_AUTO_COMPACT;
+  }
+  const effortLevels = ["low","medium","high","xhigh","max"];
+  if (params.effort !== undefined && params.effort !== null && !effortLevels.includes(params.effort))
+    throw new Error("Invalid Claude Code effort level");
+  const allowedPermissionModes = ["default","acceptEdits","plan","auto","bypassPermissions"];
+  const permissionMode = params.permissionMode ?? "default";
+  if (!allowedPermissionModes.includes(permissionMode)) throw new Error("Invalid Claude Code permission mode");
+  const thinkingDisplay = params.thinkingDisplay ?? "summarized";
+  if (!["summarized","omitted"].includes(thinkingDisplay)) throw new Error("Invalid thinking display mode");
+  if (params.fastMode !== undefined && params.fastMode !== null && typeof params.fastMode !== "boolean") throw new Error("Invalid fast mode setting");
+
+  const configFingerprint = buildSessionFingerprint(params, cwd, env, permissionMode, thinkingDisplay);
+
+  // 幂等重连：Android UI 重启或从后台恢复连接时，若常驻守护进程仍持有同一会话且配置未变，直接平滑复接而不报错。
+  if (sessions.has(id)) {
+    const existing = sessions.get(id);
+    if (existing && !existing.closed && existing.query) {
+      if (params.reopen !== true && existing.configFingerprint === configFingerprint) {
+        existing.lastActivity = Date.now();
+        return {sessionId: id, cwd: existing.cwd, reattached: true, busy: Boolean(existing.busy)};
+      }
+      if (existing.busy) {
+        throw new Error("当前会话仍在执行任务，请先停止任务再变更配置");
+      }
+      closeSession(existing);
+    } else if (existing) {
+      closeSession(existing);
+    }
+  }
+
   if (sessions.size + opening.size >= 4) {
     // 超过 4 会话上限时优先按 LRU 回收最久未活跃的空闲会话，避免永久报错卡死。
     const idleVictim = [...sessions.values()]
@@ -198,76 +341,26 @@ async function openSession(params) {
       throw new Error("同时运行中的 Claude Code 会话已达上限（4 个），请先停止其中一个任务");
     }
   }
-  if (params.trustProject !== true) throw new Error("Confirm that you trust this project before loading its Claude Code configuration");
-  const id = params.resume === undefined ? randomUUID() : uuid(params.resume);
-  if (sessions.has(id) || opening.has(id)) throw new Error("Claude Code session is already connected");
+
   opening.add(id);
   let session;
   try {
-    const cwd = await directory(params.cwd);
-    const userEnv = await loadEffectiveUserEnv(cwd, process.env.PATH || "");
-    const env = {...process.env, ...userEnv, DISABLE_AUTOUPDATER: "1"};
-    if (params.apiKey !== undefined) {
-      const key = string(params.apiKey,"API key");
-      if (/[\r\n]/.test(key)) throw new Error("API key contains an invalid newline");
-      env.ANTHROPIC_API_KEY = key;
-    }
-    if (params.oauthToken !== undefined) {
-      const token = string(params.oauthToken,"OAuth token");
-      if (/[\r\n]/.test(token)) throw new Error("OAuth token contains an invalid newline");
-      env.CLAUDE_CODE_OAUTH_TOKEN = token;
-    }
-    if (params.baseUrl !== undefined) {
-      const endpoint = new URL(string(params.baseUrl,"provider URL"));
-      const localGateway = endpoint.protocol === "http:" && endpoint.hostname === "127.0.0.1";
-      if ((endpoint.protocol !== "https:" && !localGateway) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash)
-        throw new Error("Provider URL must use HTTPS (or local 127.0.0.1 gateway) without embedded credentials or query parameters");
-      let base = endpoint.toString().replace(/\/$/,"");
-      if (localGateway && /^\/anthropic\/[a-z0-9_-]+$/i.test(endpoint.pathname)) {
-        base = `${base}/sid/${encodeURIComponent(id)}`;
-      }
-      env.ANTHROPIC_BASE_URL = base;
-    }
-    if (params.customProvider === true && params.model !== undefined) {
-      const customModel = string(params.model,"model",256);
-      env.ANTHROPIC_MODEL = customModel;
-      env.ANTHROPIC_SMALL_FAST_MODEL = customModel;
-      env.ANTHROPIC_DEFAULT_HAIKU_MODEL = customModel;
-      env.ANTHROPIC_DEFAULT_SONNET_MODEL = customModel;
-      env.ANTHROPIC_DEFAULT_OPUS_MODEL = customModel;
-      // 非 Anthropic 128k 等小窗口模型在自定义服务商下按比例下调自动压缩触发线，确保在真正触顶前自动压缩。
-      if (!env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE) {
-        const inferredWin = inferCustomContextWindow(customModel);
-        if (inferredWin < 200_000) {
-          const pct = Math.max(40, Math.min(82, Math.floor((inferredWin / 200_000) * 85)));
-          env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = String(pct);
-        }
-      }
-    }
-    if (!Object.prototype.hasOwnProperty.call(userEnv, "DISABLE_AUTO_COMPACT")) {
-      delete env.DISABLE_AUTO_COMPACT;
-    }
-    session = {id,cwd,input:inputQueue(),controller:new AbortController(),closed:false,busy:false,lastActivity:Date.now()};
+    session = {id,cwd,input:inputQueue(),controller:new AbortController(),closed:false,busy:false,lastActivity:Date.now(),stderrTail:"",configFingerprint};
     if (closing) throw new Error("Claude Code startup was cancelled");
     sessions.set(id,session);
     opening.delete(id);
     const mcpServers = {};
-    Object.assign(mcpServers, await loadMcpServersForClaude(cwd));
+    try {
+      Object.assign(mcpServers, await loadMcpServersForClaude(cwd));
+    } catch (mcpErr) {
+      appendStderrTail(session, `loadMcpServersForClaude warning: ${mcpErr?.message || mcpErr}\n`);
+    }
     if (params.allowDelegation === true) {
       session.delegation = await delegationBridge(session);
       mcpServers.galiais = {type:"stdio",command:process.execPath,args:[delegateServer],
         env:{GALIAIS_DELEGATE_SOCKET:session.delegation.path,GALIAIS_DELEGATE_TOKEN:session.delegation.token}};
       env.MCP_TOOL_TIMEOUT = String(2 * 60 * 60 * 1000);
     }
-    const effortLevels = ["low","medium","high","xhigh","max"];
-    if (params.effort !== undefined && params.effort !== null && !effortLevels.includes(params.effort))
-      throw new Error("Invalid Claude Code effort level");
-    const allowedPermissionModes = ["default","acceptEdits","plan","auto","bypassPermissions"];
-    const permissionMode = params.permissionMode ?? "default";
-    if (!allowedPermissionModes.includes(permissionMode)) throw new Error("Invalid Claude Code permission mode");
-    const thinkingDisplay = params.thinkingDisplay ?? "summarized";
-    if (!["summarized","omitted"].includes(thinkingDisplay)) throw new Error("Invalid thinking display mode");
-    if (params.fastMode !== undefined && params.fastMode !== null && typeof params.fastMode !== "boolean") throw new Error("Invalid fast mode setting");
     const systemPrompt = params.artifactsEnabled === false
       ? {type:"preset",preset:"claude_code"}
       : {type:"preset",preset:"claude_code",append:ARTIFACTS_APPEND_PROMPT};
@@ -283,6 +376,8 @@ async function openSession(params) {
       settingSources:["user","project","local"],systemPrompt,
       sandbox:{enabled:false},
       includePartialMessages:true,enableFileCheckpointing:true,mcpServers,
+      mcpServersDelivery:"initialize",
+      stderr:chunk=>appendStderrTail(session, chunk),
       ...(params.resume === undefined ? {sessionId:id} : {resume:id}),
       ...(params.model === undefined ? {} : {model:string(params.model,"model",256)}),
       ...(params.effort === undefined || params.effort === null ? {} : {effort:params.effort}),
@@ -303,39 +398,87 @@ async function openSession(params) {
     session.reading = (async()=>{
       try {
         for await (const message of session.query) {
+          session.lastActivity = Date.now();
           if (message.type === "result") session.busy = false;
           event("claude/message",{sessionId:id,message});
         }
-        if (!session.closed) event("claude/sessionClosed",{sessionId:id,reason:"Claude Code exited; no task was replayed"});
-      } catch(error) {if (!session.closed) event("claude/sessionError",{sessionId:id,message:error.message});}
+        if (!session.closed) event("claude/sessionClosed",{sessionId:id,reason:withStderrContext("Claude Code exited; no task was replayed", session.stderrTail)});
+      } catch(error) {if (!session.closed) event("claude/sessionError",{sessionId:id,message:withStderrContext(error?.message || String(error), session.stderrTail)});}
       finally {closeSession(session);}
     })();
     const initialization = await session.query.initializationResult();
-    await session.query.setMaxThinkingTokens(null, thinkingDisplay);
+    try { await session.query.setMaxThinkingTokens(null, thinkingDisplay); } catch {}
     return {sessionId:id,cwd,initialization};
-  } catch(error) {if (session) closeSession(session);throw error;}
+  } catch(error) {
+    const enriched = session ? new Error(withStderrContext(error?.message || String(error), session.stderrTail)) : error;
+    if (session) closeSession(session);
+    throw enriched;
+  }
   finally {opening.delete(id);}
 }
+function listActiveSessionsSnapshot() {
+  return [...sessions.values()]
+    .filter(s => !s.closed && s.query)
+    .map(s => ({sessionId: s.id, cwd: s.cwd, busy: Boolean(s.busy)}));
+}
+
+async function verifyInstallationOrFallback() {
+  const verifyCurrent = async () => {
+    const packageInfo = JSON.parse(await fs.readFile(`${sdkDirectory}/package.json`, "utf8"));
+    if (packageInfo.version !== installation.sdkVersion || packageInfo.claudeCodeVersion !== installation.version) {
+      throw new Error(`Claude Code SDK version mismatch (${packageInfo.version}/${packageInfo.claudeCodeVersion} vs ${installation.sdkVersion}/${installation.version})`);
+    }
+    const {stdout} = await promisify(execFile)(executable, ["--version"], {timeout: 30000, maxBuffer: 8192});
+    const cliVer = stdout.trim();
+    if (cliVer !== `${installation.version} (Claude Code)`) {
+      throw new Error(`Claude Code executable version mismatch (${cliVer} vs ${installation.version})`);
+    }
+    return {sdkVersion: packageInfo.version, cliVersion: cliVer};
+  };
+  try {
+    return await verifyCurrent();
+  } catch (err) {
+    if (!installation.bundled) {
+      const bundledInst = bundledCliInstallation("claude");
+      fallbackWarning = `已更新的 Claude Code (${installation.version}) 自检失败，已自动回退至内置版本 (${bundledInst.version})：${err?.message || err}`;
+      installation = bundledInst;
+      sdkDirectory = installation.sdkDirectory;
+      executable = installation.binary;
+      sdk = await loadSdkForInstallation(installation);
+      return await verifyCurrent();
+    }
+    throw err;
+  }
+}
+
 async function dispatch(method, params) {
   if (method === "initialize") {
     if (initialized) throw new Error("Claude Code bridge has already initialized");
-    const packageInfo = JSON.parse(await fs.readFile(`${sdkDirectory}/package.json`,"utf8"));
-    if (packageInfo.version !== installation.sdkVersion || packageInfo.claudeCodeVersion !== installation.version) throw new Error("Claude Code SDK version mismatch");
-    const {stdout} = await promisify(execFile)(executable,["--version"],{timeout:30000,maxBuffer:4096});
-    if (stdout.trim() !== `${installation.version} (Claude Code)`) throw new Error("Claude Code executable version mismatch");
+    const info = await verifyInstallationOrFallback();
     initialized = true;
-    return {sdkVersion:packageInfo.version,cliVersion:stdout.trim()};
+    return {...info, ...(fallbackWarning ? {warning: fallbackWarning} : {})};
   }
   if (!initialized) throw new Error("Claude Code bridge has not initialized");
   switch(method) {
     case "session/open": return openSession(params);
-    case "session/close": {const session=getSession(params);closeSession(session);return {};}
+    case "session/close": {
+      const id = uuid(params.sessionId);
+      const existing = sessions.get(id);
+      if (!existing || existing.closed) return {closed: false};
+      closeSession(existing);
+      return {closed: true};
+    }
+    case "session/active":
+      return {sessions: listActiveSessionsSnapshot()};
     case "session/list": {
       const limit=params.limit ?? 50;
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("Invalid session list limit");
       const offset=params.offset ?? 0;
       if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("Invalid session list offset");
-      return {sessions:await sdk.listSessions({...(params.cwd === undefined ? {} : {dir:await directory(params.cwd)}),limit,offset})};
+      return {
+        sessions: await sdk.listSessions({...(params.cwd === undefined ? {} : {dir:await directory(params.cwd)}),limit,offset}),
+        activeSessions: listActiveSessionsSnapshot(),
+      };
     }
     case "session/read": {
       const id=uuid(params.sessionId), limit=params.limit ?? 50, offset=params.offset ?? 0;
@@ -345,9 +488,23 @@ async function dispatch(method, params) {
     }
     case "session/delete": {
       const id=uuid(params.sessionId);
-      if (sessions.has(id) || opening.has(id)) throw new Error("Close the Claude Code session before deleting it");
-      await sdk.deleteSession(id,{...(params.cwd === undefined ? {} : {dir:await directory(params.cwd)})});
-      return {};
+      if (opening.has(id)) throw new Error("Claude Code 会话正在打开中，请稍后再删除");
+      const existing = sessions.get(id);
+      if (existing) {
+        if (existing.busy) throw new Error("当前会话正在运行任务，请先停止后再删除");
+        closeSession(existing);
+      }
+      try {
+        await sdk.deleteSession(id,{...(params.cwd === undefined ? {} : {dir:await directory(params.cwd)})});
+      } catch (delErr) {
+        const msg = String(delErr?.message || delErr || "");
+        // 新建但尚未发过消息的空会话尚未在磁盘生成 transcript 文件，关闭进程即视为已删除
+        if (delErr?.code === "ENOENT" || /not found/i.test(msg)) {
+          return {deleted: true, alreadyGone: true};
+        }
+        throw delErr;
+      }
+      return {deleted: true};
     }
     case "session/rename": await sdk.renameSession(uuid(params.sessionId),string(params.title,"session title",200),{...(params.cwd === undefined ? {} : {dir:await directory(params.cwd)})});return {};
     case "session/fork": {
@@ -408,6 +565,7 @@ async function dispatch(method, params) {
       const messageId=randomUUID();
       session.input.push({type:"user",session_id:session.id,uuid:messageId,parent_tool_use_id:null,message:{role:"user",content}});
       session.busy=true;
+      session.lastActivity=Date.now();
       return {messageId};
     }
     case "turn/interrupt": return await getSession(params).query.interrupt() ?? {};

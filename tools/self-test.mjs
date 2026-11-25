@@ -5,9 +5,9 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
-import {spawn} from "node:child_process";
+import {spawn, spawnSync} from "node:child_process";
 import {createInterface} from "node:readline";
-import {fileURLToPath} from "node:url";
+import {fileURLToPath, pathToFileURL} from "node:url";
 import {
   sanitizeGeminiSchema,
   responsesToChatRequest,
@@ -949,13 +949,28 @@ async function testCommunityRegistryAndAiReviewer() {
     dataDir: tmpServerDir,
     llmConfig: {baseUrl: llmUrl, apiKey: "test-key", model: "security-auditor-v1"},
     requireLlm: true,
+    adminToken: "admin-secret-token",
+    writeTokens: {
+      "alice-token": "alice",
+      "bob-token": "bob",
+    },
   });
   await new Promise(r => regSrv.listen(0, "127.0.0.1", r));
   const regUrl = `http://127.0.0.1:${regSrv.address().port}`;
 
   try {
     const client = new CommunityRegistryClient({home: tmpClientHome});
-    await client.saveConfig({mode: "http", serverUrl: regUrl, authorName: "测试作者"});
+    // 2.0 认证与所有权防线（P1 #1）：未认证客户端不可提交或删除
+    await client.saveConfig({mode: "http", serverUrl: regUrl, serverToken: "", authorName: "匿名用户"});
+    await assert.rejects(() => client.submit({
+      id: "unauth.inst", kind: "instruction", name: "未认证提交", version: "1.0.0",
+      payload: {title: "t", content: "c"},
+    }), /认证|HTTP 401/);
+    const unauthDel = await fetch(`${regUrl}/api/v1/resources/instruction/unauth.inst`, {method: "DELETE"});
+    assert.equal(unauthDel.status, 401);
+
+    // 切换为合法认证用户 alice
+    await client.saveConfig({mode: "http", serverUrl: regUrl, serverToken: "alice-token", authorName: "测试作者"});
 
     // 2a. 上传恶意钩子 -> HTTP 422 拦截，公开目录为空
     const badSubmit = await client.submit({
@@ -1037,7 +1052,20 @@ async function testCommunityRegistryAndAiReviewer() {
     fs.writeFileSync(storedFile, JSON.stringify(tampered), "utf8");
     await assert.rejects(() => client.downloadVerified({id: "community.greeter", kind: "host_plugin"}), /SHA-256/);
 
-    // 2f. 安全预检（previewAudit 不发布）+ 下架（remove）
+    // 2f. 所有权校验（P1 #1）：非所有者 bob 不得覆盖或删除 alice 发布的资源，管理员与原所有者可以
+    const bobOverwrite = await fetch(`${regUrl}/api/v1/submissions`, {
+      method: "POST",
+      headers: {"content-type": "application/json", authorization: "Bearer bob-token"},
+      body: JSON.stringify({...pluginBundle, version: "2.0.0", description: "越权覆盖尝试"}),
+    });
+    assert.equal(bobOverwrite.status, 403);
+    const bobDelete = await fetch(`${regUrl}/api/v1/resources/host_plugin/community.greeter`, {
+      method: "DELETE",
+      headers: {authorization: "Bearer bob-token"},
+    });
+    assert.equal(bobDelete.status, 403);
+
+    // 2g. 安全预检（previewAudit 不发布）+ 原所有者下架（remove）
     const prevRes = await client.previewAudit({
       id: "dryrun.inst", kind: "instruction", name: "预检指令", version: "1.0.0",
       payload: {title: "预检", content: "保持代码整洁"},
@@ -1203,11 +1231,27 @@ async function testSelfEvolvingPluginPipeline() {
   };
 
   try {
-    // 1. MCP initialize & tools/list 必须完整暴露 14 个自进化运维工具
+    // 1. MCP initialize & tools/list 必须完整暴露 15 个自进化运维工具（含本机 APK 自迭代 solbraid_self_build）
     const initResp = await rpc("initialize", {protocolVersion: "2025-06-18"});
     assert.equal(initResp.result.serverInfo.name, "solbraid-plugin-ctl");
     const listTools = await rpc("tools/list");
-    assert.equal(listTools.result.tools.length, 14);
+    assert.equal(listTools.result.tools.length, 15);
+    assert.ok(listTools.result.tools.some(t => t.name === "solbraid_self_build"));
+
+    const sbStatus = await callTool("solbraid_self_build", {action: "status"});
+    assert.equal(sbStatus.isError, false);
+    assert.equal(sbStatus.data.ok, true);
+    assert.equal(sbStatus.data.enabled, false);
+    assert.equal(sbStatus.data.scriptAvailable, true);
+    assert.equal(sbStatus.data.watchdogAvailable, true);
+    const sbDeniedOff = await callTool("solbraid_self_build", {action: "apply", apkPath: "/tmp/fake.apk"});
+    assert.equal(sbDeniedOff.isError, true);
+    assert.ok(String(sbDeniedOff.data.error || "").includes("当前已关闭"));
+    await kernel.saveSelfBuildConfig({enabled: true, allowAgentApply: true});
+    const sbDeniedConfirm = await callTool("solbraid_self_build", {action: "apply", apkPath: "/tmp/fake.apk"});
+    assert.equal(sbDeniedConfirm.isError, true);
+    assert.ok(String(sbDeniedConfirm.data.error || "").includes("confirmInstall"));
+    await kernel.saveSelfBuildConfig({enabled: false, allowAgentApply: false});
 
     // 2. list 验证控制通道就绪与内置插件输入栏快捷动作
     const listed0 = await callTool("solbraid_plugin_list");
@@ -1410,6 +1454,8 @@ async function testSelfEvolvingPluginPipeline() {
       const shText = fs.readFileSync(path.join(rootDir, "runtime", shName), "utf8");
       assert.ok(shText.includes("plugin-mcp.mjs"), `${shName} must deploy plugin-mcp.mjs`);
       assert.ok(shText.includes("plugin-worker-host.mjs"), `${shName} must deploy plugin-worker-host.mjs`);
+      assert.ok(shText.includes("self-build-apk.sh"), `${shName} must deploy self-build-apk.sh`);
+      assert.ok(shText.includes("self-update-watchdog.sh"), `${shName} must deploy self-update-watchdog.sh`);
     }
   } finally {
     mcpProc.kill();
@@ -2100,6 +2146,641 @@ async function testOrphanedHotPluginResourcesE2E() {
   }
 }
 
+async function test14AuditIssuesRegression() {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-audit14-"));
+  const wsDir = path.join(tmpHome, "workspace");
+  const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-outside-"));
+  fs.mkdirSync(wsDir, {recursive: true});
+  const outsideSecret = path.join(outsideDir, "secret.txt");
+  fs.writeFileSync(outsideSecret, "TOP_SECRET_OUTSIDE", "utf8");
+
+  const kernel = new PluginKernel({home: tmpHome, activateTimeoutMs: 4000});
+  await kernel.boot();
+
+  try {
+    // 1. P1 #4：插件工作区读写必须拦截符号链接逃逸（目录链接 + 悬空文件链接）
+    const linkDir = path.join(wsDir, "escape-dir");
+    const danglingLink = path.join(wsDir, "dangling-out.txt");
+    let symlinksSupported = true;
+    try {
+      fs.symlinkSync(outsideDir, linkDir, process.platform === "win32" ? "junction" : "dir");
+      fs.symlinkSync(path.join(outsideDir, "dangling-target.txt"), danglingLink, "file");
+    } catch {
+      // Windows 未开开发者模式时文件 symlink 可能 EPERM，但目录 junction 仍可测试
+      if (!fs.existsSync(linkDir)) symlinksSupported = false;
+    }
+
+    const wsPlug = await kernel.applyPluginSourceUpdate({
+      pluginId: "local.ws.probe",
+      manifest: {
+        manifestVersion: "1.0.0", apiVersion: ">=1.0.0 <2.0.0",
+        id: "local.ws.probe", name: "工作区探针", version: "1.0.0",
+        kind: "local", executionTier: "trusted-in-process", entrypoint: "index.mjs",
+        capabilities: {required: ["rpc", "workspace.read", "workspace.write"], optional: []},
+      },
+      files: {
+        "index.mjs": [
+          `export function activate(ctx) {`,
+          `  ctx.rpc.register("read", ({p}) => ctx.workspace.readText(p));`,
+          `  ctx.rpc.register("readdir", ({p}) => ctx.workspace.readDir(p));`,
+          `  ctx.rpc.register("write", ({p, t}) => ctx.workspace.writeText(p, t));`,
+          `}`,
+        ].join("\n"),
+      },
+    });
+    assert.equal(wsPlug.ok, true);
+    // 合法工作区内写入/读取正常
+    const okW = await kernel.invokeRpc("plugin.local.ws.probe.write", {p: path.join(wsDir, "safe.txt"), t: "SAFE_OK"});
+    assert.equal(okW.result.ok, true);
+    const okR = await kernel.invokeRpc("plugin.local.ws.probe.read", {p: path.join(wsDir, "safe.txt")});
+    assert.equal(okR.result, "SAFE_OK");
+    if (symlinksSupported) {
+      await assert.rejects(() => kernel.invokeRpc("plugin.local.ws.probe.read", {p: path.join(linkDir, "secret.txt")}), /越界|符号链接/);
+      await assert.rejects(() => kernel.invokeRpc("plugin.local.ws.probe.readdir", {p: linkDir}), /越界|符号链接/);
+      await assert.rejects(() => kernel.invokeRpc("plugin.local.ws.probe.write", {p: path.join(linkDir, "pwn.txt"), t: "BAD"}), /越界|符号链接/);
+      assert.equal(fs.existsSync(path.join(outsideDir, "pwn.txt")), false, "Symlink escape must not create outside file");
+      if (fs.lstatSync(danglingLink, {throwIfNoEntry: false})?.isSymbolicLink()) {
+        await assert.rejects(() => kernel.invokeRpc("plugin.local.ws.probe.write", {p: danglingLink, t: "BAD"}), /越界|符号链接/);
+        assert.equal(fs.existsSync(path.join(outsideDir, "dangling-target.txt")), false);
+      }
+    }
+
+    // 2. P2 #9：同进程插件热更新后，相对导入的辅助模块（./helper.mjs）必须立即加载新代码，回滚后亦然
+    const modManifest = {
+      manifestVersion: "1.0.0", apiVersion: ">=1.0.0 <2.0.0",
+      id: "local.helper.cache", name: "辅助模块缓存测试", version: "1.0.0",
+      kind: "local", executionTier: "trusted-in-process", entrypoint: "index.mjs",
+      capabilities: {required: ["rpc"], optional: []},
+    };
+    const m1 = await kernel.applyPluginSourceUpdate({
+      pluginId: "local.helper.cache",
+      manifest: modManifest,
+      files: {
+        "helper.mjs": `export const TAG = "HELPER_V1";\n`,
+        "index.mjs": `import {TAG} from "./helper.mjs";\nexport function activate(ctx) { ctx.rpc.register("tag", () => ({tag: TAG})); }\n`,
+      },
+    });
+    assert.equal(m1.ok, true);
+    assert.equal((await kernel.invokeRpc("plugin.local.helper.cache.tag", {})).result.tag, "HELPER_V1");
+
+    const m2 = await kernel.applyPluginSourceUpdate({
+      pluginId: "local.helper.cache",
+      manifest: {...modManifest, version: "2.0.0"},
+      files: {
+        "helper.mjs": `export const TAG = "HELPER_V2";\n`,
+        "index.mjs": `import {TAG} from "./helper.mjs";\nexport function activate(ctx) { ctx.rpc.register("tag", () => ({tag: TAG})); }\n`,
+      },
+    });
+    assert.equal(m2.ok, true);
+    assert.equal((await kernel.invokeRpc("plugin.local.helper.cache.tag", {})).result.tag, "HELPER_V2");
+
+    // 3. P1 #3：激活失败原子回滚后辅助模块也同步恢复为 V2，且不留残缺插件
+    const m3Crash = await kernel.applyPluginSourceUpdate({
+      pluginId: "local.helper.cache",
+      manifest: {...modManifest, version: "3.0.0"},
+      files: {
+        "helper.mjs": `export const TAG = "HELPER_V3_BROKEN";\n`,
+        "index.mjs": `import {TAG} from "./helper.mjs";\nexport function activate() { throw new Error("boom:" + TAG); }\n`,
+      },
+    });
+    assert.equal(m3Crash.ok, false);
+    assert.equal(m3Crash.rolledBack, true);
+    assert.equal((await kernel.invokeRpc("plugin.local.helper.cache.tag", {})).result.tag, "HELPER_V2");
+
+    // 4. P2 #7：撤销 deps.npm 权限后，即使 Manifest 仍声明为 optional，安装依赖也必须被拒绝
+    const depsPlug = await kernel.applyPluginSourceUpdate({
+      pluginId: "local.deps.revoke",
+      manifest: {
+        manifestVersion: "1.0.0", apiVersion: ">=1.0.0 <2.0.0",
+        id: "local.deps.revoke", name: "依赖权限测试", version: "1.0.0",
+        kind: "local", executionTier: "trusted-in-process", entrypoint: "index.mjs",
+        capabilities: {required: ["commands"], optional: ["deps.npm"]},
+      },
+      files: {"index.mjs": `export function activate(ctx) { ctx.commands.register("noop", {description: "noop"}); }\n`},
+    });
+    assert.equal(depsPlug.ok, true);
+    const dryOk = await kernel.installPluginDependencies({pluginId: "local.deps.revoke", packages: ["zod@3.24.0"], dryRun: true});
+    assert.equal(dryOk.ok, true);
+    // 撤销 deps.npm，仅保留 commands
+    await kernel.updateGrants("local.deps.revoke", ["commands"]);
+    await assert.rejects(
+      () => kernel.installPluginDependencies({pluginId: "local.deps.revoke", packages: ["zod@3.24.0"], dryRun: true}),
+      /deps\.npm/,
+    );
+
+    // 5. P2 #8：Worker 插件注册多个同类钩子时，每个钩子仅执行 1 次（非 N×N 次）
+    const multiHookPlug = await kernel.applyPluginSourceUpdate({
+      pluginId: "local.worker.multihook",
+      manifest: {
+        manifestVersion: "1.0.0", apiVersion: ">=1.0.0 <2.0.0",
+        id: "local.worker.multihook", name: "多钩子去重测试", version: "1.0.0",
+        kind: "local", executionTier: "worker-isolated", entrypoint: "index.mjs",
+        capabilities: {required: ["hooks.prompt"], optional: []},
+      },
+      files: {
+        "index.mjs": [
+          `export function activate(ctx) {`,
+          `  ctx.hooks.onBeforePrompt(({text}) => ({text: text + "|H1", notice: "N1"}));`,
+          `  ctx.hooks.onBeforePrompt(({text}) => ({text: text + "|H2", notice: "N2"}));`,
+          `  ctx.hooks.onAfterResponse(() => ({notice: "A1"}));`,
+          `  ctx.hooks.onAfterResponse(() => ({notice: "A2"}));`,
+          `}`,
+        ].join("\n"),
+      },
+    });
+    assert.equal(multiHookPlug.ok, true);
+    const bh = await kernel.runBeforePromptHooks({agentId: "codex", sessionId: "s1", cwd: wsDir, text: "BASE"});
+    assert.equal(bh.text, "BASE|H1|H2", `Expected single execution per hook, got: ${bh.text}`);
+    assert.deepEqual(bh.notices.map(n => n.message), ["N1", "N2"]);
+    const ah = await kernel.runAfterResponseHooks({agentId: "codex", sessionId: "s1", cwd: wsDir, text: "OUT", stopReason: "end_turn"});
+    assert.deepEqual(ah.notices.map(n => n.message), ["A1", "A2"]);
+
+    // 6. P1 #5：动态 Worker 插件 Agent 驱动可被 sessions/cancel 实时中止并立刻停止输出
+    const slowDriverPlug = await kernel.applyPluginSourceUpdate({
+      pluginId: "local.slow.driver",
+      manifest: {
+        manifestVersion: "1.0.0", apiVersion: ">=1.0.0 <2.0.0",
+        id: "local.slow.driver", name: "慢速可中断驱动", version: "1.0.0",
+        kind: "local", executionTier: "worker-isolated", entrypoint: "index.mjs",
+        capabilities: {required: ["agent.driver"], optional: []},
+      },
+      files: {
+        "index.mjs": [
+          `export function activate(ctx) {`,
+          `  ctx.drivers.register({`,
+          `    id: "slow-cancel-driver", name: "慢速测试驱动", protocol: "plugin-driver",`,
+          `    execute: async ({emitChunk, signal}) => {`,
+          `      emitChunk("START:");`,
+          `      for (let i = 0; i < 40; i++) {`,
+          `        if (signal?.aborted) return {text: "", stopReason: "cancelled"};`,
+          `        await new Promise(r => setTimeout(r, 80));`,
+          `        emitChunk("TICK_" + i + ";");`,
+          `      }`,
+          `      return {stopReason: "end_turn"};`,
+          `    },`,
+          `  });`,
+          `}`,
+        ].join("\n"),
+      },
+    });
+    assert.equal(slowDriverPlug.ok, true);
+    // 直接通过真实 agent-hub.mjs 验证 sessions/prompt + sessions/cancel 全链路中断
+    const hubSock = process.platform === "win32"
+      ? `\\\\.\\pipe\\solbraid-cancel-hub-${process.pid}-${Date.now()}`
+      : path.join(tmpHome, ".galiais", "run", "cancel-hub.sock");
+    const hub = spawn(process.execPath, [path.join(rootDir, "runtime", "agent-hub.mjs")], {
+      env: {...process.env, HOME: tmpHome, USERPROFILE: tmpHome, SOLBRAID_PLUGIN_CTL_SOCKET: hubSock},
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const hubRl = createInterface({input: hub.stdout, crlfDelay: Infinity});
+    const hubPending = new Map();
+    const cancelChunks = [];
+    let hubSeq = 1;
+    hubRl.on("line", line => {
+      if (!line.trim()) return;
+      const msg = JSON.parse(line);
+      if (msg.id !== undefined && hubPending.has(msg.id)) {
+        const p = hubPending.get(msg.id);
+        hubPending.delete(msg.id);
+        if (msg.error) p.reject(new Error(msg.error.message)); else p.resolve(msg.result);
+      } else if (msg.method === "agent/event" && msg.params?.update?.sessionUpdate === "agent_message_chunk") {
+        cancelChunks.push(msg.params.update.content?.text || "");
+      }
+    });
+    const hubRpc = (method, params = {}) => new Promise((resolve, reject) => {
+      const id = hubSeq++;
+      const timer = setTimeout(() => { hubPending.delete(id); reject(new Error(`hub timeout: ${method}`)); }, 15_000);
+      hubPending.set(id, {resolve: v => { clearTimeout(timer); resolve(v); }, reject: e => { clearTimeout(timer); reject(e); }});
+      hub.stdin.write(JSON.stringify({id, method, params}) + "\n");
+    });
+    try {
+      await hubRpc("initialize");
+      const sess = await hubRpc("sessions/create", {agentId: "slow-cancel-driver", cwd: wsDir});
+      const sid = sess.session.id;
+      const t0 = Date.now();
+      const promptPromise = hubRpc("sessions/prompt", {agentId: "slow-cancel-driver", sessionId: sid, text: "run long"});
+      await new Promise(r => setTimeout(r, 220));
+      const cancelRes = await hubRpc("sessions/cancel", {agentId: "slow-cancel-driver", sessionId: sid});
+      assert.equal(cancelRes.ok, true);
+      const promptOut = await promptPromise;
+      const elapsed = Date.now() - t0;
+      assert.equal(promptOut.stopReason, "cancelled", `Expected cancelled stopReason, got: ${JSON.stringify(promptOut)}`);
+      assert.ok(elapsed < 2200, `Cancel should finish promptly instead of running full 3.2s loop (took ${elapsed}ms)`);
+      const countAtCancel = cancelChunks.length;
+      await new Promise(r => setTimeout(r, 350));
+      assert.equal(cancelChunks.length, countAtCancel, "Cancelled plugin driver must stop emitting chunks after cancel");
+    } finally {
+      hub.kill("SIGTERM");
+    }
+
+    // 7. P1 #6：插件协议转换器返回 tool_calls + usage 时，Codex Responses SSE 与 Claude Messages（流式/非流式）均必须保留工具调用与用量
+    const toolPlug = await kernel.applyPluginSourceUpdate({
+      pluginId: "local.tool.translator",
+      manifest: {
+        manifestVersion: "1.0.0", apiVersion: ">=1.0.0 <2.0.0",
+        id: "local.tool.translator", name: "工具调用协议转换器", version: "1.0.0",
+        kind: "local", executionTier: "worker-isolated", entrypoint: "index.mjs",
+        capabilities: {required: ["provider.translator"], optional: []},
+      },
+      files: {
+        "index.mjs": [
+          `export function activate(ctx) {`,
+          `  ctx.providers.registerTranslator({`,
+          `    id: "tool-wire", name: "工具调用测试协议", baseProtocol: "openai_chat",`,
+          `    toUpstream: req => ({ path: "/tool-infer", body: req }),`,
+          `    fromUpstream: res => ({`,
+          `      choices: [{`,
+          `        finish_reason: "tool_calls",`,
+          `        message: {`,
+          `          role: "assistant",`,
+          `          content: "准备执行工具",`,
+          `          tool_calls: [{ id: "call_abc123", type: "function", function: { name: "read_file", arguments: JSON.stringify({path: res.file || "README.md"}) } }],`,
+          `        },`,
+          `      }],`,
+          `      usage: { prompt_tokens: 123, completion_tokens: 45 },`,
+          `    }),`,
+          `  });`,
+          `}`,
+        ].join("\n"),
+      },
+    });
+    assert.equal(toolPlug.ok, true);
+
+    const toolUpstream = http.createServer((_req, res) => {
+      res.writeHead(200, {"Content-Type": "application/json"});
+      res.end(JSON.stringify({file: "app.kt"}));
+    });
+    await new Promise(r => toolUpstream.listen(0, "127.0.0.1", r));
+    const toolUpPort = toolUpstream.address().port;
+
+    const gwSock = process.platform === "win32"
+      ? `\\\\.\\pipe\\solbraid-toolwire-${process.pid}-${Date.now()}`
+      : path.join(tmpHome, ".galiais", "run", "toolwire.sock");
+    const gwTokFile = path.join(tmpHome, ".galiais", "run", "toolwire.token");
+    const gwCtl = await startPluginControlServer(kernel, {socketPath: gwSock, tokenFile: gwTokFile});
+    const gw = spawn(process.execPath, [path.join(rootDir, "runtime", "provider-gateway.mjs")], {
+      env: {...process.env, HOME: tmpHome, USERPROFILE: tmpHome, SOLBRAID_PLUGIN_CTL_SOCKET: gwSock, SOLBRAID_PLUGIN_CTL_TOKEN: gwCtl.token},
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const gwRl = createInterface({input: gw.stdout, crlfDelay: Infinity});
+    const gwPending = new Map();
+    let gwSeq = 1;
+    gwRl.on("line", line => {
+      if (!line.trim()) return;
+      const msg = JSON.parse(line);
+      if (msg.id !== undefined && gwPending.has(msg.id)) {
+        const p = gwPending.get(msg.id);
+        gwPending.delete(msg.id);
+        if (msg.error) p.reject(new Error(msg.error.message)); else p.resolve(msg.result);
+      }
+    });
+    const gwRpc = (method, params = {}) => new Promise((resolve, reject) => {
+      const id = gwSeq++;
+      gwPending.set(id, {resolve, reject});
+      gw.stdin.write(JSON.stringify({id, method, params}) + "\n");
+    });
+    try {
+      const init = await gwRpc("initialize");
+      const base = `http://127.0.0.1:${init.port}`;
+      const hdrs = {Authorization: `Bearer ${init.token}`, "Content-Type": "application/json"};
+      await gwRpc("providers/sync", {
+        providers: [{
+          id: "p_tool", name: "ToolWire", protocol: "plugin:tool-wire",
+          baseUrl: `http://127.0.0.1:${toolUpPort}`, authMode: "none", enabled: true, models: ["tw-1"],
+        }],
+      });
+
+      // 7a. Codex Responses SSE：必须包含 function_call item、arguments 与 usage
+      const rCodex = await fetch(`${base}/openai-responses/p_tool/responses`, {
+        method: "POST", headers: hdrs,
+        body: JSON.stringify({model: "tw-1", stream: true, input: [{role: "user", content: "读文件"}]}),
+      });
+      assert.equal(rCodex.status, 200);
+      const codexSse = await rCodex.text();
+      assert.ok(codexSse.includes("function_call"), `Codex SSE missing function_call: ${codexSse}`);
+      assert.ok(codexSse.includes("call_abc123") && codexSse.includes("read_file") && codexSse.includes("app.kt"));
+      assert.ok(codexSse.includes(`"input_tokens":123`) && codexSse.includes(`"output_tokens":45`));
+
+      // 7b. Claude Messages 非流式 JSON：必须包含 tool_use 块、stop_reason=tool_use 与 usage
+      const rClaudeJson = await fetch(`${base}/anthropic/p_tool/v1/messages`, {
+        method: "POST", headers: hdrs,
+        body: JSON.stringify({model: "tw-1", stream: false, max_tokens: 64, messages: [{role: "user", content: "读文件"}]}),
+      });
+      assert.equal(rClaudeJson.status, 200);
+      const cJson = await rClaudeJson.json();
+      assert.equal(cJson.stop_reason, "tool_use");
+      assert.equal(cJson.usage?.input_tokens, 123);
+      assert.equal(cJson.usage?.output_tokens, 45);
+      const tu = cJson.content.find(b => b.type === "tool_use");
+      assert.ok(tu, `Claude JSON missing tool_use block: ${JSON.stringify(cJson)}`);
+      assert.equal(tu.id, "call_abc123");
+      assert.equal(tu.name, "read_file");
+      assert.equal(tu.input?.path, "app.kt");
+
+      // 7c. Claude Messages 流式 SSE：必须包含 tool_use content_block_start、input_json_delta 与 stop_reason=tool_use
+      const rClaudeSse = await fetch(`${base}/anthropic/p_tool/v1/messages`, {
+        method: "POST", headers: hdrs,
+        body: JSON.stringify({model: "tw-1", stream: true, max_tokens: 64, messages: [{role: "user", content: "读文件"}]}),
+      });
+      assert.equal(rClaudeSse.status, 200);
+      const cSse = await rClaudeSse.text();
+      assert.ok(cSse.includes(`"type":"tool_use"`) && cSse.includes("input_json_delta") && cSse.includes(`"stop_reason":"tool_use"`));
+    } finally {
+      gw.kill("SIGTERM");
+      toolUpstream.close();
+      await gwCtl.close();
+    }
+
+    // 8. P2 #12：终端环境 profile.sh 与 terminal-hub.mjs 防重复加载（PID 幂等卫兵 + PATH 去重）
+    const termSrc = fs.readFileSync(path.join(rootDir, "runtime", "terminal-hub.mjs"), "utf8");
+    assert.ok(termSrc.includes("_SOLBRAID_PROFILE_PID"), "terminal-hub must check _SOLBRAID_PROFILE_PID before re-sourcing profile.sh");
+    const envSrc = fs.readFileSync(path.join(rootDir, "runtime", "env-ssh-hub.mjs"), "utf8");
+    assert.ok(envSrc.includes(`_SOLBRAID_PROFILE_PID="$$"`), "env-ssh-hub must emit PID idempotency guard in profile.sh");
+    assert.ok(envSrc.includes(`case ":$PATH:" in`), "env-ssh-hub must deduplicate PATH entries");
+
+    // 9. P2 #13：跨进程并发清理用量账本不得丢失另一进程新追加的记录
+    const ledgerHome = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-ledger-lock-"));
+    try {
+      const ledgerModPath = pathToFileURL(path.join(rootDir, "runtime", "usage-ledger.mjs")).href;
+      // 预写入 30 条待清理的旧 agent 记录 + 10 条保留记录
+      const seedScript = `
+        import {recordUsageEvent} from ${JSON.stringify(ledgerModPath)};
+        for (let i = 0; i < 30; i++) await recordUsageEvent({agent: "old_agent", model: "m", in: 10, out: 5, status: 200});
+        for (let i = 0; i < 10; i++) await recordUsageEvent({agent: "keep_agent", model: "m", in: 10, out: 5, status: 200});
+      `;
+      const seedRes = spawnSync(process.execPath, ["--input-type=module", "-e", seedScript], {
+        env: {...process.env, HOME: ledgerHome}, encoding: "utf8",
+      });
+      assert.equal(seedRes.status, 0, seedRes.stderr);
+
+      // 并发拉起两个独立子进程：一个执行条件清理 old_agent，另一个并发写入 25 条 keep_agent 新记录
+      const cleanerScript = `
+        import {clearUsageLedger} from ${JSON.stringify(ledgerModPath)};
+        for (let i = 0; i < 5; i++) {
+          await clearUsageLedger({agent: "old_agent"});
+          await new Promise(r => setTimeout(r, 8));
+        }
+      `;
+      const writerScript = `
+        import {recordUsageEvent} from ${JSON.stringify(ledgerModPath)};
+        for (let i = 0; i < 25; i++) {
+          await recordUsageEvent({agent: "keep_agent", model: "live-" + i, in: 20, out: 10, status: 200});
+        }
+      `;
+      const pClean = spawn(process.execPath, ["--input-type=module", "-e", cleanerScript], {env: {...process.env, HOME: ledgerHome}});
+      const pWrite = spawn(process.execPath, ["--input-type=module", "-e", writerScript], {env: {...process.env, HOME: ledgerHome}});
+      const [cCode, wCode] = await Promise.all([
+        new Promise(r => pClean.once("close", r)),
+        new Promise(r => pWrite.once("close", r)),
+      ]);
+      assert.equal(cCode, 0);
+      assert.equal(wCode, 0);
+      const ledgerLines = fs.readFileSync(path.join(ledgerHome, ".galiais", "usage", "ledger.jsonl"), "utf8")
+        .trim().split("\n").filter(Boolean).map(l => JSON.parse(l));
+      const keepCount = ledgerLines.filter(r => r.agent === "keep_agent").length;
+      const oldCount = ledgerLines.filter(r => r.agent === "old_agent").length;
+      assert.equal(oldCount, 0, "old_agent records should be cleared");
+      assert.equal(keepCount, 35, `Cross-process clear must NOT lose concurrent records (expected 35, got ${keepCount})`);
+    } finally {
+      fs.rmSync(ledgerHome, {recursive: true, force: true});
+    }
+
+    // 10. P2 #14：共享资源缺少 SHA-256 或返回包身份与请求不一致时，downloadVerified 必须拒绝安装
+    const badRegSrv = http.createServer((req, res) => {
+      res.writeHead(200, {"content-type": "application/json"});
+      if (req.url.includes("missing-sha")) {
+        res.end(JSON.stringify({
+          bundle: {
+            id: "missing-sha", kind: "instruction", name: "无摘要包", version: "1.0.0",
+            payload: {title: "t", content: "ok"},
+            audit: {verdict: "approved", score: 95},
+          },
+        }));
+      } else {
+        const spoofed = {
+          id: "other-id", kind: "instruction", name: "冒名包", version: "1.0.0",
+          payload: {title: "t", content: "ok"},
+          audit: {verdict: "approved", score: 95},
+        };
+        res.end(JSON.stringify({bundle: spoofed, sha256: computeBundleSha256(spoofed)}));
+      }
+    });
+    await new Promise(r => badRegSrv.listen(0, "127.0.0.1", r));
+    try {
+      const cli = new CommunityRegistryClient({home: tmpHome});
+      await cli.saveConfig({mode: "http", serverUrl: `http://127.0.0.1:${badRegSrv.address().port}`});
+      await assert.rejects(() => cli.downloadVerified({id: "missing-sha", kind: "instruction"}), /缺少有效的 SHA-256/);
+      await assert.rejects(() => cli.downloadVerified({id: "wanted-id", kind: "instruction"}), /身份与请求不匹配/);
+    } finally {
+      badRegSrv.close();
+    }
+  } finally {
+    await kernel.dispose();
+    fs.rmSync(tmpHome, {recursive: true, force: true});
+    fs.rmSync(outsideDir, {recursive: true, force: true});
+  }
+}
+
+async function testClaudeFixesAndSelfBuildDefaultOff() {
+  // 1. 静态语法校验全部改动脚本（claude-host / guest-mux / provider-gateway / plugin-kernel / agent-hub / plugin-mcp / cli-components）
+  for (const rel of [
+    "runtime/cli-components.mjs",
+    "runtime/claude-host.mjs",
+    "runtime/guest-mux.mjs",
+    "runtime/provider-gateway.mjs",
+    "runtime/plugin-kernel.mjs",
+    "runtime/agent-hub.mjs",
+    "runtime/plugin-mcp.mjs",
+  ]) {
+    const chk = spawnSync(process.execPath, ["--check", path.join(rootDir, rel)], {encoding: "utf8"});
+    assert.equal(chk.status, 0, `${rel} syntax error: ${chk.stderr}`);
+  }
+
+  // 2. Claude / Codex / Antigravity 及 PRoot 关键根因修复点源码契约校验
+  const claudeHostSrc = fs.readFileSync(path.join(rootDir, "runtime", "claude-host.mjs"), "utf8");
+  assert.ok(claudeHostSrc.includes("bundledCliInstallation"), "claude-host must fallback to bundled CLI/SDK");
+  assert.ok(claudeHostSrc.includes("delete env.CLAUDE_CODE_OAUTH_TOKEN"), "claude-host must strip OAuth token for custom providers");
+  assert.ok(claudeHostSrc.includes(`mcpServersDelivery:"initialize"`), "claude-host must deliver MCP servers via initialize");
+  assert.ok(claudeHostSrc.includes("reattached: true"), "claude-host must support idempotent session reattach");
+  assert.ok(claudeHostSrc.includes("activeSessions: listActiveSessionsSnapshot()"), "claude-host must include activeSessions in session/list");
+  assert.ok(claudeHostSrc.includes("alreadyGone: true"), "claude-host must tolerate deleting unmaterialized empty sessions");
+
+  const guestMuxSrc = fs.readFileSync(path.join(rootDir, "runtime", "guest-mux.mjs"), "utf8");
+  assert.ok(guestMuxSrc.includes("resolveCodexBinaryWithFallback"), "guest-mux must fallback to bundled codex if updated binary is unusable");
+
+  const agentHubSrc = fs.readFileSync(path.join(rootDir, "runtime", "agent-hub.mjs"), "utf8");
+  assert.ok(agentHubSrc.includes("resolveAntigravityWithFallback"), "agent-hub must fallback to bundled agy if updated binary fails");
+  assert.ok(agentHubSrc.includes("delete env.GOOGLE_GENAI_USE_VERTEXAI"), "agent-hub must strip Vertex/OAuth env for custom providers");
+  assert.ok(agentHubSrc.includes("record.pendingContextBridge = true"), "agent-hub must bridge context if ACP resumeSession fails");
+
+  const instToolsSh = fs.readFileSync(path.join(rootDir, "runtime", "prepare-installer-tools.sh"), "utf8");
+  assert.ok(instToolsSh.includes("if ! (cd \"$target\" && sha256sum -c files.sha256"), "prepare-installer-tools.sh must skip host tar when PRoot non-root unpack already verified");
+
+  // 3. provider-gateway 实测：Claude 请求携带 [1m] 上下文后缀转发到 openai_responses 上游时必须剥离为裸模型名
+  let seenUpstreamModel = null;
+  const mockRespSrv = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", c => { raw += c; });
+    req.on("end", () => {
+      try { seenUpstreamModel = JSON.parse(raw).model; } catch {}
+      res.writeHead(200, {"content-type": "text/event-stream"});
+      res.end(
+        `event: response.created\ndata: ${JSON.stringify({type: "response.created", response: {id: "resp_1", model: seenUpstreamModel}})}\n\n` +
+        `event: response.output_text.delta\ndata: ${JSON.stringify({type: "response.output_text.delta", delta: "ok"})}\n\n` +
+        `event: response.completed\ndata: ${JSON.stringify({type: "response.completed", response: {id: "resp_1", status: "completed", usage: {input_tokens: 10, output_tokens: 2}}})}\n\n`,
+      );
+    });
+  });
+  await new Promise(r => mockRespSrv.listen(0, "127.0.0.1", r));
+  const upPort = mockRespSrv.address().port;
+  const gwTmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-gw-1m-"));
+  const gw = spawn(process.execPath, [path.join(rootDir, "runtime", "provider-gateway.mjs")], {
+    env: {...process.env, HOME: gwTmpHome},
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let gwSeq = 1;
+  const gwPending = new Map();
+  let gwBuf = "";
+  gw.stdout.setEncoding("utf8");
+  gw.stdout.on("data", chunk => {
+    gwBuf += chunk;
+    let nl;
+    while ((nl = gwBuf.indexOf("\n")) >= 0) {
+      const line = gwBuf.slice(0, nl).trim();
+      gwBuf = gwBuf.slice(nl + 1);
+      if (!line) continue;
+      const msg = JSON.parse(line);
+      const p = gwPending.get(msg.id);
+      if (p) {
+        gwPending.delete(msg.id);
+        if (msg.error) p.reject(new Error(msg.error.message)); else p.resolve(msg.result);
+      }
+    }
+  });
+  const gwRpc = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = gwSeq++;
+    gwPending.set(id, {resolve, reject});
+    gw.stdin.write(JSON.stringify({id, method, params}) + "\n");
+  });
+  try {
+    const init = await gwRpc("initialize");
+    await gwRpc("providers/sync", {
+      providers: [{
+        id: "p_s2a", name: "S2A", protocol: "openai_responses",
+        baseUrl: `http://127.0.0.1:${upPort}/v1`, authMode: "none", enabled: true, models: ["gpt-6-astra"],
+      }],
+    });
+    const resp = await fetch(`http://127.0.0.1:${init.port}/anthropic/p_s2a/v1/messages`, {
+      method: "POST",
+      headers: {Authorization: `Bearer ${init.token}`, "Content-Type": "application/json"},
+      body: JSON.stringify({model: "gpt-6-astra[1m]", stream: true, max_tokens: 32, messages: [{role: "user", content: "hi"}]}),
+    });
+    assert.equal(resp.status, 200);
+    await resp.text();
+    assert.equal(seenUpstreamModel, "gpt-6-astra", `Expected [1m] stripped to gpt-6-astra, got ${seenUpstreamModel}`);
+  } finally {
+    gw.kill("SIGTERM");
+    mockRespSrv.close();
+    fs.rmSync(gwTmpHome, {recursive: true, force: true});
+  }
+
+  // 4. guest-mux 实测：子进程启动即崩溃时，必须快速以非零退出并透出 stderr 诊断信息而非吞没
+  const muxTmp = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-mux-stderr-"));
+  const crashScript = path.join(muxTmp, "crash.mjs");
+  fs.writeFileSync(crashScript, `process.stderr.write("SIMULATED_CLAUDE_HOST_CRASH_REASON\\n"); process.exit(2);\n`, "utf8");
+  try {
+    const muxRes = await new Promise((resolve, reject) => {
+      const proc = spawn(process.execPath, [path.join(rootDir, "runtime", "guest-mux.mjs"), "test"], {
+        env: {
+          ...process.env,
+          HOME: muxTmp,
+          GALIAIS_MUX_DIR: path.join(muxTmp, "mux"),
+          GALIAIS_MUX_PIPE_TAG: "stderrtest-" + process.pid,
+          GALIAIS_MUX_TEST_SCRIPT: crashScript,
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stderr = "";
+      proc.stderr.on("data", c => { stderr += c.toString("utf8"); });
+      const timer = setTimeout(() => { proc.kill("SIGKILL"); reject(new Error("guest-mux crash test timed out")); }, 10_000);
+      proc.once("close", code => { clearTimeout(timer); resolve({code, stderr}); });
+      proc.once("error", err => { clearTimeout(timer); reject(err); });
+    });
+    assert.notEqual(muxRes.code, 0, `guest-mux must exit non-zero on daemon crash, stderr=${muxRes.stderr}`);
+    assert.ok(
+      muxRes.stderr.includes("SIMULATED_CLAUDE_HOST_CRASH_REASON"),
+      `guest-mux must surface daemon crash stderr, got: ${muxRes.stderr}`,
+    );
+  } finally {
+    fs.rmSync(muxTmp, {recursive: true, force: true});
+  }
+
+  // 5. 本机 ARM64 APK 自迭代闭环：默认关闭 + 全自由配置持久化 + Agent 权限护栏 + 防命令注入
+  const sbHome = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-selfbuild-cfg-"));
+  try {
+    const k1 = new PluginKernel({home: sbHome});
+    const defCfg = await k1.getSelfBuildConfig();
+    assert.equal(defCfg.enabled, false, "self-build must default to disabled");
+    assert.equal(defCfg.allowAgentBuild, false);
+    assert.equal(defCfg.allowAgentApply, false);
+    assert.equal(defCfg.runUnitTests, true);
+    assert.equal(defCfg.watchdogEnabled, true);
+    assert.equal(defCfg.watchdogTimeoutSec, 20);
+    assert.equal(defCfg.targetAbis, "arm64-v8a");
+
+    // 默认关闭状态下：status 只读放行，build / apply / bootstrap / rollback 全部拒绝
+    const stOff = await k1.manageSelfBuild({action: "status", source: "agent"});
+    assert.equal(stOff.ok, true);
+    assert.equal(stOff.enabled, false);
+    await assert.rejects(() => k1.manageSelfBuild({action: "build", source: "ui"}), /当前已关闭/);
+    await assert.rejects(() => k1.manageSelfBuild({action: "build", source: "agent"}), /当前已关闭/);
+    await assert.rejects(() => k1.manageSelfBuild({action: "apply", source: "agent", apkPath: "/tmp/a.apk", confirmInstall: true}), /当前已关闭/);
+    await assert.rejects(() => k1.manageSelfBuild({action: "bootstrap", source: "ui"}), /当前已关闭/);
+    await assert.rejects(() => k1.manageSelfBuild({action: "rollback", source: "ui", confirmRollback: true}), /当前已关闭/);
+
+    // 参数注入拦截
+    await assert.rejects(() => k1.saveSelfBuildConfig({customGradleArgs: "--offline; rm -rf /"}), /不允许的特殊字符/);
+    await assert.rejects(() => k1.saveSelfBuildConfig({repoDir: "relative/path"}), /无效绝对路径/);
+
+    // 开启总开关但未放行 Agent 权限：Agent 编译与安装仍被拦截
+    const saved = await k1.saveSelfBuildConfig({
+      enabled: true,
+      allowAgentBuild: false,
+      allowAgentApply: false,
+      gradleHeapMb: 3072,
+      watchdogTimeoutSec: 45,
+      targetAbis: "arm64-v8a,x86_64",
+      variant: "release",
+      customGradleArgs: "--offline --stacktrace",
+    });
+    assert.equal(saved.enabled, true);
+    assert.equal(saved.gradleHeapMb, 3072);
+    assert.equal(saved.watchdogTimeoutSec, 45);
+    assert.equal(saved.targetAbis, "arm64-v8a,x86_64");
+    assert.equal(saved.variant, "release");
+
+    // 跨重启持久化验证
+    const k2 = new PluginKernel({home: sbHome});
+    const reloaded = await k2.getSelfBuildConfig();
+    assert.equal(reloaded.enabled, true);
+    assert.equal(reloaded.gradleHeapMb, 3072);
+    assert.equal(reloaded.watchdogTimeoutSec, 45);
+    assert.equal(reloaded.customGradleArgs, "--offline --stacktrace");
+
+    // Agent 权限护栏校验
+    await assert.rejects(() => k2.manageSelfBuild({action: "build", source: "agent"}), /未允许 Agent 触发本机 APK 编译/);
+    await assert.rejects(() => k2.manageSelfBuild({action: "apply", source: "agent", apkPath: "/tmp/a.apk", confirmInstall: true}), /未允许 Agent 触发本机 APK 安装/);
+    await assert.rejects(() => k2.manageSelfBuild({action: "bootstrap", source: "agent"}), /用户手动触发/);
+    await assert.rejects(() => k2.manageSelfBuild({action: "rollback", source: "agent", confirmRollback: true}), /用户手动触发/);
+
+    // 允许 Agent 安装但缺少 confirmInstall=true 仍拦截
+    await k2.saveSelfBuildConfig({allowAgentApply: true});
+    await assert.rejects(() => k2.manageSelfBuild({action: "apply", source: "agent", apkPath: "/tmp/a.apk", confirmInstall: false}), /confirmInstall: true/);
+  } finally {
+    fs.rmSync(sbHome, {recursive: true, force: true});
+  }
+}
+
 await testProviderTranslators();
 await testUsageLedger();
 await testProviderGatewayE2E();
@@ -2115,4 +2796,6 @@ await testSelfEvolvingPluginPipeline();
 await testPhase4CeilingCapabilities();
 await testAuditRegressionAndCrossProcessE2E();
 await testOrphanedHotPluginResourcesE2E();
+await test14AuditIssuesRegression();
+await testClaudeFixesAndSelfBuildDefaultOff();
 console.log("ALL_SELF_TESTS_PASSED");

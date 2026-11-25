@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -92,7 +93,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
@@ -773,6 +778,18 @@ fun PrimaryFab(text: String, icon: ImageVector, onClick: () -> Unit, modifier: M
     }
 }
 
+/**
+ * 拦截内部滚动容器向上滑到底部后的负向余量，避免 Material3 1.5 ModalBottomSheet 的
+ * AnchoredDraggable 收到上冲嵌套滚动增量引发抖动（b/486562294），同时完全保留向下拖拽关闭手势。
+ */
+private val BottomSheetUpwardOverscrollGuard = object : NestedScrollConnection {
+    override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset =
+        if (available.y < 0f) Offset(0f, available.y) else Offset.Zero
+
+    override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity =
+        if (available.y < 0f) Velocity(0f, available.y) else Velocity.Zero
+}
+
 /** 底部抽屉：统一形状、底色与拖动手柄。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -780,14 +797,25 @@ fun GaliaisSheet(onDismissRequest: () -> Unit, content: @Composable ColumnScope.
     val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(
         onDismissRequest = onDismissRequest,
+        modifier = Modifier.statusBarsPadding(),
         sheetState = state,
         shape = D.sheetShape,
         containerColor = G.surface,
         contentColor = G.ink,
         scrimColor = Color.Black.copy(alpha = if (G.dark) 0.56f else 0.34f),
+        // Material3 1.5 默认 modalWindowInsets 包含 Top 状态栏并通过 SheetWindowInsets(state) 动态读取 offset，
+        // 当抽屉内容高度接近屏幕高度时会形成 offset ↔ 顶部内边距 ↔ 实测高度 ↔ Expanded 锚点 的高频上下振荡闭环；
+        // 外层使用静态 statusBarsPadding() 避让状态栏，内容区关闭动态 insets（底部由各抽屉内部显式处理 navigationBarsPadding/imePadding）。
+        contentWindowInsets = { WindowInsets(0, 0, 0, 0) },
         dragHandle = { BottomSheetDefaults.DragHandle(color = if (D.material) G.inkMuted.copy(alpha = 0.4f) else G.borderStrong) },
-        content = content,
-    )
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .nestedScroll(BottomSheetUpwardOverscrollGuard),
+            content = content,
+        )
+    }
 }
 
 @Composable

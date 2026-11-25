@@ -1710,21 +1710,24 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
 
     override suspend fun create(cwd: String, options: CreateOptions): ConversationKey {
         check(runtime.hubAvailable) { "Agent 服务未就绪" }
+        val normCwd = cwd.trim().trimEnd('/').ifEmpty { "/" }
         val st = settings.state.value
         val resolvedProviderId = when (options.providerId) {
             null -> st.agentProviders[kind.id]
             "" -> null
             else -> options.providerId
         }
-        val resolvedModel = options.model ?: st.agentModels[kind.id]
+        val resolvedModel = options.model
+            ?: st.agentModels[kind.id].takeIf { resolvedProviderId == st.agentProviders[kind.id] }
             ?: st.provider(resolvedProviderId)?.models?.firstOrNull()
+        if (resolvedProviderId != null) repo.syncProvidersNow()
         repo.envSsh.syncBeforeLaunch()
         val directApiKey = if (resolvedProviderId == null && kind.id == "antigravity") settings.antigravityApiKey() else null
         val defaultMode = if (kind.id == "antigravity") st.antigravityPermissionMode else null
         val defaultEffort = if (kind.id == "antigravity") st.antigravityEffort else null
         val res = runtime.hubRequest("sessions/create", jsonOf(
             "agentId" to kind.id,
-            "cwd" to cwd,
+            "cwd" to normCwd,
             "model" to resolvedModel,
             "mode" to defaultMode,
             "effort" to defaultEffort,
@@ -1743,7 +1746,7 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
         val initialEffort = session.str("effort") ?: hub.configOptionsOf(key).firstOrNull { it.id == "thought_level" }?.currentValue ?: defaultEffort
         repo.update(key) {
             ConversationState(
-                summary = ConversationSummary(key, session.str("title") ?: "新会话", "", cwd, System.currentTimeMillis(), parent = options.parent),
+                summary = ConversationSummary(key, session.str("title") ?: "新会话", "", normCwd, System.currentTimeMillis(), parent = options.parent),
                 loaded = true,
                 providerId = resolvedProviderId,
                 model = session.str("model") ?: resolvedModel,
@@ -1775,6 +1778,7 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
         }
         var returnedDiff: String? = null
         try {
+            if (current?.providerId != null) repo.syncProvidersNow()
             repo.envSsh.syncBeforeLaunch()
             val directApiKey = if (current?.providerId == null && kind.id == "antigravity") settings.antigravityApiKey() else null
             val res = runtime.hubRequest("sessions/prompt", jsonOf(

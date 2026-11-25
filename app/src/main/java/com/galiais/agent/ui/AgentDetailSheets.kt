@@ -257,6 +257,8 @@ fun UniversalAgentDetailScreen(
                             )
                             if (runtime.ready) {
                                 TagPill("刷新", fg = G.inkMuted, bg = G.surfaceSubtle, onClick = { refreshTick++ })
+                            } else if (!runtime.busy && runtime.bound) {
+                                TagPill("启动环境", fg = G.onAccent, bg = G.accent, onClick = app.runtime::start)
                             }
                         }
                         Text(

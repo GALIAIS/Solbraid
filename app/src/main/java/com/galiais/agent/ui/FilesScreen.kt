@@ -169,6 +169,7 @@ fun FilesScreen(
     }
 
     var confirmDiscardEdit by remember { mutableStateOf(false) }
+    var saveConflict by remember { mutableStateOf<Pair<String, String>?>(null) }
     val origPreviewText = (preview?.second as? FilePreview.Text)?.content
     val hasUnsavedEdit = editingText != null && editingText != origPreviewText
     val parent = path.substringBeforeLast('/', "").ifEmpty { "/" }
@@ -181,6 +182,38 @@ fun FilesScreen(
         }
     }
     BackHandler(enabled = editingText != null || preview != null || searching || path != "/") { goBack() }
+
+    fun performSave(filePath: String, content: String, force: Boolean = false) {
+        saving = true; error = null
+        scope.launch {
+            try {
+                if (!force && origPreviewText != null) {
+                    val latest = try { files.read(filePath) } catch (_: Exception) { null }
+                    when (latest) {
+                        is FilePreview.Text -> {
+                            if (latest.content != origPreviewText && latest.content != content) {
+                                saveConflict = filePath to latest.content
+                                saving = false
+                                return@launch
+                            }
+                        }
+                        is FilePreview.Image, is FilePreview.Binary -> {
+                            error = "保存中止：文件已被外部修改为非文本格式，请返回后重新打开"
+                            saving = false
+                            return@launch
+                        }
+                        null -> Unit
+                    }
+                }
+                files.write(filePath, content)
+                preview = filePath to FilePreview.Text(content, truncated = false)
+                editingText = null
+                saveConflict = null
+                app.conversations.notify("已保存 ${filePath.substringAfterLast('/')}")
+            } catch (e: Exception) { error = "保存失败：${e.message}" }
+            saving = false
+        }
+    }
 
     fun openFile(fullPath: String, startEdit: Boolean = false) {
         scope.launch {
@@ -241,8 +274,35 @@ fun FilesScreen(
         HeaderProgressSlot(loading || saving)
 
         if (!runtime.ready) {
-            Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-                Text("启动运行环境后可浏览和编辑项目文件。", style = MaterialTheme.typography.bodyMedium, color = G.inkMuted)
+            Box(Modifier.fillMaxSize().padding(20.dp), contentAlignment = Alignment.Center) {
+                CrispCard {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Text(
+                            if (runtime.busy) "正在准备运行环境" else "本地运行环境未就绪",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = G.ink,
+                        )
+                        Text(
+                            if (runtime.busy || runtime.state == "error") runtime.message
+                            else "启动运行环境后即可浏览、搜索和编辑工作区项目文件。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (runtime.state == "error") G.danger else G.inkMuted,
+                        )
+                        if (runtime.busy) {
+                            GaliaisProgressBar(thin = false, progress = runtime.progress)
+                        } else {
+                            PrimaryPillButton(
+                                text = if (runtime.state == "error") "重新启动" else "立即启动运行环境",
+                                enabled = runtime.bound,
+                                onClick = app.runtime::start,
+                            )
+                        }
+                    }
+                }
             }
             return@Column
         }
@@ -256,16 +316,7 @@ fun FilesScreen(
                     val prefs = RPrefs
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                         PrimaryPillButton("保存文件", enabled = !saving, onClick = {
-                            saving = true; error = null
-                            scope.launch {
-                                try {
-                                    files.write(shown.first, draft)
-                                    preview = shown.first to FilePreview.Text(draft, truncated = false)
-                                    editingText = null
-                                    app.conversations.notify("已保存 ${shown.first.substringAfterLast('/')}")
-                                } catch (e: Exception) { error = "保存失败：${e.message}" }
-                                saving = false
-                            }
+                            performSave(shown.first, draft, force = false)
                         })
                         SecondaryPillButton("取消编辑", enabled = !saving, onClick = {
                             if (hasUnsavedEdit) confirmDiscardEdit = true else editingText = null
@@ -647,6 +698,38 @@ fun FilesScreen(
                 }) { Text("删除", color = G.danger, fontWeight = FontWeight.SemiBold) }
             },
             dismissButton = { TextButton(onClick = { deleting = null }) { Text("取消", color = G.inkMuted) } },
+        )
+    }
+
+    saveConflict?.let { (conflictPath, latestDiskContent) ->
+        AlertDialog(
+            onDismissRequest = { saveConflict = null },
+            containerColor = G.surface,
+            title = { Text("文件已被外部修改", color = G.ink) },
+            text = {
+                Text(
+                    "在你编辑期间，Agent 或终端已修改了 ${conflictPath.substringAfterLast('/')}。直接覆盖可能会丢失新写入的内容。",
+                    color = G.inkMuted,
+                )
+            },
+            confirmButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    TextButton(onClick = {
+                        saveConflict = null
+                        preview = conflictPath to FilePreview.Text(latestDiskContent, truncated = false)
+                        editingText = latestDiskContent
+                        app.conversations.notify("已重新加载磁盘最新内容")
+                    }) { Text("加载最新", color = G.accent, fontWeight = FontWeight.SemiBold) }
+                    TextButton(onClick = {
+                        val draftToWrite = editingText
+                        saveConflict = null
+                        if (draftToWrite != null) performSave(conflictPath, draftToWrite, force = true)
+                    }) { Text("强制覆盖", color = G.danger, fontWeight = FontWeight.SemiBold) }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { saveConflict = null }) { Text("取消", color = G.inkMuted) }
+            },
         )
     }
 

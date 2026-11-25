@@ -254,15 +254,44 @@ class RuntimeClient(val app: Application) {
         }
     }
 
-    /** 切换运行模式（Root / 免 Root PRoot）：选择 Root 模式时自动发起 su 权限申请。 */
-    fun switchMode(nextMode: String) {
-        val settings = (app as GaliaisApplication).settings
-        if (settings.state.value.runtimeMode == nextMode) return
-        if (!snapshotFlow.value.idle) stop()
+    /**
+     * 切换运行模式（Root / 免 Root PRoot）：
+     * 默认全自动完成「停止旧模式 → 校验 Root 权限（若需）→ 自动安装离线内置环境（若未安装）→ 启动全部引擎」，
+     * 无需用户切换后再手动点击「安装运行环境」或「启动运行环境」。
+     */
+    fun switchMode(nextMode: String, autoStart: Boolean = true) {
+        val galiais = app as GaliaisApplication
+        val settings = galiais.settings
+        val sameMode = settings.state.value.runtimeMode == nextMode
+        if (sameMode) {
+            if (autoStart && snapshotFlow.value.idle) start()
+            return
+        }
         settings.setRuntimeMode(nextMode)
         refreshEnvironment(nextMode)
+        if (!autoStart) {
+            if (!snapshotFlow.value.idle) stop()
+            if (nextMode == RUNTIME_MODE_ROOT && rootAvailableFlow.value != true) {
+                scope.launch { requestRoot() }
+            }
+            return
+        }
         if (nextMode == RUNTIME_MODE_ROOT && rootAvailableFlow.value != true) {
-            scope.launch { requestRoot() }
+            scope.launch {
+                val granted = requestRoot()
+                withContext(Dispatchers.Main) {
+                    if (granted) {
+                        restart(nextMode)
+                    } else {
+                        if (!snapshotFlow.value.idle) stop()
+                        galiais.conversations.notify(
+                            rootAccessFlow.value?.message ?: "未获得 Root 权限，请授权后重试或切换回免 Root 模式",
+                        )
+                    }
+                }
+            }
+        } else {
+            restart(nextMode)
         }
     }
 
@@ -326,6 +355,10 @@ class RuntimeClient(val app: Application) {
     val hubAvailable: Boolean
         get() = snapshotFlow.value.engineInfo?.optJSONObject("agentHub")?.has("error") == false
 
+    /** 实时读取底层前台服务状态，消除异步快照延迟窗口下的误判。 */
+    val isServiceReady: Boolean
+        get() = service?.state == "ready"
+
     val gatewayEndpoint: Pair<Int, String>?
         get() {
             val gw = snapshotFlow.value.engineInfo?.optJSONObject("gateway") ?: return null
@@ -348,11 +381,13 @@ class RuntimeClient(val app: Application) {
         app.startService(Intent(app, VmRuntimeService::class.java).setAction(VmRuntimeService.STOP))
     }
 
-    fun restart() {
+    fun restart() = restart(modeOverride = null)
+
+    fun restart(modeOverride: String?) {
         app.startForegroundService(
             Intent(app, VmRuntimeService::class.java)
                 .setAction(VmRuntimeService.RESTART)
-                .putExtra(VmRuntimeService.EXTRA_MODE, settingsState.effectiveRuntimeMode),
+                .putExtra(VmRuntimeService.EXTRA_MODE, modeOverride ?: settingsState.effectiveRuntimeMode),
         )
     }
 }

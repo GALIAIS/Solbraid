@@ -85,46 +85,163 @@ async function runPluginProtocolUpstream(provider, target, ingressBody, route, s
   return {translatorId, upstream};
 }
 
-function extractTranslatedText(out) {
-  if (typeof out === "string") return out;
-  if (!out || typeof out !== "object") return "";
-  if (typeof out.text === "string") return out.text;
-  if (typeof out.output_text === "string") return out.output_text;
-  if (typeof out.choices?.[0]?.message?.content === "string") return out.choices[0].message.content;
+function extractTranslatedPayload(out) {
+  if (typeof out === "string") return {text: out, toolCalls: [], stopReason: "end_turn", usage: {inputTokens: 0, outputTokens: 0}};
+  if (!out || typeof out !== "object") return {text: "", toolCalls: [], stopReason: "end_turn", usage: {inputTokens: 0, outputTokens: 0}};
+
+  let text = "";
+  const toolCalls = [];
+  const pushTool = (id, name, rawArgs) => {
+    const cleanName = String(name || "").trim();
+    if (!cleanName) return;
+    const callId = String(id || `call_${randomBytes(6).toString("hex")}`);
+    let argsStr = "{}";
+    let argsObj = {};
+    if (typeof rawArgs === "string") {
+      argsStr = rawArgs.trim() || "{}";
+      try { const p = JSON.parse(argsStr); if (p && typeof p === "object") argsObj = p; } catch {}
+    } else if (rawArgs && typeof rawArgs === "object") {
+      argsObj = rawArgs;
+      argsStr = JSON.stringify(rawArgs);
+    }
+    toolCalls.push({id: callId, name: cleanName, arguments: argsStr, input: argsObj});
+  };
+
+  if (typeof out.text === "string") text = out.text;
+  else if (typeof out.output_text === "string") text = out.output_text;
+
+  // OpenAI Chat Completions 风格
+  const chatMsg = out.choices?.[0]?.message;
+  if (chatMsg) {
+    if (!text && typeof chatMsg.content === "string") text = chatMsg.content;
+    if (Array.isArray(chatMsg.tool_calls)) {
+      for (const tc of chatMsg.tool_calls) {
+        pushTool(tc?.id, tc?.function?.name || tc?.name, tc?.function?.arguments ?? tc?.arguments ?? tc?.input);
+      }
+    }
+  }
+  // OpenAI Responses 风格（output 数组含 message / function_call）
+  if (Array.isArray(out.output)) {
+    for (const item of out.output) {
+      if (item?.type === "function_call") {
+        pushTool(item.call_id || item.id, item.name, item.arguments);
+      } else if (item?.type === "message" && Array.isArray(item.content)) {
+        const joined = item.content.filter(c => (c?.type === "output_text" || c?.type === "text") && typeof c.text === "string").map(c => c.text).join("");
+        if (!text && joined) text = joined;
+      }
+    }
+  }
+  // Anthropic Messages 风格（content 数组含 text / tool_use）
   if (Array.isArray(out.content)) {
     const joined = out.content.filter(b => b?.type === "text" && typeof b.text === "string").map(b => b.text).join("");
-    if (joined) return joined;
+    if (!text && joined) text = joined;
+    for (const b of out.content) {
+      if (b?.type === "tool_use") pushTool(b.id, b.name, b.input);
+    }
   }
-  return "";
+  // 顶层直接携带 tool_calls / toolCalls
+  const directCalls = Array.isArray(out.tool_calls) ? out.tool_calls : (Array.isArray(out.toolCalls) ? out.toolCalls : []);
+  if (toolCalls.length === 0 && directCalls.length > 0) {
+    for (const tc of directCalls) {
+      pushTool(tc?.id || tc?.call_id, tc?.function?.name || tc?.name, tc?.function?.arguments ?? tc?.arguments ?? tc?.input);
+    }
+  }
+
+  const rawStop = String(out.stop_reason || out.finish_reason || out.choices?.[0]?.finish_reason || "").toLowerCase();
+  const stopReason = toolCalls.length > 0
+    ? "tool_use"
+    : (rawStop === "max_tokens" || rawStop === "length") ? "max_tokens"
+      : (rawStop === "stop_sequence") ? "stop_sequence"
+        : "end_turn";
+
+  const u = out.usage && typeof out.usage === "object" ? out.usage : {};
+  const inputTokens = Math.max(0, Number(u.input_tokens ?? u.prompt_tokens ?? u.inputTokens ?? 0) || 0);
+  const outputTokens = Math.max(0, Number(u.output_tokens ?? u.completion_tokens ?? u.outputTokens ?? 0) || 0);
+  return {text, toolCalls, stopReason, usage: {inputTokens, outputTokens}};
 }
 
-function writeSynthesizedResponsesSse(res, model, text) {
+function extractTranslatedText(out) {
+  return extractTranslatedPayload(out).text;
+}
+
+function writeSynthesizedResponsesSse(res, model, translated) {
+  const parsed = extractTranslatedPayload(translated);
   const respId = `resp_plug_${randomBytes(6).toString("hex")}`;
-  const msgId = `msg_plug_${randomBytes(6).toString("hex")}`;
   const sendEv = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   res.writeHead(200, {"Content-Type": "text/event-stream", "Cache-Control": "no-cache"});
   sendEv("response.created", {type: "response.created", response: {id: respId, status: "in_progress", model, output: []}});
-  sendEv("response.output_item.added", {type: "response.output_item.added", output_index: 0, item: {id: msgId, type: "message", status: "in_progress", role: "assistant", content: []}});
-  sendEv("response.content_part.added", {type: "response.content_part.added", item_id: msgId, output_index: 0, content_index: 0, part: {type: "output_text", text: "", annotations: []}});
-  if (text) sendEv("response.output_text.delta", {type: "response.output_text.delta", item_id: msgId, output_index: 0, content_index: 0, delta: text});
-  sendEv("response.output_text.done", {type: "response.output_text.done", item_id: msgId, output_index: 0, content_index: 0, text});
-  const finalItem = {id: msgId, type: "message", status: "completed", role: "assistant", content: [{type: "output_text", text, annotations: []}]};
-  sendEv("response.output_item.done", {type: "response.output_item.done", output_index: 0, item: finalItem});
-  sendEv("response.completed", {type: "response.completed", response: {id: respId, status: "completed", model, output: [finalItem]}});
+  const finalOutput = [];
+  let outIdx = 0;
+
+  if (parsed.text || parsed.toolCalls.length === 0) {
+    const msgId = `msg_plug_${randomBytes(6).toString("hex")}`;
+    sendEv("response.output_item.added", {type: "response.output_item.added", output_index: outIdx, item: {id: msgId, type: "message", status: "in_progress", role: "assistant", content: []}});
+    sendEv("response.content_part.added", {type: "response.content_part.added", item_id: msgId, output_index: outIdx, content_index: 0, part: {type: "output_text", text: "", annotations: []}});
+    if (parsed.text) sendEv("response.output_text.delta", {type: "response.output_text.delta", item_id: msgId, output_index: outIdx, content_index: 0, delta: parsed.text});
+    sendEv("response.output_text.done", {type: "response.output_text.done", item_id: msgId, output_index: outIdx, content_index: 0, text: parsed.text});
+    const finalMsg = {id: msgId, type: "message", status: "completed", role: "assistant", content: [{type: "output_text", text: parsed.text, annotations: []}]};
+    sendEv("response.output_item.done", {type: "response.output_item.done", output_index: outIdx, item: finalMsg});
+    finalOutput.push(finalMsg);
+    outIdx += 1;
+  }
+
+  for (const tc of parsed.toolCalls) {
+    const itemId = `fc_plug_${randomBytes(6).toString("hex")}`;
+    const fcInit = {id: itemId, type: "function_call", status: "in_progress", call_id: tc.id, name: tc.name, arguments: ""};
+    sendEv("response.output_item.added", {type: "response.output_item.added", output_index: outIdx, item: fcInit});
+    if (tc.arguments) {
+      sendEv("response.function_call_arguments.delta", {type: "response.function_call_arguments.delta", item_id: itemId, output_index: outIdx, delta: tc.arguments});
+    }
+    sendEv("response.function_call_arguments.done", {type: "response.function_call_arguments.done", item_id: itemId, output_index: outIdx, arguments: tc.arguments});
+    const fcDone = {id: itemId, type: "function_call", status: "completed", call_id: tc.id, name: tc.name, arguments: tc.arguments};
+    sendEv("response.output_item.done", {type: "response.output_item.done", output_index: outIdx, item: fcDone});
+    finalOutput.push(fcDone);
+    outIdx += 1;
+  }
+
+  const outTok = parsed.usage.outputTokens || Math.max(1, Math.ceil((parsed.text.length + parsed.toolCalls.reduce((n, t) => n + t.arguments.length, 0)) / 3));
+  const status = parsed.stopReason === "max_tokens" ? "incomplete" : "completed";
+  const usageObj = {input_tokens: parsed.usage.inputTokens, output_tokens: outTok, total_tokens: parsed.usage.inputTokens + outTok};
+  sendEv("response.completed", {
+    type: "response.completed",
+    response: {id: respId, status, model, output: finalOutput, usage: usageObj},
+  });
   res.end();
+  return parsed;
 }
 
-function writeSynthesizedAnthropicSse(res, model, text) {
+function writeSynthesizedAnthropicSse(res, model, translated) {
+  const parsed = extractTranslatedPayload(translated);
   const msgId = `msg_plug_${randomBytes(6).toString("hex")}`;
   const sendEv = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   res.writeHead(200, {"Content-Type": "text/event-stream", "Cache-Control": "no-cache"});
-  sendEv("message_start", {type: "message_start", message: {id: msgId, type: "message", role: "assistant", model, content: [], stop_reason: null, usage: {input_tokens: 0, output_tokens: 0}}});
-  sendEv("content_block_start", {type: "content_block_start", index: 0, content_block: {type: "text", text: ""}});
-  if (text) sendEv("content_block_delta", {type: "content_block_delta", index: 0, delta: {type: "text_delta", text}});
-  sendEv("content_block_stop", {type: "content_block_stop", index: 0});
-  sendEv("message_delta", {type: "message_delta", delta: {stop_reason: "end_turn", stop_sequence: null}, usage: {output_tokens: Math.max(1, Math.ceil(text.length / 3))}});
+  sendEv("message_start", {
+    type: "message_start",
+    message: {id: msgId, type: "message", role: "assistant", model, content: [], stop_reason: null, usage: {input_tokens: parsed.usage.inputTokens, output_tokens: 0}},
+  });
+  let blockIdx = 0;
+
+  if (parsed.text || parsed.toolCalls.length === 0) {
+    sendEv("content_block_start", {type: "content_block_start", index: blockIdx, content_block: {type: "text", text: ""}});
+    if (parsed.text) sendEv("content_block_delta", {type: "content_block_delta", index: blockIdx, delta: {type: "text_delta", text: parsed.text}});
+    sendEv("content_block_stop", {type: "content_block_stop", index: blockIdx});
+    blockIdx += 1;
+  }
+
+  for (const tc of parsed.toolCalls) {
+    sendEv("content_block_start", {type: "content_block_start", index: blockIdx, content_block: {type: "tool_use", id: tc.id, name: tc.name, input: {}}});
+    if (tc.arguments) {
+      sendEv("content_block_delta", {type: "content_block_delta", index: blockIdx, delta: {type: "input_json_delta", partial_json: tc.arguments}});
+    }
+    sendEv("content_block_stop", {type: "content_block_stop", index: blockIdx});
+    blockIdx += 1;
+  }
+
+  const outTok = parsed.usage.outputTokens || Math.max(1, Math.ceil((parsed.text.length + parsed.toolCalls.reduce((n, t) => n + t.arguments.length, 0)) / 3));
+  sendEv("message_delta", {type: "message_delta", delta: {stop_reason: parsed.stopReason, stop_sequence: null}, usage: {output_tokens: outTok}});
   sendEv("message_stop", {type: "message_stop"});
   res.end();
+  return parsed;
 }
 const AUTH_MODES = new Set(["bearer", "x-api-key", "x-goog-api-key", "api-key", "none"]);
 const AUTH_HEADER_KEYS = new Set(["authorization", "x-api-key", "x-goog-api-key", "api-key"]);
@@ -289,12 +406,17 @@ function normalizeProvider(raw) {
   };
 }
 
-function resolveMappedModel(provider, requestedModel) {
-  const req = String(requestedModel || "").trim();
-  if (!req || !provider?.modelMap) return req;
-  if (provider.modelMap[req]) return provider.modelMap[req];
-  const lower = req.toLowerCase();
-  for (const [pattern, target] of Object.entries(provider.modelMap)) {
+const CONTEXT_WINDOW_SUFFIX_RE = /\[\d+(?:\.\d+)?[km]\]$/i;
+
+function stripModelContextSuffix(model) {
+  return String(model || "").trim().replace(CONTEXT_WINDOW_SUFFIX_RE, "").trim();
+}
+
+function matchModelMap(modelMap, candidate) {
+  if (!candidate || !modelMap) return null;
+  if (modelMap[candidate]) return modelMap[candidate];
+  const lower = candidate.toLowerCase();
+  for (const [pattern, target] of Object.entries(modelMap)) {
     const p = pattern.toLowerCase();
     if (p === lower) return target;
     if (p === "*") continue;
@@ -303,7 +425,31 @@ function resolveMappedModel(provider, requestedModel) {
       if (re.test(lower)) return target;
     }
   }
-  if (provider.modelMap["*"]) return provider.modelMap["*"];
+  return null;
+}
+
+function resolveMappedModel(provider, requestedModel, targetProtocol = null) {
+  const req = String(requestedModel || "").trim();
+  if (!req) return req;
+  const stripped = stripModelContextSuffix(req);
+  if (provider?.modelMap) {
+    const direct = matchModelMap(provider.modelMap, req);
+    if (direct) return direct;
+    if (stripped && stripped !== req) {
+      const mappedStripped = matchModelMap(provider.modelMap, stripped);
+      if (mappedStripped) return mappedStripped;
+    }
+    if (provider.modelMap["*"]) return provider.modelMap["*"];
+  }
+  // Claude CLI 2.1+ 会为默认模型附加 [1m]/[200k] 上下文后缀；转发给非 Anthropic 协议或服务商显式列出裸名时自动剥离，避免上游 400 Invalid model
+  if (stripped && stripped !== req) {
+    const proto = String(targetProtocol || provider?.protocol || "");
+    const listedExact = Array.isArray(provider?.models) && provider.models.includes(req);
+    const listedStripped = Array.isArray(provider?.models) && provider.models.includes(stripped);
+    if ((proto && proto !== "anthropic_messages") || (listedStripped && !listedExact)) {
+      return stripped;
+    }
+  }
   return req;
 }
 
@@ -961,9 +1107,10 @@ async function handleCodexIngress(provider, subPath, body, req, res, signal, req
       response: parsedUp,
       context: {route: "openai-responses", model: body.model || "", stream: body.stream !== false},
     });
-    void recordUsageEvent({...meta, ms: Date.now() - startedAt, status: 200});
+    const parsedOut = extractTranslatedPayload(out);
+    void recordUsageEvent({...meta, in: parsedOut.usage.inputTokens, out: parsedOut.usage.outputTokens, ms: Date.now() - startedAt, status: 200});
     if (body.stream !== false) {
-      writeSynthesizedResponsesSse(res, body.model || "", extractTranslatedText(out));
+      writeSynthesizedResponsesSse(res, body.model || "", out);
     } else {
       res.writeHead(200, {"Content-Type": "application/json"});
       res.end(typeof out === "string" ? out : JSON.stringify(out));
@@ -1036,14 +1183,28 @@ async function handleClaudeIngress(provider, subPath, query, body, req, res, sig
       response: parsedUp,
       context: {route: "anthropic", model: body.model || "", stream: body.stream === true},
     });
-    void recordUsageEvent({...meta, ms: Date.now() - startedAt, status: 200});
+    const parsedOut = extractTranslatedPayload(out);
+    void recordUsageEvent({...meta, in: parsedOut.usage.inputTokens, out: parsedOut.usage.outputTokens, ms: Date.now() - startedAt, status: 200});
     if (body.stream === true) {
-      writeSynthesizedAnthropicSse(res, body.model || "", extractTranslatedText(out));
+      writeSynthesizedAnthropicSse(res, body.model || "", out);
     } else {
-      const txt = extractTranslatedText(out);
+      const contentBlocks = [];
+      if (parsedOut.text || parsedOut.toolCalls.length === 0) contentBlocks.push({type: "text", text: parsedOut.text});
+      for (const tc of parsedOut.toolCalls) {
+        contentBlocks.push({type: "tool_use", id: tc.id, name: tc.name, input: tc.input});
+      }
+      const outTok = parsedOut.usage.outputTokens || Math.max(1, Math.ceil(parsedOut.text.length / 3));
       const payload = (out && typeof out === "object" && Array.isArray(out.content))
         ? out
-        : {id: `msg_plug_${randomBytes(6).toString("hex")}`, type: "message", role: "assistant", model: body.model || "", content: [{type: "text", text: txt}], stop_reason: "end_turn", usage: {input_tokens: 0, output_tokens: Math.max(1, Math.ceil(txt.length / 3))}};
+        : {
+          id: `msg_plug_${randomBytes(6).toString("hex")}`,
+          type: "message",
+          role: "assistant",
+          model: body.model || "",
+          content: contentBlocks,
+          stop_reason: parsedOut.stopReason,
+          usage: {input_tokens: parsedOut.usage.inputTokens, output_tokens: outTok},
+        };
       res.writeHead(200, {"Content-Type": "application/json"});
       res.end(JSON.stringify(payload));
     }
@@ -1131,7 +1292,9 @@ async function handleHttp(req, res) {
       const picked = candidates[ci];
       const allowFailover = ci + 1 < candidates.length;
       const requestedModel = picked.model || initialRequestedModel || "";
-      const mappedModel = resolveMappedModel(picked.provider, requestedModel);
+      const desiredProto = route === "openai-responses" ? "openai_responses" : route === "anthropic" ? "anthropic_messages" : route === "gemini" ? "google_gemini" : "openai_chat";
+      const targetProto = resolveNativeTarget(picked.provider, desiredProto).protocol;
+      const mappedModel = resolveMappedModel(picked.provider, requestedModel, targetProto);
       const effectiveBody = (route !== "gemini" && mappedModel) ? {...body, model: mappedModel} : body;
       const inferredSessionId = urlSessionId
         || String(req.headers["x-solbraid-session-id"] || req.headers["session_id"] || "")

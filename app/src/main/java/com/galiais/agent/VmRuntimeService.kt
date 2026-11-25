@@ -372,6 +372,9 @@ class VmRuntimeService : Service() {
         val prepLabel = if (isFirst) "准备运行组件" else "检查运行环境"
         update("preparing", "正在准备 Codex、Claude Code 和 Node.js",
             progress = if (isFirst) 0.55f else 0.35f, step = prepStep, label = prepLabel)
+        if (mode == RUNTIME_MODE_PROOT) {
+            linux.prepareProotPayloads(directory, installControl)
+        }
         val setup = synchronized(processLock) {
             check(!cancelled.get()) { "已取消组件安装" }
             launchPlatformProcess(this, mode, File(directory, prepareScript(mode)), emptyList()).also { command = it }
@@ -491,7 +494,7 @@ class VmRuntimeService : Service() {
             if (tail.length > 16384) tail.delete(0, tail.length - 16384)
         }
     }
-    private fun startEngine(mode: String) {
+    private fun startEngine(mode: String, retriedFallback: Boolean = false) {
         if (stopping.get() || engine != null) return
         val engStep = if (firstTimeSetup) 3 else 2
         val proot = mode == RUNTIME_MODE_PROOT
@@ -547,13 +550,19 @@ class VmRuntimeService : Service() {
                 update("ready", readyText, progress = 1f, step = stepTotal, label = "已就绪")
             }
         } catch (error: Exception) {
-            // 若因在线更新的 Codex/Claude 组件损坏导致启动失败，自动清理覆写标记回退内置稳定版本，防止死锁变砖
+            // 若因在线更新的 Codex/Claude 组件损坏导致启动失败，自动清理覆写标记回退内置稳定版本并立即自动重试，避免用户手动再点一次重试
             val failedId = when (connecting) { "Codex" -> "codex"; "Claude Code" -> "claude"; else -> null }
             val overrideActive = failedId?.let { File(linuxRoot(mode), "home/agent/.galiais/cli/$it/active.json") }
-            val recovered = if (overrideActive != null && overrideActive.isFile && overrideActive.delete()) {
-                "（检测到在线更新版异常，已自动回退到内置稳定版，请点击重试）"
-            } else ""
-            if (!stopping.get()) fail("$connecting：${error.message ?: "引擎连接失败"}$recovered")
+            if (!retriedFallback && !stopping.get() && overrideActive != null && overrideActive.isFile && overrideActive.delete()) {
+                runCatching { agentHub?.close() }; agentHub = null
+                runCatching { claude?.close() }; claude = null
+                runCatching { engine?.close() }; engine = null
+                runCatching { gateway?.close() }; gateway = null
+                update("starting-engine", "检测到 $connecting 在线更新版异常，已自动回退内置稳定版并重试…", progress = 0.72f, step = engStep, label = "自动回退恢复")
+                startEngine(mode, retriedFallback = true)
+                return
+            }
+            if (!stopping.get()) fail("$connecting：${error.message ?: "引擎连接失败"}")
         }
     }
     private fun fail(reason: String) { stopRuntime(reason, killDaemons = false) }
@@ -569,26 +578,38 @@ class VmRuntimeService : Service() {
                 }
             }
             engineEvent("agent-hub", JSONObject().put("method", "hub/disconnected").put("params", JSONObject().put("message", reason)))
-            update(state, "外部 Agent 服务已断开：$reason。请停止并重新启动环境", progress = progress)
+            update(state, "外部 Agent 服务已断开：$reason（可点击「重启环境」一键恢复）", progress = progress)
         }
     }
 
     private fun requestRestart(mode: String) {
         if (maintaining || state == "backing-up") return
         pendingMaintenance = null
+        val targetTag = if (mode == RUNTIME_MODE_PROOT) "免 Root" else "Root"
         if (busy) {
             pendingRestartMode = mode
-            stopRuntime(null, killDaemons = true)
+            val switchStatus = if (activeMode != mode) "正在停止旧环境并切换启动 $targetTag 模式" else "正在重启本地运行环境"
+            stopRuntime(null, killDaemons = true, statusText = switchStatus)
             return
         }
-        if (daemonPresent(mode)) {
+        val otherMode = if (mode == RUNTIME_MODE_PROOT) RUNTIME_MODE_ROOT else RUNTIME_MODE_PROOT
+        val modesToStop = buildList {
+            if (daemonPresent(otherMode)) add(otherMode)
+            if (daemonPresent(mode)) add(mode)
+        }
+        if (modesToStop.isNotEmpty()) {
             if (!stopping.compareAndSet(false, true)) return
             pendingRestartMode = mode
             busy = true
-            startForeground(NOTIFICATION, notification("正在重启本地运行环境"))
-            update("stopping", "正在重启本地运行环境", progress = null)
+            val stopText = if (otherMode in modesToStop) "正在停止旧环境并切换启动 $targetTag 模式" else "正在重启本地运行环境"
+            startForeground(NOTIFICATION, notification(stopText))
+            update("stopping", stopText, progress = null)
             kotlin.concurrent.thread(name = "restart-detached-mux") {
-                val failure = try { stopMuxDaemons(mode); null } catch (error: Exception) { error.message }
+                val errors = mutableListOf<String>()
+                for (m in modesToStop) {
+                    try { stopMuxDaemons(m) } catch (error: Exception) { errors += (error.message ?: "停止 $m 后台进程失败") }
+                }
+                val failure = errors.takeIf { it.isNotEmpty() }?.joinToString("；")
                 main.post { finishStop(failure) }
             }
             return
@@ -622,12 +643,12 @@ class VmRuntimeService : Service() {
         } else stopSelf()
     }
 
-    private fun stopRuntime(error: String? = null, killDaemons: Boolean = error == null) {
+    private fun stopRuntime(error: String? = null, killDaemons: Boolean = error == null, statusText: String = "正在停止本地引擎") {
         if (!stopping.compareAndSet(false, true)) return
         synchronized(processLock) { cancelled.set(true) }
         installControl.cancel()
         val mode = activeMode
-        update(if (error == null) "stopping" else "error", error ?: "正在停止本地引擎", progress = null)
+        update(if (error == null) "stopping" else "error", error ?: statusText, progress = null)
         Thread({
             var failure = error
             fun record(cleanup: Exception) { failure = (failure?.plus("；") ?: "") + cleanup.message }
@@ -663,7 +684,8 @@ class VmRuntimeService : Service() {
         val finalFailure = failure ?: if (incompleteReset) "项目备份未完成，已取消重置" else null
         if (queued != null && finalFailure == null && !destroyed.get()) { runMaintenance(queued); return }
         if (restartMode != null && finalFailure == null && !destroyed.get()) {
-            update("stopped", "旧环境已停止，正在重新启动", progress = null, step = 0, label = "")
+            val targetTag = if (restartMode == RUNTIME_MODE_PROOT) "免 Root" else "Root"
+            update("stopped", "旧环境已停止，正在自动准备 $targetTag 环境", progress = null, step = 0, label = "")
             beginRun(restartMode)
             return
         }

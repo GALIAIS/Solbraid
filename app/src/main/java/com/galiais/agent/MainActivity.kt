@@ -15,13 +15,41 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.graphics.toArgb
 import com.galiais.agent.ui.G
 import com.galiais.agent.ui.GaliaisApp
 import com.galiais.agent.ui.GaliaisTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.io.File
 
 class MainActivity : ComponentActivity() {
     private val requestNotificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    /** 首帧渲染完成后原子写入启动健康心跳，供本机 APK 自迭代启动看门狗确认新版本正常存活。 */
+    private suspend fun writeSelfUpdateHealthHeartbeat() = withContext(Dispatchers.IO) {
+        runCatching {
+            val payload = JSONObject()
+                .put("ok", true)
+                .put("packageName", packageName)
+                .put("versionName", BuildConfig.VERSION_NAME)
+                .put("versionCode", BuildConfig.VERSION_CODE)
+                .put("pid", android.os.Process.myPid())
+                .put("ts", System.currentTimeMillis())
+                .toString() + "\n"
+            val target = File(filesDir, "self-update-healthy.json")
+            val tmp = File(filesDir, "self-update-healthy.json.tmp")
+            tmp.writeText(payload, Charsets.UTF_8)
+            tmp.setReadable(true, false)
+            if (!tmp.renameTo(target)) {
+                target.writeText(payload, Charsets.UTF_8)
+                target.setReadable(true, false)
+                tmp.delete()
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
@@ -53,6 +81,10 @@ class MainActivity : ComponentActivity() {
                     window.decorView.setBackgroundColor(canvasArgb)
                 }
                 GaliaisApp(app)
+                LaunchedEffect(Unit) {
+                    withFrameNanos { }
+                    writeSelfUpdateHealthHeartbeat()
+                }
             }
         }
     }

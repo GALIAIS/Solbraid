@@ -64,7 +64,8 @@ fun ModeSelectionScreen(app: GaliaisApplication) {
     fun enterWithMode(mode: String) {
         app.settings.setRuntimeMode(mode)
         app.runtime.refreshEnvironment(mode)
-        app.runtime.requestAutoStart()
+        // 用户已明确选定运行模式，离线组件均已内置于 APK 中，直接自动安装并启动，不再要求进入首页后再手动点击一次「安装运行环境」。
+        app.runtime.start()
     }
 
     LaunchedEffect(Unit) {

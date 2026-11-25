@@ -17,6 +17,7 @@ import {
 const DEFAULT_CONFIG = Object.freeze({
   mode: "builtin-local", // "builtin-local" | "http" | "github"
   serverUrl: "",
+  serverToken: "",
   githubRepo: "GALIAIS/Solbraid",
   githubBranch: "main",
   githubToken: "",
@@ -84,6 +85,7 @@ export class CommunityRegistryClient {
       ...cur,
       mode,
       serverUrl: typeof patch.serverUrl === "string" ? patch.serverUrl.trim().replace(/\/+$/, "") : cur.serverUrl,
+      serverToken: typeof patch.serverToken === "string" ? patch.serverToken.trim() : cur.serverToken,
       githubRepo: typeof patch.githubRepo === "string"
         ? patch.githubRepo.trim().replace(/^https?:\/\/github\.com\//i, "").replace(/\.git$/i, "").replace(/^\/+|\/+$/g, "")
         : cur.githubRepo,
@@ -106,6 +108,7 @@ export class CommunityRegistryClient {
     return {
       mode: cfg.mode,
       serverUrl: cfg.serverUrl,
+      hasServerToken: Boolean(cfg.serverToken),
       githubRepo: cfg.githubRepo,
       githubBranch: cfg.githubBranch,
       hasGithubToken: Boolean(cfg.githubToken),
@@ -376,9 +379,11 @@ export class CommunityRegistryClient {
     if (!RESOURCE_KINDS.includes(bundle.kind)) throw new Error(`不支持上传的资源类型：${bundle.kind}`);
 
     if (cfg.mode === "http" && cfg.serverUrl) {
+      const headers = {"content-type": "application/json"};
+      if (cfg.serverToken) headers.authorization = `Bearer ${cfg.serverToken}`;
       const resp = await fetch(`${cfg.serverUrl}/api/v1/submissions`, {
         method: "POST",
-        headers: {"content-type": "application/json"},
+        headers,
         body: JSON.stringify(bundle),
       });
       const data = await resp.json().catch(() => ({}));
@@ -442,8 +447,16 @@ export class CommunityRegistryClient {
     const cfg = await this.loadConfig();
     if (cfg.mode === "github") throw new Error("GitHub 仓库资源请通过 PR 维护下架");
     if (cfg.mode === "http" && cfg.serverUrl) {
-      const resp = await fetch(`${cfg.serverUrl}/api/v1/resources/${encodeURIComponent(kind)}/${encodeURIComponent(id)}`, {method: "DELETE"});
-      if (!resp.ok) throw new Error(`下架资源失败（HTTP ${resp.status}）`);
+      const headers = {};
+      if (cfg.serverToken) headers.authorization = `Bearer ${cfg.serverToken}`;
+      const resp = await fetch(`${cfg.serverUrl}/api/v1/resources/${encodeURIComponent(kind)}/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        headers,
+      });
+      if (!resp.ok) {
+        const errData = await resp.json().catch(() => ({}));
+        throw new Error(errData.error || `下架资源失败（HTTP ${resp.status}）`);
+      }
       return await resp.json();
     }
     const catalog = await this.#readLocalCatalog();
@@ -495,8 +508,19 @@ export class CommunityRegistryClient {
     }
 
     if (bundle?.audit?.verdict !== "approved") throw new Error("安全拦截：该资源未通过仓库 AI 安全审查，禁止下载安装");
+    const wantId = String(id || "").trim().toLowerCase();
+    const wantKind = String(kind || "").trim().toLowerCase();
+    const actualId = String(bundle?.id || "").trim().toLowerCase();
+    const actualKind = String(bundle?.kind || "").trim().toLowerCase();
+    if (!actualId || actualId !== wantId || (wantKind && actualKind !== wantKind)) {
+      throw new Error(`安全拦截：返回资源身份与请求不匹配（期望 ${wantKind || "*"}/${wantId}，实际 ${actualKind || "?"}/${actualId || "?"}）`);
+    }
+    const normalizedExpectedSha = String(expectedSha || "").trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(normalizedExpectedSha)) {
+      throw new Error("安全拦截：共享资源缺少有效的 SHA-256 摘要，禁止安装");
+    }
     const actualSha = computeBundleSha256(bundle);
-    if (expectedSha && actualSha !== expectedSha) throw new Error("安全拦截：资源 SHA-256 校验不匹配（可能被篡改），已中止安装");
+    if (actualSha !== normalizedExpectedSha) throw new Error("安全拦截：资源 SHA-256 校验不匹配（可能被篡改），已中止安装");
     const localRecheck = scanStaticSecurity(bundle);
     if (!localRecheck.ok) throw new Error(`客户端二次安全复检拦截：${localRecheck.findings[0]?.title || "检测到高危模式"}`);
     return {bundle, sha256: actualSha, audit: bundle.audit};

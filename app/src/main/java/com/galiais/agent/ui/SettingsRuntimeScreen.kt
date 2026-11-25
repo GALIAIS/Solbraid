@@ -43,9 +43,12 @@ import com.galiais.agent.GaliaisApplication
 import com.galiais.agent.VmRuntimeService
 import com.galiais.agent.engine.AgentCatalog
 import com.galiais.agent.engine.DownloadNetworkConfig
+import com.galiais.agent.engine.EngineKind
 import com.galiais.agent.engine.ProviderHealthSnapshot
 import com.galiais.agent.engine.RUNTIME_MODE_PROOT
 import com.galiais.agent.engine.RUNTIME_MODE_ROOT
+import com.galiais.agent.engine.arr
+import com.galiais.agent.engine.jsonOf
 import com.galiais.agent.engine.str
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
@@ -62,6 +65,7 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
     val requestingRoot by app.runtime.requestingRoot.collectAsState()
     val conversations by app.conversations.conversations.collectAsState()
     val cliStates by app.conversations.cliUpdates.states.collectAsState()
+    val cliRestarting by app.conversations.cliUpdates.restarting.collectAsState()
     val hubStatuses by app.conversations.hub.statuses.collectAsState()
     val scope = rememberCoroutineScope()
     var dialog by remember { mutableStateOf<String?>(null) }
@@ -93,7 +97,7 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
             runtime = runtime.copy(mode = if (runtime.idle) activeMode else runtime.mode),
             onStart = app.runtime::start,
             onStop = app.runtime::stop,
-            installed = env.fullyInstalled,
+            installed = env.isInstalledFor(activeMode),
             onRestart = {
                 if (hasRunningTasks) dialog = "restart" else app.runtime.restart()
             },
@@ -135,7 +139,12 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
                         onClick = if (requestingRoot) null else ({
                             scope.launch {
                                 val ok = app.runtime.requestRoot()
-                                app.conversations.notify(if (ok) "Root 环境权限可用" else app.runtime.rootAccess.value?.message ?: "Root 检查未完成")
+                                if (ok && activeMode == RUNTIME_MODE_ROOT && runtime.idle) {
+                                    app.runtime.start()
+                                    app.conversations.notify("Root 权限已就绪，正在自动启动 Root 运行环境…")
+                                } else {
+                                    app.conversations.notify(if (ok) "Root 环境权限可用" else app.runtime.rootAccess.value?.message ?: "Root 检查未完成")
+                                }
                             }
                         }),
                     )
@@ -149,12 +158,17 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
                     enabled = !runtime.maintenance,
                     onSelect = { next ->
                         if (next == activeMode) return@SegmentedPillBar
-                        if (runtime.idle) {
-                            app.runtime.switchMode(next)
-                            app.conversations.notify(if (next == RUNTIME_MODE_PROOT) "已切换为免 Root 模式" else "已切换为 Root 模式")
-                        } else {
+                        val targetName = if (next == RUNTIME_MODE_PROOT) "免 Root 模式" else "Root 模式"
+                        val targetInstalled = env.isInstalledFor(next)
+                        if (hasRunningTasks) {
                             pendingMode = next
                             dialog = "switch-mode"
+                        } else {
+                            app.runtime.switchMode(next, autoStart = true)
+                            app.conversations.notify(
+                                if (targetInstalled) "正在切换并自动启动 $targetName…"
+                                else "正在切换并自动安装启动 $targetName…",
+                            )
                         }
                     },
                 )
@@ -295,7 +309,9 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
                         TagPill(text, fg = fg, bg = bg)
                     }
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val anyPendingRestart = cliStates.values.any { it.pendingRestart }
+                val anyInstalling = cliStates.values.any { it.installing }
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     SecondaryPillButton(
                         text = if (anyChecking) "检查更新中…" else "检查 3 大 Agent 更新",
                         enabled = runtime.ready && app.runtime.hubAvailable && !anyChecking,
@@ -304,6 +320,13 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
                             app.conversations.notify("正在检查 Codex / Claude Code / Antigravity 更新…")
                         },
                     )
+                    if (anyPendingRestart) {
+                        PrimaryPillButton(
+                            text = if (cliRestarting) "重启中…" else "重启生效",
+                            enabled = runtime.ready && !anyInstalling && !cliRestarting,
+                            onClick = { dialog = "cli-restart" },
+                        )
+                    }
                 }
             }
         }
@@ -358,6 +381,49 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
                                         hubOk,
                                         if (hubOk) "在线" else "通道异常，建议点击上方「重启环境」恢复",
                                     )
+                                    val claudeProbe = runCatching {
+                                        app.runtime.requestObject(EngineKind.CLAUDE, "session/list", jsonOf("limit" to 1, "offset" to 0))
+                                    }
+                                    claudeProbe.onSuccess { res ->
+                                        val activeCnt = res.arr("activeSessions").length()
+                                        checks += Triple(
+                                            "Claude Code 会话桥接",
+                                            true,
+                                            if (activeCnt > 0) "在线 · $activeCnt 个活跃 SDK 会话" else "在线 · 就绪",
+                                        )
+                                    }.onFailure { err ->
+                                        checks += Triple("Claude Code 会话桥接", false, "异常：${err.message}")
+                                    }
+                                    val codexProbe = runCatching {
+                                        app.runtime.requestObject(EngineKind.CODEX, "thread/list", jsonOf("limit" to 1))
+                                    }
+                                    codexProbe.onSuccess {
+                                        checks += Triple("Codex 会话通道", true, "在线 · 就绪")
+                                    }.onFailure { err ->
+                                        checks += Triple("Codex 会话通道", false, "异常：${err.message}")
+                                    }
+                                    if (hubOk) {
+                                        val agyProbe = runCatching {
+                                            app.runtime.hubRequest("agents/status", jsonOf("agentId" to "antigravity"), timeoutMs = 15_000)
+                                        }
+                                        agyProbe.onSuccess { res ->
+                                            val st = res.arr("statuses").optJSONObject(0)
+                                            val installed = st?.optBoolean("installed") == true
+                                            val errText = st?.str("error")
+                                            val ver = st?.str("version")
+                                            checks += Triple(
+                                                "Antigravity (ACP)",
+                                                installed && errText.isNullOrBlank(),
+                                                when {
+                                                    !errText.isNullOrBlank() -> "异常：$errText"
+                                                    installed -> "在线 · ${ver ?: "已就绪"}"
+                                                    else -> "未检测到内置 agy 可执行文件"
+                                                },
+                                            )
+                                        }.onFailure { err ->
+                                            checks += Triple("Antigravity (ACP)", false, "异常：${err.message}")
+                                        }
+                                    }
                                 } else {
                                     checks += Triple("后台引擎通道", false, "环境未启动，启动后可检测 RPC 与网关连通性")
                                 }
@@ -477,17 +543,31 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
                 app.runtime.restart()
             },
         )
+        "cli-restart" -> ConfirmDialog(
+            title = "重启运行环境以应用 CLI 更新？",
+            body = "将重启本地运行环境使新版本生效，正在运行的会话、终端和 SSH 隧道将被中断。",
+            confirm = "确认重启",
+            onDismiss = { dialog = null },
+            onConfirm = {
+                dialog = null
+                app.conversations.cliUpdates.restart()
+            },
+        )
         "switch-mode" -> pendingMode?.let { target ->
             val targetName = if (target == RUNTIME_MODE_PROOT) "免 Root 模式" else "Root 模式"
+            val targetInstalled = env.isInstalledFor(target)
             ConfirmDialog(
                 title = "切换为 $targetName？",
-                body = "切换模式会停止当前环境并中断任务。两种模式的工作区和会话分别保存。",
-                confirm = "停止并切换",
+                body = "当前有会话正在执行任务，切换将中断任务并自动${if (targetInstalled) "启动" else "安装并启动"} $targetName。两种模式的工作区和会话分别保存。",
+                confirm = if (targetInstalled) "切换并启动" else "切换并自动安装",
                 onDismiss = { dialog = null; pendingMode = null },
                 onConfirm = {
                     dialog = null; pendingMode = null
-                    app.runtime.switchMode(target)
-                    app.conversations.notify("正在停止当前环境并切换为 $targetName…")
+                    app.runtime.switchMode(target, autoStart = true)
+                    app.conversations.notify(
+                        if (targetInstalled) "正在切换并自动启动 $targetName…"
+                        else "正在切换并自动安装启动 $targetName…",
+                    )
                 },
             )
         }

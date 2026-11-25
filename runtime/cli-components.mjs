@@ -38,7 +38,7 @@ const AGY_DOWNLOADS = "https://antigravity-cli-auto-updater-974169037036.us-cent
 const BIN_NAMES = {codex: "codex", claude: "claude", antigravity: "agy"};
 
 function assertId(id) { if (!IDS.includes(id)) throw new Error("未知 CLI"); return id; }
-function bundled(id) {
+export function bundledCliInstallation(id) {
   assertId(id);
   return {
     id, version: cliComponents.engines[id], bundled: true, release: null,
@@ -46,6 +46,7 @@ function bundled(id) {
     ...(id === "claude" ? {sdkVersion: cliComponents.sdk.version, sdkDirectory: "/opt/galiais-codex/claude-sdk-" + cliComponents.sdk.version} : {}),
   };
 }
+const bundled = bundledCliInstallation;
 async function readJson(file, fallback = null) {
   try { return JSON.parse(await fs.readFile(file, "utf8")); }
   catch (error) { if (error.code === "ENOENT") return fallback; throw error; }

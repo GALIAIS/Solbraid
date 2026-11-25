@@ -90,11 +90,9 @@ class CliUpdateRepository(private val repo: ConversationRepository) {
             statesFlow.value = statesFlow.value + (updated.id to updated)
             if (!updated.pendingRestart) {
                 repo.notify("已更新并热加载 ${updated.installedVersion}，无需重启")
-            } else if (repo.conversations.value.values.none { it.running } && !restartingFlow.value) {
-                repo.notify("更新已安装，正在自动重启运行环境使其生效…")
-                restart()
             } else {
-                repo.notify("更新已安装，当前有会话运行中，完成后点「重启生效」即可")
+                // 不再自动调用 restart()，避免静默中断运行中的本地终端 PTY、SSH 隧道、SFTP 传输或构建任务；保留“待重启生效”由用户明确确认。
+                repo.notify("更新已安装（${updated.installedVersion}），待重启生效；请在合适时机点击「重启生效」")
             }
         } catch (cancel: CancellationException) { throw cancel }
         catch (error: Exception) {
@@ -110,11 +108,8 @@ class CliUpdateRepository(private val repo: ConversationRepository) {
         statesFlow.value = statesFlow.value + (updated.id to updated)
         if (!updated.pendingRestart) {
             repo.notify("已热切回内置版本 ${updated.installedVersion}，无需重启")
-        } else if (repo.conversations.value.values.none { it.running } && !restartingFlow.value) {
-            repo.notify("已选择内置版本，正在自动重启运行环境使其生效…")
-            restart()
         } else {
-            repo.notify("已选择内置版本，当前有会话运行中，完成后点「重启生效」即可")
+            repo.notify("已选择内置版本（${updated.installedVersion}），待重启生效；请在合适时机点击「重启生效」")
         }
     }
     fun restart() = repo.launchOperation("重启运行环境失败") {
@@ -122,10 +117,13 @@ class CliUpdateRepository(private val repo: ConversationRepository) {
         check(statesFlow.value.values.none { it.installing }) { "请等待更新完成" }
         restartingFlow.value = true
         try {
-            runtime.stop()
-            val stopped = withTimeout(60_000) { runtime.snapshot.first { it.state == "stopped" || it.state == "error" } }
-            check(stopped.state == "stopped") { "无法确认旧环境已停止，请在运行环境页重试" }
-            runtime.start()
+            val wasReady = runtime.snapshot.value.ready
+            runtime.restart()
+            if (wasReady) {
+                withTimeout(15_000) { runtime.snapshot.first { !it.ready } }
+            }
+            val settled = withTimeout(120_000) { runtime.snapshot.first { it.ready || it.state == "error" } }
+            check(settled.ready) { settled.message.ifBlank { "重启运行环境未就绪，请在运行环境页重试" } }
         } finally { restartingFlow.value = false }
     }
     fun disconnected() { statesFlow.value = emptyMap() }

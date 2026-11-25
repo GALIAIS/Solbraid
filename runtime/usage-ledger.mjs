@@ -7,6 +7,49 @@ import path from "node:path";
 const HOME = process.env.HOME || "/home/agent";
 export const USAGE_DIR = path.join(HOME, ".galiais", "usage");
 export const LEDGER_FILE = path.join(USAGE_DIR, "ledger.jsonl");
+export const LEDGER_LOCK_FILE = path.join(USAGE_DIR, "ledger.lock");
+
+const LOCK_STALE_MS = 10_000;
+const LOCK_WAIT_TIMEOUT_MS = 6_000;
+
+/** 跨进程原子文件锁：串行化 provider-gateway 与 agent-hub 对 ledger.jsonl 的并发追加与条件清理，防止丢行。 */
+async function withCrossProcessLedgerLock(fn) {
+  await fs.mkdir(USAGE_DIR, {recursive: true, mode: 0o700});
+  const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
+  let handle = null;
+  while (!handle) {
+    try {
+      handle = await fs.open(LEDGER_LOCK_FILE, "wx", 0o600);
+      await handle.writeFile(`${process.pid}\n${Date.now()}\n`, "utf8").catch(() => {});
+      await handle.close().catch(() => {});
+      break;
+    } catch (err) {
+      if (err?.code !== "EEXIST") throw err;
+      const st = await fs.stat(LEDGER_LOCK_FILE).catch(() => null);
+      if (st && (Date.now() - st.mtimeMs) > LOCK_STALE_MS) {
+        await fs.rm(LEDGER_LOCK_FILE, {force: true}).catch(() => {});
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        // 超时后强行清理陈旧锁并重试一次，避免死锁永久阻塞统计
+        await fs.rm(LEDGER_LOCK_FILE, {force: true}).catch(() => {});
+        handle = await fs.open(LEDGER_LOCK_FILE, "wx", 0o600).catch(() => null);
+        if (handle) {
+          await handle.writeFile(`${process.pid}\n${Date.now()}\n`, "utf8").catch(() => {});
+          await handle.close().catch(() => {});
+          break;
+        }
+        throw new Error("用量账本跨进程锁获取超时");
+      }
+      await new Promise(r => setTimeout(r, 12 + Math.floor(Math.random() * 12)));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await fs.rm(LEDGER_LOCK_FILE, {force: true}).catch(() => {});
+  }
+}
 
 // 常见主流模型参考单价（USD / 1M tokens）：[input, output, cacheRead, cacheWriteRatio]
 const MODEL_PRICES = [
@@ -142,8 +185,10 @@ export function recordUsageEvent(entry) {
     keyIdx: Number.isInteger(entry.keyIdx) ? entry.keyIdx : 0,
   };
   appendTail = appendTail.then(async () => {
-    await fs.mkdir(USAGE_DIR, {recursive: true, mode: 0o700});
-    await fs.appendFile(LEDGER_FILE, JSON.stringify(rec) + "\n", {encoding: "utf8", mode: 0o600});
+    await withCrossProcessLedgerLock(async () => {
+      await fs.mkdir(USAGE_DIR, {recursive: true, mode: 0o700});
+      await fs.appendFile(LEDGER_FILE, JSON.stringify(rec) + "\n", {encoding: "utf8", mode: 0o600});
+    });
   }).catch(err => {
     try { process.stderr.write(`[usage-ledger] write failed: ${err?.message || err}\n`); } catch {}
   });
@@ -552,7 +597,7 @@ export async function clearUsageLedger(params = {}) {
     params?.providerId || params?.model || params?.agent || params?.day || params?.sessionId || params?.source ||
     params?.failedOnly || (params?.search && String(params.search).trim()) || sinceMs > 0
   );
-  const run = async () => {
+  const run = async () => withCrossProcessLedgerLock(async () => {
     if (!hasFilter) {
       await fs.rm(LEDGER_FILE, {force: true}).catch(() => {});
       return {ok: true, clearedAll: true};
@@ -565,7 +610,7 @@ export async function clearUsageLedger(params = {}) {
     await fs.writeFile(tmp, kept.map(r => JSON.stringify(r)).join("\n") + (kept.length ? "\n" : ""), {encoding: "utf8", mode: 0o600});
     await fs.rename(tmp, LEDGER_FILE);
     return {ok: true, clearedAll: false, removed, remaining: kept.length};
-  };
+  });
   const resultPromise = appendTail.then(run, run);
   appendTail = resultPromise.then(() => {}, () => {});
   return await resultPromise;

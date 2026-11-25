@@ -125,8 +125,12 @@ async function syncEnvironmentNow({config = {}, secrets = {}}) {
 
   const normalized = {vars, extraPaths, aliases, shellSnippet, git: gitCfg, secrets};
 
-  // 生成 POSIX 兼容 profile.sh 供终端、Codex 及所有登录 Shell 自动加载
-  const lines = ["# Managed by Solbraid Environment Hub"];
+  // 生成 POSIX 兼容 profile.sh 供终端、Codex 及所有登录 Shell 自动加载（同一 Shell PID 内幂等防重入，且对 PATH 去重）
+  const lines = [
+    "# Managed by Solbraid Environment Hub",
+    `if [ "\${_SOLBRAID_PROFILE_PID:-}" = "$$" ]; then return 0 2>/dev/null || true; fi`,
+    `_SOLBRAID_PROFILE_PID="$$"`,
+  ];
   for (const v of vars) {
     if (v.enabled === false) continue;
     if (v.scope && v.scope !== "global") continue;
@@ -142,8 +146,11 @@ async function syncEnvironmentNow({config = {}, secrets = {}}) {
     lines.push(`case "$PWD/" in ${shellQuote(target.replace(/\/+$/, "") + "/")}*) export ${v.key}=${shellQuote(value)} ;; esac`);
   }
   if (extraPaths.length > 0) {
-    const joined = extraPaths.map(p => p.replace(/^~(?=\/|$)/, HOME).replaceAll("$HOME", HOME)).join(":");
-    lines.push(`export PATH=${shellQuote(joined)}:"$PATH"`);
+    for (let i = extraPaths.length - 1; i >= 0; i--) {
+      const expanded = extraPaths[i].replace(/^~(?=\/|$)/, HOME).replaceAll("$HOME", HOME);
+      const q = shellQuote(expanded);
+      lines.push(`case ":$PATH:" in *:${q}:*) ;; *) export PATH=${q}:"$PATH" ;; esac`);
+    }
   }
   for (const a of aliases) {
     lines.push(`alias ${a.name}=${shellQuote(a.command)}`);
@@ -153,7 +160,7 @@ async function syncEnvironmentNow({config = {}, secrets = {}}) {
   }
   await atomicWrite(ENV_PROFILE_FILE, lines.join("\n") + "\n", 0o600);
 
-  const sourceLine = `[ -f "${ENV_PROFILE_FILE}" ] && . "${ENV_PROFILE_FILE}"`;
+  const sourceLine = `[ "\${_SOLBRAID_PROFILE_PID:-}" != "$$" ] && [ -f "${ENV_PROFILE_FILE}" ] && . "${ENV_PROFILE_FILE}"`;
   await upsertManagedBlock(path.join(HOME, ".bashrc"), ENV_BLOCK_START, ENV_BLOCK_END, sourceLine, 0o644);
   await upsertManagedBlock(path.join(HOME, ".profile"), ENV_BLOCK_START, ENV_BLOCK_END, sourceLine, 0o644);
 

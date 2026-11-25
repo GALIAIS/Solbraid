@@ -39,7 +39,24 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
         val summaries = linkedMapOf<ConversationKey, ConversationSummary>()
         var offset = 0
         while (true) {
-            val page = call("session/list", jsonOf("limit" to 100, "offset" to offset)).arr("sessions").objects()
+            val resp = call("session/list", jsonOf("limit" to 100, "offset" to offset))
+            if (offset == 0 && resp.has("activeSessions")) {
+                val activeList = resp.arr("activeSessions").objects()
+                val activeIds = mutableSetOf<String>()
+                val busyIds = mutableSetOf<String>()
+                for (a in activeList) {
+                    val sid = a.str("sessionId") ?: continue
+                    activeIds += sid
+                    if (a.optBoolean("busy", false)) busyIds += sid
+                }
+                connected.clear()
+                connected += activeIds
+                for (sid in busyIds) {
+                    val k = key(sid)
+                    if (repo.state(k) != null) repo.update(k) { it.copy(running = true) }
+                }
+            }
+            val page = resp.arr("sessions").objects()
             for (info in page) {
                 val item = ConversationSummary(key(info.getString("sessionId")), info.str("customTitle") ?: info.optString("summary").ifBlank { "未命名会话" },
                     info.optString("firstPrompt"), info.str("cwd"), normalizeTime(info.optLong("lastModified")))
@@ -70,8 +87,11 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
         if (selectedOptions != null) repo.update(key) { selectedOptions.applyTo(it) }
     }
 
+    private fun normalizeDir(path: String): String = path.trim().trimEnd('/').ifEmpty { "/" }
+
     private fun sessionOptions(cwd: String, providerId: String?, model: String?, effort: String? = null, permissionMode: String? = null, reasoningSummary: String? = null, fastMode: Boolean? = null): JSONObject {
-        require(cwd in settings.state.value.trustedProjects) { "尚未信任此项目，不能加载它的 Claude Code 配置" }
+        val normCwd = normalizeDir(cwd)
+        require(settings.state.value.trustedProjects.any { normalizeDir(it) == normCwd }) { "尚未信任此项目，不能加载它的 Claude Code 配置" }
         val state = settings.state.value
         val resolvedMode = permissionMode ?: state.claudePermissionMode
         val thinkingDisplay = if ((reasoningSummary ?: state.defaultReasoningSummaryFor(kind)) == "none") "omitted" else "summarized"
@@ -82,7 +102,7 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                 ?: provider.models.firstOrNull()
                 ?: error("请先为服务商「${provider.name}」添加或填写模型")
             return jsonOf(
-                "cwd" to cwd, "trustProject" to true,
+                "cwd" to normCwd, "trustProject" to true,
                 "apiKey" to token,
                 "baseUrl" to "http://127.0.0.1:$port/anthropic/${provider.id}",
                 "customProvider" to true,
@@ -97,7 +117,7 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
             )
         }
         val officialModel = model?.takeIf { it.isNotBlank() }
-        return jsonOf("cwd" to cwd, "trustProject" to true, "apiKey" to settings.claudeApiKey(),
+        return jsonOf("cwd" to normCwd, "trustProject" to true, "apiKey" to settings.claudeApiKey(),
             "oauthToken" to settings.claudeOauthToken(),
             "baseUrl" to state.claudeBaseUrl, "model" to officialModel, "effort" to effort,
             "permissionMode" to resolvedMode, "thinkingDisplay" to thinkingDisplay, "fastMode" to fastMode,
@@ -111,6 +131,7 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
         val cwd = state?.summary?.cwd ?: error("会话缺少工作目录，无法恢复")
         val providerId = settings.claudeSessionProvider(key.id) ?: state.providerId
         val allowDelegation = settings.state.value.delegationEnabled && state.summary.parent == null
+        if (providerId != null) repo.syncProvidersNow()
         repo.envSsh.syncBeforeLaunch()
         call("session/open", sessionOptions(cwd, providerId, state.model, state.effort, state.permissionMode, state.reasoningSummary, state.fastMode).put("resume", key.id).put("allowDelegation", allowDelegation))
         connected += key.id
@@ -133,6 +154,7 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
         val permissionMode = if (state.claudePermissionMode == "auto" && !useModelDefaults) "default" else state.claudePermissionMode
         val opts = sessionOptions(cwd, providerId, model, effort, permissionMode,
             state.defaultReasoningSummaryFor(kind), fastMode).put("allowDelegation", options.allowDelegation)
+        if (providerId != null) repo.syncProvidersNow()
         repo.envSsh.syncBeforeLaunch()
         val opened = call("session/open", opts)
         val key = key(opened.getString("sessionId"))
@@ -206,14 +228,19 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
         try { send(key, text); return waiter.await() } finally { turnWaiters.remove(key.id, waiter) }
     }
 
-    override suspend fun interrupt(key: ConversationKey) { if (key.id in connected) call("turn/interrupt", jsonOf("sessionId" to key.id)) }
+    override suspend fun interrupt(key: ConversationKey) {
+        if (key.id in connected || repo.state(key)?.running == true) {
+            runCatching { call("turn/interrupt", jsonOf("sessionId" to key.id)) }
+        }
+    }
 
     override suspend fun rename(key: ConversationKey, title: String) {
         call("session/rename", jsonOf("sessionId" to key.id, "title" to title, "cwd" to repo.state(key)?.summary?.cwd))
     }
 
     override suspend fun delete(key: ConversationKey) {
-        if (key.id in connected) { call("session/close", jsonOf("sessionId" to key.id)); connected -= key.id }
+        runCatching { call("session/close", jsonOf("sessionId" to key.id)) }
+        connected -= key.id
         call("session/delete", jsonOf("sessionId" to key.id, "cwd" to repo.state(key)?.summary?.cwd))
         settings.setClaudeSessionProvider(key.id, null)
         sessionCumulativeTokens.remove(key.id)
@@ -404,11 +431,9 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
             p
         }
         if (targetProvider != null) repo.syncProvidersNow()
-        // 切换服务商需要更换 ANTHROPIC_BASE_URL，关闭当前 SDK 进程后下次发送自动 resume 生效。
-        if (key.id in connected) {
-            call("session/close", jsonOf("sessionId" to key.id))
-            connected -= key.id
-        }
+        // 切换服务商需要更换 ANTHROPIC_BASE_URL，关闭当前 SDK 进程后下次发送自动 resume 生效（即使本地 connected 未同步也幂等关闭）。
+        runCatching { call("session/close", jsonOf("sessionId" to key.id)) }
+        connected -= key.id
         settings.setClaudeSessionProvider(key.id, providerId)
         val nextModel = model?.takeIf { it.isNotBlank() } ?: targetProvider?.models?.firstOrNull()
         val nextWin = inferModelContextWindow(nextModel)
@@ -427,11 +452,9 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
 
     override suspend fun setModel(key: ConversationKey, model: String?) {
         check(repo.state(key)?.running != true) { "请先结束当前任务再切换模型" }
-        // 重连统一应用模型及其选项，避免多次实时更新只成功一部分。
-        if (key.id in connected) {
-            call("session/close", jsonOf("sessionId" to key.id))
-            connected -= key.id
-        }
+        // 重连统一应用模型及其选项，避免多次实时更新只成功一部分（即使本地 connected 未同步也幂等关闭）。
+        runCatching { call("session/close", jsonOf("sessionId" to key.id)) }
+        connected -= key.id
         val nextWin = inferModelContextWindow(model)
         repo.update(key) {
             it.copy(

@@ -97,6 +97,9 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
     val cliUpdates = CliUpdateRepository(this)
     val superAgent = SuperAgentCoordinator(this, runtime, settings)
     private var wasReady = false
+    private var lastReadyMode: String? = null
+    private var startupSyncJob: Job? = null
+    private var refreshJob: Job? = null
 
     fun adapter(kind: EngineKind): EngineAdapter = when (kind.id) {
         "codex" -> codex
@@ -115,23 +118,53 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
             runtime.snapshot.collect { snapshot ->
                 if (snapshot.ready && !wasReady) {
                     wasReady = true
+                    if (lastReadyMode != null && lastReadyMode != snapshot.mode) {
+                        conversationsFlow.value = emptyMap()
+                        arenaGroupsFlow.value = emptyMap()
+                        requestsFlow.value = emptyList()
+                    }
+                    lastReadyMode = snapshot.mode
                     loadingFlow.value = true
                     initialSyncDoneFlow.value = false
-                    scope.launch {
+                    startupSyncJob?.cancel()
+                    startupSyncJob = scope.launch {
                         try {
-                            try { syncProvidersNow() } catch (error: Exception) { Log.w("GALIAIS", "同步自定义服务商失败", error); notify("同步自定义服务商失败：${error.message}") }
-                            try { hub.configureAndProbe() } catch (error: Exception) { Log.w("GALIAIS", "同步 Agent Hub 失败", error); notify("外部 Agent 配置失败：${error.message}") }
+                            if (!runtime.isServiceReady) return@launch
+                            try { syncProvidersNow() }
+                            catch (cancel: CancellationException) { throw cancel }
+                            catch (error: Exception) {
+                                Log.w("GALIAIS", "同步自定义服务商失败", error)
+                                if (runtime.isServiceReady) notify("同步自定义服务商失败：${error.message}")
+                            }
+                            if (!runtime.isServiceReady) return@launch
+                            try { hub.configureAndProbe() }
+                            catch (cancel: CancellationException) { throw cancel }
+                            catch (error: Exception) {
+                                Log.w("GALIAIS", "同步 Agent Hub 失败", error)
+                                if (runtime.isServiceReady) notify("外部 Agent 配置失败：${error.message}")
+                            }
+                            if (!runtime.isServiceReady) return@launch
                             try { envSsh.syncAllOnReady() }
                             catch (cancel: CancellationException) { throw cancel }
                             catch (error: Exception) { Log.w("GALIAIS", "同步环境与 SSH 失败", error) }
+                            if (!runtime.isServiceReady) return@launch
                             try { extensions.syncNow() }
                             catch (cancel: CancellationException) { throw cancel }
-                            catch (error: Exception) { Log.w("GALIAIS", "同步扩展中心失败", error); notify("扩展同步失败：${error.message}") }
+                            catch (error: Exception) {
+                                Log.w("GALIAIS", "同步扩展中心失败", error)
+                                if (runtime.isServiceReady) notify("扩展同步失败：${error.message}")
+                            }
+                            if (!runtime.isServiceReady) return@launch
                             try { extensions.refreshHostPlugins() }
                             catch (cancel: CancellationException) { throw cancel }
                             catch (error: Exception) { Log.w("GALIAIS", "拉取 Host 插件快照失败", error) }
-                            try { superAgent.loadPersisted() } catch (error: Exception) { Log.w("GALIAIS", "恢复工单失败", error) }
-                            refresh().join()
+                            try { syncSelfBuildConfigNow() }
+                            catch (cancel: CancellationException) { throw cancel }
+                            catch (error: Exception) { Log.w("GALIAIS", "同步本机自迭代配置失败", error) }
+                            try { superAgent.loadPersisted() }
+                            catch (cancel: CancellationException) { throw cancel }
+                            catch (error: Exception) { Log.w("GALIAIS", "恢复工单失败", error) }
+                            if (runtime.isServiceReady) refresh().join()
                         } finally {
                             initialSyncDoneFlow.value = true
                             loadingFlow.value = false
@@ -140,12 +173,20 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
                 }
                 else if (!snapshot.ready && wasReady && snapshot.state !in setOf("connecting", "backing-up")) {
                     wasReady = false
+                    startupSyncJob?.cancel(); startupSyncJob = null
+                    refreshJob?.cancel(); refreshJob = null
                     loadingFlow.value = false
                     initialSyncDoneFlow.value = false
                     deltaFlushJob?.cancel(); pendingDeltas.clear()
                     delegation.reset(); superAgent.resetActiveJobs(); envSsh.resetRuntimeState(); cliUpdates.disconnected(); codex.reset(); claude.reset(); hub.reset()
                     requestsFlow.value = emptyList()
-                    conversationsFlow.value = conversationsFlow.value.mapValues { it.value.copy(running = false, activeTurnId = null, loaded = false) }
+                    val modeChanged = lastReadyMode != null && settings.state.value.effectiveRuntimeMode != lastReadyMode
+                    if (modeChanged) {
+                        conversationsFlow.value = emptyMap()
+                        arenaGroupsFlow.value = emptyMap()
+                    } else {
+                        conversationsFlow.value = conversationsFlow.value.mapValues { it.value.copy(running = false, activeTurnId = null, loaded = false) }
+                    }
                 }
             }
         }
@@ -223,43 +264,58 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
     }
 
     /** 重新拉取内置与已安装外部 Agent 的会话列表；已打开会话的时间线保留。 */
-    fun refresh() = scope.launch {
-        loadingFlow.value = true
-        try {
-            for (engine in listOf<EngineAdapter>(codex, claude)) {
-                val listed = try { engine.list() } catch (error: Exception) {
-                    notify("${engine.kind.label} 会话列表读取失败：${error.message}")
-                    continue
-                }
-                val current = conversationsFlow.value
-                val merged = current.filterKeys { it.engine != engine.kind || listed.any { s -> s.key == it } }.toMutableMap()
-                for (summary in listed) {
-                    val existing = merged[summary.key]
-                    merged[summary.key] = existing?.copy(summary = summary.copy(parent = summary.parent ?: existing.summary.parent))
-                        ?: initialState(summary).copy(running = summary.running)
-                }
-                conversationsFlow.value = merged
-            }
-            if (runtime.hubAvailable) {
-                val hubListed = try { hub.listAllSessions() } catch (_: Exception) { null }
-                if (hubListed != null) {
-                    val keepKeys = hubListed.map { it.key }.toSet()
+    fun refresh(): Job {
+        refreshJob?.cancel()
+        val job = scope.launch {
+            if (!runtime.snapshot.value.ready || !runtime.isServiceReady) return@launch
+            loadingFlow.value = true
+            try {
+                for (engine in listOf<EngineAdapter>(codex, claude)) {
+                    if (!runtime.snapshot.value.ready || !runtime.isServiceReady) return@launch
+                    val listed = try {
+                        engine.list()
+                    } catch (cancel: CancellationException) {
+                        throw cancel
+                    } catch (error: Exception) {
+                        // 运行环境正在停止、重启或切换模式时，静默放弃在途刷新，避免弹出过期的“引擎尚未连接”提示
+                        if (!runtime.snapshot.value.ready || !runtime.isServiceReady) return@launch
+                        notify("${engine.kind.label} 会话列表读取失败：${error.message}")
+                        continue
+                    }
                     val current = conversationsFlow.value
-                    val merged = current.filterKeys { k ->
-                        k.engine == EngineKind.CODEX || k.engine == EngineKind.CLAUDE || k in keepKeys
-                    }.toMutableMap()
-                    for (summary in hubListed) {
+                    val merged = current.filterKeys { it.engine != engine.kind || listed.any { s -> s.key == it } }.toMutableMap()
+                    for (summary in listed) {
                         val existing = merged[summary.key]
                         merged[summary.key] = existing?.copy(summary = summary.copy(parent = summary.parent ?: existing.summary.parent))
                             ?: initialState(summary).copy(running = summary.running)
                     }
                     conversationsFlow.value = merged
                 }
+                if (runtime.snapshot.value.ready && runtime.isServiceReady && runtime.hubAvailable) {
+                    val hubListed = try { hub.listAllSessions() }
+                    catch (cancel: CancellationException) { throw cancel }
+                    catch (_: Exception) { null }
+                    if (hubListed != null) {
+                        val keepKeys = hubListed.map { it.key }.toSet()
+                        val current = conversationsFlow.value
+                        val merged = current.filterKeys { k ->
+                            k.engine == EngineKind.CODEX || k.engine == EngineKind.CLAUDE || k in keepKeys
+                        }.toMutableMap()
+                        for (summary in hubListed) {
+                            val existing = merged[summary.key]
+                            merged[summary.key] = existing?.copy(summary = summary.copy(parent = summary.parent ?: existing.summary.parent))
+                                ?: initialState(summary).copy(running = summary.running)
+                        }
+                        conversationsFlow.value = merged
+                    }
+                }
+            } finally {
+                loadingFlow.value = false
+                if (runtime.snapshot.value.ready) initialSyncDoneFlow.value = true
             }
-        } finally {
-            loadingFlow.value = false
-            initialSyncDoneFlow.value = true
         }
+        refreshJob = job
+        return job
     }
 
     fun state(key: ConversationKey): ConversationState? = conversationsFlow.value[key]
@@ -601,10 +657,36 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
 
     fun send(key: ConversationKey, text: String, attachments: List<ImageAttachment> = emptyList()) =
         launchOperation("发送失败") { sendRecoverably(key, text, attachments, steer = false) }
-    fun sendClaudeDocument(key: ConversationKey, text: String, docName: String, mimeType: String, base64OrPlain: String, isPdf: Boolean) =
-        launchOperation("发送文档失败") {
+    suspend fun sendClaudeDocumentNow(
+        key: ConversationKey,
+        text: String,
+        docName: String,
+        mimeType: String,
+        base64OrPlain: String,
+        isPdf: Boolean,
+    ) {
+        var acquired = false
+        try {
+            check(state(key)?.reverting != true) { "会话正在回退，请稍候" }
+            check(sending.add(key)) { "上一条消息仍在发送，请稍候" }
+            acquired = true
             require(key.engine == EngineKind.CLAUDE) { "仅 Claude Code 支持原生文档块输入" }
             claude.sendWithDocument(key, text, docName, mimeType, base64OrPlain, isPdf)
+        } finally {
+            if (acquired) sending.remove(key)
+        }
+    }
+    fun sendClaudeDocument(key: ConversationKey, text: String, docName: String, mimeType: String, base64OrPlain: String, isPdf: Boolean) =
+        launchOperation("发送文档失败") {
+            try {
+                sendClaudeDocumentNow(key, text, docName, mimeType, base64OrPlain, isPdf)
+            } catch (cancel: CancellationException) { throw cancel }
+            catch (error: Exception) {
+                if (text.isNotBlank()) {
+                    update(key) { it.copy(unsentMessage = UnsentMessage(com.galiais.agent.newId(), text, emptyList())) }
+                }
+                throw error
+            }
         }
     fun setAcpConfigOption(key: ConversationKey, configId: String, value: String) =
         launchOperation("更新配置项失败") {
@@ -880,6 +962,12 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
             .mapValues { (_, list) -> list.filterNot { it == key } }
             .filterValues { it.size >= 2 }
         remove(key)
+    }
+
+    /** 将 Android 端本机 APK 自迭代配置（默认关闭）同步到 Agent Hub 运行时持久层。 */
+    suspend fun syncSelfBuildConfigNow() {
+        if (!runtime.hubAvailable) return
+        runtime.hubRequest("selfBuild/saveConfig", settings.state.value.selfBuild.toJson(), timeoutMs = 15_000)
     }
 
     /** 将整个会话时间线导出为整洁的 Markdown 文档，方便复制或保存归档。 */

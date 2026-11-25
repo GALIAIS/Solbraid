@@ -444,7 +444,7 @@ name: solbraid-plugin-sdk
 description: Solbraid Host 插件微内核开发与自进化升级指南（Phase 4 全能力版）。当用户要求创建、修改、升级、调试或回滚 Solbraid 程序插件、命令、WebView 面板、原生 Compose SDUI 界面、多槽位挂载、自定义 Agent 驱动、协议转换器或工作台渲染器时使用。
 ---
 
-# Solbraid Host 插件自进化开发与升级指南（20 能力 · 14 MCP 工具）
+# Solbraid Host 插件自进化开发与升级指南（20 能力 · 15 MCP 工具）
 
 ## 1. 标准自进化闭环（必须按序执行）
 1. **查现状**：\`solbraid_plugin_list\` 查看全部插件、SDUI 页面、UI 槽位、动态驱动、协议转换器与 Studio 覆写；\`solbraid_plugin_read\` 读取目标源码。
@@ -458,6 +458,10 @@ description: Solbraid Host 插件微内核开发与自进化升级指南（Phase
    - \`solbraid_plugin_logs\` 核查运行日志无异常。
 6. **工作台热覆写**：调用 \`solbraid_studio_override\`（\`list | read | apply | rollback | reset\`）安全升级离线渲染器。
 7. **一键回滚**：\`solbraid_plugin_snapshots\` + \`solbraid_plugin_rollback\`（覆写内置插件可传 \`restoreBuiltin: true\`）。
+8. **本机 APK 源码级自迭代（方案 1）**：当改动涉及 Kotlin/Compose 底层引擎或宿主内核时，调用 \`solbraid_self_build\`：
+   - \`action: "status"\` 检测 ARM64 JDK 17 / Android SDK / 原生 \`aapt2\` 与首帧健康心跳；
+   - \`action: "build"\` 在手机端跑单测并构建单 ABI (\`arm64-v8a\`) APK；
+   - \`action: "apply"\`（须用户明确确认 \`confirmInstall: true\`）移交独立 Root 启动看门狗，备份旧版 \`last-known-good.apk\`，安装并验证 20s 首帧心跳，崩溃自动回滚。
 
 ## 2. 安全边界与隔离执行层
 - 7 个 \`kind: "core"\` 核心服务严格锁定，严禁覆写或停用。

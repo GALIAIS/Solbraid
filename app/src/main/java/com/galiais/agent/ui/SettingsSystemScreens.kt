@@ -169,7 +169,12 @@ fun AboutSettingsScreen(app: GaliaisApplication, onBack: () -> Unit) {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 val info = runtime.engineInfo
                 if (info == null) {
-                    Text("启动运行环境后可查看引擎与网关版本。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text("启动运行环境后可查看引擎与网关版本。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted, modifier = Modifier.weight(1f))
+                        if (!runtime.busy && runtime.bound) {
+                            TagPill("启动环境", fg = G.onAccent, bg = G.accent, onClick = app.runtime::start)
+                        }
+                    }
                 } else {
                     info.optJSONObject("codex")?.str("userAgent")?.let { InfoRow("Codex CLI", it) }
                     info.optJSONObject("claude")?.let {

@@ -4,7 +4,7 @@ import path from "node:path";
 import {fileURLToPath} from "node:url";
 import {spawn} from "node:child_process";
 import {createInterface} from "node:readline";
-import {resolveCliInstallation, cliPathDirectories} from "./cli-components.mjs";
+import {resolveCliInstallation, bundledCliInstallation, cliPathDirectories} from "./cli-components.mjs";
 
 /**
  * 虚拟机内常驻多路复用守护器（galiais-mux）：
@@ -64,12 +64,28 @@ function canConnect(sockPath) {
   });
 }
 
+async function resolveCodexBinaryWithFallback() {
+  const inst = await resolveCliInstallation("codex");
+  try {
+    fs.accessSync(inst.binary, fs.constants.X_OK);
+    return inst.binary;
+  } catch {
+    if (!inst.bundled) {
+      const fallback = bundledCliInstallation("codex");
+      return fallback.binary;
+    }
+    return inst.binary;
+  }
+}
+
 async function runDaemon(channel) {
-  const spec = channel === "codex" ? {...CHANNELS[channel], cmd: (await resolveCliInstallation("codex")).binary} : CHANNELS[channel];
+  const spec = channel === "codex" ? {...CHANNELS[channel], cmd: await resolveCodexBinaryWithFallback()} : CHANNELS[channel];
   const sockPath = sockPathFor(channel);
+  const stderrFile = metaPathFor(channel, "stderr");
   fs.mkdirSync(MUX_DIR, {recursive: true, mode: 0o700});
   if (await canConnect(sockPath)) process.exit(0);
   try { fs.unlinkSync(sockPath); } catch {}
+  try { fs.unlinkSync(stderrFile); } catch {}
 
   const cwd = fs.existsSync(path.join(HOME, "workspace")) ? path.join(HOME, "workspace") : process.cwd();
   const cliPath = [...await cliPathDirectories(), process.env.PATH || ""].join(":");
@@ -157,8 +173,17 @@ async function runDaemon(channel) {
     }
   });
 
+  let stderrTail = "";
+  function persistStderrTail(extra = "") {
+    if (extra) stderrTail = (stderrTail + extra).slice(-4096);
+    const trimmed = stderrTail.trim();
+    if (!trimmed) return;
+    try { fs.writeFileSync(stderrFile, trimmed, {mode: 0o600}); } catch {}
+  }
+
   child.stderr.on("data", chunk => {
     const text = chunk.toString("utf8");
+    persistStderrTail(text);
     if (text.includes("No usable sandbox")) {
       const warn = JSON.stringify({method: "galiais/platformWarning", params: {channel, message: "引擎仍要求当前设备不支持的沙箱，请检查引擎配置"}});
       if (!sendClient(activeClient, warn)) pushRing(warn);
@@ -252,11 +277,13 @@ async function runDaemon(channel) {
   };
 
   child.once("exit", code => {
+    persistStderrTail();
     signalChild("SIGKILL");
     cleanup();
     process.exit(code ?? 1);
   });
   child.once("error", error => {
+    persistStderrTail(`无法启动 ${channel}：${error.message}\n`);
     cleanup();
     process.stderr.write(`无法启动 ${channel}：${error.message}\n`);
     process.exit(1);
@@ -388,7 +415,9 @@ async function runProxy(channel) {
       stdio: "ignore",
     });
     let spawnError = null;
+    let daemonExited = false;
     daemon.once("error", error => { spawnError = error; });
+    daemon.once("exit", () => { daemonExited = true; });
     daemon.unref();
 
     let connected = false;
@@ -397,8 +426,13 @@ async function runProxy(channel) {
       await new Promise(r => setTimeout(r, 120));
       if (spawnError) throw spawnError;
       if (await canConnect(sockPath) && (!RUNTIME_GENERATION || fs.existsSync(genFile))) { connected = true; break; }
+      if (daemonExited) break;
     }
-    if (!connected) throw new Error(`无法启动常驻守护通道：${channel}`);
+    if (!connected) {
+      let detail = "";
+      try { detail = fs.readFileSync(metaPathFor(channel, "stderr"), "utf8").trim().slice(-500); } catch {}
+      throw new Error(`无法启动常驻守护通道：${channel}${detail ? `（${detail.replace(/\s+/g, " ")}）` : ""}`);
+    }
   }
 
   if (RUNTIME_GENERATION) {
@@ -408,16 +442,32 @@ async function runProxy(channel) {
   }
 
   const sock = net.createConnection(sockPath);
+  let receivedFromDaemon = false;
+  sock.on("data", () => { receivedFromDaemon = true; });
   process.stdin.pipe(sock);
   sock.pipe(process.stdout);
 
+  let reportedCrash = false;
+  const reportCrashTail = () => {
+    if (receivedFromDaemon || reportedCrash) return reportedCrash;
+    try {
+      const detail = fs.readFileSync(metaPathFor(channel, "stderr"), "utf8").trim().slice(-600);
+      if (detail) {
+        reportedCrash = true;
+        process.stderr.write(`Mux daemon (${channel}) stderr: ${detail}\n`);
+        return true;
+      }
+    } catch {}
+    return false;
+  };
   const done = (code = 0) => {
     try { sock.destroy(); } catch {}
     process.exit(code);
   };
-  sock.once("end", () => done(0));
-  sock.once("close", () => done(0));
+  sock.once("end", () => done(reportCrashTail() ? 1 : 0));
+  sock.once("close", () => done(reportCrashTail() ? 1 : 0));
   sock.once("error", err => {
+    reportCrashTail();
     process.stderr.write(`Mux connection error (${channel}): ${err.message}\n`);
     done(1);
   });

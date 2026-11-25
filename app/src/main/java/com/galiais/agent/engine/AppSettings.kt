@@ -101,6 +101,8 @@ data class SettingsState(
     val roleRoutes: Map<String, RoleRouteConfig> = RoleRouteConfig.defaults(),
     /** 默认沿用用户网络，仅在明确配置时覆盖下载来源与代理。 */
     val downloadNetwork: DownloadNetworkConfig = DownloadNetworkConfig(),
+    /** 本机纯本地 ARM64 APK 自迭代闭环配置（默认关闭，可在设置完全自由配置）。 */
+    val selfBuild: SelfBuildConfig = SelfBuildConfig(),
 ) {
     /** 兼容旧调用：明暗模式。 */
     val themeMode: String get() = theme.mode
@@ -241,6 +243,106 @@ data class DownloadNetworkConfig(
         }
     }
 }
+
+/** 本机纯本地 ARM64 APK 自迭代闭环配置：默认关闭，所有权限护栏、工具链目录、构建与看门狗参数均可在设置完全自由配置。 */
+data class SelfBuildConfig(
+    val enabled: Boolean = false,
+    val allowAgentBuild: Boolean = false,
+    val allowAgentApply: Boolean = false,
+    val runUnitTests: Boolean = true,
+    val watchdogEnabled: Boolean = true,
+    val watchdogTimeoutSec: Int = 20,
+    val repoDir: String = "/home/agent/workspace/Solbraid",
+    val androidHome: String = "/home/agent/android-sdk",
+    val javaHome: String = "",
+    val aapt2Path: String = "",
+    val targetAbis: String = "arm64-v8a",
+    val variant: String = "debug",
+    val gradleHeapMb: Int = 4096,
+    val customGradleArgs: String = "",
+) {
+    fun validated(): SelfBuildConfig {
+        fun cleanPath(value: String, label: String, allowEmpty: Boolean): String {
+            val s = value.trim()
+            if (s.isEmpty()) {
+                require(allowEmpty) { "${label}不能为空" }
+                return ""
+            }
+            require(s.startsWith("/") && '\u0000' !in s && '\n' !in s && '\r' !in s) { "${label}必须是有效的 Linux 绝对路径" }
+            return s.trimEnd('/').ifEmpty { "/" }
+        }
+        val cleanRepo = cleanPath(repoDir, "源码仓库目录", allowEmpty = false)
+        val cleanSdk = cleanPath(androidHome, "Android SDK 目录", allowEmpty = false)
+        val cleanJava = cleanPath(javaHome, "JDK 目录", allowEmpty = true)
+        val cleanAapt2 = cleanPath(aapt2Path, "原生 aapt2 路径", allowEmpty = true)
+        require(targetAbis in SELF_BUILD_ABIS) { "请选择有效的目标 ABI" }
+        require(variant in SELF_BUILD_VARIANTS) { "请选择有效的构建变体" }
+        require(gradleHeapMb in SELF_BUILD_HEAP_OPTIONS) { "请选择有效的 Gradle 内存档位" }
+        require(watchdogTimeoutSec in 10..120) { "看门狗心跳超时需在 10 到 120 秒之间" }
+        val cleanExtra = customGradleArgs.trim()
+        require(cleanExtra.length <= 512) { "附加 Gradle 参数不能超过 512 字符" }
+        require(!Regex("""[;&|`$()<>\r\n\u0000]""").containsMatchIn(cleanExtra)) { "附加 Gradle 参数包含不允许的特殊字符" }
+        if (cleanExtra.isNotEmpty()) {
+            for (tok in cleanExtra.split(Regex("\\s+"))) {
+                require(Regex("^-[A-Za-z0-9._:=/-]+$").matches(tok)) { "附加 Gradle 参数格式无效：$tok" }
+            }
+        }
+        return copy(
+            repoDir = cleanRepo,
+            androidHome = cleanSdk,
+            javaHome = cleanJava,
+            aapt2Path = cleanAapt2,
+            customGradleArgs = cleanExtra,
+        )
+    }
+
+    fun toJson(): JSONObject = JSONObject()
+        .put("enabled", enabled)
+        .put("allowAgentBuild", allowAgentBuild)
+        .put("allowAgentApply", allowAgentApply)
+        .put("runUnitTests", runUnitTests)
+        .put("watchdogEnabled", watchdogEnabled)
+        .put("watchdogTimeoutSec", watchdogTimeoutSec)
+        .put("repoDir", repoDir)
+        .put("androidHome", androidHome)
+        .put("javaHome", javaHome)
+        .put("aapt2Path", aapt2Path)
+        .put("targetAbis", targetAbis)
+        .put("variant", variant)
+        .put("gradleHeapMb", gradleHeapMb)
+        .put("customGradleArgs", customGradleArgs)
+
+    companion object {
+        fun fromJson(raw: String?): SelfBuildConfig {
+            if (raw.isNullOrBlank()) return SelfBuildConfig()
+            return try {
+                val obj = JSONObject(raw)
+                SelfBuildConfig(
+                    enabled = obj.optBoolean("enabled", false),
+                    allowAgentBuild = obj.optBoolean("allowAgentBuild", false),
+                    allowAgentApply = obj.optBoolean("allowAgentApply", false),
+                    runUnitTests = obj.optBoolean("runUnitTests", true),
+                    watchdogEnabled = obj.optBoolean("watchdogEnabled", true),
+                    watchdogTimeoutSec = obj.optInt("watchdogTimeoutSec", 20).coerceIn(10, 120),
+                    repoDir = obj.optString("repoDir", "/home/agent/workspace/Solbraid").ifBlank { "/home/agent/workspace/Solbraid" },
+                    androidHome = obj.optString("androidHome", "/home/agent/android-sdk").ifBlank { "/home/agent/android-sdk" },
+                    javaHome = obj.optString("javaHome", ""),
+                    aapt2Path = obj.optString("aapt2Path", ""),
+                    targetAbis = obj.optString("targetAbis", "arm64-v8a").takeIf { it in SELF_BUILD_ABIS } ?: "arm64-v8a",
+                    variant = obj.optString("variant", "debug").takeIf { it in SELF_BUILD_VARIANTS } ?: "debug",
+                    gradleHeapMb = obj.optInt("gradleHeapMb", 4096).takeIf { it in SELF_BUILD_HEAP_OPTIONS } ?: 4096,
+                    customGradleArgs = obj.optString("customGradleArgs", ""),
+                )
+            } catch (_: Exception) {
+                SelfBuildConfig()
+            }
+        }
+    }
+}
+
+val SELF_BUILD_ABIS = setOf("arm64-v8a", "arm64-v8a,x86_64")
+val SELF_BUILD_VARIANTS = setOf("debug", "release")
+val SELF_BUILD_HEAP_OPTIONS = setOf(2048, 3072, 4096, 6144)
 
 /** 读取 Android 系统当前网络 HTTP 代理（无需额外权限）。 */
 fun detectSystemProxy(context: Context): String? {
@@ -421,7 +523,12 @@ class AppSettings(context: Context) {
             defaultCwd = defaultCwd,
             projects = loadProjects(defaultCwd),
             collapsedProjects = prefs.getStringSet("projects.collapsed", emptySet())!!.toSet(),
-            trustedProjects = prefs.getStringSet("claude.trusted", emptySet())!!.toSet(),
+            trustedProjects = if (prefs.contains("claude.trusted")) {
+                prefs.getStringSet("claude.trusted", emptySet())!!.toSet()
+            } else {
+                // 内置空默认工作区出厂即默认信任，避免用户首次新建 Claude Code 会话就被勾选框卡住；外部目录仍需显式确认，并可在设置中随时移除。
+                setOf(DEFAULT_WORKSPACE)
+            },
             delegationEnabled = prefs.getBoolean("delegation.enabled", true),
             autoScroll = prefs.getBoolean("chat.autoScroll", true),
             expandThinking = prefs.getBoolean("chat.expandThinking", false),
@@ -454,12 +561,18 @@ class AppSettings(context: Context) {
             maxParallelWorkers = prefs.getInt("superagent.maxWorkers", 2).coerceIn(1, 3),
             roleRoutes = loadRoleRoutes(ids),
             downloadNetwork = DownloadNetworkConfig.fromJson(prefs.getString("runtime.downloadNetwork", null)),
+            selfBuild = SelfBuildConfig.fromJson(prefs.getString(SELF_BUILD_CONFIG_KEY, null)),
         )
     }
 
     fun setDownloadNetwork(config: DownloadNetworkConfig) {
         val validated = config.validated()
         edit { putString("runtime.downloadNetwork", validated.toJson().toString()) }
+    }
+
+    fun setSelfBuildConfig(config: SelfBuildConfig) {
+        val validated = config.validated()
+        edit { putString(SELF_BUILD_CONFIG_KEY, validated.toJson().toString()) }
     }
 
     private fun loadRoleRoutes(validProviderIds: Set<String>): Map<String, RoleRouteConfig> {
@@ -1027,5 +1140,6 @@ class AppSettings(context: Context) {
         const val SSH_HOSTS_KEY = "ssh.hosts.v1"
         const val SSH_TUNNELS_KEY = "ssh.tunnels.v1"
         const val CHAT_DRAFT_PREFIX = "chat.draft."
+        const val SELF_BUILD_CONFIG_KEY = "selfbuild.config.v1"
     }
 }

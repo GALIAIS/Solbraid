@@ -21,6 +21,9 @@ printf '127.0.0.1 localhost\n::1 localhost\n' > "$root/etc/hosts"
 echo "GALIAIS_PROGRESS 30 正在配置 Codex 和 Node.js"
 resources="$root/opt/galiais-codex/usr/lib/chatgpt/resources"
 mkdir -p "$resources"
+rm -f "$resources/codex" "$resources/codex-code-mode-host" 2>/dev/null || true
+: > "$resources/codex"
+ln -sf /opt/galiais-native/libbin_codex_code_mode_host.so "$resources/codex-code-mode-host"
 ln -sf /opt/galiais-native/libbin_node.so "$resources/node"
 ln -sf /opt/galiais-native/libbin_rg.so "$resources/rg"
 ln -sf /opt/galiais-native/libbin_antigravity.so "$resources/agy"
@@ -41,13 +44,13 @@ ln -sf /opt/galiais-native/libbin_claude.so "$target/claude"
 ln -sfn "$CLAUDE_VERSION" "$root/opt/galiais-codex/claude/current"
 
 sdk="$root/opt/galiais-codex/claude-sdk-$CLAUDE_SDK_VERSION"
-if ! test -f "$sdk/.galiais-sdk-ready" || ! (cd "$sdk" && sha256sum -c "$source/claude-sdk-files.sha256" >/dev/null 2>&1); then
+if ! test -d "$sdk" || ! (cd "$sdk" && sha256sum -c "$source/claude-sdk-files.sha256" >/dev/null 2>&1); then
     rm -rf "$sdk"
     mkdir -p "$sdk"
     tar -xzf "$source/$CLAUDE_SDK_ARCHIVE" -C "$sdk" --strip-components=1
     (cd "$sdk" && sha256sum -c "$source/claude-sdk-files.sha256" >/dev/null)
-    printf '%s\n' "$CLAUDE_SDK_VERSION" > "$sdk/.galiais-sdk-ready"
 fi
+printf '%s\n' "$CLAUDE_SDK_VERSION" > "$sdk/.galiais-sdk-ready"
 
 echo "GALIAIS_PROGRESS 85 正在配置本地运行服务"
 plan="$root/opt/galiais-codex/official-plan-$PLAN_VERSION"
@@ -63,12 +66,13 @@ if test -e "$skills/openai-plan" || test -L "$skills/openai-plan"; then
 fi
 ln -sfn "/opt/galiais-codex/official-plan-$PLAN_VERSION/skills/plan" "$skills/openai-plan"
 mkdir -p "$root/opt/galiais-codex/android"
-for name in components.json claude-host.mjs delegate-mcp.mjs provider-gateway.mjs provider-translators.mjs usage-ledger.mjs agent-hub.mjs acp-driver.mjs cli-bridge-driver.mjs dev-tools-hub.mjs terminal-hub.mjs cli-components.mjs terminal-headless.cjs terminal-serialize.cjs extension-sync.mjs plugin-kernel.mjs plugin-builtins.mjs plugin-mcp.mjs plugin-worker-host.mjs ai-reviewer.mjs community-registry.mjs download-network.mjs env-ssh-hub.mjs worktree-manager.mjs guest-mux.mjs; do
+for name in components.json claude-host.mjs delegate-mcp.mjs provider-gateway.mjs provider-translators.mjs usage-ledger.mjs agent-hub.mjs acp-driver.mjs cli-bridge-driver.mjs dev-tools-hub.mjs terminal-hub.mjs cli-components.mjs terminal-headless.cjs terminal-serialize.cjs extension-sync.mjs plugin-kernel.mjs plugin-builtins.mjs plugin-mcp.mjs plugin-worker-host.mjs ai-reviewer.mjs community-registry.mjs download-network.mjs env-ssh-hub.mjs worktree-manager.mjs guest-mux.mjs self-build-apk.sh self-update-watchdog.sh; do
     cp "$source/$name" "$root/opt/galiais-codex/android/$name.next"
-    chmod 644 "$root/opt/galiais-codex/android/$name.next"
+    case "$name" in *.sh) chmod 755 "$root/opt/galiais-codex/android/$name.next" ;; *) chmod 644 "$root/opt/galiais-codex/android/$name.next" ;; esac
     mv "$root/opt/galiais-codex/android/$name.next" "$root/opt/galiais-codex/android/$name"
 done
-chmod -R a+rX "$root/opt/galiais-codex"
+# 跳过指向 /opt/galiais-native 的 PRoot 符号链接，避免 Android toybox chmod -R 跟随悬空链接报 Permission denied
+find "$root/opt/galiais-codex" ! -type l -exec chmod a+rX {} + 2>/dev/null || true
 
 printf 'native-direct-v1\n' > "$root/home/agent/.galiais/vm/.provisioned"
 echo "GALIAIS_PROGRESS 100 运行环境配置完成"

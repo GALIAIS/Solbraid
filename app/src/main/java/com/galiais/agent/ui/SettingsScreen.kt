@@ -239,6 +239,25 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                     iconBg = if (runtime.ready) G.successTint else if (runtime.state == "error") G.dangerTint else G.surfaceSubtle,
                     onClick = { onNavigate("settings/runtime") },
                 )
+                Hairline(Modifier.padding(start = 66.dp))
+                val sb = settings.selfBuild
+                val selfBuildSummary = if (!sb.enabled) {
+                    "已关闭（默认） · 手机端纯本地 ARM64 编译与看门狗自更新"
+                } else {
+                    buildString {
+                        append("已启用 · ${sb.targetAbis} · ${sb.variant}")
+                        append(if (sb.allowAgentBuild) " · 允许 Agent 编译" else " · 仅手动触发")
+                    }
+                }
+                SettingsNavRow(
+                    icon = GaliaisIcons.Wrench,
+                    title = "本机 APK 自迭代",
+                    subtitle = selfBuildSummary,
+                    badge = if (sb.enabled) "已开" else null,
+                    iconTint = if (sb.enabled) G.accent else G.inkMuted,
+                    iconBg = if (sb.enabled) G.accentContainer else G.surfaceSubtle,
+                    onClick = { onNavigate("settings/selfbuild") },
+                )
             }
 
             PluginSlotBannerColumn(

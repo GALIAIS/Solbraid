@@ -34,6 +34,13 @@ data class EnvironmentStatus(
 ) {
     val fullyInstalled: Boolean get() = chrootInstalled && vmProvisioned && codexInstalled && claudeInstalled && antigravityInstalled
     val totalUsedBytes: Long get() = chrootBytes + cacheBytes
+
+    /** 返回指定模式是否已安装，避免切换模式后巡检尚未返回时界面误闪「安装运行环境」。 */
+    fun isInstalledFor(targetMode: String): Boolean = when {
+        mode == targetMode && !loading -> fullyInstalled
+        targetMode == RUNTIME_MODE_PROOT -> prootEnvInstalled
+        else -> rootEnvInstalled
+    }
 }
 
 /** 在应用私有目录中安装、巡检、重置与卸载宿主 Linux（支持 Root chroot 与免 Root PRoot 双模式）。 */
@@ -86,17 +93,24 @@ class LinuxRuntime(private val context: Context, val mode: String = RUNTIME_MODE
         val chrootOk = File(root, ".galiais-ready").isFile
         val vmOk = vmProvisioned
         val sshOk = chrootOk && File(root, "etc/ssl/certs/ca-certificates.crt").isFile
+        val rootProvisioned = !isProot && chrootOk && vmOk
         val codexOk = File(nlib, "libbin_codex.so").isFile &&
             File(nlib, "libbin_codex_code_mode_host.so").isFile &&
-            symlinkOrFileExists(File(root, "opt/galiais-codex/usr/lib/chatgpt/resources/codex")) &&
-            symlinkOrFileExists(File(root, "opt/galiais-codex/usr/lib/chatgpt/resources/codex-code-mode-host"))
+            (rootProvisioned || (symlinkOrFileExists(File(root, "opt/galiais-codex/usr/lib/chatgpt/resources/codex")) &&
+                symlinkOrFileExists(File(root, "opt/galiais-codex/usr/lib/chatgpt/resources/codex-code-mode-host"))))
         val claudeOk = File(nlib, "libbin_claude.so").isFile &&
-            symlinkOrFileExists(File(root, "opt/galiais-codex/claude/current/claude"))
+            (rootProvisioned || symlinkOrFileExists(File(root, "opt/galiais-codex/claude/current/claude")))
+        val antigravityOk = File(nlib, "libbin_antigravity.so").isFile &&
+            (rootProvisioned || symlinkOrFileExists(File(root, "opt/galiais-codex/usr/lib/chatgpt/resources/agy")))
         val daemonSock = symlinkOrFileExists(daemonSocketFile)
         val chrootBytes = if (root.exists()) allocatedBytes(root) else 0L
         val vmBytes = if (workspace.exists()) allocatedBytes(workspace) else 0L
         val cacheBytes = if (cacheDir.exists()) allocatedBytes(cacheDir) else 0L
         val freeBytes = context.filesDir.usableSpace
+        val rootComplete = File(context.filesDir, "linux/.galiais-ready").isFile &&
+            runCatching { File(context.filesDir, "linux/home/agent/.galiais/vm/.provisioned").readText(Charsets.UTF_8).trim() == "native-direct-v1" }.getOrDefault(false)
+        val prootComplete = File(context.filesDir, "linux-proot/.galiais-ready").isFile &&
+            runCatching { File(context.filesDir, "linux-proot/home/agent/.galiais/vm/.provisioned").readText(Charsets.UTF_8).trim() == "native-direct-v1" }.getOrDefault(false)
         return EnvironmentStatus(
             mode = mode,
             chrootInstalled = chrootOk,
@@ -104,11 +118,10 @@ class LinuxRuntime(private val context: Context, val mode: String = RUNTIME_MODE
             sshTrusted = sshOk,
             codexInstalled = codexOk,
             claudeInstalled = claudeOk,
-            antigravityInstalled = File(nlib, "libbin_antigravity.so").isFile &&
-                symlinkOrFileExists(File(root, "opt/galiais-codex/usr/lib/chatgpt/resources/agy")),
+            antigravityInstalled = antigravityOk,
             daemonSocketPresent = daemonSock,
-            rootEnvInstalled = File(context.filesDir, "linux/.galiais-ready").isFile,
-            prootEnvInstalled = File(context.filesDir, "linux-proot/.galiais-ready").isFile,
+            rootEnvInstalled = rootComplete,
+            prootEnvInstalled = prootComplete,
             prootBinariesReady = prootBinariesPresent(context),
             chrootBytes = chrootBytes,
             vmBytes = vmBytes,
@@ -424,10 +437,79 @@ class LinuxRuntime(private val context: Context, val mode: String = RUNTIME_MODE
     }
 
     /**
+     * 免 Root PRoot 模式下在执行 prepare-proot-runtime.sh 之前，使用纯 Kotlin 无硬链接解包器预解压所有离线 tar.gz 组件，
+     * 避免 Android 10+ SELinux 禁止 untrusted_app 调用 link(2) 导致宿主 /system/bin/tar 解压 libpayload_tools.so 报 Permission denied。
+     */
+    internal fun prepareProotPayloads(runtimeAssetsDir: File, control: RunControl) {
+        if (!isProot || !ready) return
+        val nlib = File(context.applicationInfo.nativeLibraryDir)
+        val abi = android.os.Build.SUPPORTED_ABIS.firstOrNull { it == "arm64-v8a" || it == "x86_64" } ?: "arm64-v8a"
+
+        // 1. 安装器离线工具包（libpayload_tools.so，包含 bzcat/bzip2 -> bunzip2 等 POSIX 硬链接）
+        val toolsChecksumFile = File(runtimeAssetsDir, "installer-tools-$abi.sha256")
+        val toolsArchive = File(nlib, "libpayload_tools.so")
+        if (toolsChecksumFile.isFile && toolsArchive.isFile) {
+            val digest = toolsChecksumFile.readText(Charsets.UTF_8).trim().substringBefore(' ').trim()
+            if (digest.matches(Regex("^[a-f0-9]{64}$"))) {
+                val toolsTarget = File(root, "opt/galiais-install-tools/$digest")
+                val alreadyValid = File(toolsTarget, "files.sha256").isFile &&
+                    File(toolsTarget, "usr/bin/bunzip2").isFile &&
+                    File(toolsTarget, "usr/bin/bzip2").exists() &&
+                    File(toolsTarget, "usr/bin/bzcat").exists() &&
+                    File(toolsTarget, "usr/bin/curl").isFile
+                if (!alreadyValid) {
+                    if (toolsTarget.exists()) deleteLocalTree(toolsTarget)
+                    toolsTarget.mkdirs()
+                    extractTarGzNonRoot(toolsArchive, toolsTarget, control)
+                }
+            }
+        }
+
+        // 2. 内置 npm 离线包（libpayload_npm.so）
+        val npmArchive = File(nlib, "libpayload_npm.so")
+        val resourcesDir = File(root, "opt/galiais-codex/usr/lib/chatgpt/resources")
+        if (npmArchive.isFile && !File(resourcesDir, "lib/node_modules/npm/bin/npm-cli.js").isFile) {
+            resourcesDir.mkdirs()
+            extractTarGzNonRoot(npmArchive, resourcesDir, control)
+        }
+
+        // 3. Claude Agent SDK 与 Official Plan 压缩包
+        val versionsFile = File(runtimeAssetsDir, "engine-versions.sh")
+        if (versionsFile.isFile) {
+            val vars = mutableMapOf<String, String>()
+            val lineRe = Regex("""^([A-Z0-9_]+)='([^']*)'$""")
+            versionsFile.readLines(Charsets.UTF_8).forEach { line ->
+                lineRe.matchEntire(line.trim())?.let { m -> vars[m.groupValues[1]] = m.groupValues[2] }
+            }
+            val sdkVer = vars["CLAUDE_SDK_VERSION"].orEmpty()
+            val sdkArchiveName = vars["CLAUDE_SDK_ARCHIVE"].orEmpty()
+            if (sdkVer.isNotEmpty() && sdkArchiveName.isNotEmpty()) {
+                val sdkDir = File(root, "opt/galiais-codex/claude-sdk-$sdkVer")
+                val sdkTar = File(runtimeAssetsDir, sdkArchiveName)
+                if (sdkTar.isFile && (!File(sdkDir, ".galiais-sdk-ready").isFile || !File(sdkDir, "sdk.mjs").isFile)) {
+                    if (sdkDir.exists()) deleteLocalTree(sdkDir)
+                    sdkDir.mkdirs()
+                    extractTarGzNonRoot(sdkTar, sdkDir, control, stripComponents = 1)
+                }
+            }
+            val planVer = vars["PLAN_VERSION"].orEmpty()
+            val planArchiveName = vars["PLAN_ARCHIVE"].orEmpty()
+            if (planVer.isNotEmpty() && planArchiveName.isNotEmpty()) {
+                val planDir = File(root, "opt/galiais-codex/official-plan-$planVer")
+                val planTar = File(runtimeAssetsDir, planArchiveName)
+                if (planTar.isFile && !File(planDir, "skills/plan").isDirectory) {
+                    planDir.mkdirs()
+                    extractTarGzNonRoot(planTar, planDir, control)
+                }
+            }
+        }
+    }
+
+    /**
      * 免 Root 解包 tar.gz：将 POSIX 硬链接（type '1'）转为相对符号链接（避免 Android SELinux 禁止 link() 及
      * PRoot 暂存路径绝对 .l2s 符号链接在 mv 之后断裂）。
      */
-    private fun extractTarGzNonRoot(archive: File, destination: File, control: RunControl) {
+    internal fun extractTarGzNonRoot(archive: File, destination: File, control: RunControl, stripComponents: Int = 0) {
         fun readExact(input: java.io.InputStream, buf: ByteArray, len: Int): Boolean {
             var off = 0
             while (off < len) {
@@ -458,7 +540,7 @@ class LinuxRuntime(private val context: Context, val mode: String = RUNTIME_MODE
         fun safeRel(raw: String): String {
             val parts = raw.trimStart('/').split('/').filter { it.isNotEmpty() && it != "." }
             check(parts.none { it == ".." }) { "tar 归档包含非法上级路径：$raw" }
-            return parts.joinToString("/")
+            return (if (stripComponents > 0) parts.drop(stripComponents) else parts).joinToString("/")
         }
         fun relativeLink(entryRel: String, targetRel: String): String {
             val from = entryRel.split('/').dropLast(1)

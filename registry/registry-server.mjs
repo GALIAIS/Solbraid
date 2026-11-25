@@ -2,14 +2,32 @@
 // Solbraid 共享资源仓库独立服务端（零外部依赖，支持 VPS / Docker / 局域网自托管）
 // 所有上传资源必须经过强制仓库 AI 安全审查（静态规则引擎 + LLM 语义门禁），未通过绝不进入下载目录。
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import {randomUUID} from "node:crypto";
+import {createHash, randomBytes, randomUUID, timingSafeEqual} from "node:crypto";
 import {fileURLToPath} from "node:url";
 import {RESOURCE_KINDS, STATIC_SECURITY_RULES_COUNT, reviewResourceBundle} from "../runtime/ai-reviewer.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MAX_BODY_BYTES = 600 * 1024;
+const SAFE_RESOURCE_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+function safeTokenEquals(a, b) {
+  const ba = Buffer.from(String(a || ""), "utf8");
+  const bb = Buffer.from(String(b || ""), "utf8");
+  return ba.length > 0 && ba.length === bb.length && timingSafeEqual(ba, bb);
+}
+
+function hashOwnerToken(token) {
+  return "tok:" + createHash("sha256").update(String(token || ""), "utf8").digest("hex").slice(0, 16);
+}
+
+function parseBearerToken(req) {
+  const raw = String(req.headers?.authorization || "").trim();
+  const m = raw.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1].trim() : "";
+}
 
 async function readJsonSafe(file, fallback) {
   try { return JSON.parse(await fs.readFile(file, "utf8")); }
@@ -60,14 +78,72 @@ function readBody(req) {
   });
 }
 
-export function createRegistryServer({dataDir, llmConfig = null, requireLlm = false} = {}) {
+export function createRegistryServer({
+  dataDir,
+  llmConfig = null,
+  requireLlm = false,
+  adminToken = null,
+  writeTokens = null, // 可选 Map/Object: { [token]: ownerId } 或 string[]
+} = {}) {
   const root = path.resolve(dataDir || path.join(__dirname, "data"));
   const catalogFile = path.join(root, "registry.json");
   const submissionsFile = path.join(root, "submissions.json");
   const itemsDir = path.join(root, "items");
   const quarantineDir = path.join(root, "quarantine");
+  const adminTokenFile = path.join(root, "admin.token");
 
-  return http.createServer(async (req, res) => {
+  let resolvedAdminToken = String(adminToken || process.env.SOLBRAID_REGISTRY_ADMIN_TOKEN || "").trim();
+  if (!resolvedAdminToken) {
+    try {
+      resolvedAdminToken = fsSync.readFileSync(adminTokenFile, "utf8").trim();
+    } catch {
+      resolvedAdminToken = randomBytes(24).toString("hex");
+      fsSync.mkdirSync(root, {recursive: true});
+      fsSync.writeFileSync(adminTokenFile, resolvedAdminToken + "\n", {encoding: "utf8", mode: 0o600});
+    }
+  }
+
+  // 解析额外写入令牌（环境变量 SOLBRAID_REGISTRY_TOKENS="ownerA:tokA,ownerB:tokB" 或入参 writeTokens）
+  const userTokens = [];
+  const envTokRaw = String(process.env.SOLBRAID_REGISTRY_TOKENS || "").trim();
+  if (envTokRaw) {
+    for (const pair of envTokRaw.split(",")) {
+      const idx = pair.indexOf(":");
+      if (idx > 0) {
+        const ownerId = pair.slice(0, idx).trim();
+        const tok = pair.slice(idx + 1).trim();
+        if (ownerId && tok) userTokens.push({ownerId, token: tok});
+      }
+    }
+  }
+  if (Array.isArray(writeTokens)) {
+    for (const tok of writeTokens) {
+      const clean = String(tok || "").trim();
+      if (clean) userTokens.push({ownerId: hashOwnerToken(clean), token: clean});
+    }
+  } else if (writeTokens && typeof writeTokens === "object") {
+    for (const [tok, owner] of Object.entries(writeTokens)) {
+      const clean = String(tok || "").trim();
+      const oid = String(owner || "").trim() || hashOwnerToken(clean);
+      if (clean) userTokens.push({ownerId: oid, token: clean});
+    }
+  }
+
+  function authenticateMutation(req) {
+    const token = parseBearerToken(req);
+    if (!token) return null;
+    if (safeTokenEquals(token, resolvedAdminToken)) {
+      return {isAdmin: true, ownerId: "admin"};
+    }
+    for (const entry of userTokens) {
+      if (safeTokenEquals(token, entry.token)) {
+        return {isAdmin: false, ownerId: entry.ownerId};
+      }
+    }
+    return null;
+  }
+
+  const server = http.createServer(async (req, res) => {
     try {
       if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
       const url = new URL(req.url || "/", "http://127.0.0.1");
@@ -126,12 +202,20 @@ export function createRegistryServer({dataDir, llmConfig = null, requireLlm = fa
 
       const delMatch = pathname.match(/^\/api\/v1\/resources\/([^/]+)\/([^/]+)$/);
       if (req.method === "DELETE" && delMatch) {
-        const kind = decodeURIComponent(delMatch[1]);
-        const id = decodeURIComponent(delMatch[2]);
+        const actor = authenticateMutation(req);
+        if (!actor) return sendJson(res, 401, {error: "未认证：删除资源需要有效的 Bearer Token"});
+        const kind = decodeURIComponent(delMatch[1]).trim().toLowerCase();
+        const id = decodeURIComponent(delMatch[2]).trim().toLowerCase();
+        if (!RESOURCE_KINDS.includes(kind) || !SAFE_RESOURCE_ID_RE.test(id) || id.includes("..")) {
+          return sendJson(res, 400, {error: "无效的资源类型或标识"});
+        }
         const catalog = await readJsonSafe(catalogFile, {schemaVersion: "1.0.0", updatedAt: 0, items: []});
-        const before = (catalog.items || []).length;
+        const existing = (catalog.items || []).find(x => x.id === id && x.kind === kind);
+        if (!existing) return sendJson(res, 404, {error: "未找到该资源"});
+        if (!actor.isAdmin && (!existing.ownerId || existing.ownerId !== actor.ownerId)) {
+          return sendJson(res, 403, {error: "无权删除他人发布的资源（仅资源所有者或管理员可删除）"});
+        }
         catalog.items = (catalog.items || []).filter(x => !(x.id === id && x.kind === kind));
-        if (catalog.items.length === before) return sendJson(res, 404, {error: "未找到该资源"});
         catalog.updatedAt = Date.now();
         await writeJsonAtomic(catalogFile, catalog);
         await fs.rm(path.join(itemsDir, kind, `${id}.json`), {force: true});
@@ -139,10 +223,19 @@ export function createRegistryServer({dataDir, llmConfig = null, requireLlm = fa
       }
 
       if (req.method === "POST" && pathname === "/api/v1/submissions") {
+        const actor = authenticateMutation(req);
+        if (!actor) return sendJson(res, 401, {error: "未认证：提交或更新资源需要有效的 Bearer Token"});
         const raw = await readBody(req);
         const id = String(raw?.id || "").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
         const kind = String(raw?.kind || "").trim().toLowerCase();
         if (!RESOURCE_KINDS.includes(kind)) return sendJson(res, 400, {error: `不支持的资源类型：${kind}`});
+        if (!SAFE_RESOURCE_ID_RE.test(id) || id.includes("..")) return sendJson(res, 400, {error: `无效的资源标识：${id || "(空)"}`});
+
+        const existingCatalog = await readJsonSafe(catalogFile, {schemaVersion: "1.0.0", updatedAt: 0, items: []});
+        const existingEntry = (existingCatalog.items || []).find(x => x.id === id && x.kind === kind);
+        if (existingEntry && !actor.isAdmin && (!existingEntry.ownerId || existingEntry.ownerId !== actor.ownerId)) {
+          return sendJson(res, 403, {error: `资源 ${kind}/${id} 已归属其他作者，无权覆盖更新`});
+        }
         const bundle = {
           id,
           kind,
@@ -186,12 +279,14 @@ export function createRegistryServer({dataDir, llmConfig = null, requireLlm = fa
         });
         const catalog = await readJsonSafe(catalogFile, {schemaVersion: "1.0.0", updatedAt: 0, items: []});
         const prev = (catalog.items || []).find(x => x.id === bundle.id && x.kind === bundle.kind);
+        const ownerId = prev?.ownerId || actor.ownerId;
         const entry = {
           id: bundle.id,
           kind: bundle.kind,
           name: bundle.name,
           version: bundle.version,
           author: bundle.author,
+          ownerId,
           description: bundle.description,
           tags: bundle.tags,
           sha256: audit.sha256,
@@ -211,6 +306,8 @@ export function createRegistryServer({dataDir, llmConfig = null, requireLlm = fa
       sendJson(res, 500, {error: err?.message || String(err)});
     }
   });
+  server.adminToken = resolvedAdminToken;
+  return server;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -220,11 +317,11 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     return idx >= 0 && args[idx + 1] ? args[idx + 1] : def;
   };
   const port = Number(getArg("--port", process.env.PORT || "8787"));
-  const host = getArg("--host", process.env.HOST || "0.0.0.0");
+  const host = getArg("--host", process.env.HOST || "127.0.0.1");
   const dataDir = getArg("--dir", process.env.SOLBRAID_REGISTRY_DIR || path.join(__dirname, "data"));
   const requireLlm = args.includes("--require-llm") || process.env.SOLBRAID_REQUIRE_LLM === "1";
   const srv = createRegistryServer({dataDir, requireLlm});
   srv.listen(port, host, () => {
-    console.log(`Solbraid Community Registry listening on http://${host}:${port} (data=${dataDir}, requireLlm=${requireLlm})`);
+    console.log(`Solbraid Community Registry listening on http://${host}:${port} (data=${dataDir}, requireLlm=${requireLlm}, auth=required)`);
   });
 }

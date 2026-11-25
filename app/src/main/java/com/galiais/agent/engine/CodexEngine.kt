@@ -106,10 +106,13 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
     private fun effectiveSummary(key: ConversationKey): String =
         repo.state(key)?.reasoningSummary ?: settings.reasoningSummary
 
+    private fun normalizeDir(path: String): String = path.trim().trimEnd('/').ifEmpty { "/" }
+
     private suspend fun attach(key: ConversationKey) {
         if (key.id in attached) return
         val saved = repo.settings.conversationOptions(key)
         val current = repo.state(key)
+        if (current?.providerId != null) repo.syncProvidersNow()
         val cwd = current?.summary?.cwd ?: call("thread/read", jsonOf("threadId" to key.id, "includeTurns" to false))
             .getJSONObject("thread").str("cwd")
         val environment = repo.envSsh.effectiveEnvironment(cwd)
@@ -185,12 +188,14 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
     }
 
     override suspend fun create(cwd: String, options: CreateOptions): ConversationKey {
+        val normCwd = normalizeDir(cwd)
         val selectedProviderId = when (options.providerId) {
             null -> settings.codexProviderId
             "" -> null
             else -> options.providerId
         }
         val provider = selectedProviderId?.let { settings.provider(it) ?: error("所选自定义服务商不存在") }
+        if (provider != null) repo.syncProvidersNow()
         val resolvedModel = if (provider != null) {
             options.model?.takeIf { it.isNotBlank() }
                 ?: (if (settings.codexProviderId == provider.id) settings.codexModel else null)
@@ -202,9 +207,9 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         val capability = modelsForProvider(provider?.id).selectedModel(resolvedModel)
         val effort = settings.codexEffort?.takeIf { it in capability?.reasoningEfforts().orEmpty() }
         val tier = settings.codexServiceTier?.takeIf { value -> capability?.serviceTiers?.any { it.id == value } == true }
-        val environment = repo.envSsh.effectiveEnvironment(cwd)
+        val environment = repo.envSsh.effectiveEnvironment(normCwd)
         val params = jsonOf(
-            "cwd" to cwd,
+            "cwd" to normCwd,
             "approvalPolicy" to settings.approvalPolicy,
             "approvalsReviewer" to settings.approvalsReviewer,
             "sandbox" to "danger-full-access",
@@ -355,14 +360,32 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
     }
 
     override suspend fun interrupt(key: ConversationKey) {
-        val turnId = repo.state(key)?.activeTurnId ?: return
+        var turnId = repo.state(key)?.activeTurnId
+        if (turnId == null) {
+            // UI 重启/后台重连后可能尚未加载时间线，主动探测进行中的 turnId 再发起中断
+            turnId = runCatching {
+                val turns = call("thread/read", jsonOf("threadId" to key.id, "includeTurns" to true))
+                    .optJSONObject("thread")?.arr("turns")?.objects().orEmpty()
+                turns.lastOrNull { it.optString("status") == "inProgress" }?.str("id")
+            }.getOrNull()
+        }
+        if (turnId == null) return
         call("turn/interrupt", jsonOf("threadId" to key.id, "turnId" to turnId))
     }
 
     override suspend fun rename(key: ConversationKey, title: String) { call("thread/name/set", jsonOf("threadId" to key.id, "name" to title)) }
 
     override suspend fun delete(key: ConversationKey) {
-        call("thread/delete", jsonOf("threadId" to key.id))
+        try {
+            call("thread/delete", jsonOf("threadId" to key.id))
+        } catch (e: Exception) {
+            val msg = e.message.orEmpty()
+            // 新建未发消息或已被远端清理的空线程容错放行，不阻塞本地列表删除
+            val ignorable = msg.contains("not found", ignoreCase = true) ||
+                msg.contains("no rollout", ignoreCase = true) ||
+                msg.contains("ENOENT", ignoreCase = true)
+            if (!ignorable) throw e
+        }
         attached -= key.id
     }
 

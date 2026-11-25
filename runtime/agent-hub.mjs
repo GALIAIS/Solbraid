@@ -8,7 +8,7 @@ import {createInterface} from "node:readline";
 import {AcpDriver} from "./acp-driver.mjs";
 import {CliBridgeDriver} from "./cli-bridge-driver.mjs";
 import {createDevToolsHub} from "./dev-tools-hub.mjs";
-import {createCliUpdater, resolveCliInstallation, cliPathDirectories} from "./cli-components.mjs";
+import {createCliUpdater, resolveCliInstallation, bundledCliInstallation, cliPathDirectories} from "./cli-components.mjs";
 import * as extSync from "./extension-sync.mjs";
 import * as worktreeMgr from "./worktree-manager.mjs";
 import * as envSsh from "./env-ssh-hub.mjs";
@@ -42,12 +42,36 @@ let initialized = false;
 let closing = false;
 let gatewayConfig = {port: 0, token: ""};
 let networkConfig = normalizeDownloadNetwork();
-let antigravityInstallation = await resolveCliInstallation("antigravity");
+async function resolveAntigravityWithFallback() {
+  const inst = await resolveCliInstallation("antigravity");
+  if (inst.bundled) return inst;
+  try {
+    await execFileAsync(inst.binary, ["--version"], {timeout: 15_000, maxBuffer: 65_536});
+    return inst;
+  } catch (err) {
+    const fallback = bundledCliInstallation("antigravity");
+    return {...fallback, warning: `已更新的 Antigravity CLI (${inst.version}) 自检失败，已自动回退至内置版本 (${fallback.version})：${err?.message || err}`};
+  }
+}
+
+let antigravityInstallation = await resolveAntigravityWithFallback();
 let CLI_DIRECTORIES = await cliPathDirectories();
 
 async function hotReloadAntigravityCli() {
-  antigravityInstallation = await resolveCliInstallation("antigravity");
+  antigravityInstallation = await resolveAntigravityWithFallback();
   CLI_DIRECTORIES = await cliPathDirectories();
+  if (manifests.has("antigravity")) {
+    const m = manifests.get("antigravity");
+    manifests.set("antigravity", {
+      ...m,
+      install: {...m.install, binaryPath: antigravityInstallation.binary},
+      launch: {
+        ...m.launch,
+        command: antigravityInstallation.binary,
+        authLoginCommand: "'" + antigravityInstallation.binary.replace(/'/g, "'\\''") + "' acp --login",
+      },
+    });
+  }
   // 回收所有空闲的 Antigravity 驱动进程，使新版本无需重启整个运行环境即刻生效
   for (const [key, drv] of [...drivers.entries()]) {
     if (drv.agentId !== "antigravity") continue;
@@ -69,6 +93,7 @@ const drivers = new Map();         // 会话标识 -> 独立驱动，避免切�
 const sessions = new Map();        // `${agentId}:${sessionId}` -> session state
 const busySessions = new Set();
 const activeTurns = new Map();
+const pluginDriverAborts = new Map(); // `${agentId}:${sessionId}` -> AbortController
 let packageOperation = null;
 const installationFailures = new Map();
 const installationStates = new Map();
@@ -144,13 +169,13 @@ async function prepareInstallCurlHome(config) {
 }
 
 function baseEnv(manifest, providerInfo, config = networkConfig, userEnv = userGlobalEnv, extraApiKey = null, sessionId = null) {
-  if (userGlobalEnvError) throw new Error("环境配置读取失败，请在环境中心重新同步", {cause: userGlobalEnvError});
-  const userPathParts = typeof userEnv.PATH === "string" ? userEnv.PATH.split(":") : [];
+  const safeUserEnv = (userEnv && typeof userEnv === "object") ? userEnv : {};
+  const userPathParts = typeof safeUserEnv.PATH === "string" ? safeUserEnv.PATH.split(":") : [];
   const pathList = [...userPathParts, ...CLI_DIRECTORIES, ...EXTRA_BINS, ...(process.env.PATH || "").split(":")].filter(Boolean);
   const env = {
     ...process.env,
-    ...userEnv,
-    ...downloadEnvironment(config, {...process.env, ...userEnv}),
+    ...safeUserEnv,
+    ...downloadEnvironment(config, {...process.env, ...safeUserEnv}),
     HOME,
     PATH: [...new Set(pathList)].join(":"),
     NPM_CONFIG_PREFIX: NPM_PREFIX,
@@ -165,6 +190,13 @@ function baseEnv(manifest, providerInfo, config = networkConfig, userEnv = userG
   // 将 GALIAIS 本地多协议回环网关注入到支持环境变量的第三方 CLI（API Key 不落盘）
   const bridge = manifest?.providerBridge;
   if (providerInfo && providerInfo.id && gatewayConfig.port > 0 && gatewayConfig.token && bridge?.envMapping) {
+    // 自定义网关服务商隔离宿主机云认证/OAuth 变量，防止抢占本地回环网关令牌
+    delete env.GOOGLE_APPLICATION_CREDENTIALS;
+    delete env.GOOGLE_CLOUD_PROJECT;
+    delete env.GOOGLE_CLOUD_LOCATION;
+    delete env.GOOGLE_GENAI_USE_VERTEXAI;
+    delete env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete env.ANTHROPIC_AUTH_TOKEN;
     const route = bridge.gatewayRoute || "openai-chat";
     const sidSeg = sessionId ? `/sid/${encodeURIComponent(String(sessionId).slice(0, 80))}` : "";
     const baseUrl = route === "anthropic"
@@ -813,7 +845,7 @@ async function getDriver(manifest, cwd, providerInfo, sessionId, extraApiKey = n
   const id = manifest.id;
   const key = `${id}:${sessionId}`;
   const existing = drivers.get(key);
-  const userEnv = await envSsh.loadEffectiveUserEnv(cwd, process.env.PATH || "");
+  const userEnv = await envSsh.loadEffectiveUserEnv(cwd, process.env.PATH || "").catch(() => ({}));
   const effectiveKey = extraApiKey ?? sessionApiKeys.get(key) ?? null;
   const launchOpts = launchOverrides || {};
   const envKey = JSON.stringify([providerInfo || null, gatewayConfig, manifest.protocol, manifest.launch, userEnv, effectiveKey ? effectiveKey.length : 0, launchOpts]);
@@ -1173,13 +1205,32 @@ async function attachAcpSession(driver, record) {
   let meta = null;
   if (record.remoteSessionId) {
     const canResume = Boolean(driver.agentCapabilities?.sessionCapabilities?.resume || driver.agentCapabilities?.loadSession);
-    if (!canResume) throw new Error("此 Agent 不支持在进程重启后恢复会话；历史已保留，请新建会话继续");
-    const sessKey = `${record.agentId}:${record.id}`;
-    replayingSessions.add(sessKey);
-    try {
-      meta = await driver.resumeSession(record.remoteSessionId, record.cwd, servers);
-    } finally {
-      replayingSessions.delete(sessKey);
+    if (!canResume) {
+      const created = await driver.newSession(record.cwd, servers);
+      if (!created?.sessionId) throw new Error("Agent 未返回有效会话标识");
+      record.remoteSessionId = created.sessionId;
+      if (Array.isArray(record.messages) && record.messages.length > 0) record.pendingContextBridge = true;
+      meta = created;
+    } else {
+      const sessKey = `${record.agentId}:${record.id}`;
+      replayingSessions.add(sessKey);
+      try {
+        meta = await driver.resumeSession(record.remoteSessionId, record.cwd, servers);
+      } catch (resumeErr) {
+        const msg = String(resumeErr?.message || resumeErr || "");
+        // 远端 ACP 会话已过期、未落盘或版本变更导致无法恢复时，平滑重建并桥接历史上下文而不卡死
+        if (/not found|no such|invalid session|unknown session|enoent|does not exist/i.test(msg)) {
+          const created = await driver.newSession(record.cwd, servers);
+          if (!created?.sessionId) throw new Error("Agent 未返回有效会话标识");
+          record.remoteSessionId = created.sessionId;
+          if (Array.isArray(record.messages) && record.messages.length > 0) record.pendingContextBridge = true;
+          meta = created;
+        } else {
+          throw resumeErr;
+        }
+      } finally {
+        replayingSessions.delete(sessKey);
+      }
     }
   } else {
     const created = await driver.newSession(record.cwd, servers);
@@ -2362,57 +2413,66 @@ async function dispatchRequest(method, params = {}) {
         }
         if (m.protocol === "plugin-driver") {
           const driverId = m.driverId || m.id;
-          const res = await pluginKernel.invokePluginDriver({
-            driverId,
-            sessionId: record.id,
-            prompt: promptTextForDriver,
-            cwd: record.cwd,
-            model: record.model,
-            history: (record.messages || []).slice(-16),
-            onEvent: ev => {
-              if (ev?.kind === "chunk" && ev.text) {
-                turn.text += ev.text;
-                if (!turn.firstTokenAt) turn.firstTokenAt = Date.now();
-                turn.lastTokenAt = Date.now();
-                notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "acp-update", update: {sessionUpdate: "agent_message_chunk", content: {type: "text", text: ev.text}}});
-              } else if (ev?.kind === "thought" && ev.text) {
-                if (!turn.currentThought) {
-                  turn.currentThought = {text: "", startedAtMs: Date.now(), completedAtMs: 0};
-                  turn.thoughts.push(turn.currentThought);
-                  turn.timelineOrder.push({type: "thought", ref: turn.currentThought});
+          const driverAbort = new AbortController();
+          pluginDriverAborts.set(key, driverAbort);
+          let res;
+          try {
+            res = await pluginKernel.invokePluginDriver({
+              driverId,
+              sessionId: record.id,
+              prompt: promptTextForDriver,
+              cwd: record.cwd,
+              model: record.model,
+              history: (record.messages || []).slice(-16),
+              signal: driverAbort.signal,
+              onEvent: ev => {
+                if (driverAbort.signal.aborted) return;
+                if (ev?.kind === "chunk" && ev.text) {
+                  turn.text += ev.text;
+                  if (!turn.firstTokenAt) turn.firstTokenAt = Date.now();
+                  turn.lastTokenAt = Date.now();
+                  notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "acp-update", update: {sessionUpdate: "agent_message_chunk", content: {type: "text", text: ev.text}}});
+                } else if (ev?.kind === "thought" && ev.text) {
+                  if (!turn.currentThought) {
+                    turn.currentThought = {text: "", startedAtMs: Date.now(), completedAtMs: 0};
+                    turn.thoughts.push(turn.currentThought);
+                    turn.timelineOrder.push({type: "thought", ref: turn.currentThought});
+                  }
+                  turn.currentThought.text += ev.text;
+                  notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "acp-update", update: {sessionUpdate: "agent_thought_chunk", content: {type: "text", text: ev.text}}});
+                } else if (ev?.kind === "tool" && ev.tool) {
+                  const tid = String(ev.tool.toolCallId || ev.tool.id || `tool-${Date.now()}`);
+                  const rec = {
+                    id: tid,
+                    name: String(ev.tool.title || ev.tool.name || "插件工具"),
+                    kind: String(ev.tool.kind || "other"),
+                    command: ev.tool.command ? String(ev.tool.command) : undefined,
+                    cwd: record.cwd,
+                    input: typeof ev.tool.rawInput === "string" ? ev.tool.rawInput : JSON.stringify(ev.tool.rawInput ?? ""),
+                    result: typeof ev.tool.rawOutput === "string" ? ev.tool.rawOutput : "",
+                    status: String(ev.tool.status || "completed"),
+                    ts: Date.now(),
+                  };
+                  turn.toolMap.set(tid, rec);
+                  turn.timelineOrder.push({type: "tool", ref: rec});
+                  notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "acp-update", update: {sessionUpdate: "tool_call", ...ev.tool}});
+                } else if (ev?.kind === "plan" && ev.plan) {
+                  if (typeof ev.plan.markdown === "string" || typeof ev.plan.text === "string") {
+                    upsertTurnPlan(turn, {
+                      id: String(ev.plan.id || `plan-${Date.now()}`),
+                      title: String(ev.plan.title || "执行计划"),
+                      text: String(ev.plan.markdown || ev.plan.text || ""),
+                      status: String(ev.plan.status || "completed"),
+                      requestFeedback: Boolean(ev.plan.requestFeedback),
+                    });
+                  }
+                  notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "acp-update", update: {sessionUpdate: "plan", ...ev.plan}});
                 }
-                turn.currentThought.text += ev.text;
-                notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "acp-update", update: {sessionUpdate: "agent_thought_chunk", content: {type: "text", text: ev.text}}});
-              } else if (ev?.kind === "tool" && ev.tool) {
-                const tid = String(ev.tool.toolCallId || ev.tool.id || `tool-${Date.now()}`);
-                const rec = {
-                  id: tid,
-                  name: String(ev.tool.title || ev.tool.name || "插件工具"),
-                  kind: String(ev.tool.kind || "other"),
-                  command: ev.tool.command ? String(ev.tool.command) : undefined,
-                  cwd: record.cwd,
-                  input: typeof ev.tool.rawInput === "string" ? ev.tool.rawInput : JSON.stringify(ev.tool.rawInput ?? ""),
-                  result: typeof ev.tool.rawOutput === "string" ? ev.tool.rawOutput : "",
-                  status: String(ev.tool.status || "completed"),
-                  ts: Date.now(),
-                };
-                turn.toolMap.set(tid, rec);
-                turn.timelineOrder.push({type: "tool", ref: rec});
-                notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "acp-update", update: {sessionUpdate: "tool_call", ...ev.tool}});
-              } else if (ev?.kind === "plan" && ev.plan) {
-                if (typeof ev.plan.markdown === "string" || typeof ev.plan.text === "string") {
-                  upsertTurnPlan(turn, {
-                    id: String(ev.plan.id || `plan-${Date.now()}`),
-                    title: String(ev.plan.title || "执行计划"),
-                    text: String(ev.plan.markdown || ev.plan.text || ""),
-                    status: String(ev.plan.status || "completed"),
-                    requestFeedback: Boolean(ev.plan.requestFeedback),
-                  });
-                }
-                notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "acp-update", update: {sessionUpdate: "plan", ...ev.plan}});
-              }
-            },
-          });
+              },
+            });
+          } finally {
+            if (pluginDriverAborts.get(key) === driverAbort) pluginDriverAborts.delete(key);
+          }
           replyText = res.text || turn.text || "";
           stopReason = res.stopReason || "end_turn";
           exactUsage = res.usage || null;
@@ -2684,6 +2744,12 @@ async function dispatchRequest(method, params = {}) {
       for (const waiter of pendingClientReqs.values()) {
         if (`${waiter.params.agentId}:${waiter.params.sessionId}` === key) waiter.reject(new Error("用户中断了会话"));
       }
+      const pAbort = pluginDriverAborts.get(key);
+      if (pAbort) {
+        pluginDriverAborts.delete(key);
+        try { pAbort.abort(new Error("用户中断了会话")); } catch {}
+      }
+      pluginKernel.cancelPluginDriver(m?.driverId || agentId, params.sessionId);
       const drv = drivers.get(key);
       if (drv) await drv.cancel(m?.protocol === "acp" ? (record?.remoteSessionId || params.sessionId) : params.sessionId).catch(() => {});
       return {ok: true};
@@ -2704,6 +2770,12 @@ async function dispatchRequest(method, params = {}) {
       for (const waiter of pendingClientReqs.values()) {
         if (`${waiter.params.agentId}:${waiter.params.sessionId}` === key) waiter.reject(new Error("会话已删除"));
       }
+      const pAbort = pluginDriverAborts.get(key);
+      if (pAbort) {
+        pluginDriverAborts.delete(key);
+        try { pAbort.abort(new Error("会话已删除")); } catch {}
+      }
+      pluginKernel.cancelPluginDriver(agentId, params.sessionId);
       activeTurns.delete(key);
       stopSessionDriver(key);
       sessionApiKeys.delete(key);
@@ -3044,6 +3116,21 @@ async function dispatchRequest(method, params = {}) {
       });
     case "plugins/driverModels":
       return {models: await pluginKernel.listPluginDriverModels(params.driverId)};
+
+    case "selfBuild/getConfig":
+      return await pluginKernel.getSelfBuildConfig();
+    case "selfBuild/saveConfig":
+      return await pluginKernel.saveSelfBuildConfig(params || {});
+    case "selfBuild/status":
+      return await pluginKernel.manageSelfBuild({...(params || {}), action: "status", source: "ui"});
+    case "selfBuild/bootstrap":
+      return await pluginKernel.manageSelfBuild({...(params || {}), action: "bootstrap", source: "ui"});
+    case "selfBuild/build":
+      return await pluginKernel.manageSelfBuild({...(params || {}), action: "build", source: "ui"});
+    case "selfBuild/apply":
+      return await pluginKernel.manageSelfBuild({...(params || {}), action: "apply", source: "ui"});
+    case "selfBuild/rollback":
+      return await pluginKernel.manageSelfBuild({...(params || {}), action: "rollback", source: "ui"});
 
     case "registry/getConfig":
       return communityRegistry.sanitizeConfig(await communityRegistry.loadConfig());

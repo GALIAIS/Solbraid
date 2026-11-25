@@ -13,9 +13,14 @@ checksum="$source/installer-tools-$abi.sha256"
 digest=$(cut -d ' ' -f 1 "$checksum")
 target="$root/opt/galiais-install-tools/$digest"
 mkdir -p "$target"
-tar -xzf "$nlib/libpayload_tools.so" -C "$target"
+# 免 Root (PRoot) 模式下由宿主无硬链接解包器预先解压为相对符号链接，校验通过则跳过 /system/bin/tar 避免 SELinux link(2) 拒绝
+if ! (cd "$target" && sha256sum -c files.sha256 >/dev/null 2>&1); then
+    rm -rf "$target"
+    mkdir -p "$target"
+    tar -xzf "$nlib/libpayload_tools.so" -C "$target"
+fi
 (cd "$target" && sha256sum -c files.sha256 >/dev/null)
-chmod -R a+rX "$target"
+find "$target" ! -type l -exec chmod a+rX {} + 2>/dev/null || chmod -R a+rX "$target" 2>/dev/null || true
 ln -sfn "$digest" "$root/opt/galiais-install-tools/current"
 resources="$root/opt/galiais-codex/usr/lib/chatgpt/resources"
 mkdir -p "$resources"

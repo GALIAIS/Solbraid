@@ -319,6 +319,7 @@ fun GaliaisApp(app: GaliaisApplication) {
             composable("settings/claude") { ClaudeSettingsScreen(app, snackbar, onBack = ::safePopBack, onOpenProviders = { safeNavigate("settings/providers") }) }
             composable("settings/workspace") { WorkspaceSettingsScreen(app, snackbar, onBack = ::safePopBack) }
             composable("settings/runtime") { RuntimeSettingsScreen(app, snackbar, onBack = ::safePopBack) }
+            composable("settings/selfbuild") { SelfBuildSettingsScreen(app, snackbar, onBack = ::safePopBack) }
             composable("settings/about") { AboutSettingsScreen(app, onBack = ::safePopBack) }
 
             composable("terminal") {

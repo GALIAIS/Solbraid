@@ -62,7 +62,7 @@ export function createTerminalHub({home, baseEnv, notify, prepareSshPtyLaunch, p
         const userRc = path.join(home, ".bashrc");
         const rcBody = [
           `[ -f ${quote(userRc)} ] && . ${quote(userRc)}`,
-          `[ -f ${quote(profileFile)} ] && . ${quote(profileFile)}`,
+          `[ "\${_SOLBRAID_PROFILE_PID:-}" != "$$" ] && [ -f ${quote(profileFile)} ] && . ${quote(profileFile)}`,
           `[ -z "\${PS1:-}" ] && export PS1='\\u@\\h:\\w\\$ '`,
         ].join("\n") + "\n";
         await fs.writeFile(rcFile, rcBody, {mode: 0o600});

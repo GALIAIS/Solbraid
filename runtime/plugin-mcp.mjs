@@ -201,6 +201,22 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "solbraid_self_build",
+    description: "本机纯本地 ARM64 APK 自迭代流水线（默认关闭，须用户在「设置 → 本机 APK 自迭代」启用并放行对应 Agent 权限）：检测工具链与启动心跳（action=status）、执行本地编译（action=build）、或经用户确认后触发看门狗安装（action=apply, confirmInstall=true）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {type: "string", enum: ["status", "build", "apply"], description: "操作类型"},
+        repoDir: {type: "string", description: "可选；覆盖配置中的 Solbraid 源码仓库目录"},
+        variant: {type: "string", enum: ["debug", "release"], description: "可选；覆盖配置中的构建变体（debug 或 release）"},
+        apkPath: {type: "string", description: "action=apply 时的候选 APK 路径"},
+        confirmInstall: {type: "boolean", description: "action=apply 必须显式为 true（安装将重启 App，须用户明确授权）"},
+      },
+      required: ["action"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 function send(packet) {
@@ -210,6 +226,7 @@ function send(packet) {
 const ACTION_TIMEOUT_MS = Object.freeze({
   installDeps: 75_000,
   testDriver: 130_000,
+  selfBuild: 920_000,
 });
 
 function callPluginCtl(action, params = {}) {
@@ -262,6 +279,7 @@ const TOOL_ACTION_MAP = Object.freeze({
   solbraid_plugin_test_sdui: "testSdui",
   solbraid_studio_override: "studioOverride",
   solbraid_plugin_test_driver: "testDriver",
+  solbraid_self_build: "selfBuild",
 });
 
 async function handle(message) {

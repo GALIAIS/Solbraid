@@ -312,7 +312,7 @@ fun ConversationListScreen(
                             runtime = runtime.copy(mode = if (runtime.idle) settings.effectiveRuntimeMode else runtime.mode),
                             onStart = app.runtime::start,
                             onStop = app.runtime::stop,
-                            installed = environment.fullyInstalled,
+                            installed = environment.isInstalledFor(settings.effectiveRuntimeMode),
                         )
                     }
                 }
@@ -434,24 +434,38 @@ fun ConversationListScreen(
                                 verticalArrangement = Arrangement.spacedBy(if (layoutMode == "grouped") 3.dp else D.space(8.dp)),
                             ) {
                                 if (sessions.isEmpty()) {
+                                    val canTapStart = !runtime.ready && runtime.bound && !runtime.busy
                                     Surface(
-                                        modifier = Modifier.fillMaxWidth().clickable(enabled = runtime.ready && dir != UNASSIGNED_PROJECT) {
-                                            creating = PendingCreate(dir)
+                                        modifier = Modifier.fillMaxWidth().clickable(
+                                            enabled = (runtime.ready && dir != UNASSIGNED_PROJECT) || canTapStart,
+                                        ) {
+                                            if (runtime.ready) creating = PendingCreate(dir)
+                                            else app.runtime.start()
                                         },
                                         shape = D.shape(10.dp),
                                         color = G.surfaceSubtle,
                                         border = BorderStroke(0.75.dp, G.border),
                                     ) {
-                                        Text(
-                                            when {
-                                                !runtime.ready -> "启动运行环境后可在此项目新建会话"
-                                                !initialSyncDone || loading -> "正在加载会话列表…"
-                                                else -> "此项目暂无会话"
-                                            },
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = G.inkMuted,
-                                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
-                                        )
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        ) {
+                                            Text(
+                                                when {
+                                                    !runtime.ready && runtime.busy -> "正在准备运行环境，就绪后可在此项目新建会话…"
+                                                    !runtime.ready -> "启动运行环境后可在此项目新建会话"
+                                                    !initialSyncDone || loading -> "正在加载会话列表…"
+                                                    else -> "此项目暂无会话"
+                                                },
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = G.inkMuted,
+                                                modifier = Modifier.weight(1f),
+                                            )
+                                            if (canTapStart) {
+                                                TagPill("启动环境", fg = G.onAccent, bg = G.accent, onClick = app.runtime::start)
+                                            }
+                                        }
                                     }
                                 } else {
                                     sessions.forEachIndexed { idx, summary ->

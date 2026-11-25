@@ -28,18 +28,26 @@ abstract class RuntimeAssetsTask : DefaultTask() {
 }
 
 /** 将全量离线预置的 Ubuntu 24.04 根系统与官方原生 CLI 按 ABI 打包进分包 APK 的 jniLibs。 */
+val requestedAbis = (findProperty("solbraidAbis") as? String)
+    ?.split(",")
+    ?.map { it.trim() }
+    ?.filter { it.isNotEmpty() }
+    ?.takeIf { it.isNotEmpty() }
+    ?: listOf("arm64-v8a", "x86_64")
+
 abstract class OfflineBundleTask : DefaultTask() {
     @get:InputFile abstract val generator: RegularFileProperty
     @get:InputFile abstract val helper: RegularFileProperty
     @get:InputFile abstract val manifest: RegularFileProperty
     @get:InputDirectory abstract val offlineSource: DirectoryProperty
+    @get:Input abstract val abis: Property<String>
     @get:OutputDirectory abstract val outputDirectory: DirectoryProperty
     @get:Inject abstract val operations: ExecOperations
 
     @TaskAction fun generate() {
         val nodeCmd = if (System.getProperty("os.name").lowercase().contains("win")) "node.exe" else "node"
         operations.exec {
-            commandLine(nodeCmd, generator.get().asFile, offlineSource.get().asFile, outputDirectory.get().asFile, manifest.get().asFile)
+            commandLine(nodeCmd, generator.get().asFile, offlineSource.get().asFile, outputDirectory.get().asFile, manifest.get().asFile, abis.get())
         }
     }
 }
@@ -89,6 +97,7 @@ val prepareOfflineBundle by tasks.registering(OfflineBundleTask::class) {
     helper.set(rootProject.layout.projectDirectory.file("tools/component-manifest.cjs"))
     manifest.set(componentManifest)
     offlineSource.set(rootProject.layout.projectDirectory.dir("downloads/offline"))
+    abis.set(requestedAbis.joinToString(","))
     outputDirectory.set(layout.buildDirectory.dir("generated/offlineJniLibs"))
 }
 
@@ -106,7 +115,7 @@ android {
         abi {
             isEnable = true
             reset()
-            include("arm64-v8a", "x86_64")
+            include(*requestedAbis.toTypedArray())
             isUniversalApk = false
         }
     }

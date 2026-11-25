@@ -172,6 +172,8 @@ fun ChatScreen(
     val composerFocus = remember(key) { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
     val attachments = remember(key.route) { mutableStateListOf<ImageAttachment>() }
+    var pendingFailedDoc by remember(key.route) { mutableStateOf<PendingClaudeDocument?>(null) }
+    var sendingDoc by remember(key.route) { mutableStateOf(false) }
     var renaming by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf(false) }
     var showDiffs by remember { mutableStateOf(false) }
@@ -239,6 +241,27 @@ fun ChatScreen(
         }
     }
 
+    fun sendDocumentWithRecovery(doc: PendingClaudeDocument) {
+        if (sendingDoc) return
+        val prompt = draft.trim()
+        draftValue = TextFieldValue("")
+        sendingDoc = true
+        scope.launch {
+            try {
+                app.conversations.sendClaudeDocumentNow(key, prompt, doc.name, doc.mimeType, doc.data, doc.isPdf)
+                pendingFailedDoc = null
+            } catch (cancel: CancellationException) {
+                throw cancel
+            } catch (err: Exception) {
+                if (prompt.isNotEmpty()) restoreDraft(prompt)
+                pendingFailedDoc = doc
+                app.conversations.notify("发送文档失败：${err.message ?: "请重试"}")
+            } finally {
+                sendingDoc = false
+            }
+        }
+    }
+
     val documentPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
@@ -246,14 +269,7 @@ fun ChatScreen(
             if (doc == null) {
                 app.conversations.notify("无法读取文档，或大小超过限制（PDF ≤5MB，文本 ≤512KB）")
             } else {
-                val prompt = draft.trim()
-                draftValue = TextFieldValue("")
-                runCatching {
-                    app.conversations.sendClaudeDocument(key, prompt, doc.name, doc.mimeType, doc.data, doc.isPdf)
-                }.onFailure { err ->
-                    if (prompt.isNotEmpty()) restoreDraft(prompt)
-                    app.conversations.notify("发送文档失败：${err.message ?: "请重试"}")
-                }
+                sendDocumentWithRecovery(PendingClaudeDocument(doc.name, doc.mimeType, doc.data, doc.isPdf))
             }
         }
     }
@@ -1236,6 +1252,43 @@ fun ChatScreen(
                     label = "composerBorder",
                 )
                 Column(Modifier.fillMaxWidth()) {
+                pendingFailedDoc?.let { failedDoc ->
+                    Surface(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                        shape = D.shape(12.dp),
+                        color = G.dangerTint,
+                        border = BorderStroke(0.75.dp, G.danger.copy(alpha = 0.4f)),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Icon(GaliaisIcons.FileLines, contentDescription = null, tint = G.danger, modifier = Modifier.size(15.dp))
+                            Text(
+                                "文档待重试：${failedDoc.name}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = G.danger,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                            TagPill(
+                                text = if (sendingDoc) "重试中…" else "重试发送",
+                                fg = G.onAccent,
+                                bg = G.danger,
+                                onClick = { if (!sendingDoc) sendDocumentWithRecovery(failedDoc) },
+                            )
+                            TagPill(
+                                text = "移除",
+                                fg = G.inkMuted,
+                                bg = G.surface,
+                                border = G.border,
+                                onClick = { if (!sendingDoc) pendingFailedDoc = null },
+                            )
+                        }
+                    }
+                }
                 PluginSlotActionBar(
                     app = app,
                     slotName = "chat.composerBar",
@@ -2629,6 +2682,13 @@ private fun PopoverChoiceChip(
         )
     }
 }
+
+private data class PendingClaudeDocument(
+    val name: String,
+    val mimeType: String,
+    val data: String,
+    val isPdf: Boolean,
+)
 
 private fun formatCompactTokens(n: Long): String = when {
     n >= 1_000_000 -> "%.2fM".format(n / 1_000_000.0)

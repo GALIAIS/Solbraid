@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# Solbraid 本机纯本地 ARM64 APK 自迭代构建流水线
+# 能力：
+#   1. status    : 检测本机 ARM64 JDK 17 / Android SDK (android-36) / 原生 aapt2 / 签名密钥 / 源码目录就绪度
+#   2. bootstrap : 一键配置 ARM64 依赖（openjdk-17 / 原生 aapt2 / debug.keystore）并从 /opt/galiais-native 零下载复用离线 .so
+#   3. build     : 运行单测 + 单 ABI (arm64-v8a) Gradle 编译 + 运行时完整性校验，输出可直接安装的 APK
+#   4. apply     : 经明确确认（--yes）后移交独立 Root 启动看门狗安装并验证首帧心跳（异常自动回滚）
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOME_DIR="${HOME:-/home/agent}"
+WATCHDOG_PATHS=(
+    "/data/user/0/com.galiais.agent/files/vm-runtime/self-update-watchdog.sh"
+    "$SCRIPT_DIR/self-update-watchdog.sh"
+)
+HEARTBEAT_FILE="/data/user/0/com.galiais.agent/files/self-update-healthy.json"
+WATCHDOG_STATUS_FILE="/data/local/tmp/solbraid-self-update/status.json"
+
+detect_arch() {
+    uname -m 2>/dev/null || echo "unknown"
+}
+
+detect_java_home() {
+    if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+        echo "$JAVA_HOME"
+        return
+    fi
+    for d in /usr/lib/jvm/java-17-openjdk-arm64 /usr/lib/jvm/java-17-openjdk-amd64 /usr/lib/jvm/java-21-openjdk-arm64 /usr/lib/jvm/default-java "$HOME_DIR/jdk-17"; do
+        if [ -x "$d/bin/java" ]; then
+            echo "$d"
+            return
+        fi
+    done
+    if command -v java >/dev/null 2>&1; then
+        local jbin
+        jbin="$(readlink -f "$(command -v java)" 2>/dev/null || command -v java)"
+        dirname "$(dirname "$jbin")"
+    fi
+}
+
+detect_android_home() {
+    for d in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" "$HOME_DIR/android-sdk" "/opt/android-sdk"; do
+        if [ -n "$d" ] && [ -d "$d" ]; then
+            echo "$d"
+            return
+        fi
+    done
+    echo "$HOME_DIR/android-sdk"
+}
+
+detect_aapt2() {
+    local sdk="$1"
+    local cand=""
+    # AGP 9 严格校验 android.aapt2FromMavenOverride 的文件名必须为 aapt2
+    for cand in "${SOLBRAID_AAPT2_BIN:-}" "$sdk"/build-tools/*/aapt2 "$sdk/arm64-tools/aapt2" "/usr/bin/aapt2"; do
+        if [ -n "$cand" ] && [ -x "$cand" ]; then
+            if "$cand" version >/dev/null 2>&1; then
+                echo "$cand"
+                return
+            fi
+        fi
+    done
+}
+
+detect_repo_dir() {
+    local explicit="${1:-}"
+    for d in "$explicit" "${SOLBRAID_REPO_DIR:-}" "$HOME_DIR/workspace/Solbraid" "$HOME_DIR/workspace/GALIAIS" "$PWD"; do
+        if [ -n "$d" ] && [ -f "$d/gradlew" ] && [ -f "$d/app/build.gradle.kts" ]; then
+            (cd "$d" && pwd)
+            return
+        fi
+    done
+}
+
+hydrate_offline_assets() {
+    local repo="$1"
+    local abi="${2:-arm64-v8a}"
+    local native_src=""
+    for d in "/opt/galiais-native" "${SOLBRAID_NATIVE_LIB_DIR:-}"; do
+        if [ -n "$d" ] && [ -f "$d/libbin_node.so" ]; then
+            native_src="$d"
+            break
+        fi
+    done
+    if [ -n "$native_src" ] && [ "$abi" = "arm64-v8a" ]; then
+        mkdir -p "$repo/downloads/offline/arm64-v8a"
+        for so in libbin_antigravity.so libpayload_tools.so libbin_claude.so libbin_codex_code_mode_host.so libbin_codex.so libbin_node.so libbin_rg.so libpayload_npm.so libpayload_rootfs.so; do
+            if [ ! -f "$repo/downloads/offline/arm64-v8a/$so" ] && [ -f "$native_src/$so" ]; then
+                ln -sf "$native_src/$so" "$repo/downloads/offline/arm64-v8a/$so"
+            fi
+        done
+    fi
+    # 若宿主 runtime 缓存目录可读，顺带复用已落盘的 Claude SDK 与 Official Plan 压缩包
+    local vm_rt="/data/user/0/com.galiais.agent/files/vm-runtime"
+    if [ -d "$vm_rt" ]; then
+        mkdir -p "$repo/downloads/runtime"
+        for tgz in "$vm_rt"/claude-agent-sdk-*.tgz "$vm_rt"/official-plan-*.tgz; do
+            [ -f "$tgz" ] || continue
+            local base
+            base="$(basename "$tgz")"
+            [ -f "$repo/downloads/runtime/$base" ] || cp -f "$tgz" "$repo/downloads/runtime/$base"
+        done
+    fi
+}
+
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\r\n' '  '
+}
+
+cmd_status() {
+    local repo_arg="${1:-}"
+    local arch java_home java_ver android_home aapt2_bin repo_dir
+    arch="$(detect_arch)"
+    java_home="$(detect_java_home || true)"
+    java_ver=""
+    local java_ok="false"
+    if [ -n "$java_home" ] && [ -x "$java_home/bin/java" ]; then
+        java_ver="$("$java_home/bin/java" -version 2>&1 | head -n 1 || true)"
+        java_ok="true"
+    fi
+    android_home="$(detect_android_home)"
+    local platform_ok="false"
+    [ -f "$android_home/platforms/android-36/android.jar" ] && platform_ok="true"
+    aapt2_bin="$(detect_aapt2 "$android_home" || true)"
+    local aapt2_ok="false"
+    [ -n "$aapt2_bin" ] && aapt2_ok="true"
+    repo_dir="$(detect_repo_dir "$repo_arg" || true)"
+    local repo_ok="false"
+    [ -n "$repo_dir" ] && repo_ok="true"
+    local keystore_ok="false"
+    [ -f "$HOME_DIR/.android/debug.keystore" ] && keystore_ok="true"
+    local native_ready="false"
+    [ -f "/opt/galiais-native/libbin_node.so" ] && native_ready="true"
+
+    local missing_json=""
+    add_missing() {
+        local item="$1"
+        if [ -z "$missing_json" ]; then
+            missing_json="\"$(json_escape "$item")\""
+        else
+            missing_json="$missing_json,\"$(json_escape "$item")\""
+        fi
+    }
+    [ "$java_ok" = "true" ] || add_missing "openjdk-17-jdk"
+    [ "$platform_ok" = "true" ] || add_missing "android-sdk:platforms;android-36"
+    if [ "$arch" = "aarch64" ] && [ "$aapt2_ok" != "true" ]; then
+        add_missing "arm64-aapt2"
+    fi
+    [ "$repo_ok" = "true" ] || add_missing "solbraid-git-repo"
+
+    local ready="true"
+    [ -n "$missing_json" ] && ready="false"
+
+    local hb="{}"
+    [ -r "$HEARTBEAT_FILE" ] && hb="$(cat "$HEARTBEAT_FILE" 2>/dev/null || echo '{}')"
+    local wd="{}"
+    [ -r "$WATCHDOG_STATUS_FILE" ] && wd="$(cat "$WATCHDOG_STATUS_FILE" 2>/dev/null || echo '{}')"
+    local has_backup="false"
+    [ -f "/data/local/tmp/solbraid-self-update/last-known-good.apk" ] && has_backup="true"
+
+    printf '{"arch":"%s","javaHome":"%s","javaVersion":"%s","javaOk":%s,"androidHome":"%s","platform36Ok":%s,"aapt2Bin":"%s","aapt2Ok":%s,"repoDir":"%s","repoOk":%s,"keystoreOk":%s,"nativeOfflineHydratable":%s,"readyForLocalBuild":%s,"hasBackup":%s,"missing":[%s],"heartbeat":%s,"watchdogStatus":%s}\n' \
+        "$(json_escape "$arch")" \
+        "$(json_escape "$java_home")" \
+        "$(json_escape "$java_ver")" \
+        "$java_ok" \
+        "$(json_escape "$android_home")" \
+        "$platform_ok" \
+        "$(json_escape "$aapt2_bin")" \
+        "$aapt2_ok" \
+        "$(json_escape "$repo_dir")" \
+        "$repo_ok" \
+        "$keystore_ok" \
+        "$native_ready" \
+        "$ready" \
+        "$has_backup" \
+        "$missing_json" \
+        "$hb" \
+        "$wd"
+}
+
+cmd_bootstrap() {
+    local repo_arg="${1:-}"
+    local android_home
+    android_home="$(detect_android_home)"
+    mkdir -p "$android_home" "$HOME_DIR/.android"
+
+    if [ "$(id -u)" = "0" ] && command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get -o APT::Sandbox::User=root update -y
+        apt-get -o APT::Sandbox::User=root install -y --no-install-recommends openjdk-17-jdk-headless unzip curl ca-certificates
+    fi
+
+    # ARM64 环境自动安装原生 aarch64-glibc aapt2（用于 AGP android.aapt2FromMavenOverride，文件名必须为 aapt2）
+    if [ "$(detect_arch)" = "aarch64" ] && [ -z "$(detect_aapt2 "$android_home" || true)" ] && command -v curl >/dev/null 2>&1; then
+        local aapt2_tag="${SOLBRAID_ARM64_BT_TAG:-platform-tools-36.1.0}"
+        local aapt2_url="https://github.com/Commit451/android-arm-build-tools/releases/download/${aapt2_tag}/aapt2"
+        mkdir -p "$android_home/arm64-tools"
+        if curl -fsSL "$aapt2_url" -o "$android_home/arm64-tools/aapt2.tmp"; then
+            chmod 755 "$android_home/arm64-tools/aapt2.tmp"
+            mv -f "$android_home/arm64-tools/aapt2.tmp" "$android_home/arm64-tools/aapt2"
+        else
+            rm -f "$android_home/arm64-tools/aapt2.tmp"
+        fi
+    fi
+
+    local java_home
+    java_home="$(detect_java_home || true)"
+    if [ -n "$java_home" ] && [ ! -f "$HOME_DIR/.android/debug.keystore" ] && [ -x "$java_home/bin/keytool" ]; then
+        "$java_home/bin/keytool" -genkeypair -v \
+            -keystore "$HOME_DIR/.android/debug.keystore" \
+            -storepass android -alias androiddebugkey -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1 || true
+    fi
+
+    local repo_dir
+    repo_dir="$(detect_repo_dir "$repo_arg" || true)"
+    if [ -n "$repo_dir" ]; then
+        hydrate_offline_assets "$repo_dir" "arm64-v8a"
+        printf 'sdk.dir=%s\n' "$android_home" > "$repo_dir/local.properties"
+    fi
+    cmd_status "$repo_arg"
+}
+
+cmd_build() {
+    local repo_arg=""
+    local skip_tests="false"
+    local variant="debug"
+    local abis="arm64-v8a"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --repo) repo_arg="${2:-}"; shift 2 ;;
+            --skip-tests) skip_tests="true"; shift ;;
+            --variant) variant="${2:-debug}"; shift 2 ;;
+            --abis) abis="${2:-arm64-v8a}"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local arch java_home android_home aapt2_bin repo_dir
+    arch="$(detect_arch)"
+    java_home="$(detect_java_home || true)"
+    android_home="$(detect_android_home)"
+    aapt2_bin="$(detect_aapt2 "$android_home" || true)"
+    repo_dir="$(detect_repo_dir "$repo_arg" || true)"
+
+    [ -n "$java_home" ] || { echo "ERROR: 未找到 JDK 17，请先运行 self-build-apk.sh bootstrap 安装 openjdk-17-jdk" >&2; exit 1; }
+    [ -f "$android_home/platforms/android-36/android.jar" ] || { echo "ERROR: 未找到 Android SDK platforms/android-36 ($android_home)" >&2; exit 1; }
+    [ -n "$repo_dir" ] || { echo "ERROR: 未找到 Solbraid 源码仓库（请传入 --repo <path>）" >&2; exit 1; }
+    if [ "$arch" = "aarch64" ] && [ -z "$aapt2_bin" ]; then
+        echo "ERROR: ARM64 环境缺少原生 aapt2，请安装 apt-get install -y aapt2 或设置 SOLBRAID_AAPT2_BIN" >&2
+        exit 1
+    fi
+
+    hydrate_offline_assets "$repo_dir" "$abis"
+    printf 'sdk.dir=%s\n' "$android_home" > "$repo_dir/local.properties"
+
+    export JAVA_HOME="$java_home"
+    export ANDROID_HOME="$android_home"
+    export ANDROID_SDK_ROOT="$android_home"
+    export PATH="$JAVA_HOME/bin:/opt/galiais-codex/usr/lib/chatgpt/resources:$PATH"
+
+    local heap_mb="${SOLBRAID_GRADLE_HEAP_MB:-4096}"
+    case "$heap_mb" in
+        ''|*[!0-9]*) heap_mb=4096 ;;
+    esac
+    if [ "$heap_mb" -lt 1536 ]; then heap_mb=1536; fi
+    if [ "$heap_mb" -gt 8192 ]; then heap_mb=8192; fi
+
+    local gradle_args=(
+        "--no-daemon"
+        "-PsolbraidAbis=$abis"
+        "-Dorg.gradle.jvmargs=-Xmx${heap_mb}m -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8"
+    )
+    if [ -n "$aapt2_bin" ]; then
+        gradle_args+=("-Pandroid.aapt2FromMavenOverride=$aapt2_bin")
+    fi
+    if [ -n "${SOLBRAID_EXTRA_GRADLE_ARGS:-}" ]; then
+        local tok
+        for tok in $SOLBRAID_EXTRA_GRADLE_ARGS; do
+            case "$tok" in
+                -[A-Za-z0-9._:=/-]*) gradle_args+=("$tok") ;;
+                *) echo "ERROR: 不允许的附加 Gradle 参数：$tok" >&2; exit 1 ;;
+            esac
+        done
+    fi
+
+    local tasks=()
+    if [ "$skip_tests" != "true" ]; then
+        tasks+=(":app:testDebugUnitTest")
+    fi
+    if [ "$variant" = "release" ]; then
+        tasks+=(":app:assembleRelease")
+    else
+        tasks+=(":app:assembleDebug")
+    fi
+
+    echo "[self-build] repo=$repo_dir arch=$arch abis=$abis heap=${heap_mb}m tasks=${tasks[*]}"
+    (cd "$repo_dir" && chmod +x ./gradlew && ./gradlew "${tasks[@]}" "${gradle_args[@]}")
+
+    local out_apk="$repo_dir/app/build/outputs/apk/$variant/app-arm64-v8a-$variant.apk"
+    if [ ! -f "$out_apk" ] && [ -f "$repo_dir/app/build/outputs/apk/$variant/app-$variant.apk" ]; then
+        out_apk="$repo_dir/app/build/outputs/apk/$variant/app-$variant.apk"
+    fi
+    [ -f "$out_apk" ] || { echo "ERROR: 编译完成但未找到产物 APK：$out_apk" >&2; exit 1; }
+    local size sha
+    size="$(stat -c %s "$out_apk" 2>/dev/null || wc -c < "$out_apk")"
+    sha="$(sha256sum "$out_apk" | awk '{print $1}')"
+    printf 'SOLBRAID_SELF_BUILD_RESULT:{"ok":true,"apkPath":"%s","size":%s,"sha256":"%s","variant":"%s","abis":"%s"}\n' \
+        "$(json_escape "$out_apk")" "$size" "$sha" "$variant" "$abis"
+}
+
+find_watchdog() {
+    local cand
+    for cand in "${WATCHDOG_PATHS[@]}"; do
+        if [ -f "$cand" ]; then
+            echo "$cand"
+            return
+        fi
+    done
+}
+
+cmd_apply() {
+    local apk=""
+    local confirmed="false"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes) confirmed="true"; shift ;;
+            *) [ -z "$apk" ] && apk="$1"; shift ;;
+        esac
+    done
+    [ "$confirmed" = "true" ] || { echo "ERROR: 安全护栏：安装并重启 App 必须显式传入 --yes" >&2; exit 1; }
+    [ -n "$apk" ] && [ -f "$apk" ] || { echo "ERROR: 无效 APK 路径：$apk" >&2; exit 1; }
+
+    local watchdog
+    watchdog="$(find_watchdog || true)"
+    [ -n "$watchdog" ] || { echo "ERROR: 未找到 self-update-watchdog.sh" >&2; exit 1; }
+
+    local wd_enabled="${SOLBRAID_WATCHDOG_ENABLED:-true}"
+    local wd_timeout="${SOLBRAID_WATCHDOG_TIMEOUT:-20}"
+    if [ "$(id -u)" = "0" ]; then
+        SOLBRAID_WATCHDOG_ENABLED="$wd_enabled" SOLBRAID_WATCHDOG_TIMEOUT="$wd_timeout" /system/bin/sh "$watchdog" --spawn "$apk"
+    elif command -v su >/dev/null 2>&1; then
+        su -c "SOLBRAID_WATCHDOG_ENABLED='$wd_enabled' SOLBRAID_WATCHDOG_TIMEOUT='$wd_timeout' /system/bin/sh '$watchdog' --spawn '$apk'"
+    else
+        echo "ERROR: 当前环境无 Root 权限（su 不可用），无法自动拉起独立看门狗安装 APK；请手动安装：$apk" >&2
+        exit 1
+    fi
+}
+
+cmd_rollback() {
+    local confirmed="false"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes) confirmed="true"; shift ;;
+            *) shift ;;
+        esac
+    done
+    [ "$confirmed" = "true" ] || { echo "ERROR: 安全护栏：回滚并重启 App 必须显式传入 --yes" >&2; exit 1; }
+
+    local watchdog
+    watchdog="$(find_watchdog || true)"
+    [ -n "$watchdog" ] || { echo "ERROR: 未找到 self-update-watchdog.sh" >&2; exit 1; }
+
+    if [ "$(id -u)" = "0" ]; then
+        /system/bin/sh "$watchdog" --spawn-rollback
+    elif command -v su >/dev/null 2>&1; then
+        su -c "/system/bin/sh '$watchdog' --spawn-rollback"
+    else
+        echo "ERROR: 当前环境无 Root 权限（su 不可用），无法执行看门狗回滚" >&2
+        exit 1
+    fi
+}
+
+sub="${1:-status}"
+shift || true
+case "$sub" in
+    status) cmd_status "${1:-}" ;;
+    bootstrap) cmd_bootstrap "${1:-}" ;;
+    build) cmd_build "$@" ;;
+    apply) cmd_apply "$@" ;;
+    rollback) cmd_rollback "$@" ;;
+    *)
+        echo "Usage: $0 {status [repo] | bootstrap [repo] | build [--repo dir] [--skip-tests] [--variant debug|release] [--abis arm64-v8a] | apply <apk> --yes | rollback --yes}" >&2
+        exit 1
+        ;;
+esac

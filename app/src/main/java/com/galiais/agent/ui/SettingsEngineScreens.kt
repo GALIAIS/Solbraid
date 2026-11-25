@@ -885,7 +885,10 @@ fun CodexSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, on
                 Hairline()
                 if (codexProvider == null) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("账号：${account ?: "运行环境未就绪"}", style = MaterialTheme.typography.bodyMedium, color = G.ink, modifier = Modifier.weight(1f))
+                        Text("账号：${account ?: if (runtime.busy) "运行环境启动中…" else "运行环境未就绪"}", style = MaterialTheme.typography.bodyMedium, color = G.ink, modifier = Modifier.weight(1f))
+                        if (!runtime.ready && !runtime.busy && runtime.bound) {
+                            TagPill("启动环境", fg = G.onAccent, bg = G.accent, onClick = app.runtime::start)
+                        }
                         if (runtime.ready && account != null && account != "未登录" && !account!!.startsWith("读取失败")) {
                             TagPill("退出登录", fg = G.danger, bg = G.dangerTint, onClick = {
                                 report("退出失败") { app.conversations.codex.logout(); app.conversations.notify("已退出 Codex 账号") }
@@ -1286,6 +1289,8 @@ fun ClaudeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, o
                         )
                         if (runtime.ready) {
                             TagPill("刷新", fg = G.inkMuted, bg = G.surfaceSubtle, onClick = { refreshTick++ })
+                        } else if (!runtime.busy && runtime.bound) {
+                            TagPill("启动环境", fg = G.onAccent, bg = G.accent, onClick = app.runtime::start)
                         }
                     }
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {

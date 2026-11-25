@@ -32,6 +32,8 @@
     "installer-tool.sh",
     "sync-hot-runtime.sh",
     "sync-hot-runtime-proot.sh",
+    "self-build-apk.sh",
+    "self-update-watchdog.sh",
     "run-linux.sh",
     "run-proot.sh",
     "launch-engine.sh",

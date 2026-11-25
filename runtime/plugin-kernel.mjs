@@ -7,7 +7,7 @@ import path from "node:path";
 import {execFile} from "node:child_process";
 import {promisify} from "node:util";
 import {randomBytes, randomUUID, timingSafeEqual} from "node:crypto";
-import {pathToFileURL} from "node:url";
+import {pathToFileURL, fileURLToPath} from "node:url";
 import {scanStaticSecurity} from "./ai-reviewer.mjs";
 import {spawnIsolatedPluginWorker} from "./plugin-worker-host.mjs";
 import {readDownloadNetwork, downloadEnvironment} from "./download-network.mjs";
@@ -116,6 +116,41 @@ async function writeJsonAtomic(file, data, mode = 0o600) {
   } finally {
     await fs.rm(tmp, {force: true});
   }
+}
+
+/** 递归解析真实路径（包含不存在的末级文件及悬空符号链接），彻底杜绝符号链接逃逸。 */
+async function canonicalizePath(targetPath, depth = 0) {
+  if (depth > 16) throw new Error("路径符号链接嵌套层级过深");
+  const abs = path.resolve(targetPath);
+  try {
+    return await fs.realpath(abs);
+  } catch (err) {
+    if (err?.code !== "ENOENT") throw err;
+    const lst = await fs.lstat(abs).catch(() => null);
+    if (lst && lst.isSymbolicLink()) {
+      const linkTarget = await fs.readlink(abs);
+      return await canonicalizePath(path.resolve(path.dirname(abs), linkTarget), depth + 1);
+    }
+    const parent = path.dirname(abs);
+    if (parent === abs) return abs;
+    const realParent = await canonicalizePath(parent, depth + 1);
+    return path.join(realParent, path.basename(abs));
+  }
+}
+
+function isWithinRealRoot(candidateReal, rootReal) {
+  if (candidateReal === rootReal) return true;
+  const prefix = rootReal.endsWith(path.sep) ? rootReal : rootReal + path.sep;
+  return candidateReal.startsWith(prefix);
+}
+
+async function resolveContainedRealPath(targetPath, rootPath, errorMessage) {
+  const rootReal = await canonicalizePath(rootPath);
+  const candidateReal = await canonicalizePath(targetPath);
+  if (!isWithinRealRoot(candidateReal, rootReal)) {
+    throw new Error(errorMessage);
+  }
+  return candidateReal;
 }
 
 /** 静态校验 solbraid-plugin.json 清单（无需执行任何插件代码即可完成检查）。 */
@@ -308,10 +343,12 @@ export class PluginKernel {
     this.pluginsRoot = path.join(home, ".galiais", "plugins");
     this.snapshotsRoot = path.join(home, ".galiais", "plugins-snapshots");
     this.studioOverridesRoot = path.join(home, ".galiais", "studio-overrides");
+    this.cacheRoot = path.join(home, ".galiais", "plugins-cache");
     this.dataRoot = path.join(home, ".galiais", "plugins-data");
     this.configRoot = path.join(home, ".galiais", "plugins-config");
     this.stateFile = path.join(home, ".galiais", "plugins-state.json");
     this.lkgFile = path.join(home, ".galiais", "plugins-last-known-good.json");
+    this.selfBuildConfigFile = path.join(home, ".galiais", "self-build-config.json");
     this.onNotify = onNotify;
 
     this.generationSeq = 0;
@@ -335,6 +372,7 @@ export class PluginKernel {
     this.promptHooks = new Map();     // "beforePrompt" | "afterResponse" -> Set<{pluginId, fn}>
     this.observers = new Map();       // topic -> Set<{pluginId, fn}>
     this.drivers = new Map();         // driverId -> {pluginId, id, name, protocol, builtin, description, executable, execute, listModels}
+    this.activeDriverRuns = new Map();// `${driverId}:${sessionId}` -> Set<AbortController>
     this.translators = new Map();     // translatorId -> {pluginId, id, name, description, baseProtocol, toUpstream, fromUpstream}
   }
 
@@ -385,7 +423,7 @@ export class PluginKernel {
       throw err;
     }
     for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
+      if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
       const dir = path.join(this.pluginsRoot, entry.name);
       const manifestPath = path.join(dir, MANIFEST_FILENAME);
       let raw;
@@ -689,29 +727,42 @@ export class PluginKernel {
       const wsApi = {};
       if (granted.has("workspace.read")) {
         wsApi.readDir = async targetDir => {
-          const resolved = path.resolve(targetDir || workspaceRoot);
-          if (resolved !== homeRoot && !resolved.startsWith(homeRoot + path.sep)) throw new Error("禁止越界读取工作区之外路径");
-          const list = await fs.readdir(resolved, {withFileTypes: true});
+          const realTarget = await resolveContainedRealPath(
+            targetDir || workspaceRoot,
+            homeRoot,
+            "禁止越界读取工作区之外路径（含符号链接重定向）",
+          );
+          const list = await fs.readdir(realTarget, {withFileTypes: true});
           return list.map(e => ({name: e.name, isDirectory: e.isDirectory(), isFile: e.isFile()}));
         };
         wsApi.readText = async (filePath, maxBytes = 128 * 1024) => {
-          const resolved = path.resolve(filePath);
-          if (resolved !== homeRoot && !resolved.startsWith(homeRoot + path.sep)) throw new Error("禁止越界读取工作区之外路径");
-          const buf = await fs.readFile(resolved);
+          const realTarget = await resolveContainedRealPath(
+            filePath,
+            homeRoot,
+            "禁止越界读取工作区之外路径（含符号链接重定向）",
+          );
+          const buf = await fs.readFile(realTarget);
           return buf.subarray(0, maxBytes).toString("utf8");
         };
       }
       if (granted.has("workspace.write")) {
         wsApi.writeText = async (filePath, text) => {
-          const resolved = path.resolve(filePath);
-          if (resolved !== workspaceRoot && !resolved.startsWith(workspaceRoot + path.sep)) {
-            throw new Error("workspace.write 仅允许写入 ~/workspace 目录内文件");
-          }
+          const realTarget = await resolveContainedRealPath(
+            filePath,
+            workspaceRoot,
+            "workspace.write 仅允许写入 ~/workspace 目录内真实路径（禁止符号链接越界）",
+          );
           const content = String(text ?? "");
           if (Buffer.byteLength(content, "utf8") > 512 * 1024) throw new Error("单次写入超过 512 KB 上限");
-          await fs.mkdir(path.dirname(resolved), {recursive: true});
-          await fs.writeFile(resolved, content, "utf8");
-          return {ok: true, path: resolved, bytes: Buffer.byteLength(content, "utf8")};
+          await fs.mkdir(path.dirname(realTarget), {recursive: true});
+          // 创建父目录后再次校验真实父路径，防范 TOCTOU 竞态与链接替换
+          await resolveContainedRealPath(
+            realTarget,
+            workspaceRoot,
+            "workspace.write 仅允许写入 ~/workspace 目录内真实路径（禁止符号链接越界）",
+          );
+          await fs.writeFile(realTarget, content, "utf8");
+          return {ok: true, path: realTarget, bytes: Buffer.byteLength(content, "utf8")};
         };
       }
       ctx.workspace = Object.freeze(wsApi);
@@ -897,12 +948,12 @@ export class PluginKernel {
         } else if (kind === "hook" && ctx.hooks) {
           if (spec.stage === "beforePrompt") {
             ctx.hooks.onBeforePrompt(async payload => {
-              const r = await workerHandle.invoke("beforePrompt", payload, 3_000);
+              const r = await workerHandle.invoke("beforePrompt", {...payload, hookId: spec.hookId}, 3_000);
               return {text: r?.text, notice: Array.isArray(r?.notices) && r.notices.length ? r.notices.join("；") : undefined};
             });
           } else if (spec.stage === "afterResponse") {
             ctx.hooks.onAfterResponse(async payload => {
-              const r = await workerHandle.invoke("afterResponse", payload, 3_000);
+              const r = await workerHandle.invoke("afterResponse", {...payload, hookId: spec.hookId}, 3_000);
               return {notice: Array.isArray(r?.notices) && r.notices.length ? r.notices.join("；") : undefined};
             });
           }
@@ -910,13 +961,13 @@ export class PluginKernel {
           ctx.drivers.register({
             ...spec,
             execute: spec.executable ? (drvCtx => {
-              const {emitChunk, emitThought, emitTool, emitPlan, ...plainCtx} = drvCtx;
+              const {emitChunk, emitThought, emitTool, emitPlan, signal, ...plainCtx} = drvCtx;
               return workerHandle.invoke("invokeDriver", {driverId: spec.id, ctx: plainCtx}, 120_000, ev => {
                 if (ev?.kind === "chunk") emitChunk?.(ev.text);
                 else if (ev?.kind === "thought") emitThought?.(ev.text);
                 else if (ev?.kind === "tool") emitTool?.(ev.tool);
                 else if (ev?.kind === "plan") emitPlan?.(ev.plan);
-              });
+              }, signal || null);
             }) : null,
             listModels: () => workerHandle.invoke("listDriverModels", {driverId: spec.id}, 8_000),
           });
@@ -934,6 +985,56 @@ export class PluginKernel {
     rec.settingsListeners.add(onSettings);
     rec.effects.push({cleanup: () => rec.settingsListeners.delete(onSettings), label: `worker-settings:${pluginId}`});
     await workerHandle.invoke("activate", {}, this.activateTimeoutMs);
+  }
+
+  /** 为同进程磁盘插件镜像当前代源码至独立缓存目录，彻底清除所有相对 import（如 ./helper.mjs）的 Node ESM 模块缓存。 */
+  async #stageInProcessModuleDir(pluginId, dirReal, entryRel) {
+    const pluginCacheDir = path.join(this.cacheRoot, pluginId);
+    const stageName = `gen-${this.generationSeq}-${randomUUID().slice(0, 6)}`;
+    const stageDir = path.join(pluginCacheDir, stageName);
+    await fs.mkdir(stageDir, {recursive: true});
+
+    // 清理上一代残留缓存目录，防止磁盘累积
+    const prevDirs = await fs.readdir(pluginCacheDir, {withFileTypes: true}).catch(() => []);
+    for (const e of prevDirs) {
+      if (e.name !== stageName) {
+        await fs.rm(path.join(pluginCacheDir, e.name), {recursive: true, force: true}).catch(() => {});
+      }
+    }
+
+    const copyRecursive = async (srcDir, dstDir) => {
+      const items = await fs.readdir(srcDir, {withFileTypes: true});
+      for (const item of items) {
+        if (item.name === "node_modules" || item.name === ".git") continue;
+        const srcPath = path.join(srcDir, item.name);
+        const dstPath = path.join(dstDir, item.name);
+        if (item.isDirectory()) {
+          await fs.mkdir(dstPath, {recursive: true});
+          await copyRecursive(srcPath, dstPath);
+        } else if (item.isFile()) {
+          await fs.copyFile(srcPath, dstPath);
+        } else if (item.isSymbolicLink()) {
+          const resolved = await fs.realpath(srcPath).catch(() => null);
+          if (resolved && isWithinRealRoot(resolved, dirReal)) {
+            const st = await fs.stat(resolved).catch(() => null);
+            if (st?.isFile()) await fs.copyFile(resolved, dstPath);
+          }
+        }
+      }
+    };
+    await copyRecursive(dirReal, stageDir);
+
+    // 若插件拥有 node_modules，以符号链接/联接方式复用，避免大体积复制且保持 ESM 包解析一致
+    const nmSrc = path.join(dirReal, "node_modules");
+    if (await fs.stat(nmSrc).then(s => s.isDirectory()).catch(() => false)) {
+      const nmDst = path.join(stageDir, "node_modules");
+      await fs.symlink(nmSrc, nmDst, process.platform === "win32" ? "junction" : "dir").catch(() => {});
+    }
+    const stagedEntry = path.resolve(stageDir, entryRel);
+    if (!isWithinRealRoot(stagedEntry, path.resolve(stageDir))) {
+      throw new Error("插件镜像入口路径越界");
+    }
+    return {stageDir, stagedEntry};
   }
 
   async #activateRecord(rec) {
@@ -981,7 +1082,13 @@ export class PluginKernel {
           this.#pushLog(rec, "info", `已在隔离线程（${this.generationId}）激活`);
           return;
         }
-        const modUrl = `${pathToFileURL(entryReal).href}?gen=${this.generationSeq}&t=${Date.now()}`;
+        const entryRel = path.relative(dirReal, entryReal);
+        const {stageDir, stagedEntry} = await this.#stageInProcessModuleDir(m.id, dirReal, entryRel);
+        rec.effects.push({
+          cleanup: () => fs.rm(stageDir, {recursive: true, force: true}).catch(() => {}),
+          label: `module-cache:${m.id}`,
+        });
+        const modUrl = pathToFileURL(stagedEntry).href;
         const mod = await withTimeout(import(modUrl), this.activateTimeoutMs, `导入插件 ${m.id}`);
         activateFn = mod.activate || mod.apply || mod.default?.activate || mod.default;
       }
@@ -1321,6 +1428,7 @@ export class PluginKernel {
     await fs.rm(path.join(this.dataRoot, `${cleanId}.json`), {force: true});
     await fs.rm(path.join(this.configRoot, `${cleanId}.json`), {force: true});
     await fs.rm(path.join(this.snapshotsRoot, cleanId), {recursive: true, force: true});
+    await fs.rm(path.join(this.cacheRoot, cleanId), {recursive: true, force: true});
     delete this.state.enabled[cleanId];
     delete this.state.grantedCaps[cleanId];
     await this.saveState();
@@ -1690,7 +1798,54 @@ export class PluginKernel {
     };
   }
 
-  /** Agent 自升级原子流水线：预检 → 归档源码快照 → 原子写入 → 单插件增量热重载 → 激活失败自动回滚。 */
+  /** 将已完整写好的暂存目录原子替换到目标插件目录，并在失败时尽量恢复原目录（保留 node_modules）。 */
+  async #atomicSwapPluginDir(dir, stageDir, {existedBefore, preservePackageJson}) {
+    const preserveNames = ["node_modules", "package-lock.json", ...(preservePackageJson ? ["package.json"] : [])];
+    const backupDir = existedBefore ? path.join(this.pluginsRoot, `.${path.basename(dir)}.bak-${randomUUID().slice(0, 8)}`) : null;
+    const movedIntoDir = [];
+    let movedOldToBackup = false;
+    let movedStageToDir = false;
+    try {
+      if (backupDir) {
+        await fs.rename(dir, backupDir);
+        movedOldToBackup = true;
+      }
+      await fs.rename(stageDir, dir);
+      movedStageToDir = true;
+      if (backupDir) {
+        for (const name of preserveNames) {
+          const src = path.join(backupDir, name);
+          const dst = path.join(dir, name);
+          const exists = await fs.lstat(src).then(() => true).catch(() => false);
+          if (!exists) continue;
+          const dstExists = await fs.lstat(dst).then(() => true).catch(() => false);
+          if (dstExists) continue;
+          await fs.rename(src, dst);
+          movedIntoDir.push(name);
+        }
+      }
+      return {backupDir, movedIntoDir};
+    } catch (swapErr) {
+      // 发生任何文件系统异常时尝试还原旧目录，并如实抛出恢复状态
+      const restoreErrors = [];
+      for (const name of movedIntoDir) {
+        await fs.rename(path.join(dir, name), path.join(backupDir, name)).catch(e => restoreErrors.push(`还原 ${name} 失败：${e?.message || e}`));
+      }
+      if (movedStageToDir) {
+        await fs.rm(dir, {recursive: true, force: true}).catch(e => restoreErrors.push(`清理半成品目录失败：${e?.message || e}`));
+      }
+      if (movedOldToBackup) {
+        await fs.rename(backupDir, dir).catch(e => restoreErrors.push(`恢复备份目录失败：${e?.message || e}`));
+      }
+      await fs.rm(stageDir, {recursive: true, force: true}).catch(() => {});
+      const err = new Error(swapErr?.message || String(swapErr));
+      err.rollbackSucceeded = restoreErrors.length === 0;
+      err.rollbackError = restoreErrors.length ? restoreErrors.join("；") : null;
+      throw err;
+    }
+  }
+
+  /** Agent 自升级原子流水线：预检 → 归档源码快照 → 完整写暂存目录 → 原子目录切换 → 单插件增量热重载 → 激活失败真回滚并如实报告结果。 */
   async applyPluginSourceUpdate({pluginId, manifest: rawManifest, files = {}, note = "", dryRun = false}) {
     const cleanId = String(pluginId || rawManifest?.id || "").trim();
     const validation = await this.validatePluginCandidate({pluginId: cleanId, manifest: rawManifest, files});
@@ -1701,32 +1856,69 @@ export class PluginKernel {
       return {ok: true, dryRun: true, rolledBack: false, validation};
     }
 
+    await fs.mkdir(this.pluginsRoot, {recursive: true});
     const dir = path.join(this.pluginsRoot, cleanId);
     const existedBefore = await fs.stat(dir).then(s => s.isDirectory()).catch(() => false);
     const snapshotId = existedBefore ? await this.createSourceSnapshot(cleanId, note || "自动快照（升级前）") : null;
 
-    // 原子替换源码文件，同时完整保留已安装的 node_modules 与原有 package.json（除非新提交显式覆盖 package.json）
-    await fs.mkdir(dir, {recursive: true});
     const hasExplicitPkgJson = Object.prototype.hasOwnProperty.call(validation.cleanFiles, "package.json");
-    await this.#clearPluginSourceFiles(dir, {preservePackageJson: !hasExplicitPkgJson});
     const manifestToWrite = {
       ...rawManifest,
       id: cleanId,
       kind: rawManifest?.kind === "community" ? "community" : "local",
     };
-    await writeJsonAtomic(path.join(dir, MANIFEST_FILENAME), manifestToWrite, 0o644);
-    for (const [rel, content] of Object.entries(validation.cleanFiles)) {
-      const abs = path.resolve(dir, rel);
-      await fs.mkdir(path.dirname(abs), {recursive: true});
-      await fs.writeFile(abs, content, {encoding: "utf8", mode: 0o644});
+
+    // 第一阶段：全部写入独立暂存目录，写入失败绝不破坏线上插件目录
+    const stageDir = path.join(this.pluginsRoot, `.${cleanId}.stage-${randomUUID().slice(0, 8)}`);
+    try {
+      await fs.mkdir(stageDir, {recursive: true});
+      await writeJsonAtomic(path.join(stageDir, MANIFEST_FILENAME), manifestToWrite, 0o644);
+      for (const [rel, content] of Object.entries(validation.cleanFiles)) {
+        const abs = path.resolve(stageDir, rel);
+        if (!isWithinRealRoot(abs, path.resolve(stageDir))) {
+          throw new Error(`非法文件路径越界：${rel}`);
+        }
+        await fs.mkdir(path.dirname(abs), {recursive: true});
+        await fs.writeFile(abs, content, {encoding: "utf8", mode: 0o644});
+      }
+    } catch (writeErr) {
+      await fs.rm(stageDir, {recursive: true, force: true}).catch(() => {});
+      return {
+        ok: false,
+        rolledBack: false,
+        snapshotId,
+        error: `写入暂存目录失败（原插件未受影响）：${writeErr?.message || writeErr}`,
+        validation,
+      };
     }
 
+    // 第二阶段：同盘原子目录切换
+    let swapInfo;
+    try {
+      swapInfo = await this.#atomicSwapPluginDir(dir, stageDir, {
+        existedBefore,
+        preservePackageJson: !hasExplicitPkgJson,
+      });
+    } catch (swapErr) {
+      return {
+        ok: false,
+        rolledBack: Boolean(swapErr?.rollbackSucceeded),
+        rollbackError: swapErr?.rollbackError || null,
+        snapshotId,
+        error: `原子切换插件目录失败：${swapErr?.message || swapErr}`,
+        validation,
+      };
+    }
+
+    const prevEnabledExisted = Object.prototype.hasOwnProperty.call(this.state.enabled, cleanId);
+    const prevEnabledValue = this.state.enabled[cleanId];
     this.state.enabled[cleanId] = true;
     await this.saveState();
     const reloaded = await this.reloadPlugin(cleanId);
 
     // 安全模式下跳过了扩展激活属于预期行为，不误判为激活失败
     if (this.state.safeMode && reloaded.plugin?.status === "safe_mode_skipped") {
+      if (swapInfo.backupDir) await fs.rm(swapInfo.backupDir, {recursive: true, force: true}).catch(() => {});
       return {
         ok: true,
         rolledBack: false,
@@ -1738,19 +1930,62 @@ export class PluginKernel {
       };
     }
 
-    // 激活失败自动原子回滚到改动前快照（或清理新建的坏目录）
+    // 激活失败：从同盘备份目录原子还原（或清理新建坏目录），如实报告回滚是否成功
     if (!reloaded.plugin || reloaded.plugin.status !== "active") {
       const failError = reloaded.plugin?.error || `插件未成功激活（status=${reloaded.plugin?.status || "unknown"}）`;
       const failLogs = reloaded.plugin?.recentLogs || [];
-      if (snapshotId) {
-        await this.rollbackSourceSnapshot(cleanId, snapshotId).catch(() => {});
-      } else {
-        await fs.rm(dir, {recursive: true, force: true}).catch(() => {});
-        await this.reloadPlugin(cleanId).catch(() => {});
+      let rolledBack = false;
+      let rollbackError = null;
+      try {
+        if (prevEnabledExisted) this.state.enabled[cleanId] = prevEnabledValue;
+        else delete this.state.enabled[cleanId];
+        await this.saveState();
+
+        if (swapInfo.backupDir) {
+          for (const name of swapInfo.movedIntoDir) {
+            const cur = path.join(dir, name);
+            if (await fs.lstat(cur).then(() => true).catch(() => false)) {
+              await fs.rename(cur, path.join(swapInfo.backupDir, name));
+            }
+          }
+          await fs.rm(dir, {recursive: true, force: true});
+          await fs.rename(swapInfo.backupDir, dir);
+          const restored = await this.reloadPlugin(cleanId);
+          if (restored.plugin && (restored.plugin.status === "active" || restored.plugin.status === "disabled" || restored.plugin.status === "safe_mode_skipped")) {
+            rolledBack = true;
+          } else {
+            rollbackError = restored.plugin?.error || `回滚后插件状态异常（status=${restored.plugin?.status || "unknown"}）`;
+          }
+        } else if (snapshotId) {
+          const rb = await this.rollbackSourceSnapshot(cleanId, snapshotId);
+          rolledBack = Boolean(rb?.ok && rb?.plugin && rb.plugin.status === "active");
+          if (!rolledBack) rollbackError = rb?.plugin?.error || "回滚快照后插件未能激活";
+        } else {
+          await fs.rm(dir, {recursive: true, force: true});
+          await this.reloadPlugin(cleanId);
+          rolledBack = true;
+        }
+      } catch (rbErr) {
+        rolledBack = false;
+        rollbackError = rbErr?.message || String(rbErr);
+        // 若直接备份还原失败且存在持久化快照，做一次兜底快照恢复（同样不吞错误）
+        if (snapshotId && swapInfo.backupDir) {
+          try {
+            const rb = await this.rollbackSourceSnapshot(cleanId, snapshotId);
+            if (rb?.ok && rb?.plugin?.status === "active") {
+              rolledBack = true;
+              rollbackError = null;
+              await fs.rm(swapInfo.backupDir, {recursive: true, force: true}).catch(() => {});
+            }
+          } catch (snapErr) {
+            rollbackError = `${rollbackError}；快照兜底恢复失败：${snapErr?.message || snapErr}`;
+          }
+        }
       }
       return {
         ok: false,
-        rolledBack: true,
+        rolledBack,
+        ...(rollbackError ? {rollbackError} : {}),
         snapshotId,
         error: failError,
         logs: failLogs,
@@ -1758,6 +1993,7 @@ export class PluginKernel {
       };
     }
 
+    if (swapInfo.backupDir) await fs.rm(swapInfo.backupDir, {recursive: true, force: true}).catch(() => {});
     return {
       ok: true,
       rolledBack: false,
@@ -1768,7 +2004,7 @@ export class PluginKernel {
     };
   }
 
-  /** 将插件源码恢复至指定历史快照并立即增量热重载（保留已安装的 node_modules）。 */
+  /** 将插件源码恢复至指定历史快照并立即增量热重载（先写暂存目录再原子切换，保留已安装的 node_modules）。 */
   async rollbackSourceSnapshot(pluginId, snapshotId = null) {
     const cleanId = String(pluginId || "").trim();
     if (!PLUGIN_ID_RE.test(cleanId)) throw new Error(`无效插件 ID：${pluginId}`);
@@ -1782,9 +2018,20 @@ export class PluginKernel {
     const srcFilesDir = path.join(this.snapshotsRoot, cleanId, target.id, "files");
     const dstDir = path.join(this.pluginsRoot, cleanId);
     const snapHasPkg = await fs.stat(path.join(srcFilesDir, "package.json")).then(s => s.isFile()).catch(() => false);
-    await fs.mkdir(dstDir, {recursive: true});
-    await this.#clearPluginSourceFiles(dstDir, {preservePackageJson: !snapHasPkg});
-    await fs.cp(srcFilesDir, dstDir, {recursive: true});
+    const existedBefore = await fs.stat(dstDir).then(s => s.isDirectory()).catch(() => false);
+    const stageDir = path.join(this.pluginsRoot, `.${cleanId}.rollback-${randomUUID().slice(0, 8)}`);
+    await fs.mkdir(this.pluginsRoot, {recursive: true});
+    try {
+      await fs.cp(srcFilesDir, stageDir, {recursive: true});
+    } catch (cpErr) {
+      await fs.rm(stageDir, {recursive: true, force: true}).catch(() => {});
+      throw cpErr;
+    }
+    const swapInfo = await this.#atomicSwapPluginDir(dstDir, stageDir, {
+      existedBefore,
+      preservePackageJson: !snapHasPkg,
+    });
+    if (swapInfo.backupDir) await fs.rm(swapInfo.backupDir, {recursive: true, force: true}).catch(() => {});
     const reloaded = await this.reloadPlugin(cleanId);
     return {ok: true, snapshotId: target.id, restoredVersion: target.version, plugin: reloaded.plugin, snapshot: reloaded.snapshot};
   }
@@ -1912,42 +2159,90 @@ export class PluginKernel {
     }
   }
 
-  /** 调用插件注册的可执行动态 Agent 驱动（支持实时流式 chunk / thought / tool / plan）。 */
-  async invokePluginDriver({driverId, sessionId = "", prompt = "", cwd = null, model = null, history = [], onEvent = null}) {
+  /** 调用插件注册的可执行动态 Agent 驱动（支持实时流式 chunk / thought / tool / plan 以及中途取消）。 */
+  async invokePluginDriver({driverId, sessionId = "", prompt = "", cwd = null, model = null, history = [], onEvent = null, signal = null}) {
     const cleanId = String(driverId || "").trim().toLowerCase();
     const entry = this.drivers.get(cleanId);
     if (!entry || typeof entry.execute !== "function") {
       throw new Error(`未找到可执行动态 Agent 驱动：${cleanId}`);
     }
+    const runKey = `${cleanId}:${String(sessionId || "")}`;
+    const runAbort = new AbortController();
+    let runSet = this.activeDriverRuns.get(runKey);
+    if (!runSet) { runSet = new Set(); this.activeDriverRuns.set(runKey, runSet); }
+    runSet.add(runAbort);
+
+    const onExternalAbort = () => {
+      if (!runAbort.signal.aborted) runAbort.abort(signal?.reason || new Error("用户中断了会话"));
+    };
+    if (signal) {
+      if (signal.aborted) onExternalAbort();
+      else signal.addEventListener("abort", onExternalAbort, {once: true});
+    }
+
     const chunks = [];
     const thoughts = [];
     const tools = [];
     const plans = [];
-    const res = await withTimeout(
-      Promise.resolve(entry.execute({
-        sessionId: String(sessionId || ""),
-        prompt: String(prompt || ""),
-        cwd: cwd || path.join(this.home, "workspace"),
-        model: model || null,
-        history: Array.isArray(history) ? history : [],
-        emitChunk: t => { const s = String(t ?? ""); if (s) { chunks.push(s); onEvent?.({kind: "chunk", text: s}); } },
-        emitThought: t => { const s = String(t ?? ""); if (s) { thoughts.push(s); onEvent?.({kind: "thought", text: s}); } },
-        emitTool: tool => { if (tool) { tools.push(tool); onEvent?.({kind: "tool", tool}); } },
-        emitPlan: plan => { if (plan) { plans.push(plan); onEvent?.({kind: "plan", plan}); } },
-      })),
-      120_000,
-      `执行动态 Agent 驱动 ${cleanId}`,
-    );
-    const finalText = (typeof res === "string" ? res : (typeof res?.text === "string" ? res.text : "")) || chunks.join("");
-    return {
-      text: finalText,
-      stopReason: res?.stopReason || "end_turn",
-      usage: res?.usage || null,
-      chunks,
-      thoughts,
-      tools,
-      plans,
-    };
+    try {
+      const execPromise = new Promise((resolve, reject) => {
+        const onRunAbort = () => resolve({text: "", stopReason: "cancelled"});
+        if (runAbort.signal.aborted) { onRunAbort(); return; }
+        runAbort.signal.addEventListener("abort", onRunAbort, {once: true});
+        Promise.resolve(entry.execute({
+          sessionId: String(sessionId || ""),
+          prompt: String(prompt || ""),
+          cwd: cwd || path.join(this.home, "workspace"),
+          model: model || null,
+          history: Array.isArray(history) ? history : [],
+          signal: runAbort.signal,
+          emitChunk: t => { if (runAbort.signal.aborted) return; const s = String(t ?? ""); if (s) { chunks.push(s); onEvent?.({kind: "chunk", text: s}); } },
+          emitThought: t => { if (runAbort.signal.aborted) return; const s = String(t ?? ""); if (s) { thoughts.push(s); onEvent?.({kind: "thought", text: s}); } },
+          emitTool: tool => { if (runAbort.signal.aborted) return; if (tool) { tools.push(tool); onEvent?.({kind: "tool", tool}); } },
+          emitPlan: plan => { if (runAbort.signal.aborted) return; if (plan) { plans.push(plan); onEvent?.({kind: "plan", plan}); } },
+        })).then(
+          v => { runAbort.signal.removeEventListener("abort", onRunAbort); resolve(v); },
+          e => { runAbort.signal.removeEventListener("abort", onRunAbort); reject(e); },
+        );
+      });
+      const res = await withTimeout(execPromise, 120_000, `执行动态 Agent 驱动 ${cleanId}`);
+      const cancelled = runAbort.signal.aborted || res?.stopReason === "cancelled";
+      const finalText = (typeof res === "string" ? res : (typeof res?.text === "string" ? res.text : "")) || chunks.join("");
+      return {
+        text: finalText,
+        stopReason: cancelled ? "cancelled" : (res?.stopReason || "end_turn"),
+        usage: res?.usage || null,
+        chunks,
+        thoughts,
+        tools,
+        plans,
+      };
+    } finally {
+      if (signal) signal.removeEventListener("abort", onExternalAbort);
+      const set = this.activeDriverRuns.get(runKey);
+      if (set) {
+        set.delete(runAbort);
+        if (set.size === 0) this.activeDriverRuns.delete(runKey);
+      }
+    }
+  }
+
+  /** 主动中断指定动态 Agent 驱动会话的执行（通知同进程驱动与隔离 Worker 停止输出）。 */
+  cancelPluginDriver(driverId, sessionId = "") {
+    const cleanId = String(driverId || "").trim().toLowerCase();
+    const sid = String(sessionId || "");
+    let cancelledCount = 0;
+    for (const [k, set] of this.activeDriverRuns.entries()) {
+      const match = sid ? k === `${cleanId}:${sid}` : k.startsWith(`${cleanId}:`);
+      if (!match) continue;
+      for (const ac of [...set]) {
+        if (!ac.signal.aborted) {
+          ac.abort(new Error("用户中断了会话"));
+          cancelledCount++;
+        }
+      }
+    }
+    return {ok: true, cancelledCount};
   }
 
   async listPluginDriverModels(driverId) {
@@ -2001,8 +2296,8 @@ export class PluginKernel {
     if (!rec || !rec.dir || rec.manifest.kind === "core") {
       throw new Error(`仅可为磁盘本地/社区/覆写插件安装依赖：${cleanId}`);
     }
-    if (!rec.grantedCapabilities.includes("deps.npm") && !rec.manifest.capabilities.required.includes("deps.npm") && !rec.manifest.capabilities.optional.includes("deps.npm")) {
-      throw new Error(`插件 ${cleanId} 未声明或未授权 deps.npm 能力`);
+    if (!rec.grantedCapabilities.includes("deps.npm")) {
+      throw new Error(`插件 ${cleanId} 未获得 deps.npm 有效授权，拒绝安装依赖`);
     }
     const cleanPkgs = [];
     for (const raw of (Array.isArray(packages) ? packages : [])) {
@@ -2037,6 +2332,264 @@ export class PluginKernel {
       durationMs: Date.now() - started,
       output: String(stdout || stderr || "").trim().slice(0, 1000),
     };
+  }
+
+  /** 规范化并校验本机 ARM64 APK 自迭代配置（默认关闭 enabled=false）。 */
+  #normalizeSelfBuildConfig(raw = {}, base = null) {
+    const defaults = {
+      enabled: false,
+      allowAgentBuild: false,
+      allowAgentApply: false,
+      runUnitTests: true,
+      watchdogEnabled: true,
+      watchdogTimeoutSec: 20,
+      repoDir: "/home/agent/workspace/Solbraid",
+      androidHome: "/home/agent/android-sdk",
+      javaHome: "",
+      aapt2Path: "",
+      targetAbis: "arm64-v8a",
+      variant: "debug",
+      gradleHeapMb: 4096,
+      customGradleArgs: "",
+    };
+    const merged = {...defaults, ...(base || {}), ...(raw && typeof raw === "object" ? raw : {})};
+    const cleanPath = (val, fallback = "") => {
+      const s = String(val ?? fallback).trim();
+      if (!s) return "";
+      if (/[\0\r\n]/.test(s) || !s.startsWith("/")) throw new Error(`无效绝对路径：${s}`);
+      return s.replace(/\/+$/, "") || "/";
+    };
+    const allowedAbis = new Set(["arm64-v8a", "arm64-v8a,x86_64"]);
+    const allowedHeap = new Set([2048, 3072, 4096, 6144]);
+    const abis = allowedAbis.has(String(merged.targetAbis || "")) ? String(merged.targetAbis) : "arm64-v8a";
+    const variant = merged.variant === "release" ? "release" : "debug";
+    const heapRaw = Number(merged.gradleHeapMb);
+    const gradleHeapMb = allowedHeap.has(heapRaw) ? heapRaw : 4096;
+    const timeoutRaw = Number(merged.watchdogTimeoutSec);
+    const watchdogTimeoutSec = Number.isFinite(timeoutRaw) ? Math.max(10, Math.min(120, Math.round(timeoutRaw))) : 20;
+    const customGradleArgs = String(merged.customGradleArgs || "").trim();
+    if (customGradleArgs.length > 512) throw new Error("附加 Gradle 参数不能超过 512 字符");
+    if (/[;&|`$()<>\r\n\0]/.test(customGradleArgs)) {
+      throw new Error("附加 Gradle 参数包含不允许的特殊字符");
+    }
+    if (customGradleArgs) {
+      for (const tok of customGradleArgs.split(/\s+/)) {
+        if (!/^-[A-Za-z0-9._:=/-]+$/.test(tok)) {
+          throw new Error(`附加 Gradle 参数格式无效：${tok}`);
+        }
+      }
+    }
+    return {
+      enabled: merged.enabled === true,
+      allowAgentBuild: merged.allowAgentBuild === true,
+      allowAgentApply: merged.allowAgentApply === true,
+      runUnitTests: merged.runUnitTests !== false,
+      watchdogEnabled: merged.watchdogEnabled !== false,
+      watchdogTimeoutSec,
+      repoDir: cleanPath(merged.repoDir, defaults.repoDir) || defaults.repoDir,
+      androidHome: cleanPath(merged.androidHome, defaults.androidHome) || defaults.androidHome,
+      javaHome: cleanPath(merged.javaHome, ""),
+      aapt2Path: cleanPath(merged.aapt2Path, ""),
+      targetAbis: abis,
+      variant,
+      gradleHeapMb,
+      customGradleArgs,
+    };
+  }
+
+  async getSelfBuildConfig() {
+    const saved = await readJsonSafe(this.selfBuildConfigFile, null);
+    try {
+      return this.#normalizeSelfBuildConfig(saved || {});
+    } catch {
+      return this.#normalizeSelfBuildConfig({});
+    }
+  }
+
+  async saveSelfBuildConfig(patch = {}) {
+    const current = await this.getSelfBuildConfig();
+    const next = this.#normalizeSelfBuildConfig(patch, current);
+    await writeJsonAtomic(this.selfBuildConfigFile, next);
+    return next;
+  }
+
+  /** 方案 1：本机纯本地 ARM64 APK 自迭代流水线控制（默认关闭，完全遵循设置开关与路径/构建参数配置）。 */
+  async manageSelfBuild({
+    action = "status",
+    source = "agent",
+    repoDir = "",
+    variant = "",
+    abis = "",
+    skipTests = undefined,
+    apkPath = "",
+    confirmInstall = false,
+    confirmRollback = false,
+  } = {}) {
+    const act = String(action || "status").trim().toLowerCase();
+    const cfg = await this.getSelfBuildConfig();
+    const runtimeDir = path.dirname(fileURLToPath(import.meta.url));
+    const scriptPath = path.join(runtimeDir, "self-build-apk.sh");
+    const watchdogPath = path.join(runtimeDir, "self-update-watchdog.sh");
+    const effectiveRepo = String(repoDir || "").trim() || cfg.repoDir;
+    const effectiveVariant = (variant === "release" || variant === "debug") ? variant : cfg.variant;
+    const effectiveAbis = (abis === "arm64-v8a" || abis === "arm64-v8a,x86_64") ? abis : cfg.targetAbis;
+    const effectiveSkipTests = source === "agent"
+      ? !cfg.runUnitTests
+      : (typeof skipTests === "boolean" ? skipTests : !cfg.runUnitTests);
+
+    const buildEnv = {
+      ...process.env,
+      HOME: this.home,
+      SOLBRAID_REPO_DIR: effectiveRepo,
+      ANDROID_HOME: cfg.androidHome,
+      ANDROID_SDK_ROOT: cfg.androidHome,
+      SOLBRAID_GRADLE_HEAP_MB: String(cfg.gradleHeapMb),
+      SOLBRAID_WATCHDOG_ENABLED: cfg.watchdogEnabled ? "true" : "false",
+      SOLBRAID_WATCHDOG_TIMEOUT: String(cfg.watchdogTimeoutSec),
+      ...(cfg.javaHome ? {JAVA_HOME: cfg.javaHome} : {}),
+      ...(cfg.aapt2Path ? {SOLBRAID_AAPT2_BIN: cfg.aapt2Path} : {}),
+      ...(cfg.customGradleArgs ? {SOLBRAID_EXTRA_GRADLE_ARGS: cfg.customGradleArgs} : {}),
+    };
+
+    if (act === "status") {
+      const hasScript = await fs.stat(scriptPath).then(s => s.isFile()).catch(() => false);
+      const hasWatchdog = await fs.stat(watchdogPath).then(s => s.isFile()).catch(() => false);
+      if (process.platform === "win32" || !hasScript) {
+        return {
+          ok: true,
+          enabled: cfg.enabled,
+          config: cfg,
+          platform: process.platform,
+          arch: process.arch,
+          scriptPath,
+          watchdogPath,
+          scriptAvailable: hasScript,
+          watchdogAvailable: hasWatchdog,
+          readyForLocalBuild: false,
+          note: cfg.enabled
+            ? "本机 APK 自迭代脚本运行于手机端 Linux (ARM64) 容器内"
+            : "本机 APK 自迭代当前已关闭（默认关闭），可在「设置 → 本机 APK 自迭代」中启用与配置",
+        };
+      }
+      const args = [scriptPath, "status", ...(effectiveRepo ? [effectiveRepo] : [])];
+      const {stdout} = await execFileAsync("bash", args, {
+        env: buildEnv,
+        timeout: 15_000,
+        maxBuffer: 1024 * 1024,
+      });
+      const parsed = JSON.parse(String(stdout || "{}").trim() || "{}");
+      return {
+        ok: true,
+        enabled: cfg.enabled,
+        config: cfg,
+        platform: process.platform,
+        scriptPath,
+        watchdogPath,
+        scriptAvailable: hasScript,
+        watchdogAvailable: hasWatchdog,
+        ...parsed,
+      };
+    }
+
+    if (!cfg.enabled) {
+      throw new Error("本机 ARM64 APK 自迭代功能当前已关闭（默认关闭），请先在「设置 → 本机 APK 自迭代」中启用");
+    }
+
+    if (act === "bootstrap") {
+      if (source === "agent") {
+        throw new Error("初始化编译工具链请在「设置 → 本机 APK 自迭代」中由用户手动触发");
+      }
+      if (process.platform === "win32") throw new Error("self-build-apk.sh 仅在 Android 端 Linux 容器内执行");
+      const started = Date.now();
+      const {stdout, stderr} = await execFileAsync("bash", [scriptPath, "bootstrap", effectiveRepo], {
+        env: buildEnv,
+        timeout: 8 * 60 * 1000,
+        maxBuffer: 4 * 1024 * 1024,
+      });
+      const lines = String(stdout || "").trim().split(/\r?\n/);
+      let parsed = null;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i].startsWith("{")) {
+          try { parsed = JSON.parse(lines[i]); break; } catch {}
+        }
+      }
+      return {
+        ok: true,
+        enabled: cfg.enabled,
+        config: cfg,
+        durationMs: Date.now() - started,
+        ...(parsed || {}),
+        outputTail: (String(stdout || "") + "\n" + String(stderr || "")).trim().slice(-2400),
+      };
+    }
+
+    if (act === "build") {
+      if (source === "agent" && !cfg.allowAgentBuild) {
+        throw new Error("当前未允许 Agent 触发本机 APK 编译，请在「设置 → 本机 APK 自迭代」中开启「允许 Agent 触发本地编译」");
+      }
+      if (process.platform === "win32") throw new Error("self-build-apk.sh 仅在 Android 端 Linux 容器内执行");
+      const args = [scriptPath, "build", "--variant", effectiveVariant, "--abis", effectiveAbis];
+      if (effectiveRepo) args.push("--repo", effectiveRepo);
+      if (effectiveSkipTests) args.push("--skip-tests");
+      const started = Date.now();
+      const {stdout, stderr} = await execFileAsync("bash", args, {
+        env: buildEnv,
+        timeout: 15 * 60 * 1000,
+        maxBuffer: 8 * 1024 * 1024,
+      });
+      const text = String(stdout || "");
+      const match = /SOLBRAID_SELF_BUILD_RESULT:(\{.*\})/.exec(text);
+      const meta = match ? JSON.parse(match[1]) : {ok: true};
+      return {
+        ...meta,
+        durationMs: Date.now() - started,
+        outputTail: (text + "\n" + String(stderr || "")).trim().slice(-2400),
+      };
+    }
+
+    if (act === "apply") {
+      if (source === "agent" && !cfg.allowAgentApply) {
+        throw new Error("当前未允许 Agent 触发本机 APK 安装，请在「设置 → 本机 APK 自迭代」中开启「允许 Agent 触发看门狗安装」");
+      }
+      if (confirmInstall !== true) {
+        throw new Error("安全护栏：安装新 APK 将重启 Solbraid 并中断当前会话，请由用户明确确认后传入 confirmInstall: true");
+      }
+      const cleanApk = String(apkPath || "").trim();
+      if (!cleanApk || !cleanApk.endsWith(".apk")) throw new Error("必须提供有效的 .apk 文件路径");
+      const realApk = await fs.realpath(cleanApk).catch(() => null);
+      if (!realApk) throw new Error(`候选 APK 不存在：${cleanApk}`);
+      const st = await fs.stat(realApk).catch(() => null);
+      if (!st?.isFile()) throw new Error(`候选路径不是有效文件：${cleanApk}`);
+      if (process.platform === "win32") throw new Error("自动启动看门狗安装仅支持 Android Root 环境");
+      const {stdout, stderr} = await execFileAsync("bash", [scriptPath, "apply", realApk, "--yes"], {
+        env: buildEnv,
+        timeout: 20_000,
+        maxBuffer: 512 * 1024,
+      });
+      let parsed = null;
+      try { parsed = JSON.parse(String(stdout || "").trim()); } catch {}
+      return parsed || {ok: true, output: String(stdout || stderr || "").trim()};
+    }
+
+    if (act === "rollback") {
+      if (source === "agent") {
+        throw new Error("版本回滚请在「设置 → 本机 APK 自迭代」中由用户手动触发");
+      }
+      if (confirmRollback !== true) {
+        throw new Error("安全护栏：回滚上一稳定版本将重启 Solbraid，请确认后传入 confirmRollback: true");
+      }
+      if (process.platform === "win32") throw new Error("看门狗回滚仅支持 Android Root 环境");
+      const {stdout, stderr} = await execFileAsync("bash", [scriptPath, "rollback", "--yes"], {
+        env: buildEnv,
+        timeout: 20_000,
+        maxBuffer: 512 * 1024,
+      });
+      let parsed = null;
+      try { parsed = JSON.parse(String(stdout || "").trim()); } catch {}
+      return parsed || {ok: true, output: String(stdout || stderr || "").trim()};
+    }
+
+    throw new Error(`不支持的自构建动作：${act}（可选 status | bootstrap | build | apply | rollback）`);
   }
 
   /** 安全管理 Artifact Studio 渲染器热覆写（~/.galiais/studio-overrides/）：白名单 + 语法校验 + 自动快照与一键恢复原版。 */
@@ -2315,6 +2868,8 @@ export async function startPluginControlServer(kernel, options = {}) {
         return await kernel.translateProviderResponse(params);
       case "listTranslators":
         return {translators: kernel.snapshot().translators};
+      case "selfBuild":
+        return await serialize(() => kernel.manageSelfBuild({...params, source: "agent"}));
       default:
         throw new Error(`未知插件控制动作：${action}`);
     }

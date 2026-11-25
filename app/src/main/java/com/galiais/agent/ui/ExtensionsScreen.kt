@@ -133,10 +133,16 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text("全 Agent 统一资源库", style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
                     Text(
-                        "单源管理指令（CLAUDE.md / AGENTS.md / GEMINI.md）、MCP、技能、子代理、钩子与插件包，自动无侵入同步到三大内置 CLI。",
+                        if (runtime.ready)
+                            "单源管理指令（CLAUDE.md / AGENTS.md / GEMINI.md）、MCP、技能、子代理、钩子与插件包，自动无侵入同步到三大内置 CLI。"
+                        else
+                            "运行环境未启动，启动后可安装共享仓库资源、加载插件与同步 MCP / 技能。",
                         style = MaterialTheme.typography.bodySmall,
                         color = G.inkMuted,
                     )
+                }
+                if (!runtime.ready && !runtime.busy && runtime.bound) {
+                    TagPill("启动环境", fg = G.onAccent, bg = G.accent, onClick = app.runtime::start)
                 }
             }
         }
