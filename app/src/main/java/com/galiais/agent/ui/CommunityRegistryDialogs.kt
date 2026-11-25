@@ -4,14 +4,9 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -159,149 +154,148 @@ internal fun CommunityUploadSheet(
             .put("description", description.trim()).put("tags", tags.trim()).put("payload", payload)
     }
 
-    GaliaisSheet(onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier.fillMaxWidth().imePadding().navigationBarsPadding()
-                .verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = 22.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text("上传资源到共享仓库", style = MaterialTheme.typography.titleLarge, color = G.ink)
-            val targetHint = when (config.mode) {
-                "github" -> if (config.hasGithubToken) "目标：GitHub ${config.githubRepo}（将一键自动建分支发 PR 并触发仓库 AI 审查）"
-                else "目标：GitHub ${config.githubRepo}（未填 PAT 将先预检并导出 PR 包）"
-                "http" -> "目标：远程仓库 ${config.serverUrl.ifBlank { "未配置" }}（强制通过服务端 AI 审查后公开）"
-                else -> "目标：内置共享仓库（通过静态恶意扫描 + AI 语义审查后即时发布）"
-            }
-            Text(targetHint, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+    val targetHint = when (config.mode) {
+        "github" -> if (config.hasGithubToken) "目标：GitHub ${config.githubRepo}（一键建分支发 PR 触发仓库 AI 审查）"
+        else "目标：GitHub ${config.githubRepo}（未填 PAT 将先预检并导出 PR 包）"
+        "http" -> "目标：远程仓库 ${config.serverUrl.ifBlank { "未配置" }}（通过服务端 AI 审查后公开）"
+        else -> "目标：内置共享仓库（静态扫描 + AI 语义审查后即时发布）"
+    }
 
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf("instruction", "skill", "mcp", "subagent", "hook", "host_plugin", "plugin_pack").forEach { k ->
-                    SelectableChip(resourceKindLabel(k), selected = kind == k, onClick = {
-                        kind = k; selectedLocalPluginId = null; selectedPackId = null; auditResult = null; error = null
-                    })
+    GaliaisSheetScaffold(
+        title = "上传资源到共享仓库",
+        subtitle = targetHint,
+        onDismiss = onDismiss,
+        footer = {
+            SecondaryPillButton(if (busyAction == "preview") "预检中…" else "安全预检", enabled = busyAction == null, onClick = {
+                busyAction = "preview"; error = null; auditResult = null
+                scope.launch {
+                    try { buildBundleOrNull()?.let { auditResult = true to app.extensions.previewCommunityAudit(it) } }
+                    catch (e: Exception) { error = e.message ?: "安全预检失败" }
+                    finally { busyAction = null }
                 }
-            }
-
-            val pickers: List<Pair<String, () -> Unit>> = when (kind) {
-                "instruction" -> localRegistry.instructions.map { it.title to { applyPrefill("instruction", it.id) } }
-                "skill" -> localRegistry.skills.map { it.name to { applyPrefill("skill", it.id) } }
-                "mcp" -> localRegistry.mcpServers.map { it.name to { applyPrefill("mcp", it.id) } }
-                "subagent" -> localRegistry.subagents.map { it.name to { applyPrefill("subagent", it.id) } }
-                "hook" -> localRegistry.hooks.map { it.name to { applyPrefill("hook", it.id) } }
-                "host_plugin" -> localExportablePlugins.map { it.name to { applyPrefill("host_plugin", it.id) } }
-                "plugin_pack" -> localRegistry.plugins.map { it.name to { applyPrefill("plugin_pack", it.id) } }
-                else -> emptyList()
-            }
-            if (pickers.isNotEmpty()) {
-                Text("从本地已有资源一键填入（自动剥离敏感密钥值）", style = MaterialTheme.typography.labelMedium, color = G.inkMuted)
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    pickers.take(8).forEach { (label, fill) -> SecondaryPillButton(label, onClick = { fill(); auditResult = null; error = null }) }
-                }
-            }
-
-            OutlinedTextField(value = name, onValueChange = { name = it; error = null }, label = { Text("资源名称") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth())
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(value = id, onValueChange = { id = it.lowercase(); error = null }, label = { Text("唯一 ID") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.weight(1.3f))
-                OutlinedTextField(value = version, onValueChange = { version = it.trim() }, label = { Text("版本") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.weight(0.7f))
-            }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(value = author, onValueChange = { author = it }, label = { Text("分享作者") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.weight(1f))
-                OutlinedTextField(value = tags, onValueChange = { tags = it }, label = { Text("标签（逗号分隔）") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.weight(1f))
-            }
-            OutlinedTextField(value = description, onValueChange = { description = it }, label = { Text("简介说明") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth())
-
-            when (kind) {
-                "mcp" -> {
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        SelectableChip("Stdio 命令", selected = mcpTransport == "stdio", onClick = { mcpTransport = "stdio" })
-                        SelectableChip("HTTPS 端点", selected = mcpTransport == "http", onClick = { mcpTransport = "http" })
-                    }
-                    OutlinedTextField(value = primaryContent, onValueChange = { primaryContent = it }, label = { Text(if (mcpTransport == "http") "MCP HTTPS URL" else "启动命令与参数（如 npx -y @pkg/mcp）") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(value = extraField, onValueChange = { extraField = it }, label = { Text("所需密钥变量名（选填，仅填键名如 GITHUB_TOKEN，切勿填真实密钥）") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth())
-                }
-                "hook" -> {
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        listOf("PreToolUse", "PostToolUse", "Stop", "SessionStart").forEach { ev -> SelectableChip(ev, selected = hookEvent == ev, onClick = { hookEvent = ev }) }
-                    }
-                    OutlinedTextField(value = extraField, onValueChange = { extraField = it }, label = { Text("匹配器 Matcher（默认 *）") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(value = primaryContent, onValueChange = { primaryContent = it }, label = { Text("Shell 命令（将接受仓库恶意命令审查）") }, minLines = 2, maxLines = 6, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth())
-                }
-                "subagent" -> {
-                    OutlinedTextField(value = extraField, onValueChange = { extraField = it.trim() }, label = { Text("推荐模型（选填）") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(value = primaryContent, onValueChange = { primaryContent = it }, label = { Text("子代理 System Prompt") }, minLines = 4, maxLines = 8, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth())
-                }
-                "host_plugin" -> if (selectedLocalPluginId != null) {
-                    Text("已绑定本地插件目录 `$selectedLocalPluginId`，提交时自动打包 solbraid-plugin.json 与全部源码。", style = MaterialTheme.typography.bodySmall, color = G.accent)
-                } else {
-                    OutlinedTextField(value = primaryContent, onValueChange = { primaryContent = it }, label = { Text("插件入口 index.mjs 源码（或上方选择本地插件）") }, minLines = 5, maxLines = 10, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth())
-                }
-                "plugin_pack" -> Text(
-                    if (selectedPackId != null) "已选定插件包 `$selectedPackId`，将打包其关联的 MCP、技能与斜杠命令（不上传本地密钥值）。"
-                    else "请从上方选择已安装的插件包进行分享（如尚未安装，可先通过 GitHub 导入或组合 MCP/技能）。",
-                    style = MaterialTheme.typography.bodySmall, color = if (selectedPackId != null) G.accent else G.inkMuted,
-                )
-                else -> OutlinedTextField(
-                    value = primaryContent, onValueChange = { primaryContent = it; error = null },
-                    label = { Text(if (kind == "instruction") "指令正文（Markdown）" else "技能正文（SKILL.md）") },
-                    minLines = 4, maxLines = 9, shape = D.fieldShape, colors = galiaisTextFieldColors(),
-                    textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth(),
-                )
-            }
-
-            error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
-
-            auditResult?.let { (isPreview, res) ->
-                val ok = res.status in setOf("approved", "pr_bundle_ready", "pr_submitted")
-                CrispCard {
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            TagPill(
-                                text = when {
-                                    isPreview && ok -> "安全预检通过（可安全上传）"
-                                    isPreview -> "安全预检拦截（请先整改）"
-                                    res.status == "approved" -> "AI 审查通过并已发布"
-                                    res.status == "pr_submitted" -> "已自动发起 GitHub PR #${res.prNumber}"
-                                    res.status == "pr_bundle_ready" -> "已通过预检（已导出 PR 包）"
-                                    res.status == "rejected" -> "仓库 AI 安全审查已拦截"
-                                    else -> "待人工复审（未公开）"
-                                },
-                                fg = if (ok) G.success else G.danger,
-                                bg = if (ok) G.successTint else G.dangerTint,
-                            )
-                            TagPill("评分 ${res.audit.score}", fg = G.inkMuted, bg = G.surfaceSubtle)
-                        }
-                        Text(res.audit.summary, style = MaterialTheme.typography.bodySmall, color = G.ink)
-                        if (res.prHint.isNotBlank()) Text(res.prHint, style = MaterialTheme.typography.bodySmall, color = G.accent)
-                        if (res.prUrl.isNotBlank()) {
-                            SecondaryPillButton("在浏览器查看 PR #${res.prNumber} 审查进度", onClick = { runCatching { uriHandler.openUri(res.prUrl) } })
-                        }
-                        res.audit.findings.forEach { f ->
-                            Text("• [${f.severity.uppercase()}] ${f.title}：${f.detail}", fontFamily = Mono, fontSize = 11.sp, color = G.danger)
-                        }
-                    }
-                }
-            }
-
-            FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                SecondaryPillButton("关闭", onClick = onDismiss)
-                Spacer(Modifier.size(6.dp))
-                SecondaryPillButton(if (busyAction == "preview") "预检中…" else "安全预检", enabled = busyAction == null, onClick = {
-                    busyAction = "preview"; error = null; auditResult = null
-                    scope.launch {
-                        try { buildBundleOrNull()?.let { auditResult = true to app.extensions.previewCommunityAudit(it) } }
-                        catch (e: Exception) { error = e.message ?: "安全预检失败" }
-                        finally { busyAction = null }
-                    }
-                })
-                Spacer(Modifier.size(6.dp))
-                PrimaryPillButton(if (busyAction == "submit") "上传审查中…" else "提交审查并上传", enabled = busyAction == null, onClick = {
+            })
+            PrimaryPillButton(
+                text = if (busyAction == "submit") "审查上传中…" else "提交审查并上传",
+                modifier = Modifier.weight(1f),
+                enabled = busyAction == null,
+                onClick = {
                     busyAction = "submit"; error = null; auditResult = null
                     scope.launch {
                         try { buildBundleOrNull()?.let { auditResult = false to app.extensions.submitToCommunityRegistry(it) } }
                         catch (e: Exception) { error = e.message ?: "提交失败" }
                         finally { busyAction = null }
                     }
+                },
+            )
+        },
+    ) {
+        LazyRow(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            items(listOf("instruction", "skill", "mcp", "subagent", "hook", "host_plugin", "plugin_pack")) { k ->
+                SelectableChip(resourceKindLabel(k), selected = kind == k, onClick = {
+                    kind = k; selectedLocalPluginId = null; selectedPackId = null; auditResult = null; error = null
                 })
+            }
+        }
+
+        val pickers: List<Pair<String, () -> Unit>> = when (kind) {
+            "instruction" -> localRegistry.instructions.map { it.title to { applyPrefill("instruction", it.id) } }
+            "skill" -> localRegistry.skills.map { it.name to { applyPrefill("skill", it.id) } }
+            "mcp" -> localRegistry.mcpServers.map { it.name to { applyPrefill("mcp", it.id) } }
+            "subagent" -> localRegistry.subagents.map { it.name to { applyPrefill("subagent", it.id) } }
+            "hook" -> localRegistry.hooks.map { it.name to { applyPrefill("hook", it.id) } }
+            "host_plugin" -> localExportablePlugins.map { it.name to { applyPrefill("host_plugin", it.id) } }
+            "plugin_pack" -> localRegistry.plugins.map { it.name to { applyPrefill("plugin_pack", it.id) } }
+            else -> emptyList()
+        }
+        if (pickers.isNotEmpty()) {
+            Text("从本地已有资源一键填入（自动剥离敏感密钥值）", style = MaterialTheme.typography.labelMedium, color = G.inkMuted)
+            LazyRow(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                items(pickers.take(12)) { (label, fill) ->
+                    SelectableChip(label, selected = name == label, onClick = { fill(); auditResult = null; error = null })
+                }
+            }
+        }
+
+        OutlinedTextField(value = name, onValueChange = { name = it; error = null }, label = { Text("资源名称") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth())
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(value = id, onValueChange = { id = it.lowercase(); error = null }, label = { Text("唯一 ID") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.weight(1.3f))
+            OutlinedTextField(value = version, onValueChange = { version = it.trim() }, label = { Text("版本") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.weight(0.7f))
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(value = author, onValueChange = { author = it }, label = { Text("分享作者") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.weight(1f))
+            OutlinedTextField(value = tags, onValueChange = { tags = it }, label = { Text("标签（逗号分隔）") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.weight(1f))
+        }
+        OutlinedTextField(value = description, onValueChange = { description = it }, label = { Text("简介说明") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth())
+
+        when (kind) {
+            "mcp" -> {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    SelectableChip("Stdio 命令", selected = mcpTransport == "stdio", onClick = { mcpTransport = "stdio" })
+                    SelectableChip("HTTPS 端点", selected = mcpTransport == "http", onClick = { mcpTransport = "http" })
+                }
+                OutlinedTextField(value = primaryContent, onValueChange = { primaryContent = it }, label = { Text(if (mcpTransport == "http") "MCP HTTPS URL" else "启动命令与参数（如 npx -y @pkg/mcp）") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = extraField, onValueChange = { extraField = it }, label = { Text("所需密钥变量名（选填，仅填键名如 GITHUB_TOKEN，切勿填真实密钥）") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth())
+            }
+            "hook" -> {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("PreToolUse", "PostToolUse", "Stop", "SessionStart").forEach { ev -> SelectableChip(ev, selected = hookEvent == ev, onClick = { hookEvent = ev }) }
+                }
+                OutlinedTextField(value = extraField, onValueChange = { extraField = it }, label = { Text("匹配器 Matcher（默认 *）") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = primaryContent, onValueChange = { primaryContent = it }, label = { Text("Shell 命令（将接受仓库恶意命令审查）") }, minLines = 2, maxLines = 6, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth())
+            }
+            "subagent" -> {
+                OutlinedTextField(value = extraField, onValueChange = { extraField = it.trim() }, label = { Text("推荐模型（选填）") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = primaryContent, onValueChange = { primaryContent = it }, label = { Text("子代理 System Prompt") }, minLines = 4, maxLines = 8, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth())
+            }
+            "host_plugin" -> if (selectedLocalPluginId != null) {
+                Text("已绑定本地插件目录 `$selectedLocalPluginId`，提交时自动打包 solbraid-plugin.json 与全部源码。", style = MaterialTheme.typography.bodySmall, color = G.accent)
+            } else {
+                OutlinedTextField(value = primaryContent, onValueChange = { primaryContent = it }, label = { Text("插件入口 index.mjs 源码（或上方选择本地插件）") }, minLines = 5, maxLines = 10, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth())
+            }
+            "plugin_pack" -> Text(
+                if (selectedPackId != null) "已选定插件包 `$selectedPackId`，将打包其关联的 MCP、技能与斜杠命令（不上传本地密钥值）。"
+                else "请从上方选择已安装的插件包进行分享（如尚未安装，可先通过 GitHub 导入或组合 MCP/技能）。",
+                style = MaterialTheme.typography.bodySmall, color = if (selectedPackId != null) G.accent else G.inkMuted,
+            )
+            else -> OutlinedTextField(
+                value = primaryContent, onValueChange = { primaryContent = it; error = null },
+                label = { Text(if (kind == "instruction") "指令正文（Markdown）" else "技能正文（SKILL.md）") },
+                minLines = 4, maxLines = 9, shape = D.fieldShape, colors = galiaisTextFieldColors(),
+                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth(),
+            )
+        }
+
+        error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
+
+        auditResult?.let { (isPreview, res) ->
+            val ok = res.status in setOf("approved", "pr_bundle_ready", "pr_submitted")
+            CrispCard {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        TagPill(
+                            text = when {
+                                isPreview && ok -> "安全预检通过（可安全上传）"
+                                isPreview -> "安全预检拦截（请先整改）"
+                                res.status == "approved" -> "AI 审查通过并已发布"
+                                res.status == "pr_submitted" -> "已自动发起 GitHub PR #${res.prNumber}"
+                                res.status == "pr_bundle_ready" -> "已通过预检（已导出 PR 包）"
+                                res.status == "rejected" -> "仓库 AI 安全审查已拦截"
+                                else -> "待人工复审（未公开）"
+                            },
+                            fg = if (ok) G.success else G.danger,
+                            bg = if (ok) G.successTint else G.dangerTint,
+                        )
+                        TagPill("评分 ${res.audit.score}", fg = G.inkMuted, bg = G.surfaceSubtle)
+                    }
+                    Text(res.audit.summary, style = MaterialTheme.typography.bodySmall, color = G.ink)
+                    if (res.prHint.isNotBlank()) Text(res.prHint, style = MaterialTheme.typography.bodySmall, color = G.accent)
+                    if (res.prUrl.isNotBlank()) {
+                        SecondaryPillButton("在浏览器查看 PR #${res.prNumber} 审查进度", onClick = { runCatching { uriHandler.openUri(res.prUrl) } })
+                    }
+                    res.audit.findings.forEach { f ->
+                        Text("• [${f.severity.uppercase()}] ${f.title}：${f.detail}", fontFamily = Mono, fontSize = 11.sp, color = G.danger)
+                    }
+                }
             }
         }
     }

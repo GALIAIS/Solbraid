@@ -208,22 +208,30 @@ fun LazyListScope.turnBlockItems(
     activeTurnStartedAt: Long?,
     expandByDefault: Boolean,
     cwd: String? = null,
+    editingUserMessageId: String? = null,
     onOpenConversation: (ConversationKey) -> Unit,
     onCancelDelegation: () -> Unit,
     onQuote: ((String) -> Unit)?,
+    onEditResend: ((TimelineItem.UserMessage) -> Unit)? = null,
+    onRegenerate: ((TimelineItem.UserMessage) -> Unit)? = null,
     onUndoTurn: ((TimelineItem.UserMessage) -> Unit)?,
+    onRewindFiles: ((TimelineItem.UserMessage) -> Unit)? = null,
     onFork: (() -> Unit)? = null,
     onInspectDiffs: (List<FileDiff>) -> Unit,
     onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
     onApprovePlan: ((TimelineItem.Plan) -> Unit)? = null,
     onRevisePlan: ((TimelineItem.Plan, String) -> Unit)? = null,
 ) {
+    val editableUser = block.userMessage?.takeIf { !it.id.startsWith("steer-") }
     block.userMessage?.let { user ->
+        val canEdit = editableUser != null
         item(key = "u-${block.id}-${user.id}", contentType = "user_msg") {
             UserMessageBubble(
                 item = user,
                 onQuote = onQuote,
-                onRevert = if (onUndoTurn != null) ({ onUndoTurn(user) }) else null,
+                onEditResend = if (canEdit && onEditResend != null) ({ onEditResend(user) }) else null,
+                onRevert = if (canEdit && onUndoTurn != null) ({ onUndoTurn(user) }) else null,
+                isEditing = editingUserMessageId == user.id,
             )
         }
     }
@@ -287,11 +295,14 @@ fun LazyListScope.turnBlockItems(
     }
 
     if (block.editedFiles.isNotEmpty() && !block.inProgress) {
+        val undoFilesAction = editableUser?.let { u ->
+            (onRewindFiles ?: onUndoTurn)?.let { cb -> ({ cb(u) }) }
+        }
         item(key = "f-${block.id}", contentType = "edited_files") {
             EditedFilesSummaryCard(
                 files = block.editedFiles,
                 cwd = cwd,
-                onUndo = block.userMessage?.let { u -> onUndoTurn?.let { cb -> ({ cb(u) }) } },
+                onUndo = undoFilesAction,
                 onViewAll = { onInspectDiffs(block.editedFiles.flatMap { it.diffs }) },
                 onViewFile = { file -> onInspectDiffs(file.diffs) },
             )
@@ -299,7 +310,8 @@ fun LazyListScope.turnBlockItems(
     }
 
     val answerText = block.finalMessage?.takeIf { !it.streaming && it.text.isNotBlank() }?.text
-    if (!block.inProgress && (answerText != null || block.editedFiles.isNotEmpty())) {
+    val hasFooterTrigger = answerText != null || block.editedFiles.isNotEmpty() || block.trailingNotices.isNotEmpty()
+    if (!block.inProgress && hasFooterTrigger) {
         item(key = "a-${block.id}", contentType = "turn_footer") {
             TurnFooterActionBar(
                 copyText = answerText,
@@ -307,8 +319,11 @@ fun LazyListScope.turnBlockItems(
                     val snippet = answerText.lineSequence().firstOrNull { it.isNotBlank() }?.take(120) ?: answerText.take(120)
                     onQuote("> $snippet\n\n")
                 }) else null,
+                onEditResend = editableUser?.let { u -> onEditResend?.let { cb -> ({ cb(u) }) } },
+                onRegenerate = editableUser?.takeIf { it.text.isNotBlank() }?.let { u -> onRegenerate?.let { cb -> ({ cb(u) }) } },
                 onViewDiffs = if (block.editedFiles.isNotEmpty()) ({ onInspectDiffs(block.editedFiles.flatMap { it.diffs }) }) else null,
-                onUndo = block.userMessage?.let { u -> onUndoTurn?.let { cb -> ({ cb(u) }) } },
+                onUndo = editableUser?.let { u -> onUndoTurn?.let { cb -> ({ cb(u) }) } },
+                onRewindFiles = if (block.editedFiles.isNotEmpty()) editableUser?.let { u -> onRewindFiles?.let { cb -> ({ cb(u) }) } } else null,
                 onFork = onFork,
             )
         }
@@ -322,22 +337,30 @@ fun TurnBlockView(
     activeTurnStartedAt: Long?,
     expandByDefault: Boolean,
     cwd: String? = null,
+    editingUserMessageId: String? = null,
     onOpenConversation: (ConversationKey) -> Unit,
     onCancelDelegation: () -> Unit,
     onQuote: ((String) -> Unit)?,
+    onEditResend: ((TimelineItem.UserMessage) -> Unit)? = null,
+    onRegenerate: ((TimelineItem.UserMessage) -> Unit)? = null,
     onUndoTurn: ((TimelineItem.UserMessage) -> Unit)?,
+    onRewindFiles: ((TimelineItem.UserMessage) -> Unit)? = null,
     onFork: (() -> Unit)? = null,
     onInspectDiffs: (List<FileDiff>) -> Unit,
     onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
     onApprovePlan: ((TimelineItem.Plan) -> Unit)? = null,
     onRevisePlan: ((TimelineItem.Plan, String) -> Unit)? = null,
 ) {
+    val editableUser = block.userMessage?.takeIf { !it.id.startsWith("steer-") }
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(D.space(10.dp))) {
         block.userMessage?.let { user ->
+            val canEdit = editableUser != null
             UserMessageBubble(
                 item = user,
                 onQuote = onQuote,
-                onRevert = if (onUndoTurn != null) ({ onUndoTurn(user) }) else null,
+                onEditResend = if (canEdit && onEditResend != null) ({ onEditResend(user) }) else null,
+                onRevert = if (canEdit && onUndoTurn != null) ({ onUndoTurn(user) }) else null,
+                isEditing = editingUserMessageId == user.id,
             )
         }
 
@@ -391,22 +414,26 @@ fun TurnBlockView(
             EditedFilesSummaryCard(
                 files = block.editedFiles,
                 cwd = cwd,
-                onUndo = block.userMessage?.let { u -> onUndoTurn?.let { cb -> ({ cb(u) }) } },
+                onUndo = editableUser?.let { u -> (onRewindFiles ?: onUndoTurn)?.let { cb -> ({ cb(u) }) } },
                 onViewAll = { onInspectDiffs(block.editedFiles.flatMap { it.diffs }) },
                 onViewFile = { file -> onInspectDiffs(file.diffs) },
             )
         }
 
         val answerText = block.finalMessage?.takeIf { !it.streaming && it.text.isNotBlank() }?.text
-        if (!block.inProgress && (answerText != null || block.editedFiles.isNotEmpty())) {
+        val hasFooterTrigger = answerText != null || block.editedFiles.isNotEmpty() || block.trailingNotices.isNotEmpty()
+        if (!block.inProgress && hasFooterTrigger) {
             TurnFooterActionBar(
                 copyText = answerText,
                 onQuote = if (answerText != null && onQuote != null) ({
                     val snippet = answerText.lineSequence().firstOrNull { it.isNotBlank() }?.take(120) ?: answerText.take(120)
                     onQuote("> $snippet\n\n")
                 }) else null,
+                onEditResend = editableUser?.let { u -> onEditResend?.let { cb -> ({ cb(u) }) } },
+                onRegenerate = editableUser?.takeIf { it.text.isNotBlank() }?.let { u -> onRegenerate?.let { cb -> ({ cb(u) }) } },
                 onViewDiffs = if (block.editedFiles.isNotEmpty()) ({ onInspectDiffs(block.editedFiles.flatMap { it.diffs }) }) else null,
-                onUndo = block.userMessage?.let { u -> onUndoTurn?.let { cb -> ({ cb(u) }) } },
+                onUndo = editableUser?.let { u -> onUndoTurn?.let { cb -> ({ cb(u) }) } },
+                onRewindFiles = if (block.editedFiles.isNotEmpty()) editableUser?.let { u -> onRewindFiles?.let { cb -> ({ cb(u) }) } } else null,
                 onFork = onFork,
             )
         }
@@ -533,6 +560,7 @@ private fun CodexTurnTrace(
     Column(Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
+                .fillMaxWidth()
                 .clip(D.shape(8.dp))
                 .clickable(enabled = block.traceItems.isNotEmpty()) { userOverride = !open }
                 .padding(vertical = 4.dp, horizontal = 2.dp),
@@ -666,9 +694,9 @@ private fun FramelessActivityCluster(
         border = BorderStroke(0.75.dp, clusterBorder),
     ) {
         Column(Modifier.fillMaxWidth()) {
-            // 与顶层折叠条一致：包裹内容长度、恒定内边距与边框厚度，箭头紧跟文字后不留大块空白。
             Row(
                 modifier = Modifier
+                    .fillMaxWidth()
                     .clip(D.shape(10.dp))
                     .clickable { open = !open }
                     .padding(vertical = 6.dp, horizontal = 8.dp),
@@ -686,7 +714,7 @@ private fun FramelessActivityCluster(
                     fontWeight = FontWeight.Medium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false),
+                    modifier = Modifier.weight(1f),
                 )
                 AnimatedChevron(expanded = open, tint = G.inkSubtle, size = 13.5.dp)
             }
@@ -734,6 +762,7 @@ private fun CompactCommandRow(item: TimelineItem.CommandRun, sessionCwd: String?
     Column(Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
+                .fillMaxWidth()
                 .clip(D.shape(7.dp))
                 .background(if (showOutput) G.surface.copy(alpha = 0.8f) else Color.Transparent)
                 .clickable { showOutput = !showOutput }
@@ -749,7 +778,6 @@ private fun CompactCommandRow(item: TimelineItem.CommandRun, sessionCwd: String?
                 tint = if (failed) G.danger else if (item.status == ItemStatus.RUNNING) G.warning else G.inkSubtle,
                 modifier = Modifier.size(13.5.dp),
             )
-            // 关键优化：始终保持单行省略，且箭头紧跟文本不留大块空白。
             Text(
                 text = oneLinePreview,
                 fontFamily = Mono,
@@ -757,9 +785,8 @@ private fun CompactCommandRow(item: TimelineItem.CommandRun, sessionCwd: String?
                 color = if (showOutput) G.ink else G.inkMuted,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f, fill = false),
+                modifier = Modifier.weight(1f),
             )
-            AnimatedChevron(expanded = showOutput, tint = G.inkSubtle, size = 12.5.dp)
             item.durationMs?.takeIf { it >= 200L }?.let { ms ->
                 Text(formatCompactDuration(ms), fontFamily = Mono, fontSize = 10.5.sp, color = G.inkSubtle)
             }
@@ -768,6 +795,7 @@ private fun CompactCommandRow(item: TimelineItem.CommandRun, sessionCwd: String?
                     TagPill("exit $code", fg = G.danger, bg = G.dangerTint)
                 }
             }
+            AnimatedChevron(expanded = showOutput, tint = G.inkSubtle, size = 12.5.dp)
         }
         AnimatedExpandable(expanded = showOutput) {
             Surface(
@@ -901,6 +929,7 @@ private fun CompactFileEditRow(item: TimelineItem.FileEdit, cwd: String?) {
     Column(Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
+                .fillMaxWidth()
                 .clip(D.shape(7.dp))
                 .background(if (open) G.surface.copy(alpha = 0.85f) else Color.Transparent)
                 .clickable { open = !open }
@@ -916,14 +945,14 @@ private fun CompactFileEditRow(item: TimelineItem.FileEdit, cwd: String?) {
                 tint = if (item.status == ItemStatus.FAILED) G.danger else if (item.status == ItemStatus.RUNNING) G.warning else G.accent,
                 modifier = Modifier.size(13.5.dp),
             )
-            Text(names, fontFamily = Mono, fontSize = 11.5.sp, color = if (open) G.ink else G.inkMuted, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-            AnimatedChevron(expanded = open, tint = G.inkSubtle, size = 12.5.dp)
+            Text(names, fontFamily = Mono, fontSize = 11.5.sp, color = if (open) G.ink else G.inkMuted, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
             if (stats.first > 0) {
                 Text("+${stats.first}", fontFamily = Mono, fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold, color = G.diffAddedInk, modifier = Modifier.clip(RoundedCornerShape(4.dp)).background(G.diffAddedBg).padding(horizontal = 4.dp, vertical = 1.dp))
             }
             if (stats.second > 0) {
                 Text("-${stats.second}", fontFamily = Mono, fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold, color = G.diffRemovedInk, modifier = Modifier.clip(RoundedCornerShape(4.dp)).background(G.diffRemovedBg).padding(horizontal = 4.dp, vertical = 1.dp))
             }
+            AnimatedChevron(expanded = open, tint = G.inkSubtle, size = 12.5.dp)
         }
         AnimatedExpandable(expanded = open) {
             Column(Modifier.padding(top = 4.dp, bottom = 2.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -942,6 +971,7 @@ private fun CompactToolRow(item: TimelineItem.ToolCall, cwd: String?, onOpenArti
     Column(Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
+                .fillMaxWidth()
                 .clip(D.shape(7.dp))
                 .background(if (open) G.surface.copy(alpha = 0.85f) else Color.Transparent)
                 .clickable { open = !open }
@@ -961,14 +991,14 @@ private fun CompactToolRow(item: TimelineItem.ToolCall, cwd: String?, onOpenArti
                 modifier = Modifier.size(13.5.dp),
             )
             Text(meta.badge, style = MaterialTheme.typography.labelSmall, color = G.inkSubtle, fontWeight = FontWeight.Medium)
-            Text(summary, fontFamily = Mono, fontSize = 11.5.sp, color = if (open) G.ink else G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-            AnimatedChevron(expanded = open, tint = G.inkSubtle, size = 12.5.dp)
+            Text(summary, fontFamily = Mono, fontSize = 11.5.sp, color = if (open) G.ink else G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
             if (widgetArtifact != null && onOpenArtifact != null) {
                 TagPill("预览", fg = G.accent, bg = G.accentContainer, onClick = { onOpenArtifact(widgetArtifact) })
             }
             if (item.status == ItemStatus.FAILED) {
                 Icon(GaliaisIcons.AlertTriangle, contentDescription = null, tint = G.danger, modifier = Modifier.size(12.dp))
             }
+            AnimatedChevron(expanded = open, tint = G.inkSubtle, size = 12.5.dp)
         }
         AnimatedExpandable(expanded = open) {
             Column(Modifier.padding(top = 4.dp, bottom = 2.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1026,6 +1056,7 @@ fun EditedFilesSummaryCard(
                     color = G.ink,
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text("+$totalAdded", fontFamily = Mono, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = G.success)
@@ -1141,13 +1172,16 @@ private fun EditedFileSummaryRow(
     }
 }
 
-/** 图 1 底部风格的轻量单轮操作栏（位于文件变更卡下方：复制 / 引用 / 更多浮窗）。 */
+/** 图 1 底部风格的轻量单轮操作栏（位于文件变更卡下方：复制 / 引用 / 编辑重发 / 重新生成 / 更多浮窗）。 */
 @Composable
 private fun TurnFooterActionBar(
     copyText: String?,
     onQuote: (() -> Unit)?,
+    onEditResend: (() -> Unit)?,
+    onRegenerate: (() -> Unit)?,
     onViewDiffs: (() -> Unit)?,
     onUndo: (() -> Unit)?,
+    onRewindFiles: (() -> Unit)?,
     onFork: (() -> Unit)?,
 ) {
     val clipboard = LocalClipboard.current
@@ -1156,7 +1190,7 @@ private fun TurnFooterActionBar(
     var moreOpen by remember { mutableStateOf(false) }
     LaunchedEffect(copied) { if (copied) { delay(1500); copied = false } }
 
-    val hasMore = onViewDiffs != null || onUndo != null || onFork != null
+    val hasMore = onViewDiffs != null || onUndo != null || onRewindFiles != null || onFork != null || onEditResend != null || onRegenerate != null
     Row(
         modifier = Modifier.fillMaxWidth().padding(top = 1.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -1210,6 +1244,32 @@ private fun TurnFooterActionBar(
             }
         }
 
+        if (onEditResend != null) {
+            Box(
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(D.shape(8.dp))
+                    .semantics { contentDescription = "编辑并重发" }
+                    .clickable(role = Role.Button, onClick = onEditResend),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(GaliaisIcons.Edit, contentDescription = null, tint = G.inkSubtle, modifier = Modifier.size(14.5.dp))
+            }
+        }
+
+        if (onRegenerate != null) {
+            Box(
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(D.shape(8.dp))
+                    .semantics { contentDescription = "重新生成回复" }
+                    .clickable(role = Role.Button, onClick = onRegenerate),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(GaliaisIcons.Refresh, contentDescription = null, tint = G.inkSubtle, modifier = Modifier.size(14.5.dp))
+            }
+        }
+
         if (hasMore) {
             Box {
                 Box(
@@ -1228,9 +1288,23 @@ private fun TurnFooterActionBar(
                     onDismissRequest = { moreOpen = false },
                     preferAbove = true,
                     alignEnd = false,
-                    minWidth = 176.dp,
-                    maxWidth = 224.dp,
+                    minWidth = 188.dp,
+                    maxWidth = 236.dp,
                 ) {
+                    if (onEditResend != null) {
+                        GaliaisMenuRow(
+                            title = "编辑此轮并重发",
+                            icon = GaliaisIcons.Edit,
+                            onClick = { moreOpen = false; onEditResend() },
+                        )
+                    }
+                    if (onRegenerate != null) {
+                        GaliaisMenuRow(
+                            title = "重新生成此轮回复",
+                            icon = GaliaisIcons.Refresh,
+                            onClick = { moreOpen = false; onRegenerate() },
+                        )
+                    }
                     if (copyText != null) {
                         GaliaisMenuRow(
                             title = "复制完整答复",
@@ -1265,10 +1339,18 @@ private fun TurnFooterActionBar(
                             onClick = { moreOpen = false; onFork() },
                         )
                     }
+                    if (onRewindFiles != null) {
+                        GaliaisMenuRow(
+                            title = "撤销本轮文件修改",
+                            icon = GaliaisIcons.Undo,
+                            tintOverride = G.warning,
+                            onClick = { moreOpen = false; onRewindFiles() },
+                        )
+                    }
                     if (onUndo != null) {
                         Hairline(Modifier.padding(vertical = 2.dp))
                         GaliaisMenuRow(
-                            title = "撤销 / 回退此轮",
+                            title = "回退到此轮前",
                             icon = GaliaisIcons.Undo,
                             tintOverride = G.warning,
                             onClick = { moreOpen = false; onUndo() },

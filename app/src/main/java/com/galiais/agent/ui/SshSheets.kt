@@ -2,22 +2,29 @@ package com.galiais.agent.ui
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -76,8 +83,7 @@ fun SshHostEditorSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .imePadding()
-                .navigationBarsPadding()
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp)
                 .padding(bottom = 22.dp),
@@ -311,8 +317,7 @@ fun SshTunnelEditorSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .imePadding()
-                .navigationBarsPadding()
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp)
                 .padding(bottom = 22.dp),
@@ -322,12 +327,9 @@ fun SshTunnelEditorSheet(
             Text("选择目标 SSH 主机", style = MaterialTheme.typography.labelMedium, color = G.inkMuted)
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 hosts.forEach { h ->
-                    val chosen = h.id == selectedHost?.id
-                    TagPill(
+                    SelectableChip(
                         text = "${h.name} (${h.alias})",
-                        fg = if (chosen) G.accent else G.inkMuted,
-                        bg = if (chosen) G.accentContainer else G.surfaceSubtle,
-                        border = if (chosen) G.accent else null,
+                        selected = h.id == selectedHost?.id,
                         onClick = { selectedHostId = h.id },
                     )
                 }
@@ -448,12 +450,14 @@ fun GenerateSshKeyDialog(
     val scope = rememberCoroutineScope()
     var error by remember { mutableStateOf<String?>(null) }
 
-    AlertDialog(
+    GaliaisAlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = G.surface,
-        title = { Text("生成 SSH 密钥对", color = G.ink) },
+        title = "生成 SSH 密钥对",
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
                 SegmentedPillBar(
                     options = listOf("ed25519" to "Ed25519（推荐）", "rsa" to "RSA 4096"),
                     selected = keyType,
@@ -482,8 +486,16 @@ fun GenerateSshKeyDialog(
                     colors = galiaisTextFieldColors(),
                     modifier = Modifier.fillMaxWidth(),
                 )
-                OutlinedTextField(value = passphrase, onValueChange = { passphrase = it }, label = { Text("密钥口令（可选）") },
-                    visualTransformation = PasswordVisualTransformation(), singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(
+                    value = passphrase,
+                    onValueChange = { passphrase = it },
+                    label = { Text("密钥口令（可选）") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    shape = D.fieldShape,
+                    colors = galiaisTextFieldColors(),
+                    modifier = Modifier.fillMaxWidth(),
+                )
                 error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
             }
         },
@@ -501,7 +513,7 @@ fun GenerateSshKeyDialog(
                         finally { busy = false }
                     }
                 }
-            }) { Text("生成", color = G.accent) }
+            }) { Text("生成", color = G.accent, fontWeight = FontWeight.SemiBold) }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("取消", color = G.inkMuted) }
@@ -521,12 +533,14 @@ fun ImportSshKeyDialog(
     val scope = rememberCoroutineScope()
     var error by remember { mutableStateOf<String?>(null) }
 
-    AlertDialog(
+    GaliaisAlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = G.surface,
-        title = { Text("导入 SSH 私钥", color = G.ink) },
+        title = "导入 SSH 私钥",
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
                 OutlinedTextField(
                     value = keyName,
                     onValueChange = { keyName = it.trim() },
@@ -550,8 +564,16 @@ fun ImportSshKeyDialog(
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Text("将自动写入 0600 权限并派生 .pub 公钥。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-                OutlinedTextField(value = passphrase, onValueChange = { passphrase = it }, label = { Text("密钥口令（加密私钥必填）") },
-                    visualTransformation = PasswordVisualTransformation(), singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(
+                    value = passphrase,
+                    onValueChange = { passphrase = it },
+                    label = { Text("密钥口令（加密私钥必填）") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    shape = D.fieldShape,
+                    colors = galiaisTextFieldColors(),
+                    modifier = Modifier.fillMaxWidth(),
+                )
                 error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
             }
         },
@@ -571,7 +593,7 @@ fun ImportSshKeyDialog(
                         }
                     }
                 }
-            }) { Text("导入", color = G.accent) }
+            }) { Text("导入", color = G.accent, fontWeight = FontWeight.SemiBold) }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("取消", color = G.inkMuted) }
@@ -654,6 +676,7 @@ fun SftpBrowserSheet(
                 TagPill("在此开终端", fg = G.accent, bg = G.accentContainer, onClick = { onOpenTerminalAt(remotePath) })
             }
 
+            HeaderProgressSlot(loading)
             busyLabel?.let {
                 Text(it, style = MaterialTheme.typography.bodySmall, color = G.accent)
             }
@@ -664,23 +687,24 @@ fun SftpBrowserSheet(
                 }
             }
 
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 180.dp, max = 420.dp)
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                if (loading) {
-                    Text("正在读取远端目录…", style = MaterialTheme.typography.bodySmall, color = G.inkMuted, modifier = Modifier.padding(8.dp))
-                } else if (entries.isEmpty() && error == null) {
-                    CrispCard { Text("此远端目录为空。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted) }
-                } else {
-                    entries.forEach { entry ->
+            if (loading) {
+                Text("正在读取远端目录…", style = MaterialTheme.typography.bodySmall, color = G.inkMuted, modifier = Modifier.padding(8.dp))
+            } else if (entries.isEmpty() && error == null) {
+                CrispCard { Text("此远端目录为空。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted) }
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 180.dp, max = 440.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    items(entries, key = { it.path }) { entry ->
+                        var rowMenu by remember(entry.path) { mutableStateOf(false) }
                         CrispCard(
-                            padding = PaddingValues(horizontal = 12.dp, vertical = 9.dp),
-                            modifier = Modifier.clickable {
+                            padding = PaddingValues(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+                            onClick = {
                                 if (entry.directory) remotePath = entry.path
+                                else if (entry.permissions.startsWith("-")) editingFile = entry
                             },
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -705,25 +729,32 @@ fun SftpBrowserSheet(
                                         overflow = TextOverflow.Ellipsis,
                                     )
                                 }
-                            }
-                            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    TagPill("下载", fg = G.accent, bg = G.accentContainer, onClick = {
-                                        if (busyLabel != null) return@TagPill
-                                        busyLabel = "正在下载 ${entry.name} → $localDefaultDir …"
-                                        scope.launch {
-                                            try {
-                                                app.envSsh.startTransfer(host, "download", localDefaultDir, entry.path)
-                                            } catch (e: Exception) {
-                                                error = "下载失败：${e.message}"
-                                            } finally {
-                                                busyLabel = null
+                                Box {
+                                    IconButton(onClick = { rowMenu = true }, modifier = Modifier.size(34.dp)) {
+                                        Icon(GaliaisIcons.MoreHoriz, contentDescription = "文件操作", tint = G.inkMuted, modifier = Modifier.size(17.dp))
+                                    }
+                                    GaliaisDropdownMenu(expanded = rowMenu, onDismissRequest = { rowMenu = false }) {
+                                        Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                            if (entry.permissions.startsWith("-")) {
+                                                GaliaisMenuRow("在线编辑", icon = GaliaisIcons.Edit, onClick = { rowMenu = false; editingFile = entry })
                                             }
+                                            GaliaisMenuRow("下载到本地", icon = GaliaisIcons.Download, onClick = {
+                                                rowMenu = false
+                                                if (busyLabel != null) return@GaliaisMenuRow
+                                                busyLabel = "正在下载 ${entry.name} → $localDefaultDir …"
+                                                scope.launch {
+                                                    try { app.envSsh.startTransfer(host, "download", localDefaultDir, entry.path) }
+                                                    catch (e: Exception) { error = "下载失败：${e.message}" }
+                                                    finally { busyLabel = null }
+                                                }
+                                            })
+                                            GaliaisMenuRow("重命名", icon = GaliaisIcons.FilePen, onClick = { rowMenu = false; entryAction = "rename"; actionEntry = entry })
+                                            GaliaisMenuRow("修改权限", icon = GaliaisIcons.ShieldCheck, onClick = { rowMenu = false; entryAction = "chmod"; actionEntry = entry })
+                                            Hairline(Modifier.padding(vertical = 2.dp))
+                                            GaliaisMenuRow("删除", icon = GaliaisIcons.Trash, danger = true, onClick = { rowMenu = false; entryAction = "delete"; actionEntry = entry })
                                         }
-                                    })
-                                if (entry.permissions.startsWith("-")) TagPill("编辑", fg = G.accent, bg = G.accentContainer, onClick = { editingFile = entry })
-                                TagPill("重命名", fg = G.ink, bg = G.surfaceSubtle, onClick = { entryAction = "rename"; actionEntry = entry })
-                                TagPill("权限", fg = G.ink, bg = G.surfaceSubtle, onClick = { entryAction = "chmod"; actionEntry = entry })
-                                TagPill("删除", fg = G.danger, bg = G.dangerTint, onClick = { entryAction = "delete"; actionEntry = entry })
+                                    }
+                                }
                             }
                         }
                     }
@@ -741,17 +772,30 @@ fun SftpBrowserSheet(
     }
     jumpPath?.let { initial ->
         var value by remember { mutableStateOf(initial) }
-        AlertDialog(onDismissRequest = { jumpPath = null }, title = { Text("转到远端目录") },
-            text = { OutlinedTextField(value, { value = it }, label = { Text("目录路径") }, singleLine = true) },
-            confirmButton = { TextButton(enabled = value.isNotBlank(), onClick = { remotePath = value; jumpPath = null }) { Text("打开") } },
-            dismissButton = { TextButton(onClick = { jumpPath = null }) { Text("取消") } })
+        GaliaisAlertDialog(
+            onDismissRequest = { jumpPath = null },
+            title = "转到远端目录",
+            text = {
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = { value = it },
+                    label = { Text("目录路径") },
+                    singleLine = true,
+                    shape = D.fieldShape,
+                    colors = galiaisTextFieldColors(),
+                    textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+            confirmButton = { TextButton(enabled = value.isNotBlank(), onClick = { remotePath = value; jumpPath = null }) { Text("打开", color = G.accent, fontWeight = FontWeight.SemiBold) } },
+            dismissButton = { TextButton(onClick = { jumpPath = null }) { Text("取消", color = G.inkMuted) } },
+        )
     }
     if (showMkdir) {
         var dirName by remember { mutableStateOf("") }
-        AlertDialog(
+        GaliaisAlertDialog(
             onDismissRequest = { showMkdir = false },
-            containerColor = G.surface,
-            title = { Text("新建远端目录", color = G.ink) },
+            title = "新建远端目录",
             text = {
                 OutlinedTextField(
                     value = dirName,
@@ -782,7 +826,7 @@ fun SftpBrowserSheet(
                             }
                         }
                     }
-                }) { Text("创建", color = G.accent) }
+                }) { Text("创建", color = G.accent, fontWeight = FontWeight.SemiBold) }
             },
             dismissButton = {
                 TextButton(onClick = { showMkdir = false }) { Text("取消", color = G.inkMuted) }
@@ -833,10 +877,9 @@ private fun LocalUploadPickerDialog(
         }
     }
 
-    AlertDialog(
+    GaliaisAlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = G.surface,
-        title = { Text("选择文件或目录", color = G.ink) },
+        title = "选择文件或目录",
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {

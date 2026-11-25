@@ -6,9 +6,10 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -63,6 +64,7 @@ fun CommunityRegistrySection(
     var showConfigSheet by remember { mutableStateOf(false) }
     var showAuditLog by remember { mutableStateOf(false) }
     var inspectingAudit by remember { mutableStateOf<Pair<String, ResourceAuditReport>?>(null) }
+    var removingItem by remember { mutableStateOf<CommunityResourceItem?>(null) }
 
     LaunchedEffect(prefillUpload) {
         if (prefillUpload != null) {
@@ -100,16 +102,14 @@ fun CommunityRegistrySection(
 
     val canRemove = snapshot.config.mode != "github"
 
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionLabel("统一共享资源仓库")
-        Spacer(Modifier.weight(1f))
-        PrimaryPillButton("+ 上传分享", enabled = runtimeReady, onClick = {
+    SectionHeader("统一共享资源仓库") {
+        CompactActionButton("+ 上传分享", primary = true, enabled = runtimeReady, onClick = {
             activePrefill = null
             showUploadSheet = true
         })
     }
 
-    CrispCard(padding = PaddingValues(14.dp)) {
+    CrispCard(padding = PaddingValues(13.dp)) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(
@@ -121,21 +121,21 @@ fun CommunityRegistrySection(
                     style = MaterialTheme.typography.titleSmall,
                     color = G.ink,
                     fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
                 )
-                TagPill("AI 安全门禁已启用", fg = G.success, bg = G.successTint)
+                TagPill(
+                    text = if (snapshot.config.reviewerBaseUrl.isNotBlank()) "AI 语义门禁" else "规则门禁 (${snapshot.config.staticRulesCount})",
+                    fg = G.success,
+                    bg = G.successTint,
+                )
             }
             val sourceText = snapshot.sourceLabel.ifBlank { "运行环境就绪后自动连接共享仓库" }
             Text(sourceText, fontFamily = Mono, fontSize = 11.sp, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(
-                "所有用户上传的资源均强制经过仓库安全审查（${snapshot.config.staticRulesCount} 条静态恶意代码规则" +
-                    (if (snapshot.config.reviewerBaseUrl.isNotBlank()) " + LLM 语义审计" else " · 可接入仓库 AI 模型复审") +
-                    "），拦截高危恶意代码；下载时二次校验 SHA-256 指纹。",
-                style = MaterialTheme.typography.bodySmall,
-                color = G.inkMuted,
-            )
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                SecondaryPillButton("配置仓库与审查 AI", enabled = runtimeReady, onClick = { showConfigSheet = true })
-                SecondaryPillButton("刷新目录", enabled = runtimeReady, onClick = {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                CompactActionButton("配置仓库与审查", enabled = runtimeReady, onClick = { showConfigSheet = true })
+                CompactActionButton("刷新目录", enabled = runtimeReady, onClick = {
                     scope.launch {
                         onBusy("正在拉取共享仓库目录…")
                         try { app.extensions.refreshCommunityRegistry() }
@@ -153,7 +153,7 @@ fun CommunityRegistrySection(
         placeholder = "搜索共享资源名称、作者或标签…",
     )
 
-    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+    val kindFilters = remember(snapshot.items.size) {
         listOf(
             "all" to "全部 (${snapshot.items.size})",
             "host_plugin" to "Host 插件",
@@ -163,26 +163,25 @@ fun CommunityRegistrySection(
             "subagent" to "子代理",
             "hook" to "钩子",
             "plugin_pack" to "插件包",
-        ).forEach { (key, label) ->
+        )
+    }
+    LazyRow(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        items(kindFilters, key = { it.first }) { (key, label) ->
             SelectableChip(text = label, selected = filterKind == key, onClick = { filterKind = key })
         }
     }
 
     if (visibleItems.isEmpty()) {
-        CrispCard {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text(
-                    if (snapshot.items.isEmpty()) "当前仓库暂无已发布的社区资源。" else "没有匹配筛选条件的共享资源。",
-                    style = MaterialTheme.typography.titleSmall,
-                    color = G.ink,
-                )
-                Text(
-                    "点击右上角「+ 上传分享」可将指令、技能、MCP、子代理、钩子、Host 插件或插件包提交至仓库 AI 安全审查后分享给所有用户；在「配置仓库」中可切换至 GALIAIS/Solbraid GitHub 社区仓库或团队 HTTP 服务端。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = G.inkMuted,
-                )
-            }
-        }
+        EmptyStateView(
+            icon = GaliaisIcons.Sparkles,
+            title = if (snapshot.items.isEmpty()) "当前仓库暂无已发布的社区资源" else "没有匹配筛选条件的共享资源",
+            description = "点击「+ 上传分享」可将指令、技能、MCP、子代理、钩子或插件提交 AI 审查后分享；可在仓库配置中切换 GitHub 或团队 HTTP 服务。",
+            actionLabel = if (runtimeReady) "上传分享" else null,
+            onAction = if (runtimeReady) ({ activePrefill = null; showUploadSheet = true }) else null,
+        )
     } else {
         CrispCard(padding = PaddingValues(0.dp)) {
             visibleItems.forEachIndexed { idx, item ->
@@ -201,12 +200,7 @@ fun CommunityRegistrySection(
                             finally { onBusy(null) }
                         }
                     },
-                    onRemove = {
-                        scope.launch {
-                            try { app.extensions.removeCommunityResource(item.id, item.kind) }
-                            catch (e: Exception) { app.conversations.notify("下架失败：${e.message}") }
-                        }
-                    },
+                    onRemove = { removingItem = item },
                 )
                 if (idx < visibleItems.lastIndex) Hairline()
             }
@@ -295,6 +289,23 @@ fun CommunityRegistrySection(
     inspectingAudit?.let { (title, report) ->
         AuditReportDialog(title = title, report = report, onDismiss = { inspectingAudit = null })
     }
+
+    removingItem?.let { item ->
+        GaliaisConfirmDialog(
+            title = "从共享仓库下架？",
+            message = "确定下架资源「${item.name}」（${resourceKindLabel(item.kind)}）吗？此操作不会卸载本机已安装副本。",
+            confirmText = "确认下架",
+            danger = true,
+            onConfirm = {
+                removingItem = null
+                scope.launch {
+                    try { app.extensions.removeCommunityResource(item.id, item.kind) }
+                    catch (e: Exception) { app.conversations.notify("下架失败：${e.message}") }
+                }
+            },
+            onDismiss = { removingItem = null },
+        )
+    }
 }
 
 @Composable
@@ -321,14 +332,18 @@ private fun CommunityResourceCardRow(
                 }
                 Text("作者：${item.author} · 下载 ${item.downloads} 次", style = MaterialTheme.typography.labelSmall, color = G.inkSubtle)
             }
-            PrimaryPillButton(if (installed) "更新安装" else "下载安装", enabled = runtimeReady, onClick = onDownload)
+            CompactActionButton(
+                text = if (installed) "更新" else "安装",
+                primary = !installed,
+                enabled = runtimeReady,
+                onClick = onDownload,
+            )
         }
         if (item.description.isNotBlank()) {
-            Text(item.description, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+            Text(item.description, style = MaterialTheme.typography.bodySmall, color = G.inkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            TagPill("AI 审查通过 · ${item.audit.score}分", fg = G.success, bg = G.successTint, onClick = onInspectAudit)
-            TagPill("查看审查报告", fg = G.inkMuted, bg = G.surfaceSubtle, onClick = onInspectAudit)
+            TagPill("AI 审查 ${item.audit.score}分 · 报告", fg = G.success, bg = G.successTint, onClick = onInspectAudit)
             item.tags.take(3).forEach { t -> TagPill("#$t", fg = G.inkMuted, bg = G.surfaceSubtle) }
             if (canRemove) {
                 TagPill("下架", fg = G.danger, bg = G.dangerTint, onClick = onRemove)

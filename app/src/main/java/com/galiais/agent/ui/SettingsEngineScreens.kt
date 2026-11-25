@@ -11,20 +11,17 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -33,7 +30,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -166,14 +162,6 @@ fun ProvidersSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
             )
         },
     ) {
-        CrispCard {
-            Text(
-                "统一管理模型服务商与跨服务商路由组：内置 ${providerPresets.size} 个主流官方/套餐/中转预设，支持单服务商多协议直通、多 Key 池自动故障转移与 429 冷却轮换，所有请求自动计入用量中心。",
-                style = MaterialTheme.typography.bodySmall,
-                color = G.inkMuted,
-            )
-        }
-
         if (!runtime.ready) {
             CrispCard(background = G.surfaceSubtle) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -207,12 +195,13 @@ fun ProvidersSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                 Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(D.space(10.dp))) {
                     if (currentTab == "groups") {
             if (settings.routingGroups.isEmpty()) {
-                CrispCard {
-                    Column(Modifier.fillMaxWidth().padding(vertical = 16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("尚未创建路由组", style = MaterialTheme.typography.titleSmall, color = G.ink)
-                        Text("路由组可将多个服务商与模型编排为「主备故障转移 / 轮询均衡 / 最低费率」，像单个服务商一样绑定到任意 Agent。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-                    }
-                }
+                EmptyStateView(
+                    icon = GaliaisIcons.SwapHoriz,
+                    title = "尚未创建路由组",
+                    description = "将多个服务商与模型编排为主备故障转移、轮询均衡或最低费率策略，像单个服务商一样绑定到任意 Agent。",
+                    actionLabel = "新建路由组",
+                    onAction = { addingGroup = true },
+                )
             } else {
                 SectionLabel("已配置路由组（${settings.routingGroups.size}）")
                 settings.routingGroups.forEach { group ->
@@ -221,8 +210,11 @@ fun ProvidersSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                     val isClaude = settings.claudeProviderId == vid
                     val isAgy = settings.agentProviders["antigravity"] == vid
                     var groupMenu by remember(group.id) { mutableStateOf(false) }
-                    CrispCard {
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    CrispCard(padding = PaddingValues(0.dp)) {
+                        Column(
+                            Modifier.fillMaxWidth().clickable { editingGroup = group }.padding(D.space(14.dp)),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                 Text(group.name, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                                 TagPill(group.strategyLabel(), fg = G.accent, bg = G.accentContainer)
@@ -283,12 +275,13 @@ fun ProvidersSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                 }
             }
         } else if (settings.providers.isEmpty()) {
-            CrispCard {
-                Column(Modifier.fillMaxWidth().padding(vertical = 16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("尚未添加服务商", style = MaterialTheme.typography.titleSmall, color = G.ink)
-                    Text("点击右下角「添加服务商」，可从 ${providerPresets.size} 个官方/套餐/中转预设一键配置。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-                }
-            }
+            EmptyStateView(
+                icon = GaliaisIcons.Plug,
+                title = "尚未添加服务商",
+                description = "内置 ${providerPresets.size} 个主流官方/套餐/中转预设，支持多协议直通与多 Key 池故障转移。",
+                actionLabel = "添加服务商",
+                onAction = { addingProvider = true },
+            )
         } else {
             SectionLabel("已配置服务商（${settings.providers.size}）")
             settings.providers.forEachIndexed { pIdx, provider ->
@@ -300,8 +293,60 @@ fun ProvidersSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                 val health = healthMap[provider.id]
                 var menuOpen by remember(provider.id) { mutableStateOf(false) }
 
-                CrispCard {
-                    Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                fun runFetchModels() {
+                    if (!runtime.ready || busy) return
+                    testing[provider.id] = true
+                    scope.launch {
+                        try {
+                            val res = app.conversations.testProvider(provider, null)
+                            val ms = res.optInt("latencyMs")
+                            val count = res.optInt("modelCount")
+                            val remoteArr = res.optJSONArray("models")
+                            val remoteList = buildList {
+                                if (remoteArr != null) {
+                                    for (i in 0 until remoteArr.length()) {
+                                        val m = remoteArr.optString(i).trim()
+                                        if (m.isNotEmpty()) add(m)
+                                    }
+                                }
+                            }
+                            testStatus[provider.id] = ProviderTestResult(true, ms, "已获取 $count 个模型 · $ms ms")
+                            if (remoteList.isNotEmpty()) {
+                                fetchedPicker = provider to remoteList
+                            }
+                        } catch (e: Exception) {
+                            testStatus[provider.id] = ProviderTestResult(false, null, "连接失败：${e.message}")
+                        } finally {
+                            testing[provider.id] = false
+                        }
+                    }
+                }
+
+                fun runPingProvider() {
+                    if (!runtime.ready || busy) return
+                    testing[provider.id] = true
+                    scope.launch {
+                        try {
+                            val res = app.conversations.pingProvider(provider, null)
+                            val ttft = res.optInt("ttftMs")
+                            val ms = res.optInt("latencyMs")
+                            val m = res.optString("mappedModel").ifBlank { res.optString("model") }
+                            val prev = res.optString("preview")
+                            testStatus[provider.id] = ProviderTestResult(true, ms, "实测成功（$m）· TTFT ${ttft}ms / 总 ${ms}ms" + if (prev.isNotBlank()) " · 「$prev」" else "")
+                        } catch (e: Exception) {
+                            testStatus[provider.id] = ProviderTestResult(false, null, "推理实测失败：${e.message}")
+                        } finally {
+                            testing[provider.id] = false
+                            refreshHealth()
+                        }
+                    }
+                }
+
+                CrispCard(padding = PaddingValues(0.dp)) {
+                    Column(
+                        Modifier.fillMaxWidth().clickable { editingProvider = provider }.padding(D.space(14.dp)),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             Text(
                                 provider.name,
@@ -312,29 +357,20 @@ fun ProvidersSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                                 overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier.weight(1f),
                             )
-                            if (!provider.enabled) {
-                                TagPill("已停用", fg = G.inkSubtle, bg = G.surfaceSubtle)
-                            }
-                            val missingPluginProto = provider.customProtocolId.startsWith("plugin:") &&
-                                provider.customProtocolId.lowercase() !in activePluginProtocols
-                            if (missingPluginProto) {
-                                TagPill("插件协议未加载", fg = G.warning, bg = G.warningTint)
-                            }
-                            provider.billingLabel().takeIf { it.isNotBlank() }?.let { b ->
-                                TagPill(b, fg = if (provider.billingKind == "plan") G.accent else if (provider.billingKind == "free") G.success else G.inkMuted, bg = G.surfaceSubtle)
-                            }
-                            if (provider.billingKind !in setOf("plan", "free") && provider.priceRate != 1.0) {
-                                TagPill("${provider.priceRate}x", fg = G.warning, bg = G.warningTint)
-                            }
                             GaliaisSwitch(checked = provider.enabled, onCheckedChange = { on ->
                                 app.conversations.saveProvider(provider.copy(enabled = on), null)
                             })
                             Box {
-                                IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(30.dp)) {
+                                IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(32.dp)) {
                                     Icon(GaliaisIcons.MoreHoriz, contentDescription = "更多操作", tint = G.inkMuted, modifier = Modifier.size(18.dp))
                                 }
                                 GaliaisDropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                                     Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        GaliaisMenuRow(title = "编辑服务商", onClick = { menuOpen = false; editingProvider = provider })
+                                        if (runtime.ready && !busy) {
+                                            GaliaisMenuRow(title = "拉取远端模型", onClick = { menuOpen = false; runFetchModels() })
+                                            GaliaisMenuRow(title = "实测推理 Ping", onClick = { menuOpen = false; runPingProvider() })
+                                        }
                                         if (settings.providers.size > 1 && pIdx > 0) {
                                             GaliaisMenuRow(title = "上移", onClick = { menuOpen = false; app.conversations.moveProvider(provider.id, -1) })
                                         }
@@ -378,17 +414,22 @@ fun ProvidersSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                             }
                         }
                         Text(provider.baseUrl, fontFamily = Mono, fontSize = 11.5.sp, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                             TagPill(provider.supportedProtocolsSummary(), fg = G.inkMuted, bg = G.surfaceSubtle, border = G.border)
-                            val (keyLabel, keyColor) = when {
-                                provider.authMode == ProviderAuthMode.NONE -> "无需密钥" to G.inkSubtle
-                                provider.keyPoolCount > 1 -> "${provider.keyPoolCount} 密钥轮换" to G.success
-                                provider.hasApiKey -> "已保存密钥" to G.success
-                                else -> "未设置密钥" to G.warning
+                            if (!provider.enabled) {
+                                TagPill("已停用", fg = G.inkSubtle, bg = G.surfaceSubtle)
                             }
-                            Text("${provider.models.size} 模型 · ", style = MaterialTheme.typography.labelSmall, color = G.inkMuted)
-                            Text(keyLabel, style = MaterialTheme.typography.labelSmall, color = keyColor)
-                            Spacer(Modifier.weight(1f))
+                            val missingPluginProto = provider.customProtocolId.startsWith("plugin:") &&
+                                provider.customProtocolId.lowercase() !in activePluginProtocols
+                            if (missingPluginProto) {
+                                TagPill("插件协议未加载", fg = G.warning, bg = G.warningTint)
+                            }
+                            provider.billingLabel().takeIf { it.isNotBlank() }?.let { b ->
+                                TagPill(b, fg = if (provider.billingKind == "plan") G.accent else if (provider.billingKind == "free") G.success else G.inkMuted, bg = G.surfaceSubtle)
+                            }
+                            if (provider.billingKind !in setOf("plan", "free") && provider.priceRate != 1.0) {
+                                TagPill("${provider.priceRate}x", fg = G.warning, bg = G.warningTint)
+                            }
                             status?.latencyMs?.takeIf { status.ok }?.let { ms ->
                                 val (fg, bg) = when {
                                     ms < 1500 -> G.success to G.successTint
@@ -396,6 +437,20 @@ fun ProvidersSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                                     else -> G.danger to G.dangerTint
                                 }
                                 TagPill("${ms}ms", fg = fg, bg = bg)
+                            }
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            val (keyLabel, keyColor) = when {
+                                provider.authMode == ProviderAuthMode.NONE -> "无需密钥" to G.inkSubtle
+                                provider.keyPoolCount > 1 -> "${provider.keyPoolCount} 密钥轮换" to G.success
+                                provider.hasApiKey -> "已保存密钥" to G.success
+                                else -> "未设置密钥" to G.warning
+                            }
+                            Text("${provider.models.size} 模型", style = MaterialTheme.typography.labelSmall, color = G.inkMuted)
+                            Text("·", style = MaterialTheme.typography.labelSmall, color = G.inkSubtle)
+                            Text(keyLabel, style = MaterialTheme.typography.labelSmall, color = keyColor)
+                            if (provider.modelMap.isNotEmpty()) {
+                                Text("· 映射 ${provider.modelMap.size} 条", style = MaterialTheme.typography.labelSmall, color = G.claude)
                             }
                         }
                         if (health?.hasCoolingKeys == true) {
@@ -461,15 +516,12 @@ fun ProvidersSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                                 },
                             )
                         }
-                        if (provider.models.isNotEmpty() || provider.modelMap.isNotEmpty()) {
+                        if (provider.models.isNotEmpty()) {
                             FlowRow(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                                if (provider.modelMap.isNotEmpty()) {
-                                    TagPill("映射 ${provider.modelMap.size} 条", fg = G.claude, bg = G.claudeTint)
-                                }
-                                provider.models.take(5).forEach { m ->
+                                provider.models.take(4).forEach { m ->
                                     TagPill(m, fg = G.inkMuted, bg = G.surfaceSubtle)
                                 }
-                                if (provider.models.size > 5) TagPill("+${provider.models.size - 5}", fg = G.inkSubtle, bg = G.surfaceSubtle)
+                                if (provider.models.size > 4) TagPill("+${provider.models.size - 4}", fg = G.inkSubtle, bg = G.surfaceSubtle)
                             }
                         }
                         status?.let { res ->
@@ -482,69 +534,20 @@ fun ProvidersSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                                 Text(res.message, style = MaterialTheme.typography.labelSmall, color = fg, modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp))
                             }
                         }
-                        Hairline(Modifier.padding(top = 2.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            TagPill(
-                                text = if (busy) "测试中…" else "拉取模型",
-                                fg = if (runtime.ready && !busy) G.accent else G.inkSubtle,
-                                bg = if (runtime.ready && !busy) G.accentContainer else G.surfaceSubtle,
-                                onClick = if (runtime.ready && !busy) {
-                                    {
-                                        testing[provider.id] = true
-                                        scope.launch {
-                                            try {
-                                                val res = app.conversations.testProvider(provider, null)
-                                                val ms = res.optInt("latencyMs")
-                                                val count = res.optInt("modelCount")
-                                                val remoteArr = res.optJSONArray("models")
-                                                val remoteList = buildList {
-                                                    if (remoteArr != null) {
-                                                        for (i in 0 until remoteArr.length()) {
-                                                            val m = remoteArr.optString(i).trim()
-                                                            if (m.isNotEmpty()) add(m)
-                                                        }
-                                                    }
-                                                }
-                                                testStatus[provider.id] = ProviderTestResult(true, ms, "已获取 $count 个模型 · $ms ms")
-                                                if (remoteList.isNotEmpty()) {
-                                                    fetchedPicker = provider to remoteList
-                                                }
-                                            } catch (e: Exception) {
-                                                testStatus[provider.id] = ProviderTestResult(false, null, "连接失败：${e.message}")
-                                            } finally {
-                                                testing[provider.id] = false
-                                            }
-                                        }
-                                    }
-                                } else null,
-                            )
-                            TagPill(
-                                text = "实测 Ping",
-                                fg = if (runtime.ready && !busy) G.success else G.inkSubtle,
-                                bg = if (runtime.ready && !busy) G.successTint else G.surfaceSubtle,
-                                onClick = if (runtime.ready && !busy) {
-                                    {
-                                        testing[provider.id] = true
-                                        scope.launch {
-                                            try {
-                                                val res = app.conversations.pingProvider(provider, null)
-                                                val ttft = res.optInt("ttftMs")
-                                                val ms = res.optInt("latencyMs")
-                                                val m = res.optString("mappedModel").ifBlank { res.optString("model") }
-                                                val prev = res.optString("preview")
-                                                testStatus[provider.id] = ProviderTestResult(true, ms, "实测成功（$m）· TTFT ${ttft}ms / 总 ${ms}ms" + if (prev.isNotBlank()) " · 「$prev」" else "")
-                                            } catch (e: Exception) {
-                                                testStatus[provider.id] = ProviderTestResult(false, null, "推理实测失败：${e.message}")
-                                            } finally {
-                                                testing[provider.id] = false
-                                                refreshHealth()
-                                            }
-                                        }
-                                    }
-                                } else null,
-                            )
-                            Spacer(Modifier.weight(1f))
-                            TagPill("编辑", fg = G.ink, bg = G.surfaceSubtle, border = G.border, onClick = { editingProvider = provider })
+                        if (runtime.ready) {
+                            Hairline(Modifier.padding(top = 2.dp))
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                CompactActionButton(
+                                    text = if (busy) "检测中…" else "拉取模型",
+                                    enabled = !busy,
+                                    onClick = ::runFetchModels,
+                                )
+                                CompactActionButton(
+                                    text = "实测 Ping",
+                                    enabled = !busy,
+                                    onClick = ::runPingProvider,
+                                )
+                            }
                         }
                     }
                 }
@@ -577,66 +580,57 @@ fun ProvidersSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
     }
 
     deletingGroup?.let { target ->
-        AlertDialog(
-            onDismissRequest = { deletingGroup = null },
-            containerColor = G.surface,
-            shape = D.dialogShape,
-            title = { Text("删除路由组？", color = G.ink) },
-            text = { Text("将删除路由组「${target.name}」，不会删除其中的服务商。", color = G.inkMuted) },
-            confirmButton = {
-                TextButton(onClick = {
-                    app.conversations.deleteRoutingGroup(target.id)
-                    deletingGroup = null
-                    app.conversations.notify("已删除路由组「${target.name}」")
-                }) { Text("删除", color = G.danger, fontWeight = FontWeight.SemiBold) }
+        GaliaisConfirmDialog(
+            title = "删除路由组？",
+            message = "将删除路由组「${target.name}」，不会删除其中的服务商。",
+            confirmText = "删除",
+            danger = true,
+            onConfirm = {
+                app.conversations.deleteRoutingGroup(target.id)
+                deletingGroup = null
+                app.conversations.notify("已删除路由组「${target.name}」")
             },
-            dismissButton = { TextButton(onClick = { deletingGroup = null }) { Text("取消", color = G.inkMuted) } },
+            onDismiss = { deletingGroup = null },
         )
     }
 
     if (showImportDialog) {
-        AlertDialog(
+        GaliaisAlertDialog(
+            title = "导入服务商 JSON",
             onDismissRequest = { showImportDialog = false },
-            containerColor = G.surface,
-            shape = D.dialogShape,
-            title = { Text("导入服务商 JSON", color = G.ink) },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("粘贴由「导出」生成的 JSON（或单条服务商配置）。导入后请在对应服务商中补充 API Key。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-                    OutlinedTextField(
-                        value = importJsonText,
-                        onValueChange = { importJsonText = it; importError = null },
-                        label = { Text("服务商 JSON") },
-                        shape = D.fieldShape,
-                        colors = galiaisTextFieldColors(),
-                        textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
-                        minLines = 4,
-                        maxLines = 8,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    importError?.let { err ->
-                        Text(err, style = MaterialTheme.typography.labelSmall, color = G.danger)
-                    }
+            confirmText = "导入",
+            confirmEnabled = importJsonText.isNotBlank(),
+            onConfirm = {
+                runCatching {
+                    val (providers, groups) = parseProvidersBundleJson(importJsonText)
+                    providers.forEach { p -> app.conversations.saveProvider(p, null) }
+                    groups.forEach { g -> app.conversations.saveRoutingGroup(g) }
+                    providers.size to groups.size
                 }
-            },
-            confirmButton = {
-                TextButton(enabled = importJsonText.isNotBlank(), onClick = {
-                    runCatching {
-                        val (providers, groups) = parseProvidersBundleJson(importJsonText)
-                        providers.forEach { p -> app.conversations.saveProvider(p, null) }
-                        groups.forEach { g -> app.conversations.saveRoutingGroup(g) }
-                        providers.size to groups.size
+                    .onSuccess { (pCount, gCount) ->
+                        showImportDialog = false
+                        importJsonText = ""
+                        app.conversations.notify("已导入 $pCount 个服务商" + if (gCount > 0) "与 $gCount 个路由组" else "")
                     }
-                        .onSuccess { (pCount, gCount) ->
-                            showImportDialog = false
-                            importJsonText = ""
-                            app.conversations.notify("已导入 $pCount 个服务商" + if (gCount > 0) "与 $gCount 个路由组" else "")
-                        }
-                        .onFailure { importError = "导入失败：${it.message}" }
-                }) { Text("导入", color = G.accent, fontWeight = FontWeight.SemiBold) }
+                    .onFailure { importError = "导入失败：${it.message}" }
             },
-            dismissButton = { TextButton(onClick = { showImportDialog = false }) { Text("取消", color = G.inkMuted) } },
-        )
+        ) {
+            Text("粘贴由「导出」生成的 JSON（或单条服务商配置）。导入后请在对应服务商中补充 API Key。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+            OutlinedTextField(
+                value = importJsonText,
+                onValueChange = { importJsonText = it; importError = null },
+                label = { Text("服务商 JSON") },
+                shape = D.fieldShape,
+                colors = galiaisTextFieldColors(),
+                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
+                minLines = 4,
+                maxLines = 8,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            importError?.let { err ->
+                Text(err, style = MaterialTheme.typography.labelSmall, color = G.danger)
+            }
+        }
     }
 
     fetchedPicker?.let { (targetProvider, remoteModels) ->
@@ -658,20 +652,17 @@ fun ProvidersSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
     }
 
     deletingProvider?.let { target ->
-        AlertDialog(
-            onDismissRequest = { deletingProvider = null },
-            containerColor = G.surface,
-            shape = D.dialogShape,
-            title = { Text("删除服务商？", color = G.ink) },
-            text = { Text("将删除「${target.name}」及其加密保存的全部 API Key。", color = G.inkMuted) },
-            confirmButton = {
-                TextButton(onClick = {
-                    app.conversations.deleteProvider(target.id)
-                    deletingProvider = null
-                    app.conversations.notify("已删除服务商「${target.name}」")
-                }) { Text("删除", color = G.danger, fontWeight = FontWeight.SemiBold) }
+        GaliaisConfirmDialog(
+            title = "删除服务商？",
+            message = "将删除「${target.name}」及其加密保存的全部 API Key。",
+            confirmText = "删除",
+            danger = true,
+            onConfirm = {
+                app.conversations.deleteProvider(target.id)
+                deletingProvider = null
+                app.conversations.notify("已删除服务商「${target.name}」")
             },
-            dismissButton = { TextButton(onClick = { deletingProvider = null }) { Text("取消", color = G.inkMuted) } },
+            onDismiss = { deletingProvider = null },
         )
     }
 }
@@ -693,122 +684,118 @@ private fun RoutingGroupEditorDialog(
     }
     val pickedProvider = providers.firstOrNull { it.id == pickProviderId }
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = G.surface,
-        shape = D.dialogShape,
-        title = { Text(if (initial == null) "新建服务商路由组" else "编辑路由组", color = G.ink) },
-        text = {
-            Column(
-                modifier = Modifier.fillMaxWidth().heightIn(max = 460.dp).verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                OutlinedTextField(value = name, onValueChange = { name = it.take(60) }, label = { Text("路由组名称（如：主力编程高可用）") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth())
-                AgentOptionChips(
-                    title = "调度策略",
-                    options = listOf("failover" to "主备故障转移", "round_robin" to "轮询均衡", "cheapest" to "最低费率"),
-                    selected = strategy,
-                    onSelect = { if (it != null) strategy = it },
-                )
-                Text(
-                    when (strategy) {
-                        "round_robin" -> "按节点权重轮询分发请求，点下方节点权重标签可循环切换 1x–5x。"
-                        "cheapest" -> "优先路由到免费、订阅套餐与低倍率节点，故障时自动回退下一节点。"
-                        else -> "严格按列表顺序请求主节点，遇到 429 / 5xx 自动无感切换至备选节点。"
-                    },
-                    style = MaterialTheme.typography.labelSmall,
-                    color = G.inkMuted,
-                )
-                if (providers.isEmpty()) {
-                    Text("请先在「服务商」页添加至少 1 个服务商。", style = MaterialTheme.typography.bodySmall, color = G.warning)
-                } else {
-                    Text("选择服务商与目标模型", style = MaterialTheme.typography.labelSmall, color = G.inkMuted)
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        providers.forEach { p ->
-                            val chipLabel = if (!p.enabled) "${p.name}(已停用)" else p.name
-                            SelectableChip(chipLabel, selected = pickProviderId == p.id, onClick = {
-                                pickProviderId = p.id
-                                pickModel = p.models.firstOrNull() ?: ""
-                            })
-                        }
-                    }
-                    if (pickedProvider != null && (!pickedProvider.enabled || (pickedProvider.authMode != ProviderAuthMode.NONE && !pickedProvider.hasApiKey))) {
-                        Surface(Modifier.fillMaxWidth(), shape = D.shape(8.dp), color = G.warningTint) {
-                            Text(
-                                if (!pickedProvider.enabled) "提示：「${pickedProvider.name}」当前已停用，请求会被路由组跳过。"
-                                else "提示：「${pickedProvider.name}」尚未设置 API Key，请求可能会鉴权失败。",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = G.warning,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-                            )
-                        }
-                    }
-                    if (pickedProvider != null && pickedProvider.models.isNotEmpty()) {
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                            pickedProvider.models.take(12).forEach { m ->
-                                SelectableChip(m, selected = pickModel == m, onClick = { pickModel = m })
-                            }
-                        }
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        OutlinedTextField(value = pickModel, onValueChange = { pickModel = it.trim() }, label = { Text("目标模型 ID") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.weight(1f))
-                        SecondaryPillButton("加入", enabled = pickProviderId.isNotBlank() && pickModel.isNotBlank(), onClick = {
-                            targets = targets + RoutingTarget(pickProviderId, pickModel.trim(), weight = 1)
-                        })
-                    }
+    GaliaisSheetScaffold(
+        title = if (initial == null) "新建服务商路由组" else "编辑路由组",
+        subtitle = "跨服务商编排主备故障转移、权重轮询或最低费率策略",
+        onDismiss = onDismiss,
+        footer = {
+            SecondaryPillButton("取消", onClick = onDismiss)
+            PrimaryPillButton(
+                text = "保存路由组",
+                modifier = Modifier.weight(1f),
+                enabled = name.isNotBlank() && targets.isNotEmpty(),
+                onClick = { onSave(RoutingGroup(id = id, name = name.trim(), strategy = strategy, targets = targets)) },
+            )
+        },
+    ) {
+        OutlinedTextField(value = name, onValueChange = { name = it.take(60) }, label = { Text("路由组名称（如：主力编程高可用）") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth())
+        AgentOptionChips(
+            title = "调度策略",
+            options = listOf("failover" to "主备故障转移", "round_robin" to "轮询均衡", "cheapest" to "最低费率"),
+            selected = strategy,
+            onSelect = { if (it != null) strategy = it },
+        )
+        Text(
+            when (strategy) {
+                "round_robin" -> "按节点权重轮询分发请求，点下方节点权重标签可循环切换 1x–5x。"
+                "cheapest" -> "优先路由到免费、订阅套餐与低倍率节点，故障时自动回退下一节点。"
+                else -> "严格按列表顺序请求主节点，遇到 429 / 5xx 自动无感切换至备选节点。"
+            },
+            style = MaterialTheme.typography.labelSmall,
+            color = G.inkMuted,
+        )
+        if (providers.isEmpty()) {
+            Text("请先在「服务商」页添加至少 1 个服务商。", style = MaterialTheme.typography.bodySmall, color = G.warning)
+        } else {
+            Text("选择服务商与目标模型", style = MaterialTheme.typography.labelSmall, color = G.inkMuted)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                providers.forEach { p ->
+                    val chipLabel = if (!p.enabled) "${p.name}(已停用)" else p.name
+                    SelectableChip(chipLabel, selected = pickProviderId == p.id, onClick = {
+                        pickProviderId = p.id
+                        pickModel = p.models.firstOrNull() ?: ""
+                    })
                 }
-                if (targets.isNotEmpty()) {
-                    Text("已编排节点（${targets.size}）", style = MaterialTheme.typography.labelSmall, color = G.inkMuted)
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        targets.forEachIndexed { idx, t ->
-                            val p = providers.firstOrNull { it.id == t.providerId }
-                            val pName = p?.name ?: t.providerId
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                                Text(
-                                    "${idx + 1}. $pName / ${t.model}",
-                                    fontFamily = Mono,
-                                    fontSize = 11.5.sp,
-                                    color = if (p == null || !p.enabled) G.inkSubtle else G.ink,
-                                    modifier = Modifier.weight(1f),
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                                if (strategy == "round_robin") {
-                                    TagPill("${t.weight}x", fg = G.accent, bg = G.accentContainer, onClick = {
-                                        val nextWeight = if (t.weight >= 5) 1 else t.weight + 1
-                                        targets = targets.mapIndexed { i, item -> if (i == idx) item.copy(weight = nextWeight) else item }
-                                    })
-                                }
-                                if (idx > 0) {
-                                    TagPill("↑", fg = G.inkMuted, bg = G.surfaceSubtle, border = G.border, onClick = {
-                                        val list = targets.toMutableList()
-                                        val cur = list.removeAt(idx)
-                                        list.add(idx - 1, cur)
-                                        targets = list
-                                    })
-                                }
-                                if (idx < targets.lastIndex) {
-                                    TagPill("↓", fg = G.inkMuted, bg = G.surfaceSubtle, border = G.border, onClick = {
-                                        val list = targets.toMutableList()
-                                        val cur = list.removeAt(idx)
-                                        list.add(idx + 1, cur)
-                                        targets = list
-                                    })
-                                }
-                                TagPill("移除", fg = G.danger, bg = G.dangerTint, onClick = { targets = targets.filterIndexed { i, _ -> i != idx } })
-                            }
-                        }
+            }
+            if (pickedProvider != null && (!pickedProvider.enabled || (pickedProvider.authMode != ProviderAuthMode.NONE && !pickedProvider.hasApiKey))) {
+                Surface(Modifier.fillMaxWidth(), shape = D.shape(8.dp), color = G.warningTint) {
+                    Text(
+                        if (!pickedProvider.enabled) "提示：「${pickedProvider.name}」当前已停用，请求会被路由组跳过。"
+                        else "提示：「${pickedProvider.name}」尚未设置 API Key，请求可能会鉴权失败。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = G.warning,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                    )
+                }
+            }
+            if (pickedProvider != null && pickedProvider.models.isNotEmpty()) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    pickedProvider.models.take(12).forEach { m ->
+                        SelectableChip(m, selected = pickModel == m, onClick = { pickModel = m })
                     }
                 }
             }
-        },
-        confirmButton = {
-            TextButton(enabled = name.isNotBlank() && targets.isNotEmpty(), onClick = {
-                onSave(RoutingGroup(id = id, name = name.trim(), strategy = strategy, targets = targets))
-            }) { Text("保存", color = G.accent, fontWeight = FontWeight.SemiBold) }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消", color = G.inkMuted) } },
-    )
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                OutlinedTextField(value = pickModel, onValueChange = { pickModel = it.trim() }, label = { Text("目标模型 ID") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.weight(1f))
+                SecondaryPillButton("加入", enabled = pickProviderId.isNotBlank() && pickModel.isNotBlank(), onClick = {
+                    targets = targets + RoutingTarget(pickProviderId, pickModel.trim(), weight = 1)
+                })
+            }
+        }
+        if (targets.isNotEmpty()) {
+            Text("已编排节点（${targets.size}）", style = MaterialTheme.typography.labelSmall, color = G.inkMuted)
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                targets.forEachIndexed { idx, t ->
+                    val p = providers.firstOrNull { it.id == t.providerId }
+                    val pName = p?.name ?: t.providerId
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                        Text(
+                            "${idx + 1}. $pName / ${t.model}",
+                            fontFamily = Mono,
+                            fontSize = 11.5.sp,
+                            color = if (p == null || !p.enabled) G.inkSubtle else G.ink,
+                            modifier = Modifier.weight(1f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        if (strategy == "round_robin") {
+                            TagPill("${t.weight}x", fg = G.accent, bg = G.accentContainer, onClick = {
+                                val nextWeight = if (t.weight >= 5) 1 else t.weight + 1
+                                targets = targets.mapIndexed { i, item -> if (i == idx) item.copy(weight = nextWeight) else item }
+                            })
+                        }
+                        if (idx > 0) {
+                            TagPill("↑", fg = G.inkMuted, bg = G.surfaceSubtle, border = G.border, onClick = {
+                                val list = targets.toMutableList()
+                                val cur = list.removeAt(idx)
+                                list.add(idx - 1, cur)
+                                targets = list
+                            })
+                        }
+                        if (idx < targets.lastIndex) {
+                            TagPill("↓", fg = G.inkMuted, bg = G.surfaceSubtle, border = G.border, onClick = {
+                                val list = targets.toMutableList()
+                                val cur = list.removeAt(idx)
+                                list.add(idx + 1, cur)
+                                targets = list
+                            })
+                        }
+                        TagPill("移除", fg = G.danger, bg = G.dangerTint, onClick = { targets = targets.filterIndexed { i, _ -> i != idx } })
+                    }
+                }
+            }
+        }
+    }
 }
 
 /** Codex 设置专属设置子页面。 */
@@ -868,7 +855,6 @@ fun CodexSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, on
     val codexModelOption = codexModels.selectedModel(settings.codexModel ?: codexProvider?.models?.firstOrNull())
 
     SubPageScaffold(title = "Codex 设置", onBack = onBack, snackbar = snackbar, loading = codexLoading) {
-        CrispCard { CliUpdateControls(app, "codex") }
         CrispCard {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 AgentAppIcon(engine = EngineKind.CODEX, size = 42.dp)
@@ -878,6 +864,7 @@ fun CodexSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, on
                 }
             }
         }
+        CrispCard { CliUpdateControls(app, "codex") }
         SectionLabel("模型与接入方式")
         CrispCard {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -995,17 +982,14 @@ fun CodexSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, on
                         visualTransformation = PasswordVisualTransformation(),
                         modifier = Modifier.fillMaxWidth(),
                     )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        PrimaryPillButton(
-                            text = "用 Key 登录",
-                            enabled = runtime.ready && codexKey.isNotBlank(),
-                            onClick = {
-                                val key = codexKey; codexKey = ""
-                                report("Codex 登录失败") { app.conversations.codex.loginWithApiKey(key); app.conversations.notify("Codex 已登录") }
-                            },
-                        )
-                        SecondaryPillButton("退出登录", enabled = runtime.ready, onClick = { report("退出失败") { app.conversations.codex.logout() } })
-                    }
+                    PrimaryPillButton(
+                        text = "用 Key 登录",
+                        enabled = runtime.ready && codexKey.isNotBlank(),
+                        onClick = {
+                            val key = codexKey; codexKey = ""
+                            report("Codex 登录失败") { app.conversations.codex.loginWithApiKey(key); app.conversations.notify("Codex 已登录") }
+                        },
+                    )
                     Text("ChatGPT Plus/Pro/Team 订阅账号推荐设备码登录；API Key 将由本地 Codex 保存。", style = MaterialTheme.typography.bodySmall, color = G.inkSubtle)
                     ModelPickerRow("默认模型", settings.codexModel, codexModels) { app.settings.setCodexModel(it) }
                 } else {
@@ -1251,9 +1235,17 @@ fun ClaudeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, o
 
     val claudeProvider = settings.provider(settings.claudeProviderId)
     val claudeModelOption = claudeModels.selectedModel(settings.claudeModel ?: claudeProvider?.models?.firstOrNull())
+    var claudeAuthTab by rememberSaveable {
+        mutableStateOf(
+            when {
+                settings.hasClaudeOauthToken -> "token"
+                settings.hasClaudeKey -> "apikey"
+                else -> "oauth"
+            },
+        )
+    }
 
     SubPageScaffold(title = "Claude Code 设置", onBack = onBack, snackbar = snackbar, loading = claudeLoading) {
-        CrispCard { CliUpdateControls(app, "claude") }
         CrispCard {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 AgentAppIcon(engine = EngineKind.CLAUDE, size = 42.dp)
@@ -1263,6 +1255,7 @@ fun ClaudeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, o
                 }
             }
         }
+        CrispCard { CliUpdateControls(app, "claude") }
         SectionLabel("模型与接入方式")
         CrispCard {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1293,129 +1286,148 @@ fun ClaudeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, o
                             TagPill("启动环境", fg = G.onAccent, bg = G.accent, onClick = app.runtime::start)
                         }
                     }
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        PrimaryPillButton(
-                            text = if (claudeAuthState?.running == true) "等待授权完成…" else "Claude.ai OAuth 登录",
-                            enabled = runtime.ready && claudeAuthState?.running != true,
-                            onClick = { report("启动 Claude OAuth 失败") { app.conversations.hub.startCliAuth("claude", "oauth") } },
-                        )
-                        SecondaryPillButton(
-                            text = "setup-token 订阅登录",
-                            enabled = runtime.ready && claudeAuthState?.running != true,
-                            onClick = { report("启动 setup-token 失败") { app.conversations.hub.startCliAuth("claude", "setup-token") } },
-                        )
-                        if (runtime.ready && claudeAuthStatus?.loggedIn == true) {
-                            SecondaryPillButton("退出登录", danger = true, onClick = {
-                                report("退出登录失败") {
-                                    app.conversations.hub.logoutAuth("claude")
-                                    refreshTick++
-                                    app.conversations.notify("已退出 Claude 账号")
+                    SegmentedPillBar(
+                        options = listOf("oauth" to "OAuth 登录", "token" to "长效 Token", "apikey" to "API Key"),
+                        selected = claudeAuthTab,
+                        onSelect = { claudeAuthTab = it },
+                    )
+                    when (claudeAuthTab) {
+                        "oauth" -> {
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                PrimaryPillButton(
+                                    text = if (claudeAuthState?.running == true) "等待授权完成…" else "Claude.ai OAuth 登录",
+                                    enabled = runtime.ready && claudeAuthState?.running != true,
+                                    onClick = { report("启动 Claude OAuth 失败") { app.conversations.hub.startCliAuth("claude", "oauth") } },
+                                )
+                                SecondaryPillButton(
+                                    text = "setup-token 订阅登录",
+                                    enabled = runtime.ready && claudeAuthState?.running != true,
+                                    onClick = { report("启动 setup-token 失败") { app.conversations.hub.startCliAuth("claude", "setup-token") } },
+                                )
+                                if (runtime.ready && claudeAuthStatus?.loggedIn == true) {
+                                    SecondaryPillButton("退出登录", danger = true, onClick = {
+                                        report("退出登录失败") {
+                                            app.conversations.hub.logoutAuth("claude")
+                                            refreshTick++
+                                            app.conversations.notify("已退出 Claude 账号")
+                                        }
+                                    })
                                 }
-                            })
+                            }
+                            if (claudeAuthState != null) {
+                                CliInteractiveAuthCard(
+                                    app = app,
+                                    agentId = "claude",
+                                    authState = claudeAuthState,
+                                    onCancel = { report("取消登录失败") { app.conversations.hub.cancelAuth("claude") } },
+                                )
+                            }
+                        }
+                        "token" -> {
+                            Text(
+                                if (settings.hasClaudeOauthToken) "长效 OAuth Token（CLAUDE_CODE_OAUTH_TOKEN）已加密保存" else "粘贴由 claude setup-token 生成的长效 OAuth Token",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (settings.hasClaudeOauthToken) G.success else G.inkMuted,
+                            )
+                            OutlinedTextField(
+                                value = claudeOauthInput,
+                                onValueChange = { claudeOauthInput = it.trim() },
+                                label = { Text("CLAUDE_CODE_OAUTH_TOKEN") },
+                                singleLine = true,
+                                shape = D.fieldShape,
+                                colors = galiaisTextFieldColors(),
+                                visualTransformation = PasswordVisualTransformation(),
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                PrimaryPillButton(
+                                    text = "保存 Token",
+                                    enabled = claudeOauthInput.isNotBlank(),
+                                    onClick = {
+                                        report("保存 Token 失败") {
+                                            app.settings.setClaudeOauthToken(claudeOauthInput)
+                                            claudeOauthInput = ""
+                                            app.conversations.notify("已加密保存 OAuth Token，新会话生效")
+                                        }
+                                    },
+                                )
+                                if (settings.hasClaudeOauthToken) {
+                                    SecondaryPillButton("删除 Token", danger = true, onClick = { app.settings.setClaudeOauthToken(null) })
+                                }
+                            }
+                        }
+                        else -> {
+                            Text(
+                                if (settings.hasClaudeKey) "Anthropic API Key 已加密保存" else "使用 Anthropic API Key 连接官方或自定义端点",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (settings.hasClaudeKey) G.success else G.inkMuted,
+                            )
+                            OutlinedTextField(
+                                value = claudeKey,
+                                onValueChange = { claudeKey = it.trim() },
+                                label = { Text("Anthropic API Key") },
+                                singleLine = true,
+                                shape = D.fieldShape,
+                                colors = galiaisTextFieldColors(),
+                                visualTransformation = PasswordVisualTransformation(),
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                PrimaryPillButton(
+                                    text = "保存密钥",
+                                    enabled = claudeKey.isNotBlank(),
+                                    onClick = {
+                                        report("保存失败") {
+                                            app.settings.setClaudeApiKey(claudeKey)
+                                            claudeKey = ""
+                                            app.conversations.notify("已加密保存，新打开的 Claude 会话生效")
+                                        }
+                                    },
+                                )
+                                if (settings.hasClaudeKey) SecondaryPillButton("删除密钥", danger = true, onClick = { app.settings.setClaudeApiKey(null) })
+                            }
                         }
                     }
-                    if (claudeAuthState != null) {
-                        CliInteractiveAuthCard(
-                            app = app,
-                            agentId = "claude",
-                            authState = claudeAuthState,
-                            onCancel = { report("取消登录失败") { app.conversations.hub.cancelAuth("claude") } },
-                        )
-                    }
                     Hairline()
-                    Text(
-                        if (settings.hasClaudeOauthToken) "长效 OAuth Token（CLAUDE_CODE_OAUTH_TOKEN）已加密保存" else "或粘贴长效 OAuth Token（claude setup-token 生成）",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (settings.hasClaudeOauthToken) G.success else G.inkMuted,
-                    )
-                    OutlinedTextField(
-                        value = claudeOauthInput,
-                        onValueChange = { claudeOauthInput = it.trim() },
-                        label = { Text("CLAUDE_CODE_OAUTH_TOKEN（可选）") },
-                        singleLine = true,
-                        shape = D.fieldShape,
-                        colors = galiaisTextFieldColors(),
-                        visualTransformation = PasswordVisualTransformation(),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        SecondaryPillButton(
-                            text = "保存 Token",
-                            enabled = claudeOauthInput.isNotBlank(),
-                            onClick = {
-                                report("保存 Token 失败") {
-                                    app.settings.setClaudeOauthToken(claudeOauthInput)
-                                    claudeOauthInput = ""
-                                    app.conversations.notify("已加密保存 OAuth Token，新会话生效")
-                                }
-                            },
-                        )
-                        if (settings.hasClaudeOauthToken) {
-                            SecondaryPillButton("删除 Token", danger = true, onClick = { app.settings.setClaudeOauthToken(null) })
-                        }
-                    }
-                    Hairline()
-                    Text(
-                        if (settings.hasClaudeKey) "Anthropic API Key 已加密保存" else "或使用 Anthropic API Key",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = if (settings.hasClaudeKey) G.success else G.inkMuted,
-                    )
-                    OutlinedTextField(
-                        value = claudeKey,
-                        onValueChange = { claudeKey = it.trim() },
-                        label = { Text("Anthropic API Key") },
-                        singleLine = true,
-                        shape = D.fieldShape,
-                        colors = galiaisTextFieldColors(),
-                        visualTransformation = PasswordVisualTransformation(),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        PrimaryPillButton(
-                            text = "保存密钥",
-                            enabled = claudeKey.isNotBlank(),
-                            onClick = {
-                                report("保存失败") {
-                                    app.settings.setClaudeApiKey(claudeKey)
-                                    claudeKey = ""
-                                    app.conversations.notify("已加密保存，新打开的 Claude 会话生效")
-                                }
-                            },
-                        )
-                        if (settings.hasClaudeKey) SecondaryPillButton("删除密钥", danger = true, onClick = { app.settings.setClaudeApiKey(null) })
-                    }
                     ModelPickerRow("默认模型", settings.claudeModel, claudeModels.ifEmpty { claudeAliases }) {
                         app.settings.setClaudeModel(it)
                         claudeModel = it ?: ""
                     }
-                    OutlinedTextField(
-                        value = claudeUrl,
-                        onValueChange = { claudeUrl = it.trim() },
-                        label = { Text("API 地址（可选，HTTPS）") },
-                        singleLine = true,
-                        shape = D.fieldShape,
-                        colors = galiaisTextFieldColors(),
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    OutlinedTextField(
-                        value = claudeModel,
-                        onValueChange = { claudeModel = it.trim() },
-                        label = { Text("自定义模型（可选，如 sonnet / opus）") },
-                        singleLine = true,
-                        shape = D.fieldShape,
-                        colors = galiaisTextFieldColors(),
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    PrimaryPillButton("保存地址与模型", onClick = {
-                        report("保存失败") {
-                            app.settings.setClaudeBaseUrl(claudeUrl)
-                            app.settings.setClaudeModel(claudeModel.ifBlank { null })
-                            app.conversations.notify("已保存")
+                    Collapsible(
+                        title = if (claudeUrl.isNotBlank()) "自定义 API 地址与模型覆盖（已配置）" else "自定义 API 地址与模型覆盖（可选）",
+                        initiallyOpen = claudeUrl.isNotBlank(),
+                    ) {
+                        Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedTextField(
+                                value = claudeUrl,
+                                onValueChange = { claudeUrl = it.trim() },
+                                label = { Text("API 地址（可选，HTTPS）") },
+                                singleLine = true,
+                                shape = D.fieldShape,
+                                colors = galiaisTextFieldColors(),
+                                textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            OutlinedTextField(
+                                value = claudeModel,
+                                onValueChange = { claudeModel = it.trim() },
+                                label = { Text("自定义模型（可选，如 sonnet / opus）") },
+                                singleLine = true,
+                                shape = D.fieldShape,
+                                colors = galiaisTextFieldColors(),
+                                textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            SecondaryPillButton("保存地址与模型", onClick = {
+                                report("保存失败") {
+                                    app.settings.setClaudeBaseUrl(claudeUrl)
+                                    app.settings.setClaudeModel(claudeModel.ifBlank { null })
+                                    app.conversations.notify("已保存")
+                                }
+                            })
                         }
-                    })
-                    Text("API Key 加密保存在本机，打开会话时传给 Claude Code，用于连接模型服务商。", style = MaterialTheme.typography.bodySmall, color = G.inkSubtle)
+                    }
+                    Text("凭证仅加密保存在本机 Keystore，打开会话时传给 Claude Code。", style = MaterialTheme.typography.bodySmall, color = G.inkSubtle)
                 } else {
                     Surface(Modifier.fillMaxWidth(), shape = D.shape(10.dp), color = G.claudeTint) {
                         Text(
@@ -1455,35 +1467,26 @@ fun ClaudeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, o
                         app.conversations.notify("Prompt 缓存窗口已设为：${it ?: "默认"}")
                     },
                 )
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text("Git 提交附带 Co-Authored-By 归属", style = MaterialTheme.typography.bodyMedium, color = G.ink)
-                        Text("关闭后提交信息不再附加 Claude 署名。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-                    }
-                    GaliaisSwitch(checked = settings.claudeCommitAttribution, onCheckedChange = { app.settings.setClaudeCommitAttribution(it) })
-                }
+                SettingsToggleRow(
+                    title = "Git 提交附带 Co-Authored-By 归属",
+                    subtitle = "关闭后提交信息不再附加 Claude 署名。",
+                    checked = settings.claudeCommitAttribution,
+                    onCheckedChange = { app.settings.setClaudeCommitAttribution(it) },
+                )
             }
         }
 
         SectionLabel("Artifacts 富交互产物")
         CrispCard {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text("启用 Claude Artifacts 模式", style = MaterialTheme.typography.titleSmall, color = G.ink)
-                    Text(
-                        "允许 Claude Code 生成 <antArtifact> 交互网页、SVG 图形、Mermaid 图表、React 组件与 LaTeX 论文，并在离线产物工作台即时渲染与导出 PDF。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = G.inkMuted,
-                    )
-                }
-                GaliaisSwitch(
-                    checked = settings.artifactsModeEnabled,
-                    onCheckedChange = {
-                        app.settings.setArtifactsModeEnabled(it)
-                        app.conversations.notify(if (it) "已开启 Artifacts 交互产物模式（新会话生效）" else "已关闭 Artifacts 交互产物模式")
-                    },
-                )
-            }
+            SettingsToggleRow(
+                title = "启用 Claude Artifacts 模式",
+                subtitle = "允许生成交互网页、SVG、Mermaid 图表、React 组件与 LaTeX 论文，并在离线产物工作台渲染与导出 PDF。",
+                checked = settings.artifactsModeEnabled,
+                onCheckedChange = {
+                    app.settings.setArtifactsModeEnabled(it)
+                    app.conversations.notify(if (it) "已开启 Artifacts 交互产物模式（新会话生效）" else "已关闭 Artifacts 交互产物模式")
+                },
+            )
         }
 
         SectionLabel("默认权限模式")

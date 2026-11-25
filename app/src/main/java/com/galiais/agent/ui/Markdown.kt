@@ -37,6 +37,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.toClipEntry
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
@@ -615,16 +616,18 @@ private fun ListBlock(
                     itemChildren.forEachIndexed { childIdx, child ->
                         if (childIdx == 0 && taskMarker != null && child is Paragraph) {
                             val checked = taskMarker.first
-                            Text(
-                                text = inline(
-                                    node = child,
-                                    overrideTextColor = if (checked) (overrideTextColor?.copy(alpha = 0.65f) ?: G.inkMuted) else overrideTextColor,
-                                    stripLeadingChars = taskMarker.second,
-                                    strikethrough = checked,
-                                ),
-                                style = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodyLarge,
-                                color = if (checked) (overrideTextColor?.copy(alpha = 0.65f) ?: G.inkMuted) else (overrideTextColor ?: G.ink),
-                            )
+                            SelectionContainer {
+                                Text(
+                                    text = inline(
+                                        node = child,
+                                        overrideTextColor = if (checked) (overrideTextColor?.copy(alpha = 0.65f) ?: G.inkMuted) else overrideTextColor,
+                                        stripLeadingChars = taskMarker.second,
+                                        strikethrough = checked,
+                                    ),
+                                    style = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodyLarge,
+                                    color = if (checked) (overrideTextColor?.copy(alpha = 0.65f) ?: G.inkMuted) else (overrideTextColor ?: G.ink),
+                                )
+                            }
                         } else {
                             Block(child, compact, sourceItemId, streaming, overrideTextColor, onOpenArtifact)
                         }
@@ -662,47 +665,50 @@ internal fun reasoningPreview(text: String, streaming: Boolean): ReasoningPrevie
 private fun TableView(table: TableBlock) {
     val rows = table.children().flatMap { section -> section.children() }.filterIsInstance<TableRow>()
     if (rows.isEmpty()) return
-    val colWidths = remember(rows) {
+    val fontScale = LocalDensity.current.fontScale.coerceIn(0.85f, 1.5f)
+    val colWidths = remember(rows, fontScale) {
         val maxLens = mutableListOf<Int>()
         for (row in rows) {
             row.children().filterIsInstance<TableCell>().forEachIndexed { colIdx, cell ->
                 val txt = rawParagraphText(cell)
-                // 中文与宽字符按 1.65 宽度估算，使各列按内容自适应而不僵硬统一 148dp
+                // 中文与宽字符按 2 宽估算，并随系统/应用 fontScale 等比缩放列宽
                 val visualLen = txt.sumOf { ch -> if (ch.code > 0x7F) 2 else 1 }
                 while (maxLens.size <= colIdx) maxLens += 0
                 if (visualLen > maxLens[colIdx]) maxLens[colIdx] = visualLen
             }
         }
-        maxLens.map { len -> (len * 7.4f + 28f).coerceIn(82f, 224f).dp }
+        maxLens.map { len -> ((len * 7.4f * fontScale) + 28f).coerceIn(82f * fontScale, 256f * fontScale).dp }
     }
     val totalTableWidth = remember(colWidths) { colWidths.fold(0.dp) { acc, w -> acc + w } }
     Surface(shape = D.shape(12.dp), color = G.surface, border = BorderStroke(0.75.dp, G.border)) {
-        Column(Modifier.horizontalScroll(rememberScrollState())) {
-            rows.forEachIndexed { index, row ->
-                val rowBg = when {
-                    index == 0 -> G.surfaceSubtle
-                    index % 2 == 0 -> G.surfaceSubtle.copy(alpha = if (G.dark) 0.28f else 0.36f)
-                    else -> G.surface
-                }
-                Row(Modifier.background(rowBg)) {
-                    row.children().filterIsInstance<TableCell>().forEachIndexed { colIdx, cell ->
-                        val cellWidth = colWidths.getOrElse(colIdx) { 128.dp }
-                        val align = when (cell.alignment) {
-                            TableCell.Alignment.CENTER -> TextAlign.Center
-                            TableCell.Alignment.RIGHT -> TextAlign.End
-                            else -> TextAlign.Start
-                        }
-                        Text(
-                            inline(cell),
-                            modifier = Modifier.width(cellWidth).padding(horizontal = 12.dp, vertical = 9.dp),
-                            style = if (cell.isHeader) MaterialTheme.typography.labelMedium else MaterialTheme.typography.bodySmall,
-                            fontWeight = if (cell.isHeader) FontWeight.SemiBold else null,
-                            textAlign = align,
-                            color = G.ink,
-                        )
+        SelectionContainer {
+            Column(Modifier.horizontalScroll(rememberScrollState())) {
+                rows.forEachIndexed { index, row ->
+                    val rowBg = when {
+                        index == 0 -> G.surfaceSubtle
+                        index % 2 == 0 -> G.surfaceSubtle.copy(alpha = if (G.dark) 0.28f else 0.36f)
+                        else -> G.surface
                     }
+                    Row(Modifier.background(rowBg)) {
+                        row.children().filterIsInstance<TableCell>().forEachIndexed { colIdx, cell ->
+                            val cellWidth = colWidths.getOrElse(colIdx) { (128f * fontScale).dp }
+                            val align = when (cell.alignment) {
+                                TableCell.Alignment.CENTER -> TextAlign.Center
+                                TableCell.Alignment.RIGHT -> TextAlign.End
+                                else -> TextAlign.Start
+                            }
+                            Text(
+                                inline(cell),
+                                modifier = Modifier.width(cellWidth).padding(horizontal = 12.dp, vertical = 9.dp),
+                                style = if (cell.isHeader) MaterialTheme.typography.labelMedium else MaterialTheme.typography.bodySmall,
+                                fontWeight = if (cell.isHeader) FontWeight.SemiBold else null,
+                                textAlign = align,
+                                color = G.ink,
+                            )
+                        }
+                    }
+                    if (index < rows.lastIndex) HorizontalDivider(modifier = Modifier.width(totalTableWidth), thickness = 0.5.dp, color = G.border.copy(alpha = 0.85f))
                 }
-                if (index < rows.lastIndex) HorizontalDivider(modifier = Modifier.width(totalTableWidth), thickness = 0.5.dp, color = G.border.copy(alpha = 0.85f))
             }
         }
     }

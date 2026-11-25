@@ -1,9 +1,11 @@
 package com.galiais.agent
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -59,6 +61,7 @@ class MainActivity : ComponentActivity() {
             requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
         val app = application as GaliaisApplication
+        handleIncomingShareIntent(app, intent)
         // 已安装环境：每次打开应用按设置自动启动；若后台仍有常驻引擎则自动重新挂接（旋转等配置变更不重复触发）。
         if (savedInstanceState == null) app.runtime.requestAutoStart()
         setContent {
@@ -86,6 +89,37 @@ class MainActivity : ComponentActivity() {
                     writeSelfUpdateHealthHeartbeat()
                 }
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingShareIntent(application as GaliaisApplication, intent)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun handleIncomingShareIntent(app: GaliaisApplication, incoming: Intent?) {
+        if (incoming == null) return
+        val uris = when (incoming.action) {
+            Intent.ACTION_SEND -> listOfNotNull(
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    incoming.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    incoming.getParcelableExtra(Intent.EXTRA_STREAM)
+                },
+            )
+            Intent.ACTION_SEND_MULTIPLE -> (
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    incoming.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    incoming.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
+                }
+            ).orEmpty()
+            else -> emptyList()
+        }
+        if (uris.isNotEmpty()) {
+            app.fileManager.enqueueSharedUris(uris)
         }
     }
 }

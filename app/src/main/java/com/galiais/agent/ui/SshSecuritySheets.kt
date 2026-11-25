@@ -1,15 +1,20 @@
 package com.galiais.agent.ui
 
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -22,8 +27,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.toClipEntry
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.galiais.agent.GaliaisApplication
@@ -46,18 +53,30 @@ fun SshKeyPassphraseDialog(app: GaliaisApplication, name: String, onDismiss: () 
             finally { busy = false }
         }
     }
-    AlertDialog(onDismissRequest = { if (!busy) onDismiss() }, title = { Text("密钥口令 · $name") },
+    GaliaisAlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        title = "密钥口令 · $name",
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("口令加密保存在本机，用于 SSH、SFTP 和隧道认证。", style = MaterialTheme.typography.bodySmall)
-                OutlinedTextField(value, { value = it }, enabled = !busy, label = { Text("口令") },
-                    visualTransformation = PasswordVisualTransformation(), singleLine = true, modifier = Modifier.fillMaxWidth())
+                Text("口令加密保存在本机，用于 SSH、SFTP 和隧道认证。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = { value = it },
+                    enabled = !busy,
+                    label = { Text("口令") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    shape = D.fieldShape,
+                    colors = galiaisTextFieldColors(),
+                    modifier = Modifier.fillMaxWidth(),
+                )
                 if (app.envSsh.hasSshKeyPassphrase(name)) SecondaryPillButton("清除已保存口令", enabled = !busy, onClick = { save("") })
-                error?.let { Text(it, color = G.danger) }
+                error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
             }
         },
-        confirmButton = { TextButton(onClick = { save(value) }, enabled = !busy && value.isNotEmpty()) { Text(if (busy) "正在校验" else "保存") } },
-        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("取消") } })
+        confirmButton = { TextButton(onClick = { save(value) }, enabled = !busy && value.isNotEmpty()) { Text(if (busy) "正在校验" else "保存", color = G.accent, fontWeight = FontWeight.SemiBold) } },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("取消", color = G.inkMuted) } },
+    )
 }
 
 @Composable
@@ -97,9 +116,13 @@ fun KnownHostsSheet(app: GaliaisApplication, onDismiss: () -> Unit) {
         }
     }
     deleting?.let { entry ->
-        AlertDialog(onDismissRequest = { if (!removing) deleting = null }, title = { Text("移除此主机指纹？") },
-            text = { Text("下次连接将重新记录主机密钥。请先核对服务器身份，避免信任被替换的主机。") },
-            confirmButton = { TextButton(enabled = !removing, onClick = {
+        GaliaisConfirmDialog(
+            title = "移除此主机指纹？",
+            message = "下次连接将重新记录主机密钥。请先核对服务器身份，避免信任被替换的主机。",
+            confirmText = "移除",
+            danger = true,
+            confirmEnabled = !removing,
+            onConfirm = {
                 removing = true
                 scope.launch {
                     try { app.envSsh.removeKnownHost(entry.id); deleting = null; nonce++ }
@@ -107,8 +130,9 @@ fun KnownHostsSheet(app: GaliaisApplication, onDismiss: () -> Unit) {
                     catch (e: Exception) { error = e.message ?: "移除失败"; deleting = null }
                     finally { removing = false }
                 }
-            }) { Text("移除", color = G.danger) } },
-            dismissButton = { TextButton(enabled = !removing, onClick = { deleting = null }) { Text("取消") } })
+            },
+            onDismiss = { if (!removing) deleting = null },
+        )
     }
 }
 
@@ -151,7 +175,8 @@ fun SshQuickExecSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .navigationBarsPadding()
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
+                .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp)
                 .padding(bottom = 18.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -170,7 +195,10 @@ fun SshQuickExecSheet(
                     TagPill(label, fg = G.accent, bg = G.accentContainer, onClick = { execute(cmd) })
                 }
             }
-            androidx.compose.foundation.layout.Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            androidx.compose.foundation.layout.Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 OutlinedTextField(
                     value = command,
                     onValueChange = { command = it },
@@ -194,7 +222,11 @@ fun SshQuickExecSheet(
                     }
                 }.ifBlank { "（无输出）" }
                 CrispCard(background = G.codeBg, borderColor = G.codeBorder, padding = PaddingValues(10.dp)) {
-                    androidx.compose.foundation.layout.Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    androidx.compose.foundation.layout.Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
                         Text("$ $lastCommand", fontFamily = Mono, style = MaterialTheme.typography.labelSmall, color = G.codeInk, modifier = Modifier.weight(1f), maxLines = 1)
                         TagPill("exit ${res.exitCode} · ${res.durationMs}ms", fg = if (res.exitCode == 0) G.success else G.danger, bg = if (res.exitCode == 0) G.successTint else G.dangerTint)
                         TagPill("复制", fg = G.accent, bg = G.accentContainer, onClick = {
@@ -210,7 +242,11 @@ fun SshQuickExecSheet(
                             fontFamily = Mono,
                             style = MaterialTheme.typography.bodySmall,
                             color = G.codeInk,
-                            modifier = Modifier.fillMaxWidth().heightIn(max = 260.dp).verticalScroll(rememberScrollState()),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 260.dp)
+                                .verticalScroll(rememberScrollState())
+                                .horizontalScroll(rememberScrollState()),
                         )
                     }
                 }

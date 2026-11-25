@@ -9,13 +9,11 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -203,17 +201,14 @@ fun DiffView(
                 }
             }
             Hairline()
-            val bodyModifier = if (inlineCompact) {
-                Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = if (expanded) 440.dp else 240.dp)
-                    .verticalScroll(rememberScrollState())
-                    .horizontalScroll(rememberScrollState())
-            } else {
-                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+            val maxLineNo = remember(visible) {
+                visible.maxOfOrNull { maxOf(it.oldNumber ?: 0, it.newNumber ?: 0) } ?: 0
             }
+            val numDigits = remember(maxLineNo) { maxLineNo.toString().length.coerceAtLeast(3) }
+            val numColWidth = (numDigits * 7.2f + 10f).dp
+            val gutterDividerOffset = 3.dp + numColWidth * 2
             val dividerColor = G.border.copy(alpha = 0.65f)
-            Column(bodyModifier.padding(vertical = 4.dp)) {
+            Column(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 4.dp)) {
                 for (line in visible) {
                     val (bg, fg, stripe) = when (line.kind) {
                         '+' -> Triple(addedBg, addedInk, G.success)
@@ -221,7 +216,7 @@ fun DiffView(
                         '@' -> Triple(hunkBg, hunkInk, G.accent)
                         else -> Triple(Color.Transparent, G.ink, Color.Transparent)
                     }
-                    // 使用 drawBehind 绘制左侧状态色条与行号分隔线，消除逐行 IntrinsicSize.Min 双次测量卡顿。
+                    // 使用 drawBehind 绘制左侧状态色条与动态宽度的行号分隔线，消除逐行 IntrinsicSize.Min 双次测量卡顿。
                     Row(
                         Modifier
                             .fillMaxWidth()
@@ -232,7 +227,7 @@ fun DiffView(
                                 }
                                 drawRect(
                                     color = dividerColor,
-                                    topLeft = Offset(63.dp.toPx(), 0f),
+                                    topLeft = Offset(gutterDividerOffset.toPx(), 0f),
                                     size = Size(0.75.dp.toPx(), size.height),
                                 )
                             }
@@ -245,7 +240,8 @@ fun DiffView(
                             fontSize = D.codeSize(10f),
                             color = G.inkSubtle,
                             textAlign = TextAlign.End,
-                            modifier = Modifier.width(30.dp).padding(horizontal = 3.dp, vertical = 1.dp),
+                            maxLines = 1,
+                            modifier = Modifier.width(numColWidth).padding(horizontal = 3.dp, vertical = 1.dp),
                         )
                         Text(
                             line.newNumber?.toString() ?: "",
@@ -253,7 +249,8 @@ fun DiffView(
                             fontSize = D.codeSize(10f),
                             color = G.inkSubtle,
                             textAlign = TextAlign.End,
-                            modifier = Modifier.width(30.dp).padding(end = 5.dp, top = 1.dp, bottom = 1.dp),
+                            maxLines = 1,
+                            modifier = Modifier.width(numColWidth).padding(end = 5.dp, top = 1.dp, bottom = 1.dp),
                         )
                         val marker = when (line.kind) {
                             '+' -> "+"

@@ -84,23 +84,9 @@ fun WorkspaceSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
             )
         }
 
-        SectionLabel("会话显示与输入")
+        SectionLabel("引擎推理摘要显示")
         CrispCard {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                SettingsToggleRow(
-                    title = "自动跟随新消息",
-                    subtitle = "阅读位置接近底部时，自动滚动到新内容。",
-                    checked = settings.autoScroll,
-                    onCheckedChange = app.settings::setAutoScroll,
-                )
-                Hairline()
-                SettingsToggleRow(
-                    title = "默认展开执行过程",
-                    subtitle = "轮次完成后自动展开「用时」轨迹与推理摘要。",
-                    checked = settings.expandThinking,
-                    onCheckedChange = app.settings::setExpandThinking,
-                )
-                Hairline()
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Codex 推理摘要", style = MaterialTheme.typography.titleSmall, color = G.ink)
                     SegmentedPillBar(
@@ -109,6 +95,7 @@ fun WorkspaceSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                         onSelect = app.settings::setReasoningSummary,
                     )
                 }
+                Hairline()
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Claude Code 推理摘要", style = MaterialTheme.typography.titleSmall, color = G.ink)
                     SegmentedPillBar(
@@ -117,33 +104,25 @@ fun WorkspaceSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                         onSelect = app.settings::setClaudeThinkingDisplay,
                     )
                 }
-                Hairline()
-                SettingsToggleRow(
-                    title = "显示 Token 用量",
-                    subtitle = "在会话顶部显示用量，点击查看明细。",
-                    checked = settings.showTokenUsage,
-                    onCheckedChange = app.settings::setShowTokenUsage,
-                )
-                Hairline()
-                SettingsToggleRow(
-                    title = "Enter 发送",
-                    subtitle = "使用键盘时，Shift+Enter 换行。",
-                    checked = settings.enterToSend,
-                    onCheckedChange = app.settings::setEnterToSend,
-                )
             }
         }
+        Text(
+            "编辑器模式、自动跟随、执行过程展开、Token 环与快捷键等通用显示偏好，请前往「设置 → 常规」统一配置。",
+            style = MaterialTheme.typography.labelSmall,
+            color = G.inkMuted,
+            modifier = Modifier.padding(horizontal = 4.dp),
+        )
     }
 }
 
-/** 关于 GALIAIS 子页面。 */
+/** 关于 Solbraid 子页面。 */
 @Composable
-fun AboutSettingsScreen(app: GaliaisApplication, onBack: () -> Unit) {
+fun AboutSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState? = null, onBack: () -> Unit) {
     val runtime by app.runtime.snapshot.collectAsState()
     val cliStates by app.conversations.cliUpdates.states.collectAsState()
     val hubStatuses by app.conversations.hub.statuses.collectAsState()
 
-    SubPageScaffold(title = "关于 Solbraid", onBack = onBack) {
+    SubPageScaffold(title = "关于 Solbraid", onBack = onBack, snackbar = snackbar) {
         CrispCard {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -198,10 +177,10 @@ fun AboutSettingsScreen(app: GaliaisApplication, onBack: () -> Unit) {
         SectionLabel("运行与数据")
         CrispCard {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                InfoRow("应用密钥存储", "使用 Android Keystore 和 AES-GCM 加密")
-                InfoRow("服务商连接", "本地网关使用随机令牌认证")
-                InfoRow("后台运行", "支持重新连接仍在运行的引擎")
-                InfoRow("执行方式", "本地 Linux 环境，不启用官方沙箱")
+                InfoRow("应用密钥存储", "使用 Android Keystore 和 AES-GCM 加密", mono = false)
+                InfoRow("服务商连接", "本地网关使用随机令牌认证", mono = false)
+                InfoRow("后台运行", "支持重新连接仍在运行的引擎", mono = false)
+                InfoRow("执行方式", "本地 Linux 环境，不启用官方沙箱", mono = false)
             }
         }
         Spacer(Modifier.height(12.dp))
@@ -209,9 +188,13 @@ fun AboutSettingsScreen(app: GaliaisApplication, onBack: () -> Unit) {
 }
 
 @Composable
-private fun InfoRow(label: String, value: String) {
+private fun InfoRow(label: String, value: String, mono: Boolean = true) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text(label, style = MaterialTheme.typography.bodySmall, color = G.inkMuted, modifier = Modifier.weight(0.42f))
-        Text(value, fontFamily = Mono, fontSize = 12.sp, color = G.ink, modifier = Modifier.weight(0.58f))
+        Text(label, style = MaterialTheme.typography.bodySmall, color = G.inkMuted, modifier = Modifier.weight(0.40f))
+        if (mono) {
+            Text(value, fontFamily = Mono, fontSize = 12.sp, color = G.ink, modifier = Modifier.weight(0.60f))
+        } else {
+            Text(value, style = MaterialTheme.typography.bodySmall, color = G.ink, modifier = Modifier.weight(0.60f))
+        }
     }
 }

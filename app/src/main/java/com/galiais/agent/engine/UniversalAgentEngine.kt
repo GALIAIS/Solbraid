@@ -1760,7 +1760,8 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
     override suspend fun send(key: ConversationKey, text: String, attachments: List<ImageAttachment>) {
         hub.clearTurnStream(key)
         val current = repo.state(key)
-        repo.upsertItem(key, TimelineItem.UserMessage("local-" + newId(), text, imageCount = attachments.size))
+        val clientId = "user-" + newId()
+        repo.upsertItem(key, TimelineItem.UserMessage(clientId, text, imageCount = attachments.size))
         repo.update(key) { st ->
             val preview = text.lineSequence().firstOrNull { it.isNotBlank() }?.take(60) ?: st.summary.title
             st.copy(
@@ -1784,6 +1785,7 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
             val res = runtime.hubRequest("sessions/prompt", jsonOf(
                 "agentId" to kind.id,
                 "sessionId" to key.id,
+                "clientMessageId" to clientId,
                 "text" to text,
                 "images" to imagesArr,
                 "provider" to hub.providerPayload(kind.id, current?.providerId, current?.model),
@@ -1810,6 +1812,20 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
 
     override suspend fun interrupt(key: ConversationKey) {
         runtime.hubRequest("sessions/cancel", jsonOf("agentId" to kind.id, "sessionId" to key.id))
+    }
+
+    /** 截断持久化消息记录至指定用户消息之前，并重置远端驱动会话以在下次发送时桥接剩余上下文。 */
+    suspend fun revertBeforeTurn(key: ConversationKey, userMessageId: String, userTurnIndex: Int) {
+        hub.clearTurnStream(key)
+        runtime.hubRequest(
+            "sessions/revertBefore",
+            jsonOf(
+                "agentId" to kind.id,
+                "sessionId" to key.id,
+                "messageId" to userMessageId,
+                "userTurnIndex" to userTurnIndex,
+            ),
+        )
     }
 
     override suspend fun rename(key: ConversationKey, title: String) {

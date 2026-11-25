@@ -11,13 +11,11 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -97,7 +95,14 @@ fun SelfBuildSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
         }
     }
 
-    SubPageScaffold(title = "本机 APK 自迭代", onBack = onBack, snackbar = snackbar) {
+    val hasTextChanges = repoDir != saved.repoDir ||
+        androidHome != saved.androidHome ||
+        javaHome != saved.javaHome ||
+        aapt2Path != saved.aapt2Path ||
+        timeoutText != saved.watchdogTimeoutSec.toString() ||
+        customGradleArgs != saved.customGradleArgs
+
+    SubPageScaffold(title = "本机 APK 自迭代", onBack = onBack, snackbar = snackbar, loading = busyLabel != null) {
         // 1. 总开关（默认关闭）
         CrispCard(
             background = if (saved.enabled) G.accentContainer.copy(alpha = 0.22f) else G.surface,
@@ -126,194 +131,181 @@ fun SelfBuildSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                             toast = if (enabled) "已启用本机 APK 自迭代功能" else "已关闭本机 APK 自迭代功能",
                         )
                     },
-                    icon = GaliaisIcons.Wrench,
+                    icon = GaliaisIcons.Cpu,
                 )
             }
         }
 
-        // 2. Agent 权限与安全护栏
-        SectionLabel("权限与安全护栏")
-        CrispCard {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                SettingsToggleRow(
-                    title = "允许 Agent 通过 MCP 触发本地编译",
-                    subtitle = "关闭时，Agent 调用 solbraid_self_build(build) 会被直接拦截，仅允许查看状态或由你在此页面手动触发编译。",
-                    checked = saved.allowAgentBuild,
-                    enabled = saved.enabled,
-                    onCheckedChange = { persistAndSync(saved.copy(allowAgentBuild = it)) },
-                )
-                Hairline()
-                SettingsToggleRow(
-                    title = "允许 Agent 触发看门狗安装 APK",
-                    subtitle = "高风险开关（默认关闭）。即使开启，Agent 仍必须显式传入 confirmInstall=true 才能触发安装并重启应用。",
-                    checked = saved.allowAgentApply,
-                    enabled = saved.enabled,
-                    onCheckedChange = { persistAndSync(saved.copy(allowAgentApply = it)) },
-                )
-                Hairline()
-                SettingsToggleRow(
-                    title = "编译前运行单元测试（testDebugUnitTest）",
-                    subtitle = "强烈建议开启：任意单测失败将立即中止打包，防止错误代码进入安装阶段。",
-                    checked = saved.runUnitTests,
-                    enabled = saved.enabled,
-                    onCheckedChange = { persistAndSync(saved.copy(runUnitTests = it)) },
-                )
-                Hairline()
-                SettingsToggleRow(
-                    title = "安装后启用首帧心跳看门狗（崩溃自动回滚）",
-                    subtitle = "独立于 App 进程树监控新版本首帧渲染心跳；超时或启动崩溃将自动恢复 last-known-good.apk。",
-                    checked = saved.watchdogEnabled,
-                    enabled = saved.enabled,
-                    onCheckedChange = { persistAndSync(saved.copy(watchdogEnabled = it)) },
-                )
-            }
-        }
+        AnimatedExpandable(expanded = saved.enabled) {
+            Column(verticalArrangement = Arrangement.spacedBy(D.space(12.dp))) {
+                // 2. Agent 权限与安全护栏
+                SectionLabel("权限与安全护栏")
+                CrispCard {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        SettingsToggleRow(
+                            title = "允许 Agent 通过 MCP 触发本地编译",
+                            subtitle = "关闭时，Agent 调用 solbraid_self_build(build) 会被直接拦截，仅允许查看状态或由你在此页面手动触发编译。",
+                            checked = saved.allowAgentBuild,
+                            onCheckedChange = { persistAndSync(saved.copy(allowAgentBuild = it)) },
+                        )
+                        Hairline()
+                        SettingsToggleRow(
+                            title = "允许 Agent 触发看门狗安装 APK",
+                            subtitle = "高风险开关（默认关闭）。即使开启，Agent 仍必须显式传入 confirmInstall=true 才能触发安装并重启应用。",
+                            checked = saved.allowAgentApply,
+                            onCheckedChange = { persistAndSync(saved.copy(allowAgentApply = it)) },
+                        )
+                        Hairline()
+                        SettingsToggleRow(
+                            title = "编译前运行单元测试（testDebugUnitTest）",
+                            subtitle = "强烈建议开启：任意单测失败将立即中止打包，防止错误代码进入安装阶段。",
+                            checked = saved.runUnitTests,
+                            onCheckedChange = { persistAndSync(saved.copy(runUnitTests = it)) },
+                        )
+                        Hairline()
+                        SettingsToggleRow(
+                            title = "安装后启用首帧心跳看门狗（崩溃自动回滚）",
+                            subtitle = "独立于 App 进程树监控新版本首帧渲染心跳；超时或启动崩溃将自动恢复 last-known-good.apk。",
+                            checked = saved.watchdogEnabled,
+                            onCheckedChange = { persistAndSync(saved.copy(watchdogEnabled = it)) },
+                        )
+                    }
+                }
 
-        // 3. 构建与看门狗参数
-        SectionLabel("构建与看门狗参数")
-        CrispCard {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text("目标 ABI 架构", style = MaterialTheme.typography.labelMedium, color = G.ink)
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("arm64-v8a" to "仅 arm64-v8a（极速推荐）", "arm64-v8a,x86_64" to "arm64-v8a + x86_64").forEach { (abi, label) ->
-                        val active = saved.targetAbis == abi
-                        TagPill(
-                            text = label,
-                            fg = if (active) G.onAccentContainer else G.inkMuted,
-                            bg = if (active) G.accentContainer else G.surfaceSubtle,
-                            onClick = if (saved.enabled) ({ persistAndSync(saved.copy(targetAbis = abi)) }) else null,
+                // 3. 构建与看门狗参数
+                SectionLabel("构建与看门狗参数")
+                CrispCard {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("目标 ABI 架构", style = MaterialTheme.typography.labelMedium, color = G.ink)
+                        SegmentedPillBar(
+                            options = listOf("arm64-v8a" to "仅 arm64-v8a", "arm64-v8a,x86_64" to "arm64 + x86_64"),
+                            selected = saved.targetAbis,
+                            onSelect = { persistAndSync(saved.copy(targetAbis = it)) },
+                        )
+                        Hairline()
+                        Text("构建变体（Variant）", style = MaterialTheme.typography.labelMedium, color = G.ink)
+                        SegmentedPillBar(
+                            options = listOf("debug" to "Debug 调试版", "release" to "Release 发布版"),
+                            selected = saved.variant,
+                            onSelect = { persistAndSync(saved.copy(variant = it)) },
+                        )
+                        Hairline()
+                        Text("Gradle JVM 堆内存上限", style = MaterialTheme.typography.labelMedium, color = G.ink)
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            SELF_BUILD_HEAP_OPTIONS.sorted().forEach { mb ->
+                                SelectableChip(
+                                    text = "${mb} MB",
+                                    selected = saved.gradleHeapMb == mb,
+                                    onClick = { persistAndSync(saved.copy(gradleHeapMb = mb)) },
+                                )
+                            }
+                        }
+                        Hairline()
+                        Text("看门狗心跳超时（10–120 秒）", style = MaterialTheme.typography.labelMedium, color = G.ink)
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf(10, 20, 30, 60).forEach { sec ->
+                                SelectableChip(
+                                    text = "${sec}s",
+                                    selected = saved.watchdogTimeoutSec == sec,
+                                    onClick = {
+                                        timeoutText = sec.toString()
+                                        persistAndSync(saved.copy(watchdogTimeoutSec = sec))
+                                    },
+                                )
+                            }
+                        }
+                        OutlinedTextField(
+                            value = timeoutText,
+                            onValueChange = { s -> timeoutText = s.filter { it.isDigit() }.take(3) },
+                            label = { Text("自定义看门狗超时（秒）") },
+                            singleLine = true,
+                            shape = D.fieldShape,
+                            colors = galiaisTextFieldColors(),
+                            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        OutlinedTextField(
+                            value = customGradleArgs,
+                            onValueChange = { customGradleArgs = it },
+                            label = { Text("附加 Gradle 参数（可选，如 --offline --stacktrace）") },
+                            singleLine = true,
+                            shape = D.fieldShape,
+                            colors = galiaisTextFieldColors(),
+                            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
+                            modifier = Modifier.fillMaxWidth(),
                         )
                     }
                 }
-                Hairline()
-                Text("构建变体（Variant）", style = MaterialTheme.typography.labelMedium, color = G.ink)
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("debug" to "Debug（本地调试签名）", "release" to "Release（发布版）").forEach { (v, label) ->
-                        val active = saved.variant == v
-                        TagPill(
-                            text = label,
-                            fg = if (active) G.onAccentContainer else G.inkMuted,
-                            bg = if (active) G.accentContainer else G.surfaceSubtle,
-                            onClick = if (saved.enabled) ({ persistAndSync(saved.copy(variant = v)) }) else null,
-                        )
-                    }
-                }
-                Hairline()
-                Text("Gradle JVM 堆内存上限", style = MaterialTheme.typography.labelMedium, color = G.ink)
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    SELF_BUILD_HEAP_OPTIONS.sorted().forEach { mb ->
-                        val active = saved.gradleHeapMb == mb
-                        TagPill(
-                            text = "${mb} MB",
-                            fg = if (active) G.onAccentContainer else G.inkMuted,
-                            bg = if (active) G.accentContainer else G.surfaceSubtle,
-                            onClick = if (saved.enabled) ({ persistAndSync(saved.copy(gradleHeapMb = mb)) }) else null,
-                        )
-                    }
-                }
-                Hairline()
-                Text("看门狗心跳超时（10–120 秒）", style = MaterialTheme.typography.labelMedium, color = G.ink)
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(10, 20, 30, 60).forEach { sec ->
-                        val active = saved.watchdogTimeoutSec == sec
-                        TagPill(
-                            text = "${sec}s",
-                            fg = if (active) G.onAccentContainer else G.inkMuted,
-                            bg = if (active) G.accentContainer else G.surfaceSubtle,
-                            onClick = if (saved.enabled) ({
-                                timeoutText = sec.toString()
-                                persistAndSync(saved.copy(watchdogTimeoutSec = sec))
-                            }) else null,
-                        )
-                    }
-                }
-                OutlinedTextField(
-                    value = timeoutText,
-                    onValueChange = { s -> timeoutText = s.filter { it.isDigit() }.take(3) },
-                    label = { Text("自定义看门狗超时（秒）") },
-                    singleLine = true,
-                    enabled = saved.enabled,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = customGradleArgs,
-                    onValueChange = { customGradleArgs = it },
-                    label = { Text("附加 Gradle 参数（可选，如 --offline --stacktrace）") },
-                    singleLine = true,
-                    enabled = saved.enabled,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-        }
 
-        // 4. 工具链与目录配置
-        SectionLabel("工具链与目录路径")
-        CrispCard {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(
-                    value = repoDir,
-                    onValueChange = { repoDir = it },
-                    label = { Text("Solbraid 源码仓库目录") },
-                    singleLine = true,
-                    enabled = saved.enabled,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = androidHome,
-                    onValueChange = { androidHome = it },
-                    label = { Text("Android SDK 目录（ANDROID_HOME）") },
-                    singleLine = true,
-                    enabled = saved.enabled,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = javaHome,
-                    onValueChange = { javaHome = it },
-                    label = { Text("JDK 17 目录（留空自动检测）") },
-                    singleLine = true,
-                    enabled = saved.enabled,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = aapt2Path,
-                    onValueChange = { aapt2Path = it },
-                    label = { Text("原生 ARM64 aapt2 路径（留空自动检测）") },
-                    singleLine = true,
-                    enabled = saved.enabled,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    PrimaryPillButton(
-                        text = "保存全部配置",
-                        enabled = saved.enabled,
-                        onClick = {
-                            val sec = timeoutText.toIntOrNull() ?: saved.watchdogTimeoutSec
-                            persistAndSync(
-                                saved.copy(
-                                    repoDir = repoDir,
-                                    androidHome = androidHome,
-                                    javaHome = javaHome,
-                                    aapt2Path = aapt2Path,
-                                    watchdogTimeoutSec = sec,
-                                    customGradleArgs = customGradleArgs,
-                                ),
-                                toast = "已保存并同步本机 APK 自迭代配置",
+                // 4. 工具链与目录配置
+                SectionLabel("工具链与目录路径")
+                CrispCard {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        OutlinedTextField(
+                            value = repoDir,
+                            onValueChange = { repoDir = it },
+                            label = { Text("Solbraid 源码仓库目录") },
+                            singleLine = true,
+                            shape = D.fieldShape,
+                            colors = galiaisTextFieldColors(),
+                            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        OutlinedTextField(
+                            value = androidHome,
+                            onValueChange = { androidHome = it },
+                            label = { Text("Android SDK 目录（ANDROID_HOME）") },
+                            singleLine = true,
+                            shape = D.fieldShape,
+                            colors = galiaisTextFieldColors(),
+                            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        OutlinedTextField(
+                            value = javaHome,
+                            onValueChange = { javaHome = it },
+                            label = { Text("JDK 17 目录（留空自动检测）") },
+                            singleLine = true,
+                            shape = D.fieldShape,
+                            colors = galiaisTextFieldColors(),
+                            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        OutlinedTextField(
+                            value = aapt2Path,
+                            onValueChange = { aapt2Path = it },
+                            label = { Text("原生 ARM64 aapt2 路径（留空自动检测）") },
+                            singleLine = true,
+                            shape = D.fieldShape,
+                            colors = galiaisTextFieldColors(),
+                            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            PrimaryPillButton(
+                                text = "保存全部配置",
+                                enabled = hasTextChanges,
+                                onClick = {
+                                    val sec = timeoutText.toIntOrNull() ?: saved.watchdogTimeoutSec
+                                    persistAndSync(
+                                        saved.copy(
+                                            repoDir = repoDir,
+                                            androidHome = androidHome,
+                                            javaHome = javaHome,
+                                            aapt2Path = aapt2Path,
+                                            watchdogTimeoutSec = sec,
+                                            customGradleArgs = customGradleArgs,
+                                        ),
+                                        toast = "已保存并同步本机 APK 自迭代配置",
+                                    )
+                                },
                             )
-                        },
-                    )
-                    SecondaryPillButton(
-                        text = "恢复默认",
-                        onClick = {
-                            val def = SelfBuildConfig()
-                            repoDir = def.repoDir
-                            androidHome = def.androidHome
-                            javaHome = def.javaHome
-                            aapt2Path = def.aapt2Path
-                            timeoutText = def.watchdogTimeoutSec.toString()
-                            customGradleArgs = def.customGradleArgs
-                            persistAndSync(def, toast = "已恢复默认配置（默认关闭）")
-                        },
-                    )
+                            SecondaryPillButton(
+                                text = "恢复默认",
+                                onClick = { confirmDialog = "reset" },
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -467,63 +459,77 @@ fun SelfBuildSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
     }
 
     if (confirmDialog == "apply" && !lastApkPath.isNullOrBlank()) {
-        AlertDialog(
-            onDismissRequest = { confirmDialog = null },
-            title = { Text("确认安装自编译 APK？") },
-            text = {
-                Text(
-                    "即将通过独立 Root 进程安装：$lastApkPath\n\n安装过程会重启 Solbraid 并中断当前前台页面。" +
-                        if (saved.watchdogEnabled) "已启用首帧心跳看门狗（${saved.watchdogTimeoutSec}s），若启动异常将自动回滚上一版本。"
-                        else "注意：当前看门狗已关闭，异常时需手动回滚。",
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    val apk = lastApkPath!!
-                    confirmDialog = null
-                    scope.launch {
-                        busyLabel = "正在移交独立看门狗安装 APK…"
-                        try {
-                            app.runtime.hubRequest("selfBuild/apply", jsonOf("apkPath" to apk, "confirmInstall" to true), timeoutMs = 30_000)
-                            app.conversations.notify("已移交看门狗安装，应用即将自动重启…")
-                        } catch (cancel: CancellationException) {
-                            throw cancel
-                        } catch (e: Exception) {
-                            app.conversations.notify("触发安装失败：${e.message}")
-                        } finally {
-                            busyLabel = null
-                        }
+        GaliaisConfirmDialog(
+            title = "确认安装自编译 APK？",
+            message = "即将通过独立 Root 进程安装：$lastApkPath\n\n安装过程会重启 Solbraid 并中断当前前台页面。" +
+                if (saved.watchdogEnabled) "已启用首帧心跳看门狗（${saved.watchdogTimeoutSec}s），若启动异常将自动回滚上一版本。"
+                else "注意：当前看门狗已关闭，异常时需手动回滚。",
+            confirmText = "确认安装并重启",
+            onConfirm = {
+                val apk = lastApkPath!!
+                confirmDialog = null
+                scope.launch {
+                    busyLabel = "正在移交独立看门狗安装 APK…"
+                    try {
+                        app.runtime.hubRequest("selfBuild/apply", jsonOf("apkPath" to apk, "confirmInstall" to true), timeoutMs = 30_000)
+                        app.conversations.notify("已移交看门狗安装，应用即将自动重启…")
+                    } catch (cancel: CancellationException) {
+                        throw cancel
+                    } catch (e: Exception) {
+                        app.conversations.notify("触发安装失败：${e.message}")
+                    } finally {
+                        busyLabel = null
                     }
-                }) { Text("确认安装并重启", color = G.accent) }
+                }
             },
-            dismissButton = { TextButton(onClick = { confirmDialog = null }) { Text("取消") } },
+            onDismiss = { confirmDialog = null },
         )
     }
 
     if (confirmDialog == "rollback") {
-        AlertDialog(
-            onDismissRequest = { confirmDialog = null },
-            title = { Text("确认回滚到上一稳定版本？") },
-            text = { Text("将使用 last-known-good.apk 覆盖安装当前版本并重启 Solbraid。") },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirmDialog = null
-                    scope.launch {
-                        busyLabel = "正在触发回滚安装…"
-                        try {
-                            app.runtime.hubRequest("selfBuild/rollback", jsonOf("confirmRollback" to true), timeoutMs = 30_000)
-                            app.conversations.notify("已触发回滚，应用即将自动重启…")
-                        } catch (cancel: CancellationException) {
-                            throw cancel
-                        } catch (e: Exception) {
-                            app.conversations.notify("回滚失败：${e.message}")
-                        } finally {
-                            busyLabel = null
-                        }
+        GaliaisConfirmDialog(
+            title = "确认回滚到上一稳定版本？",
+            message = "将使用 last-known-good.apk 覆盖安装当前版本并重启 Solbraid。",
+            confirmText = "确认回滚",
+            danger = true,
+            onConfirm = {
+                confirmDialog = null
+                scope.launch {
+                    busyLabel = "正在触发回滚安装…"
+                    try {
+                        app.runtime.hubRequest("selfBuild/rollback", jsonOf("confirmRollback" to true), timeoutMs = 30_000)
+                        app.conversations.notify("已触发回滚，应用即将自动重启…")
+                    } catch (cancel: CancellationException) {
+                        throw cancel
+                    } catch (e: Exception) {
+                        app.conversations.notify("回滚失败：${e.message}")
+                    } finally {
+                        busyLabel = null
                     }
-                }) { Text("确认回滚", color = G.danger) }
+                }
             },
-            dismissButton = { TextButton(onClick = { confirmDialog = null }) { Text("取消") } },
+            onDismiss = { confirmDialog = null },
+        )
+    }
+
+    if (confirmDialog == "reset") {
+        GaliaisConfirmDialog(
+            title = "恢复自迭代默认配置？",
+            message = "将清空自定义路径与 Gradle 参数，并关闭自迭代总开关。",
+            confirmText = "恢复默认",
+            danger = true,
+            onConfirm = {
+                confirmDialog = null
+                val def = SelfBuildConfig()
+                repoDir = def.repoDir
+                androidHome = def.androidHome
+                javaHome = def.javaHome
+                aapt2Path = def.aapt2Path
+                timeoutText = def.watchdogTimeoutSec.toString()
+                customGradleArgs = def.customGradleArgs
+                persistAndSync(def, toast = "已恢复默认配置（默认关闭）")
+            },
+            onDismiss = { confirmDialog = null },
         )
     }
 }

@@ -2781,6 +2781,27 @@ async function testClaudeFixesAndSelfBuildDefaultOff() {
   }
 }
 
+async function testEditAndResendRuntimeContracts() {
+  const {execFileSync} = await import("node:child_process");
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const claudeHostPath = path.join(repoRoot, "runtime", "claude-host.mjs");
+  const agentHubPath = path.join(repoRoot, "runtime", "agent-hub.mjs");
+  execFileSync(process.execPath, ["--check", claudeHostPath], {stdio: "pipe"});
+  execFileSync(process.execPath, ["--check", agentHubPath], {stdio: "pipe"});
+
+  const claudeSrc = fs.readFileSync(claudeHostPath, "utf8");
+  assert.ok(claudeSrc.includes('case "session/revertBefore":'), "claude-host must expose session/revertBefore");
+  assert.ok(claudeSrc.includes("sdk.forkSession(id, {...opts, upToMessageId: prevUuid"), "claude-host revertBefore must fork up to previous message uuid");
+  assert.ok(claudeSrc.includes("userMessageUuids"), "claude-host revertBefore must return remapped userMessageUuids");
+
+  const hubSrc = fs.readFileSync(agentHubPath, "utf8");
+  assert.ok(hubSrc.includes('"sessions/revertBefore"'), "agent-hub must serialize sessions/revertBefore in SESSION_MUTATIONS");
+  assert.ok(hubSrc.includes('case "sessions/revertBefore":'), "agent-hub must expose sessions/revertBefore");
+  assert.ok(hubSrc.includes("params.clientMessageId"), "agent-hub sessions/prompt must honor clientMessageId");
+  assert.ok(hubSrc.includes("const consumedContextBridge = Boolean(record.pendingContextBridge);"), "agent-hub must bridge context independently of ACP remoteSessionId creation");
+  assert.ok(!hubSrc.includes("if (record.pendingContextBridge && !record.remoteSessionId)"), "agent-hub must not skip ACP context bridge after attachAcpSession");
+}
+
 await testProviderTranslators();
 await testUsageLedger();
 await testProviderGatewayE2E();
@@ -2798,4 +2819,5 @@ await testAuditRegressionAndCrossProcessE2E();
 await testOrphanedHotPluginResourcesE2E();
 await test14AuditIssuesRegression();
 await testClaudeFixesAndSelfBuildDefaultOff();
+await testEditAndResendRuntimeContracts();
 console.log("ALL_SELF_TESTS_PASSED");

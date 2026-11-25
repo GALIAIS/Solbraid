@@ -517,6 +517,63 @@ async function dispatch(method, params) {
       const forked = await sdk.forkSession(id, opts);
       return {sessionId: forked.sessionId};
     }
+    case "session/revertBefore": {
+      const id = uuid(params.sessionId);
+      if (opening.has(id)) throw new Error("Claude Code 会话正在连接中，请稍候");
+      const beforeMessageId = params.beforeMessageId ? string(params.beforeMessageId, "message id", 200) : null;
+      const userTurnIndex = Number.isInteger(params.userTurnIndex) && params.userTurnIndex >= 0 ? params.userTurnIndex : -1;
+      if (!beforeMessageId && userTurnIndex < 0) throw new Error("缺少待回退的用户消息标识");
+      const existing = sessions.get(id);
+      if (existing && !existing.closed && existing.busy) {
+        throw new Error("当前会话正在运行任务，请先停止后再编辑重发");
+      }
+      if (params.rewindFiles === true && beforeMessageId && existing && !existing.closed && existing.query) {
+        await existing.query.rewindFiles(beforeMessageId, {dryRun: false});
+      }
+      if (existing && !existing.closed) closeSession(existing);
+      const opts = {...(params.cwd === undefined ? {} : {dir: await directory(params.cwd)})};
+      const info = await sdk.getSessionInfo(id, opts).catch(() => null);
+      const allMessages = await sdk.getSessionMessages(id, {...opts, includeSystemMessages: true}).catch(() => []);
+      const isRealUserPrompt = (m) => {
+        if (!m || m.type !== "user" || m.isSynthetic === true) return false;
+        const c = m.message?.content;
+        if (typeof c === "string") return c.trim().length > 0;
+        if (Array.isArray(c)) {
+          return c.some(b => b && (b.type === "text" || b.type === "image" || b.type === "document") && (b.type !== "text" || String(b.text || "").trim().length > 0));
+        }
+        return false;
+      };
+      let targetIdx = beforeMessageId ? allMessages.findIndex(m => m?.uuid === beforeMessageId) : -1;
+      if (targetIdx < 0 && userTurnIndex >= 0) {
+        let seen = 0;
+        for (let i = 0; i < allMessages.length; i++) {
+          if (isRealUserPrompt(allMessages[i])) {
+            if (seen === userTurnIndex) { targetIdx = i; break; }
+            seen++;
+          }
+        }
+      }
+      if (targetIdx < 0) {
+        // 目标消息尚未落盘（例如上次发送失败未写入 transcript），服务端历史已处于其之前
+        return {sessionId: id, mode: "noop", retainedCount: allMessages.length, userMessageUuids: []};
+      }
+      if (targetIdx === 0) {
+        try { await sdk.deleteSession(id, opts); } catch (err) {
+          if (err?.code !== "ENOENT" && !/not found/i.test(String(err?.message || err || ""))) throw err;
+        }
+        return {sessionId: null, mode: "reset", retainedCount: 0, userMessageUuids: []};
+      }
+      const prevUuid = allMessages[targetIdx - 1]?.uuid;
+      if (!prevUuid) throw new Error("无法定位前一轮消息检查点");
+      const title = (typeof params.title === "string" && params.title.trim())
+        ? params.title.trim().slice(0, 200)
+        : (info?.customTitle || info?.summary || undefined);
+      const forked = await sdk.forkSession(id, {...opts, upToMessageId: prevUuid, ...(title ? {title} : {})});
+      const remappedMsgs = await sdk.getSessionMessages(forked.sessionId, opts).catch(() => []);
+      const userMessageUuids = remappedMsgs.filter(isRealUserPrompt).map(m => m.uuid).filter(Boolean);
+      try { await sdk.deleteSession(id, opts); } catch {}
+      return {sessionId: forked.sessionId, mode: "forked", retainedCount: targetIdx, userMessageUuids};
+    }
     case "session/setPermissionMode": {
       const mode = string(params.mode,"permission mode",32);
       if (!["default","acceptEdits","plan","auto","bypassPermissions"].includes(mode)) throw new Error("Unsupported Claude Code permission mode: " + mode);

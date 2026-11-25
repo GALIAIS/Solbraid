@@ -73,6 +73,7 @@ fun SshScreen(
     var editingHost by remember { mutableStateOf<SshHostConfig?>(null) }
     var deletingHost by remember { mutableStateOf<SshHostConfig?>(null) }
     var deletingKey by remember { mutableStateOf<String?>(null) }
+    var deletingTunnel by remember { mutableStateOf<SshTunnelPreset?>(null) }
     var execHost by remember { mutableStateOf<SshHostConfig?>(null) }
     var sftpHost by remember { mutableStateOf<SshHostConfig?>(null) }
     var creatingTunnel by remember { mutableStateOf(false) }
@@ -177,10 +178,10 @@ fun SshScreen(
                     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(D.space(10.dp))) {
                         when (activeSection) {
                 "hosts" -> {
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Column(Modifier.weight(1f)) { SectionLabel("SSH 服务器（自动同步 ~/.ssh/config）") }
-                        PrimaryPillButton("+ 添加主机", onClick = { creatingHost = true })
-                    }
+                    SectionHeader(
+                        title = "SSH 服务器（自动同步 ~/.ssh/config）",
+                        trailing = { PrimaryPillButton("+ 添加主机", onClick = { creatingHost = true }) },
+                    )
                     if (hosts.isEmpty()) {
                         CrispCard {
                             Text("尚未添加远程主机。添加后不仅可在此一键连接交互终端、浏览 SFTP 文件和开端口隧道，本地终端与 Codex/Claude 也可直接执行 ssh <别名>。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
@@ -199,13 +200,22 @@ fun SshScreen(
                         visibleHosts.forEach { host ->
                             val test = hostTests[host.id]
                             val testing = testingIds[host.id] == true
+                            var hostMenu by remember(host.id) { mutableStateOf(false) }
                             CrispCard(padding = PaddingValues(14.dp)) {
                                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                         Icon(GaliaisIcons.Server, contentDescription = null, tint = G.accent, modifier = Modifier.size(18.dp))
                                         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                                Text(host.name, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                Text(
+                                                    host.name,
+                                                    style = MaterialTheme.typography.titleSmall,
+                                                    color = G.ink,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    modifier = Modifier.weight(1f, fill = false),
+                                                )
                                                 TagPill("ssh ${host.alias}", fg = G.accent, bg = G.accentContainer)
                                             }
                                             Text(
@@ -234,48 +244,77 @@ fun SshScreen(
                                             overflow = TextOverflow.Ellipsis,
                                         )
                                     }
-                                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
                                         PrimaryPillButton("连接终端", enabled = runtime.ready, onClick = { onOpenTerminal(settings.defaultCwd, host) })
                                         SecondaryPillButton("SFTP 文件", enabled = runtime.ready, onClick = { sftpHost = host })
-                                        TagPill(
-                                            text = "快捷命令",
-                                            fg = G.ink,
-                                            bg = G.surfaceSubtle,
-                                            border = G.border,
-                                            onClick = if (runtime.ready) ({ execHost = host }) else null,
-                                        )
-                                        TagPill(
-                                            text = if (testing) "测速中…" else "测速",
-                                            fg = G.accent,
-                                            bg = G.accentContainer,
-                                            onClick = if (runtime.ready && !testing) ({
-                                                testingIds[host.id] = true
-                                                scope.launch {
-                                                    try {
-                                                        val r = app.envSsh.testSshHost(host)
-                                                        app.conversations.notify(if (r.ok) "${host.name} 连通正常（${r.latencyMs}ms）" else "${host.name} 连接失败")
-                                                    } catch (e: Exception) {
-                                                        app.conversations.notify("测速失败：${e.message}")
-                                                    } finally {
-                                                        testingIds.remove(host.id)
+                                        Spacer(Modifier.weight(1f))
+                                        Box {
+                                            IconButton(onClick = { hostMenu = true }, modifier = Modifier.size(36.dp)) {
+                                                Icon(GaliaisIcons.MoreHoriz, contentDescription = "更多主机操作", tint = G.inkMuted, modifier = Modifier.size(19.dp))
+                                            }
+                                            GaliaisDropdownMenu(expanded = hostMenu, onDismissRequest = { hostMenu = false }) {
+                                                Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                                    GaliaisMenuRow(
+                                                        title = "快捷命令",
+                                                        icon = GaliaisIcons.Terminal,
+                                                        enabled = runtime.ready,
+                                                        onClick = { hostMenu = false; execHost = host },
+                                                    )
+                                                    GaliaisMenuRow(
+                                                        title = if (testing) "测速中…" else "连通测速",
+                                                        icon = GaliaisIcons.Activity,
+                                                        enabled = runtime.ready && !testing,
+                                                        onClick = {
+                                                            hostMenu = false
+                                                            testingIds[host.id] = true
+                                                            scope.launch {
+                                                                try {
+                                                                    val r = app.envSsh.testSshHost(host)
+                                                                    app.conversations.notify(if (r.ok) "${host.name} 连通正常（${r.latencyMs}ms）" else "${host.name} 连接失败")
+                                                                } catch (e: Exception) {
+                                                                    app.conversations.notify("测速失败：${e.message}")
+                                                                } finally {
+                                                                    testingIds.remove(host.id)
+                                                                }
+                                                            }
+                                                        },
+                                                    )
+                                                    if (runtime.ready && keys.isNotEmpty()) {
+                                                        GaliaisMenuRow(
+                                                            title = "部署公钥到主机",
+                                                            icon = GaliaisIcons.ShieldCheck,
+                                                            onClick = {
+                                                                hostMenu = false
+                                                                scope.launch {
+                                                                    try {
+                                                                        val targetKey = host.keyName.ifBlank { keys.first().name }
+                                                                        app.envSsh.deployKeyToHost(host, targetKey)
+                                                                    } catch (e: Exception) {
+                                                                        app.conversations.notify("部署公钥失败：${e.message}")
+                                                                    }
+                                                                }
+                                                            },
+                                                        )
                                                     }
+                                                    GaliaisMenuRow(
+                                                        title = "编辑主机",
+                                                        icon = GaliaisIcons.Edit,
+                                                        onClick = { hostMenu = false; editingHost = host },
+                                                    )
+                                                    Hairline(Modifier.padding(vertical = 2.dp))
+                                                    GaliaisMenuRow(
+                                                        title = "删除主机",
+                                                        icon = GaliaisIcons.Trash,
+                                                        danger = true,
+                                                        onClick = { hostMenu = false; deletingHost = host },
+                                                    )
                                                 }
-                                            }) else null,
-                                        )
-                                        if (runtime.ready && keys.isNotEmpty()) {
-                                            TagPill("部署公钥", fg = G.ink, bg = G.surfaceSubtle, border = G.border, onClick = {
-                                                scope.launch {
-                                                    try {
-                                                        val targetKey = host.keyName.ifBlank { keys.first().name }
-                                                        app.envSsh.deployKeyToHost(host, targetKey)
-                                                    } catch (e: Exception) {
-                                                        app.conversations.notify("部署公钥失败：${e.message}")
-                                                    }
-                                                }
-                                            })
+                                            }
                                         }
-                                        TagPill("编辑", fg = G.inkMuted, bg = G.surfaceSubtle, onClick = { editingHost = host })
-                                        TagPill("删除", fg = G.danger, bg = G.dangerTint, onClick = { deletingHost = host })
                                     }
                                 }
                             }
@@ -284,11 +323,10 @@ fun SshScreen(
                 }
 
                 "tunnels" -> {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        SectionLabel("端口转发隧道（-L / -R / -D）")
-                        Spacer(Modifier.weight(1f))
-                        PrimaryPillButton("+ 新建隧道", enabled = hosts.isNotEmpty(), onClick = { creatingTunnel = true })
-                    }
+                    SectionHeader(
+                        title = "端口转发隧道（-L / -R / -D）",
+                        trailing = { PrimaryPillButton("+ 新建隧道", enabled = hosts.isNotEmpty(), onClick = { creatingTunnel = true }) },
+                    )
                     if (hosts.isEmpty()) {
                         CrispCard {
                             Text("请先在「主机」页添加至少一台 SSH 服务器，即可创建本地转发（-L）、远端转发（-R）或 SOCKS5 动态代理隧道（-D）。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
@@ -308,7 +346,15 @@ fun SshScreen(
                                         if (running) PulsingDot(G.success, size = 7.dp)
                                         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                                Text(preset.name, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
+                                                Text(
+                                                    preset.name,
+                                                    style = MaterialTheme.typography.titleSmall,
+                                                    color = G.ink,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    modifier = Modifier.weight(1f, fill = false),
+                                                )
                                                 TagPill(preset.alias, fg = G.accent, bg = G.accentContainer)
                                             }
                                             Text(preset.summary(), fontFamily = Mono, fontSize = 11.5.sp, color = G.inkMuted)
@@ -348,8 +394,12 @@ fun SshScreen(
                                             })
                                         }
                                         Spacer(Modifier.weight(1f))
-                                        TagPill("删除", fg = G.danger, bg = G.dangerTint,
-                                            onClick = if (busy) null else ({ app.envSsh.deleteTunnelPreset(preset.id) }))
+                                        TagPill(
+                                            "删除",
+                                            fg = G.danger,
+                                            bg = G.dangerTint,
+                                            onClick = if (busy) null else ({ deletingTunnel = preset }),
+                                        )
                                     }
                                 }
                             }
@@ -358,13 +408,23 @@ fun SshScreen(
                 }
 
                 else -> {
-                    SecondaryPillButton("已知主机指纹", enabled = runtime.ready, onClick = { showKnownHosts = true })
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        SectionLabel("SSH 密钥库（~/.ssh/）")
-                        Spacer(Modifier.weight(1f))
-                        SecondaryPillButton("导入私钥", enabled = runtime.ready, onClick = { showImportKey = true })
-                        PrimaryPillButton("+ 生成", enabled = runtime.ready, onClick = { showGenerateKey = true })
+                    CrispCard(padding = PaddingValues(0.dp)) {
+                        SettingsNavRow(
+                            icon = GaliaisIcons.ShieldCheck,
+                            title = "已知主机指纹 (known_hosts)",
+                            subtitle = "查看或移除已信任的 SSH 服务器密钥指纹",
+                            onClick = { if (runtime.ready) showKnownHosts = true },
+                        )
                     }
+                    SectionHeader(
+                        title = "SSH 密钥库（~/.ssh/）",
+                        trailing = {
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                CompactActionButton("导入", enabled = runtime.ready, onClick = { showImportKey = true })
+                                CompactActionButton("+ 生成", primary = true, enabled = runtime.ready, onClick = { showGenerateKey = true })
+                            }
+                        },
+                    )
                     if (keys.isEmpty()) {
                         CrispCard {
                             Text("暂未检测到 SSH 密钥。点击「+ 生成」可一键创建 Ed25519 或 RSA 4096 密钥对，或导入已有私钥。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
@@ -468,44 +528,47 @@ fun SshScreen(
     }
     if (showKnownHosts) KnownHostsSheet(app, onDismiss = { showKnownHosts = false })
     passphraseKey?.let { name -> SshKeyPassphraseDialog(app, name, onDismiss = { passphraseKey = null }) }
+    deletingTunnel?.let { target ->
+        GaliaisConfirmDialog(
+            title = "删除端口转发隧道？",
+            message = "将删除隧道预设「${target.name}（${target.summary()}）」。如正在运行则会先断开转发。",
+            confirmText = "删除",
+            danger = true,
+            onConfirm = {
+                app.envSsh.deleteTunnelPreset(target.id)
+                deletingTunnel = null
+            },
+            onDismiss = { deletingTunnel = null },
+        )
+    }
     deletingHost?.let { target ->
-        androidx.compose.material3.AlertDialog(
-            onDismissRequest = { deletingHost = null },
-            containerColor = G.surface,
-            shape = D.dialogShape,
-            title = { Text("删除 SSH 主机？", color = G.ink) },
-            text = { Text("将删除主机「${target.name} (${target.alias})」、关联隧道预设及其加密保存的密码。", color = G.inkMuted) },
-            confirmButton = {
-                androidx.compose.material3.TextButton(onClick = {
-                    app.envSsh.deleteSshHost(target.id)
-                    deletingHost = null
-                }) { Text("删除", color = G.danger, fontWeight = FontWeight.SemiBold) }
+        GaliaisConfirmDialog(
+            title = "删除 SSH 主机？",
+            message = "将删除主机「${target.name} (${target.alias})」、关联隧道预设及其加密保存的密码。",
+            confirmText = "删除",
+            danger = true,
+            onConfirm = {
+                app.envSsh.deleteSshHost(target.id)
+                deletingHost = null
             },
-            dismissButton = {
-                androidx.compose.material3.TextButton(onClick = { deletingHost = null }) { Text("取消", color = G.inkMuted) }
-            },
+            onDismiss = { deletingHost = null },
         )
     }
     deletingKey?.let { keyName ->
-        androidx.compose.material3.AlertDialog(
-            onDismissRequest = { deletingKey = null },
-            containerColor = G.surface,
-            shape = D.dialogShape,
-            title = { Text("删除 SSH 密钥？", color = G.ink) },
-            text = { Text("将永久删除 ~/.ssh/$keyName 与对应公钥，并清除保存的口令。此操作无法撤销。", color = G.inkMuted) },
-            confirmButton = {
-                androidx.compose.material3.TextButton(onClick = {
-                    val name = keyName
-                    deletingKey = null
-                    scope.launch {
-                        runCatching { app.envSsh.deleteSshKey(name) }
-                            .onFailure { app.conversations.notify("删除失败：${it.message}") }
-                    }
-                }) { Text("永久删除", color = G.danger, fontWeight = FontWeight.SemiBold) }
+        GaliaisConfirmDialog(
+            title = "删除 SSH 密钥？",
+            message = "将永久删除 ~/.ssh/$keyName 与对应公钥，并清除保存的口令。此操作无法撤销。",
+            confirmText = "永久删除",
+            danger = true,
+            onConfirm = {
+                val name = keyName
+                deletingKey = null
+                scope.launch {
+                    runCatching { app.envSsh.deleteSshKey(name) }
+                        .onFailure { app.conversations.notify("删除失败：${it.message}") }
+                }
             },
-            dismissButton = {
-                androidx.compose.material3.TextButton(onClick = { deletingKey = null }) { Text("取消", color = G.inkMuted) }
-            },
+            onDismiss = { deletingKey = null },
         )
     }
     PluginSlotOverlayHost(

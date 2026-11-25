@@ -121,6 +121,7 @@ fun UniversalAgentDetailScreen(
     var agyPlugins by remember { mutableStateOf<List<AgyPluginSummary>>(emptyList()) }
     var agyArtifacts by remember { mutableStateOf<List<AgyArtifactEntry>>(emptyList()) }
     var installPluginDialog by remember { mutableStateOf(false) }
+    var uninstallPluginTarget by remember { mutableStateOf<AgyPluginSummary?>(null) }
     var pluginBusy by remember { mutableStateOf(false) }
     var refreshTick by remember { mutableStateOf(0) }
     var loadingDetail by remember { mutableStateOf(false) }
@@ -163,8 +164,8 @@ fun UniversalAgentDetailScreen(
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     AgentAppIcon(engine = manifest.engineKind, size = 42.dp)
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(manifest.name, style = MaterialTheme.typography.titleMedium, color = G.ink, fontWeight = FontWeight.SemiBold)
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(manifest.name, style = MaterialTheme.typography.titleMedium, color = G.ink, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             TagPill(manifest.vendor, fg = G.inkMuted, bg = G.surfaceSubtle)
                             TagPill(if (agentId == "antigravity") "Antigravity 原生" else manifest.protocol.badge, fg = accent, bg = tint)
                         }
@@ -383,16 +384,15 @@ fun UniversalAgentDetailScreen(
                             }
                         }
                         Hairline()
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                Text("终端沙箱隔离（--sandbox）", style = MaterialTheme.typography.titleSmall, color = G.ink)
-                                Text("限制终端命令的文件与网络访问边界，新建会话生效。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-                            }
-                            GaliaisSwitch(checked = settings.antigravitySandbox, onCheckedChange = {
+                        SettingsToggleRow(
+                            title = "终端沙箱隔离（--sandbox）",
+                            subtitle = "限制终端命令的文件与网络访问边界，新建会话生效。",
+                            checked = settings.antigravitySandbox,
+                            onCheckedChange = {
                                 app.settings.setAntigravitySandbox(it)
                                 app.conversations.notify(if (it) "已开启 Antigravity 沙箱隔离" else "已关闭 Antigravity 沙箱隔离")
-                            })
-                        }
+                            },
+                        )
                         Hairline()
                         AgentOptionChips(
                             title = "通信协议（ACP / Stream-JSON）",
@@ -453,15 +453,12 @@ fun UniversalAgentDetailScreen(
                                             Text(plugin.description, style = MaterialTheme.typography.bodySmall, color = G.inkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                         }
                                     }
-                                    TagPill("卸载", fg = G.danger, bg = G.dangerTint, onClick = if (!pluginBusy) ({
-                                        pluginBusy = true
-                                        scope.launch {
-                                            runCatching { app.conversations.hub.uninstallAgyPlugin(plugin.name) }
-                                                .onSuccess { refreshTick++; app.conversations.notify("已卸载插件 ${plugin.name}") }
-                                                .onFailure { app.conversations.notify("卸载失败：${it.message}") }
-                                            pluginBusy = false
-                                        }
-                                    }) else null)
+                                    TagPill(
+                                        "卸载",
+                                        fg = G.danger,
+                                        bg = G.dangerTint,
+                                        onClick = if (!pluginBusy) ({ uninstallPluginTarget = plugin }) else null,
+                                    )
                                     GaliaisSwitch(checked = plugin.enabled, onCheckedChange = { enabled ->
                                         scope.launch {
                                             runCatching {
@@ -567,27 +564,11 @@ fun UniversalAgentDetailScreen(
                         }
                         Spacer(Modifier.height(6.dp))
                         Box {
-                            Surface(
+                            PickerField(
+                                label = "快速选择已授权模型",
+                                value = agyModels.firstOrNull { it.id == modelDraft }?.label ?: modelDraft.ifBlank { "引擎默认（由 Antigravity 自动选择）" },
                                 onClick = { modelMenu = true },
-                                shape = D.shape(10.dp),
-                                color = G.surfaceSubtle,
-                                border = BorderStroke(0.75.dp, G.border),
-                                modifier = Modifier.fillMaxWidth(),
-                            ) {
-                                Row(Modifier.padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Column(Modifier.weight(1f)) {
-                                        Text("快速选择已授权模型", style = MaterialTheme.typography.labelSmall, color = G.inkMuted)
-                                        Text(
-                                            agyModels.firstOrNull { it.id == modelDraft }?.label ?: modelDraft.ifBlank { "引擎默认（由 Antigravity 自动选择）" },
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            color = G.ink,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                    }
-                                    TagPill("选择", fg = G.accent, bg = G.accentContainer)
-                                }
-                            }
+                            )
                             GaliaisDropdownMenu(expanded = modelMenu, onDismissRequest = { modelMenu = false }) {
                                 Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState()).padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                     GaliaisMenuRow(title = "引擎默认", selected = modelDraft.isBlank(), onClick = {
@@ -690,6 +671,25 @@ fun UniversalAgentDetailScreen(
 
     }
 
+    uninstallPluginTarget?.let { target ->
+        GaliaisConfirmDialog(
+            title = "卸载 Antigravity 插件？",
+            message = "将从本地运行时卸载插件「${target.name}」。之后可随时重新安装。",
+            confirmText = "卸载",
+            danger = true,
+            onConfirm = {
+                uninstallPluginTarget = null
+                pluginBusy = true
+                scope.launch {
+                    runCatching { app.conversations.hub.uninstallAgyPlugin(target.name) }
+                        .onSuccess { refreshTick++; app.conversations.notify("已卸载插件 ${target.name}") }
+                        .onFailure { app.conversations.notify("卸载失败：${it.message}") }
+                    pluginBusy = false
+                }
+            },
+            onDismiss = { uninstallPluginTarget = null },
+        )
+    }
     if (installPluginDialog) {
         TextInputDialog(
             title = "安装 Antigravity 插件",

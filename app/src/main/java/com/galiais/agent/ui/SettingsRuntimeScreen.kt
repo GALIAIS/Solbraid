@@ -6,13 +6,17 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
@@ -74,6 +78,7 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
     var diagnosing by remember { mutableStateOf(false) }
     var diagnosticItems by remember { mutableStateOf<List<Triple<String, Boolean, String>>>(emptyList()) }
     var syncingAll by remember { mutableStateOf(false) }
+    var showDownloadSheet by remember { mutableStateOf(false) }
 
     val activeMode = settings.effectiveRuntimeMode
     val isProot = activeMode == RUNTIME_MODE_PROOT
@@ -135,8 +140,8 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
                     TagPill(
                         text = if (requestingRoot) "检查中…" else if (rootAvailable == true) "已授权" else "重新检查",
                         fg = if (rootAvailable == true) G.success else G.accent,
-                        bg = G.surfaceSubtle,
-                        onClick = if (requestingRoot) null else ({
+                        bg = if (rootAvailable == true) G.successTint else G.accentContainer,
+                        onClick = if (requestingRoot || rootAvailable == true) null else ({
                             scope.launch {
                                 val ok = app.runtime.requestRoot()
                                 if (ok && activeMode == RUNTIME_MODE_ROOT && runtime.idle) {
@@ -196,7 +201,29 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
         }
 
         SectionLabel("下载与网络")
-        DownloadAccelerationCard(app = app)
+        CrispCard(padding = PaddingValues(0.dp)) {
+            val net = settings.downloadNetwork
+            val netSummary = buildString {
+                append(if (net.mirrorPreset == "cn_mirror") "国内镜像" else "默认官方源")
+                append(" · ")
+                append(
+                    when (net.proxyMode) {
+                        "manual" -> "手动代理"
+                        "none" -> "直连无代理"
+                        else -> "跟随环境代理"
+                    },
+                )
+                if (net.preferIpv4) append(" · IPv4")
+            }
+            SettingsNavRow(
+                icon = GaliaisIcons.Globe,
+                title = "下载镜像与代理",
+                subtitle = netSummary,
+                iconTint = G.accent,
+                iconBg = G.accentContainer,
+                onClick = { showDownloadSheet = true },
+            )
+        }
 
         SectionLabel("启动与后台运行")
         CrispCard {
@@ -575,6 +602,7 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
             title = "清理历史下载缓存？",
             body = "将删除 ${formatBytes(env.cacheBytes)} 下载缓存，保留已安装环境和项目文件。",
             confirm = "清理",
+            danger = true,
             onDismiss = { dialog = null },
             onConfirm = {
                 dialog = null
@@ -628,6 +656,10 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
             },
         )
     }
+
+    if (showDownloadSheet) {
+        DownloadAccelerationSheet(app = app, onDismiss = { showDownloadSheet = false })
+    }
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -648,12 +680,9 @@ private fun ArchitectureCard(env: EnvironmentStatus) {
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (isProot) ComponentPill("PRoot", env.prootBinariesReady, env.loading)
                 ComponentPill(if (isProot) "Ubuntu PRoot" else "Ubuntu chroot", env.chrootInstalled, env.loading)
-                ComponentPill("运行组件", env.vmProvisioned, env.loading)
+                ComponentPill("Node 与运行组件", env.vmProvisioned, env.loading)
                 ComponentPill("CA 证书与 Git", env.sshTrusted, env.loading)
-                ComponentPill("Codex", env.codexInstalled, env.loading)
-                ComponentPill("Claude Code", env.claudeInstalled, env.loading)
-                ComponentPill("Antigravity", env.antigravityInstalled, env.loading)
-                ComponentPill(if (env.daemonSocketPresent) "已检测到后台连接入口" else "未检测到后台连接入口", env.daemonSocketPresent, env.loading)
+                ComponentPill(if (env.daemonSocketPresent) "后台连接入口就绪" else "未检测到后台入口", env.daemonSocketPresent, env.loading)
             }
         }
     }
@@ -703,7 +732,7 @@ private fun StorageCard(env: EnvironmentStatus, canClean: Boolean, onRefresh: ()
                     Text(formatBytes(bytes), fontFamily = Mono, fontSize = 12.sp, color = G.inkMuted)
                 }
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 SecondaryPillButton(if (env.loading) "统计中…" else "刷新统计", onClick = onRefresh, enabled = !env.loading)
                 if (env.cacheBytes > 0) SecondaryPillButton("清理下载缓存", onClick = onClean, enabled = canClean)
             }
@@ -721,15 +750,14 @@ private fun MaintenanceRow(title: String, body: String, action: String, enabled:
 }
 
 @Composable
-private fun ConfirmDialog(title: String, body: String, confirm: String, onDismiss: () -> Unit, onConfirm: () -> Unit) {
-    androidx.compose.material3.AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = G.surface,
-        shape = D.dialogShape,
-        title = { Text(title, color = G.ink) },
-        text = { Text(body, color = G.inkMuted) },
-        confirmButton = { androidx.compose.material3.TextButton(onClick = onConfirm) { Text(confirm, color = G.danger, fontWeight = FontWeight.SemiBold) } },
-        dismissButton = { androidx.compose.material3.TextButton(onClick = onDismiss) { Text("取消", color = G.inkMuted) } },
+private fun ConfirmDialog(title: String, body: String, confirm: String, danger: Boolean = false, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    GaliaisConfirmDialog(
+        title = title,
+        message = body,
+        confirmText = confirm,
+        danger = danger,
+        onConfirm = onConfirm,
+        onDismiss = onDismiss,
     )
 }
 
@@ -810,17 +838,16 @@ fun formatBytes(bytes: Long): String {
     return if (index == 0) "$bytes B" else String.format(Locale.US, if (value >= 100) "%.0f %s" else "%.1f %s", value, units[index])
 }
 
-/** Agent 管理页共用的下载网络设置。 */
+/** Agent 管理页与运行环境页共用的下载网络设置抽屉（无二次套壳卡片）。 */
 @Composable
 fun DownloadAccelerationSheet(app: GaliaisApplication, onDismiss: () -> Unit) {
     GaliaisSheet(onDismissRequest = onDismiss) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .imePadding()
-                .navigationBarsPadding()
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp)
+                .padding(horizontal = 18.dp)
                 .padding(bottom = 22.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
@@ -831,7 +858,7 @@ fun DownloadAccelerationSheet(app: GaliaisApplication, onDismiss: () -> Unit) {
                 }
                 SecondaryPillButton("关闭", onClick = onDismiss)
             }
-            DownloadAccelerationCard(app = app)
+            DownloadAccelerationCard(app = app, wrapInCard = false)
         }
     }
 }
@@ -839,7 +866,7 @@ fun DownloadAccelerationSheet(app: GaliaisApplication, onDismiss: () -> Unit) {
 /** 镜像源、本机/系统代理、IPv4 优先与连通性测速卡片（运行环境页与 Agent 页共用）。 */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun DownloadAccelerationCard(app: GaliaisApplication) {
+fun DownloadAccelerationCard(app: GaliaisApplication, wrapInCard: Boolean = true) {
     val runtime by app.runtime.snapshot.collectAsState()
     val settings by app.settings.state.collectAsState()
     val saved = settings.downloadNetwork
@@ -895,7 +922,8 @@ fun DownloadAccelerationCard(app: GaliaisApplication) {
         }
     }
 
-    CrispCard {
+    val hasChanges = currentDraft() != saved
+    val body: @Composable () -> Unit = {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("下载来源", style = MaterialTheme.typography.titleSmall, color = G.ink)
@@ -1026,7 +1054,7 @@ fun DownloadAccelerationCard(app: GaliaisApplication) {
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 PrimaryPillButton(
                     text = if (applying) "应用中…" else "保存并应用",
-                    enabled = !applying && !testing,
+                    enabled = hasChanges && !applying && !testing,
                     onClick = {
                         val draft = currentDraft()
                         saveAndApply(draft)
@@ -1076,4 +1104,5 @@ fun DownloadAccelerationCard(app: GaliaisApplication) {
             }
         }
     }
+    if (wrapInCard) CrispCard { body() } else body()
 }

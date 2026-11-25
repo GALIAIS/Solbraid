@@ -28,26 +28,52 @@ object SyntaxHighlight {
         "fi", "then", "elif", "esac", "done", "local", "export", "exec", "test", "echo", "printf", "exit",
     )
 
-    private val hashCommentLangs = setOf("py", "python", "sh", "bash", "zsh", "shell", "yaml", "yml", "toml", "rb", "ruby", "dockerfile", "makefile", "ini", "conf")
+    private val hashCommentLangs = setOf(
+        "py", "python", "sh", "bash", "zsh", "fish", "shell", "yaml", "yml", "toml",
+        "rb", "ruby", "dockerfile", "makefile", "cmake", "ini", "conf", "cfg", "properties", "env", "r", "pl",
+    )
 
-    fun languageFromPath(path: String): String? = when (path.substringAfterLast('.', "").lowercase()) {
-        "kt", "kts" -> "kotlin"
-        "java" -> "java"
-        "js", "mjs", "cjs" -> "javascript"
-        "ts", "tsx", "jsx" -> "typescript"
-        "py" -> "python"
-        "rs" -> "rust"
-        "go" -> "go"
-        "c", "h", "cpp", "cc", "hpp" -> "c"
-        "sh", "bash", "zsh" -> "bash"
-        "json" -> "json"
-        "yml", "yaml" -> "yaml"
-        "toml" -> "toml"
-        "xml", "html", "htm", "svg" -> "xml"
-        "css" -> "css"
-        "sql" -> "sql"
-        "md", "markdown" -> "markdown"
-        else -> null
+    fun languageFromPath(path: String): String? {
+        val fileName = path.substringAfterLast('/').lowercase()
+        when (fileName) {
+            "dockerfile" -> return "dockerfile"
+            "makefile", "gnumakefile" -> return "makefile"
+            "cmakelists.txt" -> return "cmake"
+            "build.prop", "hosts", "fstab", "resolv.conf" -> return "conf"
+        }
+        return when (path.substringAfterLast('.', "").lowercase()) {
+            "kt", "kts" -> "kotlin"
+            "java" -> "java"
+            "js", "mjs", "cjs" -> "javascript"
+            "ts", "tsx", "jsx" -> "typescript"
+            "py" -> "python"
+            "rs" -> "rust"
+            "go" -> "go"
+            "c", "h", "cpp", "cc", "cxx", "hpp" -> "c"
+            "cs" -> "csharp"
+            "swift" -> "swift"
+            "dart" -> "dart"
+            "php" -> "php"
+            "rb" -> "ruby"
+            "lua" -> "lua"
+            "groovy", "gradle" -> "groovy"
+            "sh", "bash", "zsh", "fish" -> "bash"
+            "ps1" -> "powershell"
+            "json", "jsonc" -> "json"
+            "yml", "yaml" -> "yaml"
+            "toml" -> "toml"
+            "ini", "conf", "cfg", "properties", "env", "service", "rules" -> "conf"
+            "xml", "html", "htm", "svg", "vue", "svelte" -> "xml"
+            "css", "scss", "less" -> "css"
+            "sql" -> "sql"
+            "graphql", "gql" -> "graphql"
+            "proto" -> "proto"
+            "tex", "bib" -> "latex"
+            "diff", "patch" -> "diff"
+            "md", "markdown" -> "markdown"
+            "log" -> "log"
+            else -> null
+        }
     }
 
     fun highlight(code: String, language: String?, palette: CodePalette = CodePalettes.githubDark): AnnotatedString {

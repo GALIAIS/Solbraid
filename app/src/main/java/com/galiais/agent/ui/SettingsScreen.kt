@@ -10,8 +10,10 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -91,19 +93,26 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                 .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(D.space(10.dp)),
         ) {
-            // 顶部紧凑运行环境状态卡（快捷启停，点整张卡进入运行环境详情页）
+            // 顶部紧凑运行环境状态卡（快捷启停，点整张卡进入运行环境详情页，去除下方重复入口）
             CrispCard(
                 onClick = { onNavigate("settings/runtime") },
                 padding = PaddingValues(D.space(14.dp)),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Text("本地运行环境", style = MaterialTheme.typography.titleSmall, color = G.ink)
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text(
+                                "本地运行环境",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = G.ink,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false),
+                            )
                             RuntimeBadge(runtime)
                         }
                         Text(
-                            runtime.message,
+                            runtimeSummary,
                             style = MaterialTheme.typography.bodySmall,
                             color = if (runtime.state == "error") G.danger else G.inkMuted,
                             maxLines = 2,
@@ -123,6 +132,7 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                             enabled = runtime.bound,
                         )
                     }
+                    Icon(GaliaisIcons.ChevronRight, contentDescription = "查看运行环境详情", tint = G.inkSubtle, modifier = Modifier.size(16.dp))
                 }
                 if (runtime.busy) {
                     Spacer(Modifier.height(10.dp))
@@ -151,6 +161,8 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                     icon = GaliaisIcons.Palette,
                     title = "主题与外观",
                     subtitle = themeSummary(settings.theme),
+                    iconTint = G.artifact,
+                    iconBg = G.artifactTint,
                     onClick = { onNavigate("settings/theme") },
                 )
             }
@@ -172,6 +184,8 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                     title = "服务商",
                     subtitle = providersSummary,
                     badge = if (settings.providers.isNotEmpty()) "${settings.providers.size}" else null,
+                    iconTint = G.codex,
+                    iconBg = G.codexTint,
                     onClick = { onNavigate("settings/providers") },
                 )
                 Hairline(Modifier.padding(start = 66.dp))
@@ -179,6 +193,8 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                     icon = GaliaisIcons.Activity,
                     title = "用量中心",
                     subtitle = "概览 · 逐请求 · 会话分析 · 上下文监控 · 预估费用",
+                    iconTint = G.success,
+                    iconBg = G.successTint,
                     onClick = { onNavigate("settings/usage") },
                 )
                 Hairline(Modifier.padding(start = 66.dp))
@@ -188,8 +204,8 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                     title = "资源库",
                     subtitle = "指令 ${extRegistry.instructions.size} · MCP ${extRegistry.mcpServers.size} · 技能 ${extRegistry.skills.size} · 子代理 ${extRegistry.subagents.size} · 插件 ${extRegistry.plugins.size}",
                     badge = if (extCount > 0) "$extCount" else null,
-                    iconTint = G.accent,
-                    iconBg = G.accentContainer,
+                    iconTint = G.artifact,
+                    iconBg = G.artifactTint,
                     onClick = { onNavigate("settings/extensions") },
                 )
                 Hairline(Modifier.padding(start = 66.dp))
@@ -199,6 +215,8 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                     title = "Super-Agent 编排",
                     subtitle = "Worktree 并行 · 并发 ${settings.maxParallelWorkers} 槽 · 按角色分配引擎模型",
                     badge = if (activeTicketCount > 0) "$activeTicketCount" else null,
+                    iconTint = G.inkMuted,
+                    iconBg = G.surfaceSubtle,
                     onClick = { onNavigate("settings/superagent") },
                 )
             }
@@ -221,6 +239,8 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                     title = "SSH 工作台",
                     subtitle = "已保存 ${sshHosts.size} 台主机" + if (activeTunnels.isNotEmpty()) " · ${activeTunnels.size} 条隧道运行中" else " · 终端 · 隧道 · SFTP · 多密钥",
                     badge = if (sshHosts.isNotEmpty()) "${sshHosts.size}" else null,
+                    iconTint = G.codex,
+                    iconBg = G.codexTint,
                     onClick = { onNavigate("tab/ssh") },
                 )
                 Hairline(Modifier.padding(start = 66.dp))
@@ -228,16 +248,9 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                     icon = GaliaisIcons.Layers,
                     title = "工作区与会话",
                     subtitle = workspaceSummary,
+                    iconTint = G.inkMuted,
+                    iconBg = G.surfaceSubtle,
                     onClick = { onNavigate("settings/workspace") },
-                )
-                Hairline(Modifier.padding(start = 66.dp))
-                SettingsNavRow(
-                    icon = GaliaisIcons.Cpu,
-                    title = "运行环境",
-                    subtitle = runtimeSummary,
-                    iconTint = if (runtime.ready) G.success else if (runtime.state == "error") G.danger else G.inkMuted,
-                    iconBg = if (runtime.ready) G.successTint else if (runtime.state == "error") G.dangerTint else G.surfaceSubtle,
-                    onClick = { onNavigate("settings/runtime") },
                 )
                 Hairline(Modifier.padding(start = 66.dp))
                 val sb = settings.selfBuild
@@ -250,7 +263,7 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                     }
                 }
                 SettingsNavRow(
-                    icon = GaliaisIcons.Wrench,
+                    icon = GaliaisIcons.Cpu,
                     title = "本机 APK 自迭代",
                     subtitle = selfBuildSummary,
                     badge = if (sb.enabled) "已开" else null,

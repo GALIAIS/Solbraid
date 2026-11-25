@@ -36,6 +36,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -83,8 +84,7 @@ fun ModeSelectionScreen(app: GaliaisApplication) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .statusBarsPadding()
-                .navigationBarsPadding(),
+                .statusBarsPadding(),
         ) {
             Column(
                 modifier = Modifier
@@ -151,7 +151,7 @@ fun ModeSelectionScreen(app: GaliaisApplication) {
                             text = if (rootAvailable == true) "已授权" else "申请授权",
                             fg = if (rootAvailable == true) G.success else G.accent,
                             bg = G.surface,
-                            onClick = { scope.launch { rootDeniedHint = !app.runtime.requestRoot() } },
+                            onClick = if (rootAvailable == true) null else ({ scope.launch { rootDeniedHint = !app.runtime.requestRoot() } }),
                         )
                     }
                 }
@@ -200,11 +200,12 @@ fun ModeSelectionScreen(app: GaliaisApplication) {
                 )
             }
 
-            HeaderDivider()
+            Hairline()
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(G.surface)
+                    .navigationBarsPadding()
                     .padding(horizontal = 18.dp, vertical = 14.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
@@ -259,8 +260,8 @@ private fun ModeOptionCard(
 ) {
     CrispCard(
         onClick = onClick,
-        borderColor = if (selected) G.accent else G.border,
-        background = if (selected && !D.material) G.surface else if (selected && D.material) G.accentContainer.copy(alpha = 0.22f) else G.surface,
+        borderColor = if (selected) G.accent else Color.Unspecified,
+        background = if (selected && D.material) G.accentContainer.copy(alpha = 0.22f) else Color.Unspecified,
         padding = PaddingValues(16.dp),
     ) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -279,17 +280,8 @@ private fun ModeOptionCard(
                         }
                     }
                 }
-                Icon(
-                    imageVector = if (selected) GaliaisIcons.Check else GaliaisIcons.Cpu,
-                    contentDescription = null,
-                    tint = if (selected) G.accent else G.inkSubtle,
-                    modifier = Modifier.size(18.dp),
-                )
             }
             Text(description, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-            if (existingHint != null) {
-                Text(existingHint, style = MaterialTheme.typography.labelSmall, color = G.success, fontWeight = FontWeight.Medium)
-            }
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 bullets.forEach { item ->
                     Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(6.dp)) {

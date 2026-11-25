@@ -17,6 +17,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -33,6 +36,7 @@ fun GeneralSettingsScreen(
     onBack: () -> Unit,
 ) {
     val settings by app.settings.state.collectAsState()
+    var confirmReset by remember { mutableStateOf(false) }
 
     SubPageScaffold(title = "常规", onBack = onBack, snackbar = snackbar) {
         // 1. 用户编辑器与输入渲染
@@ -125,7 +129,6 @@ fun GeneralSettingsScreen(
                                     options = listOf(4000 to "4K 字", 8000 to "8K 字", 20000 to "20K 字", 0 to "不限制"),
                                     selected = settings.editorPlainFallbackThreshold,
                                     onSelect = app.settings::setEditorPlainFallbackThreshold,
-                                    compact = true,
                                 )
                             }
                         }
@@ -190,7 +193,6 @@ fun GeneralSettingsScreen(
                         ),
                         selected = settings.userMessageRenderMode,
                         onSelect = app.settings::setUserMessageRenderMode,
-                        compact = true,
                     )
                 }
                 Hairline()
@@ -248,7 +250,6 @@ fun GeneralSettingsScreen(
                         options = listOf(2 to "2 空格", 4 to "4 空格", 0 to "Tab 制表符"),
                         selected = settings.editorTabSize,
                         onSelect = app.settings::setEditorTabSize,
-                        compact = true,
                     )
                 }
                 Hairline()
@@ -276,11 +277,23 @@ fun GeneralSettingsScreen(
         }
 
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-            SecondaryPillButton("恢复常规默认设置", onClick = {
-                app.settings.resetGeneralSettings()
-                app.conversations.notify("已恢复常规默认设置")
-            })
+            SecondaryPillButton("恢复常规默认设置", onClick = { confirmReset = true })
         }
         Spacer(Modifier.height(16.dp))
+    }
+
+    if (confirmReset) {
+        GaliaisConfirmDialog(
+            title = "恢复常规默认设置？",
+            message = "将重置编辑器模式、消息渲染偏好、自动滚动与输入快捷键为默认值，不影响服务商与工作区数据。",
+            confirmText = "确认恢复",
+            danger = true,
+            onConfirm = {
+                confirmReset = false
+                app.settings.resetGeneralSettings()
+                app.conversations.notify("已恢复常规默认设置")
+            },
+            onDismiss = { confirmReset = false },
+        )
     }
 }

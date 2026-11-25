@@ -7,7 +7,6 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -20,20 +19,19 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -55,6 +53,7 @@ import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.toClipEntry
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -378,6 +377,7 @@ fun UsageScreen(
     var codexLimits by remember { mutableStateOf<List<RateLimitSummary>>(emptyList()) }
     var confirmClear by remember { mutableStateOf(false) }
     var inspectRow by remember { mutableStateOf<UsageRequestRow?>(null) }
+    var topMenuOpen by remember { mutableStateOf(false) }
 
     LaunchedEffect(searchInput) {
         delay(220)
@@ -493,51 +493,64 @@ fun UsageScreen(
         loading = loading,
         actions = {
             if (runtime.ready) {
-                if (totals.requests > 0) {
-                    TagPill("导出 CSV", fg = G.accent, bg = G.accentContainer, onClick = {
-                        scope.launch {
-                            runCatching {
-                                app.conversations.hub.exportUsageCsv(
-                                    period = period,
-                                    agent = filterAgent,
-                                    providerId = filterProviderId,
-                                    model = filterModel,
-                                    day = filterDay,
-                                    sessionId = filterSessionId,
-                                    source = filterSource,
-                                    failedOnly = failedOnly,
-                                    search = debouncedSearch.ifBlank { null },
-                                )
-                            }.onSuccess { res ->
-                                val csv = res.optString("csv")
-                                val count = res.optInt("count")
-                                val fname = res.optString("filename", "solbraid-usage.csv").replace(Regex("[^a-zA-Z0-9._-]"), "_")
-                                if (csv.length <= 128_000) {
-                                    clipboard.setClipEntry(ClipData.newPlainText(fname, csv).toClipEntry())
-                                }
-                                runCatching {
-                                    val exportDir = java.io.File(context.cacheDir, "exports").apply { mkdirs() }
-                                    val csvFile = java.io.File(exportDir, fname)
-                                    csvFile.writeText(csv, Charsets.UTF_8)
-                                    val uri = androidx.core.content.FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", csvFile)
-                                    val share = Intent(Intent.ACTION_SEND).apply {
-                                        type = "text/csv"
-                                        putExtra(Intent.EXTRA_SUBJECT, fname)
-                                        putExtra(Intent.EXTRA_STREAM, uri)
-                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-                                    }
-                                    context.startActivity(Intent.createChooser(share, "导出用量 CSV（$count 条记录）"))
-                                }.onFailure { err ->
-                                    app.conversations.notify("文件分享失败：${err.message}")
-                                }
-                                app.conversations.notify("已生成 CSV 文件（$count 条记录）")
-                            }.onFailure { app.conversations.notify("导出失败：${it.message}") }
-                        }
-                    })
-                    TagPill("清空", fg = G.danger, bg = G.dangerTint, onClick = { confirmClear = true })
-                }
-                IconButton(enabled = !loading, onClick = { tick++ }, modifier = Modifier.size(38.dp)) {
+                IconButton(enabled = !loading, onClick = { tick++ }) {
                     Icon(GaliaisIcons.Refresh, contentDescription = "刷新用量", tint = if (!loading) G.inkMuted else G.inkSubtle, modifier = Modifier.size(19.dp))
+                }
+                if (totals.requests > 0) {
+                    Box {
+                        IconButton(onClick = { topMenuOpen = true }) {
+                            Icon(GaliaisIcons.MoreHoriz, contentDescription = "更多用量操作", tint = G.inkMuted, modifier = Modifier.size(20.dp))
+                        }
+                        GaliaisDropdownMenu(expanded = topMenuOpen, onDismissRequest = { topMenuOpen = false }) {
+                            Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                GaliaisMenuRow(title = "导出 CSV 报表", onClick = {
+                                    topMenuOpen = false
+                                    scope.launch {
+                                        runCatching {
+                                            app.conversations.hub.exportUsageCsv(
+                                                period = period,
+                                                agent = filterAgent,
+                                                providerId = filterProviderId,
+                                                model = filterModel,
+                                                day = filterDay,
+                                                sessionId = filterSessionId,
+                                                source = filterSource,
+                                                failedOnly = failedOnly,
+                                                search = debouncedSearch.ifBlank { null },
+                                            )
+                                        }.onSuccess { res ->
+                                            val csv = res.optString("csv")
+                                            val count = res.optInt("count")
+                                            val fname = res.optString("filename", "solbraid-usage.csv").replace(Regex("[^a-zA-Z0-9._-]"), "_")
+                                            if (csv.length <= 128_000) {
+                                                clipboard.setClipEntry(ClipData.newPlainText(fname, csv).toClipEntry())
+                                            }
+                                            runCatching {
+                                                val exportDir = java.io.File(context.cacheDir, "exports").apply { mkdirs() }
+                                                val csvFile = java.io.File(exportDir, fname)
+                                                csvFile.writeText(csv, Charsets.UTF_8)
+                                                val uri = androidx.core.content.FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", csvFile)
+                                                val share = Intent(Intent.ACTION_SEND).apply {
+                                                    type = "text/csv"
+                                                    putExtra(Intent.EXTRA_SUBJECT, fname)
+                                                    putExtra(Intent.EXTRA_STREAM, uri)
+                                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                }
+                                                context.startActivity(Intent.createChooser(share, "导出用量 CSV（$count 条记录）"))
+                                            }.onFailure { err ->
+                                                app.conversations.notify("文件分享失败：${err.message}")
+                                            }
+                                            app.conversations.notify("已生成 CSV 文件（$count 条记录）")
+                                        }.onFailure { app.conversations.notify("导出失败：${it.message}") }
+                                    }
+                                })
+                                GaliaisMenuRow(title = "清空用量账本", tintOverride = G.danger, onClick = {
+                                    topMenuOpen = false
+                                    confirmClear = true
+                                })
+                            }
+                        }
+                    }
                 }
             }
         },
@@ -549,11 +562,15 @@ fun UsageScreen(
         )
 
         if (mainTab != "context") {
-            SegmentedPillBar(
-                options = listOf("today" to "今天", "24h" to "24h", "7d" to "7天", "30d" to "30天", "all" to "全部"),
-                selected = period,
-                onSelect = { period = it; filterDay = null },
-            )
+            LazyRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                items(listOf("today" to "今天", "24h" to "24h", "7d" to "7天", "30d" to "30天", "all" to "全部"), key = { it.first }) { (key, label) ->
+                    SelectableChip(text = label, selected = period == key, onClick = { period = key; filterDay = null })
+                }
+            }
         }
 
         if (hasAnyFilter && mainTab != "context") {
@@ -676,7 +693,7 @@ fun UsageScreen(
             onDismissRequest = { confirmClear = false },
             containerColor = G.surface,
             shape = D.dialogShape,
-            title = { Text("清空本地用量账本？", color = G.ink) },
+            title = { Text("清空本地用量账本？", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = G.danger) },
             text = {
                 Text(
                     if (canClearFiltered) "可选择仅清除当前筛选/周期条件命中的记录，或清空全部历史账本，此操作不可撤销。"
@@ -741,7 +758,7 @@ private fun UsageOverviewTab(
     onDrillAgent: (UsageGroupRow) -> Unit,
     onDrillModel: (UsageGroupRow) -> Unit,
 ) {
-    // 8 项高精度核心 KPI 网格（严格区分纯解码吞吐与端到端速率、提供 P50/P95 延迟与未缓存拆解）
+    // 2×2 核心 KPI 网格 + 可折叠延迟/吞吐深度指标卡
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         UsageKpiCard(
             title = "总 Token",
@@ -750,18 +767,18 @@ private fun UsageOverviewTab(
             modifier = Modifier.weight(1f),
         )
         UsageKpiCard(
-            title = "缓存命中率",
-            value = if (totals.inputTokens > 0L) fmtRatePct(totals.cacheHitRate) else "—",
-            subtitle = "读 ${fmtCompactTokens(totals.cacheReadTokens)} · 写 ${fmtCompactTokens(totals.cacheWriteTokens)}",
+            title = "预估费用",
+            value = fmtUsd(totals.costUsd),
+            subtitle = "网关 ${totals.gatewayCount} · 直连 ${totals.directCount}" +
+                if (totals.estimatedCount > 0) " · 估 ${totals.estimatedCount}" else "",
             modifier = Modifier.weight(1f),
         )
     }
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         UsageKpiCard(
-            title = "预估费用",
-            value = fmtUsd(totals.costUsd),
-            subtitle = "网关 ${totals.gatewayCount} · 直连 ${totals.directCount}" +
-                if (totals.estimatedCount > 0) " · 估 ${totals.estimatedCount}" else "",
+            title = "缓存命中率",
+            value = if (totals.inputTokens > 0L) fmtRatePct(totals.cacheHitRate) else "—",
+            subtitle = "读 ${fmtCompactTokens(totals.cacheReadTokens)} · 写 ${fmtCompactTokens(totals.cacheWriteTokens)}",
             modifier = Modifier.weight(1f),
         )
         UsageKpiCard(
@@ -775,39 +792,50 @@ private fun UsageOverviewTab(
             modifier = Modifier.weight(1f),
         )
     }
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        UsageKpiCard(
-            title = "纯解码吞吐",
-            value = if (totals.avgTps > 0.0) "${String.format(Locale.US, "%.1f", totals.avgTps)} tok/s" else "—",
-            subtitle = if (totals.tpsSampleCount > 0)
-                "中位 ${String.format(Locale.US, "%.1f", totals.medianTps)} · 峰 ${String.format(Locale.US, "%.1f", totals.peakTps)} (${totals.tpsSampleCount})"
-            else "需流式生成 ≥100ms",
-            modifier = Modifier.weight(1f),
-        )
-        UsageKpiCard(
-            title = "端到端速率",
-            value = if (totals.e2eAvgTps > 0.0) "${String.format(Locale.US, "%.1f", totals.e2eAvgTps)} tok/s" else "—",
-            subtitle = "总输出 / API 耗时（含首字）",
-            modifier = Modifier.weight(1f),
-        )
-    }
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        UsageKpiCard(
-            title = "首字延迟 TTFT",
-            value = fmtDurationMs(totals.avgTtftMs),
-            subtitle = if (totals.ttftSampleCount > 0)
-                "P50 ${fmtDurationMs(totals.p50TtftMs)} · P95 ${fmtDurationMs(totals.p95TtftMs)}"
-            else "暂无流式首字样本",
-            modifier = Modifier.weight(1f),
-        )
-        UsageKpiCard(
-            title = "API 响应延迟",
-            value = fmtDurationMs(totals.avgLatencyMs),
-            subtitle = if (totals.p50LatencyMs > 0)
-                "P50 ${fmtDurationMs(totals.p50LatencyMs)} · P95 ${fmtDurationMs(totals.p95LatencyMs)}"
-            else "暂无延迟样本",
-            modifier = Modifier.weight(1f),
-        )
+    CrispCard(padding = PaddingValues(12.dp)) {
+        val perfSummary = buildString {
+            append("吞吐与延迟详情")
+            if (totals.avgTps > 0.0) append(" · ${String.format(Locale.US, "%.1f", totals.avgTps)} tok/s")
+            if (totals.avgTtftMs > 0) append(" · TTFT ${fmtDurationMs(totals.avgTtftMs)}")
+        }
+        Collapsible(title = perfSummary, initiallyOpen = false) {
+            Column(Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    UsageKpiCard(
+                        title = "纯解码吞吐",
+                        value = if (totals.avgTps > 0.0) "${String.format(Locale.US, "%.1f", totals.avgTps)} tok/s" else "—",
+                        subtitle = if (totals.tpsSampleCount > 0)
+                            "中位 ${String.format(Locale.US, "%.1f", totals.medianTps)} · 峰 ${String.format(Locale.US, "%.1f", totals.peakTps)}"
+                        else "需流式生成 ≥100ms",
+                        modifier = Modifier.weight(1f),
+                    )
+                    UsageKpiCard(
+                        title = "端到端速率",
+                        value = if (totals.e2eAvgTps > 0.0) "${String.format(Locale.US, "%.1f", totals.e2eAvgTps)} tok/s" else "—",
+                        subtitle = "总输出 / API 耗时（含首字）",
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    UsageKpiCard(
+                        title = "首字延迟 TTFT",
+                        value = fmtDurationMs(totals.avgTtftMs),
+                        subtitle = if (totals.ttftSampleCount > 0)
+                            "P50 ${fmtDurationMs(totals.p50TtftMs)} · P95 ${fmtDurationMs(totals.p95TtftMs)}"
+                        else "暂无流式首字样本",
+                        modifier = Modifier.weight(1f),
+                    )
+                    UsageKpiCard(
+                        title = "API 响应延迟",
+                        value = fmtDurationMs(totals.avgLatencyMs),
+                        subtitle = if (totals.p50LatencyMs > 0)
+                            "P50 ${fmtDurationMs(totals.p50LatencyMs)} · P95 ${fmtDurationMs(totals.p95LatencyMs)}"
+                        else "暂无延迟样本",
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+        }
     }
 
     // 精确 Token 全构成条
@@ -891,7 +919,15 @@ private fun UsageOverviewTab(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        Text(d.id.takeLast(5), fontFamily = Mono, fontSize = 11.sp, color = if (activeDay) G.accent else G.inkMuted, fontWeight = if (activeDay) FontWeight.Bold else FontWeight.Normal)
+                        Text(
+                            d.id.takeLast(5),
+                            fontFamily = Mono,
+                            fontSize = 11.sp,
+                            color = if (activeDay) G.accent else G.inkMuted,
+                            fontWeight = if (activeDay) FontWeight.Bold else FontWeight.Normal,
+                            maxLines = 1,
+                            modifier = Modifier.width(40.dp),
+                        )
                         Box(Modifier.weight(1f).height(10.dp).clip(RoundedCornerShape(99.dp)).background(G.surfaceSubtle)) {
                             val barColor = when (chartMetric) { "cost" -> G.claude; "requests" -> G.codex; else -> G.accent }
                             Box(Modifier.fillMaxWidth(frac).height(10.dp).clip(RoundedCornerShape(99.dp)).background(barColor))
@@ -900,7 +936,15 @@ private fun UsageOverviewTab(
                             "requests" -> "${d.requests} 次" + if (d.errors > 0) " (${d.errors}错)" else ""
                             else -> "${fmtCompactTokens(d.totalTokens)} · ${fmtUsd(d.costUsd)}"
                         }
-                        Text(rightText, fontFamily = Mono, fontSize = 11.sp, color = G.ink)
+                        Text(
+                            rightText,
+                            fontFamily = Mono,
+                            fontSize = 11.sp,
+                            color = G.ink,
+                            maxLines = 1,
+                            textAlign = TextAlign.End,
+                            modifier = Modifier.widthIn(min = 84.dp),
+                        )
                     }
                 }
             }
@@ -938,6 +982,9 @@ private fun UsageHeatmapCard(
 ) {
     val activeDays = remember(cells) { cells.count { it.requests > 0 } }
     val weeks = remember(cells) { cells.chunked(7) }
+    var inspectedCell by remember(cells, selectedDay) {
+        mutableStateOf(cells.firstOrNull { it.day == selectedDay })
+    }
     val rowWeekdays = remember(cells) {
         val df = SimpleDateFormat("yyyy-MM-dd", Locale.US)
         val cal = java.util.Calendar.getInstance()
@@ -951,7 +998,7 @@ private fun UsageHeatmapCard(
             }.getOrDefault("")
         }
     }
-    SectionLabel("近 12 周活跃热力图（$activeDays 天有请求 · 点击日期下钻）")
+    SectionLabel("近 12 周活跃热力图（$activeDays 天有请求 · 点击预览单日）")
     CrispCard(padding = PaddingValues(12.dp)) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
@@ -999,7 +1046,7 @@ private fun UsageHeatmapCard(
                                     if (cell == null) {
                                         Spacer(Modifier.fillMaxWidth().aspectRatio(1f))
                                     } else {
-                                        val isSelected = selectedDay == cell.day
+                                        val isSelected = selectedDay == cell.day || inspectedCell?.day == cell.day
                                         val bg = when (cell.level) {
                                             0 -> G.surfaceSubtle
                                             1 -> G.accent.copy(alpha = 0.22f)
@@ -1012,7 +1059,9 @@ private fun UsageHeatmapCard(
                                                 .fillMaxWidth()
                                                 .aspectRatio(1f)
                                                 .clip(RoundedCornerShape(cellRadius))
-                                                .clickable { onSelectDay(cell.day) },
+                                                .clickable {
+                                                    inspectedCell = if (inspectedCell?.day == cell.day) null else cell
+                                                },
                                             shape = RoundedCornerShape(cellRadius),
                                             color = bg,
                                             border = if (isSelected) BorderStroke(1.5.dp, G.ink) else if (cell.errors > 0 && cell.requests > 0) BorderStroke(0.75.dp, G.danger.copy(alpha = 0.6f)) else null,
@@ -1020,6 +1069,28 @@ private fun UsageHeatmapCard(
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+            inspectedCell?.let { cell ->
+                Surface(Modifier.fillMaxWidth(), shape = D.shape(9.dp), color = G.surfaceSubtle) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            "${cell.day} · ${cell.requests} 次 · ${fmtCompactTokens(cell.tokens)} · ${fmtUsd(cell.costUsd)}",
+                            fontFamily = Mono,
+                            fontSize = 11.sp,
+                            color = G.ink,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (cell.requests > 0) {
+                            TagPill("查看请求 ▸", fg = G.accent, bg = G.accentContainer, onClick = { onSelectDay(cell.day) })
                         }
                     }
                 }
@@ -1118,31 +1189,26 @@ private fun UsageRequestsTab(
     onInspect: (UsageRequestRow) -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        OutlinedTextField(
+        SearchBar(
             value = search,
             onValueChange = onSearchChange,
-            placeholder = { Text("搜索模型、服务商、会话 ID 或错误信息…", style = MaterialTheme.typography.bodySmall) },
-            singleLine = true,
-            shape = D.fieldShape,
-            colors = galiaisTextFieldColors(),
-            textStyle = MaterialTheme.typography.bodySmall,
-            modifier = Modifier.fillMaxWidth(),
+            placeholder = "搜索模型、服务商、会话 ID 或错误信息…",
         )
-        Row(
-            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        LazyRow(
+            modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            SelectableChip("仅看异常", selected = failedOnly, onClick = onToggleFailed)
-            SelectableChip("本地网关", selected = selectedSource == "gateway", onClick = { onSelectSource("gateway") })
-            SelectableChip("官方直连", selected = selectedSource == "direct", onClick = { onSelectSource("direct") })
-            facetAgents.forEach { a ->
+            item { SelectableChip("仅看异常", selected = failedOnly, onClick = onToggleFailed) }
+            item { SelectableChip("本地网关", selected = selectedSource == "gateway", onClick = { onSelectSource("gateway") }) }
+            item { SelectableChip("官方直连", selected = selectedSource == "direct", onClick = { onSelectSource("direct") }) }
+            items(facetAgents, key = { "ag:$it" }) { a ->
                 SelectableChip(displayAgentName(a), selected = selectedAgent == a, onClick = { onSelectAgent(a) })
             }
-            facetProviders.forEach { (pid, pname) ->
+            items(facetProviders, key = { "pr:${it.first}" }) { (pid, pname) ->
                 SelectableChip(pname, selected = selectedProviderId == pid, onClick = { onSelectProvider(pid, pname) })
             }
-            facetModels.take(10).forEach { m ->
+            items(facetModels.take(10), key = { "md:$it" }) { m ->
                 SelectableChip(m, selected = selectedModel == m, onClick = { onSelectModel(m) })
             }
         }
@@ -1246,18 +1312,30 @@ private fun UsageSessionsTab(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                        TagPill("${s.requests} 次请求" + if (s.errors > 0) " (${s.errors} 错)" else "", fg = if (s.errors > 0) G.danger else G.inkMuted, bg = if (s.errors > 0) G.dangerTint else G.surfaceSubtle)
-                        TagPill("总 ${fmtCompactTokens(s.totalTokens)} (入 ${fmtCompactTokens(s.inputTokens)} / 出 ${fmtCompactTokens(s.outputTokens)})", fg = G.ink, bg = G.surfaceSubtle)
-                        if (s.cacheReadTokens > 0L) TagPill("缓存命中 ${fmtRatePct(s.cacheHitRate)}", fg = G.success, bg = G.successTint)
-                        if (s.reasoningTokens > 0L) TagPill("思维链 ${fmtCompactTokens(s.reasoningTokens)}", fg = G.claude, bg = G.claudeTint)
-                        if (s.avgTps > 0.0) TagPill("解码 ${String.format(Locale.US, "%.1f", s.avgTps)} tok/s", fg = G.codex, bg = G.codexTint)
+                    val metricLine1 = buildString {
+                        append("${s.requests} 次")
+                        if (s.errors > 0) append(" (${s.errors}错)")
+                        append(" · 总 ${fmtCompactTokens(s.totalTokens)}")
+                        append("（入 ${fmtCompactTokens(s.inputTokens)} / 出 ${fmtCompactTokens(s.outputTokens)}）")
+                    }
+                    val metricLine2 = buildList {
+                        if (s.cacheReadTokens > 0L) add("缓存 ${fmtRatePct(s.cacheHitRate)}")
+                        if (s.reasoningTokens > 0L) add("思维链 ${fmtCompactTokens(s.reasoningTokens)}")
+                        if (s.avgTps > 0.0) add("${String.format(Locale.US, "%.1f", s.avgTps)} tok/s")
                         if (s.maxContextUsed > 0L) {
-                            val peakLabel = if (s.contextWindow > 0L) {
+                            val peak = if (s.contextWindow > 0L) {
                                 val pct = ((s.maxContextUsed * 100.0) / s.contextWindow).coerceIn(0.0, 100.0)
-                                "峰值上下文 ${fmtCompactTokens(s.maxContextUsed)} (${fmtRatePct(pct)})"
-                            } else "峰值上下文 ${fmtCompactTokens(s.maxContextUsed)}"
-                            TagPill(peakLabel, fg = G.inkMuted, bg = G.surfaceSubtle)
+                                "峰值 ${fmtCompactTokens(s.maxContextUsed)} (${fmtRatePct(pct)})"
+                            } else "峰值 ${fmtCompactTokens(s.maxContextUsed)}"
+                            add(peak)
+                        }
+                    }.joinToString(" · ")
+                    Surface(Modifier.fillMaxWidth(), shape = D.shape(8.dp), color = G.surfaceSubtle) {
+                        Column(Modifier.padding(horizontal = 10.dp, vertical = 7.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(metricLine1, fontFamily = Mono, fontSize = 11.sp, color = G.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            if (metricLine2.isNotBlank()) {
+                                Text(metricLine2, fontFamily = Mono, fontSize = 10.5.sp, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
                         }
                     }
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1267,12 +1345,14 @@ private fun UsageSessionsTab(
                             fontSize = 10.5.sp,
                             color = G.inkSubtle,
                             modifier = Modifier.weight(1f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
                         if (s.id.isNotBlank()) {
-                            TagPill("筛选请求", fg = G.accent, bg = G.accentContainer, onClick = { onDrillSession(s.id, title) })
+                            CompactActionButton("筛选请求", onClick = { onDrillSession(s.id, title) })
                         }
                         if (live != null && onOpenConversation != null) {
-                            TagPill("打开会话", fg = G.ink, bg = G.surfaceSubtle, border = G.border, onClick = { onOpenConversation(live.summary.key) })
+                            CompactActionButton("打开会话", primary = true, onClick = { onOpenConversation(live.summary.key) })
                         }
                     }
                 }
@@ -1405,28 +1485,36 @@ private fun UsageContextTab(
                             fontSize = 11.sp,
                             color = G.inkMuted,
                         )
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                            TagPill("未缓存入 ${fmtCompactTokens(usage.uncachedInputTokens)}", fg = G.ink, bg = G.surfaceSubtle)
+                        val ctxLine1 = buildList {
+                            add("未缓存入 ${fmtCompactTokens(usage.uncachedInputTokens)}")
                             if (usage.cachedInputTokens > 0L) {
-                                TagPill("缓存读 ${fmtCompactTokens(usage.cachedInputTokens)}" + (cacheHit?.let { " (${fmtRatePct(it)})" } ?: ""), fg = G.success, bg = G.successTint)
+                                add("缓存读 ${fmtCompactTokens(usage.cachedInputTokens)}" + (cacheHit?.let { " (${fmtRatePct(it)})" } ?: ""))
                             }
-                            if (usage.cacheWriteTokens > 0L) {
-                                TagPill("缓存写 ${fmtCompactTokens(usage.cacheWriteTokens)}", fg = G.warning, bg = G.warningTint)
-                            }
-                            TagPill("输出 ${fmtCompactTokens(usage.outputTokens)}", fg = G.accent, bg = G.accentContainer)
-                            if (usage.reasoningTokens > 0L) TagPill("思维链 ${fmtCompactTokens(usage.reasoningTokens)}", fg = G.claude, bg = G.claudeTint)
-                            if (compactThreshold != null) TagPill("自动压缩线 ${fmtCompactTokens(compactThreshold)}", fg = G.inkMuted, bg = G.surfaceSubtle)
+                            if (usage.cacheWriteTokens > 0L) add("缓写 ${fmtCompactTokens(usage.cacheWriteTokens)}")
+                            add("输出 ${fmtCompactTokens(usage.outputTokens)}")
+                        }.joinToString(" · ")
+                        val ctxLine2 = buildList {
+                            if (usage.reasoningTokens > 0L) add("思维链 ${fmtCompactTokens(usage.reasoningTokens)}")
+                            if (compactThreshold != null) add("压缩线 ${fmtCompactTokens(compactThreshold)}")
                             usage.sessionTotalTokens?.takeIf { it > usage.totalTokens }?.let { cum ->
-                                TagPill("会话累计 ${fmtCompactTokens(cum)}", fg = G.inkMuted, bg = G.surfaceSubtle)
+                                add("累计 ${fmtCompactTokens(cum)}")
+                            }
+                        }.joinToString(" · ")
+                        Surface(Modifier.fillMaxWidth(), shape = D.shape(8.dp), color = G.surfaceSubtle) {
+                            Column(Modifier.padding(horizontal = 10.dp, vertical = 7.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(ctxLine1, fontFamily = Mono, fontSize = 10.5.sp, color = G.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                if (ctxLine2.isNotBlank()) {
+                                    Text(ctxLine2, fontFamily = Mono, fontSize = 10.5.sp, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
                             }
                         }
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Spacer(Modifier.weight(1f))
                             if (runtimeReady && !st.running) {
-                                TagPill("压缩上下文", fg = G.warning, bg = G.warningTint, onClick = { onCompact(st.summary.key) })
+                                CompactActionButton("压缩上下文", onClick = { onCompact(st.summary.key) })
                             }
                             if (onOpenConversation != null) {
-                                TagPill("打开会话", fg = G.accent, bg = G.accentContainer, onClick = { onOpenConversation(st.summary.key) })
+                                CompactActionButton("打开会话", primary = true, onClick = { onOpenConversation(st.summary.key) })
                             }
                         }
                     }
@@ -1484,78 +1572,66 @@ private fun UsageRequestDetailSheet(row: UsageRequestRow, onDismiss: () -> Unit,
     val failed = (row.status >= 400 || row.err.isNotBlank()) && row.status != 499
     val cancelled = row.status == 499
 
-    GaliaisSheet(onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .navigationBarsPadding()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 18.dp)
-                .padding(bottom = 22.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("请求账本详情", style = MaterialTheme.typography.titleMedium, color = G.ink, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                TagPill(
-                    text = if (cancelled) "已中断 499" else "HTTP ${row.status}",
-                    fg = if (failed) G.danger else if (cancelled) G.warning else G.success,
-                    bg = if (failed) G.dangerTint else if (cancelled) G.warningTint else G.successTint,
+    GaliaisSheetScaffold(
+        title = "请求账本详情",
+        subtitle = "${displayAgentName(row.agent)} · ${if (cancelled) "已中断 499" else "HTTP ${row.status}"}",
+        onDismiss = onDismiss,
+        headerAction = {
+            TagPill("复制 JSON", fg = G.accent, bg = G.accentContainer, onClick = onCopyJson)
+        },
+    ) {
+        CrispCard {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                UsageDetailKv("时间", fmt.format(Date(row.ts)))
+                UsageDetailKv("引擎 / 来源", "${displayAgentName(row.agent)} · ${if (row.source == "direct") "官方直连" else "本地网关"}")
+                UsageDetailKv("数据精度", if (!row.exact) "估算（上游未返回精确 Token）" else if (row.streamed) "流式精确实测" else "API 精确返回（非流式）")
+                UsageDetailKv("服务商", "${row.providerName} (${row.providerId})")
+                if (row.requestedModel.isNotBlank() && row.requestedModel != row.model) {
+                    UsageDetailKv("模型映射", "${row.requestedModel} → ${row.model}")
+                } else {
+                    UsageDetailKv("模型", row.model.ifBlank { "default" })
+                }
+                if (row.sessionId.isNotBlank()) UsageDetailKv("会话 ID", row.sessionId)
+                if (row.contextUsed > 0L) {
+                    val ctxStr = fmtExactTokens(row.contextUsed) + if (row.contextWindow > 0L) {
+                        " / ${fmtExactTokens(row.contextWindow)} (${fmtRatePct((row.contextUsed * 100.0) / row.contextWindow)})"
+                    } else ""
+                    UsageDetailKv("当时上下文", ctxStr)
+                }
+            }
+        }
+        CrispCard {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("Token 精确拆解", style = MaterialTheme.typography.labelMedium, color = G.inkMuted, fontWeight = FontWeight.SemiBold)
+                UsageDetailKv("总输入（未缓存 + 缓读 + 缓写）", fmtExactTokens(row.inputTokens))
+                UsageDetailKv("未命中缓存输入", fmtExactTokens(row.uncachedInputTokens))
+                UsageDetailKv("缓存读取 / 命中率", "${fmtExactTokens(row.cacheReadTokens)} (${fmtRatePct(row.cacheHitRate)})")
+                if (row.cacheWriteTokens > 0L) UsageDetailKv("缓存写入", fmtExactTokens(row.cacheWriteTokens))
+                UsageDetailKv("总输出", fmtExactTokens(row.outputTokens))
+                if (row.reasoningTokens > 0L) UsageDetailKv("其中思维链推理", fmtExactTokens(row.reasoningTokens))
+                UsageDetailKv("合计 Token", fmtExactTokens(row.totalTokens))
+            }
+        }
+        CrispCard {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("耗时、吞吐与计费", style = MaterialTheme.typography.labelMedium, color = G.inkMuted, fontWeight = FontWeight.SemiBold)
+                UsageDetailKv("首字延迟 (TTFT)", if (row.streamed && row.ttftMs > 0) "${row.ttftMs} ms" else if (!row.streamed) "非流式（不适用）" else "—")
+                UsageDetailKv("纯生成解码耗时", if (row.genMs > 0) "${row.genMs} ms" else "—")
+                UsageDetailKv("API 总耗时", if (row.ms > 0) "${row.ms} ms" else "—")
+                UsageDetailKv("纯解码吞吐", if (row.tps > 0.0) "${String.format(Locale.US, "%.1f", row.tps)} tok/s" else "样本不足（需流式生成 ≥100ms）")
+                UsageDetailKv("端到端速率", if (row.e2eTps > 0.0) "${String.format(Locale.US, "%.1f", row.e2eTps)} tok/s" else "—")
+                UsageDetailKv(
+                    "计费类型 / 倍率",
+                    "${when (row.billingKind) { "plan" -> "订阅套餐"; "free" -> "免费"; "payg" -> "按量计费"; else -> "默认按量" }} · ${row.priceRate}x" +
+                        if (!row.priceMatched && row.billingKind !in setOf("plan", "free")) "（默认单价）" else "",
                 )
-                TagPill("复制 JSON", fg = G.accent, bg = G.accentContainer, onClick = onCopyJson)
+                UsageDetailKv("预估费用", fmtUsd(row.costUsd))
             }
-            CrispCard {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    UsageDetailKv("时间", fmt.format(Date(row.ts)))
-                    UsageDetailKv("引擎 / 来源", "${displayAgentName(row.agent)} · ${if (row.source == "direct") "官方直连" else "本地网关"}")
-                    UsageDetailKv("数据精度", if (!row.exact) "估算（上游未返回精确 Token）" else if (row.streamed) "流式精确实测" else "API 精确返回（非流式）")
-                    UsageDetailKv("服务商", "${row.providerName} (${row.providerId})")
-                    if (row.requestedModel.isNotBlank() && row.requestedModel != row.model) {
-                        UsageDetailKv("模型映射", "${row.requestedModel} → ${row.model}")
-                    } else {
-                        UsageDetailKv("模型", row.model.ifBlank { "default" })
-                    }
-                    if (row.sessionId.isNotBlank()) UsageDetailKv("会话 ID", row.sessionId)
-                    if (row.contextUsed > 0L) {
-                        val ctxStr = fmtExactTokens(row.contextUsed) + if (row.contextWindow > 0L) {
-                            " / ${fmtExactTokens(row.contextWindow)} (${fmtRatePct((row.contextUsed * 100.0) / row.contextWindow)})"
-                        } else ""
-                        UsageDetailKv("当时上下文", ctxStr)
-                    }
-                }
-            }
-            CrispCard {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Token 精确拆解", style = MaterialTheme.typography.labelMedium, color = G.inkMuted, fontWeight = FontWeight.SemiBold)
-                    UsageDetailKv("总输入（未缓存 + 缓读 + 缓写）", fmtExactTokens(row.inputTokens))
-                    UsageDetailKv("未命中缓存输入", fmtExactTokens(row.uncachedInputTokens))
-                    UsageDetailKv("缓存读取 / 命中率", "${fmtExactTokens(row.cacheReadTokens)} (${fmtRatePct(row.cacheHitRate)})")
-                    if (row.cacheWriteTokens > 0L) UsageDetailKv("缓存写入", fmtExactTokens(row.cacheWriteTokens))
-                    UsageDetailKv("总输出", fmtExactTokens(row.outputTokens))
-                    if (row.reasoningTokens > 0L) UsageDetailKv("其中思维链推理", fmtExactTokens(row.reasoningTokens))
-                    UsageDetailKv("合计 Token", fmtExactTokens(row.totalTokens))
-                }
-            }
-            CrispCard {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("耗时、吞吐与计费", style = MaterialTheme.typography.labelMedium, color = G.inkMuted, fontWeight = FontWeight.SemiBold)
-                    UsageDetailKv("首字延迟 (TTFT)", if (row.streamed && row.ttftMs > 0) "${row.ttftMs} ms" else if (!row.streamed) "非流式（不适用）" else "—")
-                    UsageDetailKv("纯生成解码耗时", if (row.genMs > 0) "${row.genMs} ms" else "—")
-                    UsageDetailKv("API 总耗时", if (row.ms > 0) "${row.ms} ms" else "—")
-                    UsageDetailKv("纯解码吞吐", if (row.tps > 0.0) "${String.format(Locale.US, "%.1f", row.tps)} tok/s" else "样本不足（需流式生成 ≥100ms）")
-                    UsageDetailKv("端到端速率", if (row.e2eTps > 0.0) "${String.format(Locale.US, "%.1f", row.e2eTps)} tok/s" else "—")
-                    UsageDetailKv(
-                        "计费类型 / 倍率",
-                        "${when (row.billingKind) { "plan" -> "订阅套餐"; "free" -> "免费"; "payg" -> "按量计费"; else -> "默认按量" }} · ${row.priceRate}x" +
-                            if (!row.priceMatched && row.billingKind !in setOf("plan", "free")) "（默认单价）" else "",
-                    )
-                    UsageDetailKv("预估费用", fmtUsd(row.costUsd))
-                }
-            }
-            if (row.err.isNotBlank()) {
-                Surface(Modifier.fillMaxWidth(), shape = D.shape(10.dp), color = G.dangerTint, border = BorderStroke(0.75.dp, G.danger.copy(alpha = 0.35f))) {
-                    SelectionContainer {
-                        Text(row.err, fontFamily = Mono, fontSize = 11.5.sp, color = G.danger, modifier = Modifier.padding(10.dp))
-                    }
+        }
+        if (row.err.isNotBlank()) {
+            Surface(Modifier.fillMaxWidth(), shape = D.shape(10.dp), color = G.dangerTint, border = BorderStroke(0.75.dp, G.danger.copy(alpha = 0.35f))) {
+                SelectionContainer {
+                    Text(row.err, fontFamily = Mono, fontSize = 11.5.sp, color = G.danger, modifier = Modifier.padding(10.dp))
                 }
             }
         }

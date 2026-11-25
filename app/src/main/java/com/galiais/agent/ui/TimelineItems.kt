@@ -12,6 +12,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -51,6 +53,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.toClipEntry
 import androidx.compose.ui.semantics.Role
@@ -83,12 +87,14 @@ fun TimelineItemView(
     onOpenConversation: (ConversationKey) -> Unit,
     onCancelDelegation: () -> Unit = {},
     onQuote: ((String) -> Unit)? = null,
+    onEditResend: (() -> Unit)? = null,
     onRevert: ((String) -> Unit)? = null,
+    isEditing: Boolean = false,
     expandThinking: Boolean = false,
     onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
 ) {
     when (item) {
-        is TimelineItem.UserMessage -> UserMessageBubble(item, onQuote, onRevert)
+        is TimelineItem.UserMessage -> UserMessageBubble(item, onQuote, onEditResend, onRevert, isEditing)
         is TimelineItem.AgentMessage -> AgentMessageView(item, onQuote, onOpenArtifact = onOpenArtifact)
         is TimelineItem.Reasoning -> ThinkingBlock(item, initiallyOpen = expandThinking)
         is TimelineItem.Plan -> PlanArtifactCard(item = item, onOpenArtifact = onOpenArtifact)
@@ -129,7 +135,9 @@ fun TimelineItemView(
 internal fun UserMessageBubble(
     item: TimelineItem.UserMessage,
     onQuote: ((String) -> Unit)?,
-    onRevert: ((String) -> Unit)?,
+    onEditResend: (() -> Unit)? = null,
+    onRevert: ((String) -> Unit)? = null,
+    isEditing: Boolean = false,
 ) {
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
@@ -138,12 +146,48 @@ internal fun UserMessageBubble(
     LaunchedEffect(copied) { if (copied) { delay(1400); copied = false } }
 
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End) {
+        if (isEditing) {
+            Row(
+                modifier = Modifier.padding(end = 6.dp, bottom = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Icon(GaliaisIcons.Edit, contentDescription = null, tint = G.accent, modifier = Modifier.size(11.dp))
+                Text("正在编辑此消息", style = MaterialTheme.typography.labelSmall, color = G.accent, fontWeight = FontWeight.SemiBold)
+            }
+        }
         val big = D.radius(18.dp)
+        val bubbleBorder = when {
+            isEditing -> BorderStroke(1.5.dp, G.accent)
+            G.userBubbleBorder == Color.Transparent -> null
+            else -> BorderStroke(0.75.dp, G.userBubbleBorder)
+        }
         Surface(
-            modifier = Modifier.widthIn(max = 316.dp).clickable { showActions = !showActions },
+            modifier = Modifier
+                .widthIn(max = 316.dp)
+                .pointerInput(Unit) {
+                    val slop = viewConfiguration.touchSlop
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                        val startPos = down.position
+                        val startTime = System.currentTimeMillis()
+                        var moved = false
+                        while (true) {
+                            val ev = awaitPointerEvent(pass = PointerEventPass.Initial)
+                            val change = ev.changes.firstOrNull { it.id == down.id } ?: break
+                            if ((change.position - startPos).getDistance() > slop) moved = true
+                            if (!change.pressed) {
+                                if (!moved && System.currentTimeMillis() - startTime < 350L) {
+                                    showActions = !showActions
+                                }
+                                break
+                            }
+                        }
+                    }
+                },
             shape = RoundedCornerShape(big, big, D.radius(5.dp), big),
             color = G.userBubble,
-            border = if (G.userBubbleBorder == Color.Transparent) null else BorderStroke(0.75.dp, G.userBubbleBorder),
+            border = bubbleBorder,
         ) {
             Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 if (item.imageCount > 0) {
@@ -173,11 +217,28 @@ internal fun UserMessageBubble(
             }
         }
         AnimatedExpandable(expanded = showActions) {
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.align(Alignment.End).padding(end = 4.dp, top = 6.dp),
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+                modifier = Modifier.fillMaxWidth().padding(end = 4.dp, top = 6.dp),
             ) {
+                if (onEditResend != null) {
+                    Row(
+                        modifier = Modifier
+                            .clip(D.shape(6.dp))
+                            .background(G.accentContainer.copy(alpha = 0.65f))
+                            .clickable {
+                                showActions = false
+                                onEditResend()
+                            }
+                            .padding(horizontal = 7.dp, vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(3.dp),
+                    ) {
+                        Icon(GaliaisIcons.Edit, contentDescription = null, tint = G.accent, modifier = Modifier.size(12.dp))
+                        Text("编辑重发", style = MaterialTheme.typography.labelSmall, color = G.accent, fontWeight = FontWeight.SemiBold)
+                    }
+                }
                 if (item.text.isNotBlank()) {
                     Row(
                         modifier = Modifier.clip(D.shape(6.dp)).clickable {
@@ -185,7 +246,7 @@ internal fun UserMessageBubble(
                                 clipboard.setClipEntry(ClipData.newPlainText("user", item.text).toClipEntry())
                                 copied = true
                             }
-                        }.padding(horizontal = 5.dp, vertical = 2.dp),
+                        }.padding(horizontal = 5.dp, vertical = 3.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(3.dp),
                     ) {
@@ -199,7 +260,7 @@ internal fun UserMessageBubble(
                             val snippet = item.text.lineSequence().firstOrNull { it.isNotBlank() }?.take(120) ?: item.text.take(120)
                             onQuote("> $snippet\n\n")
                             showActions = false
-                        }.padding(horizontal = 5.dp, vertical = 2.dp),
+                        }.padding(horizontal = 5.dp, vertical = 3.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(3.dp),
                     ) {
@@ -207,12 +268,12 @@ internal fun UserMessageBubble(
                         Text("引用", style = MaterialTheme.typography.labelSmall, color = G.inkSubtle)
                     }
                 }
-                if (item.turnId != null && onRevert != null) {
+                if (onRevert != null) {
                     Row(
                         modifier = Modifier.clip(D.shape(6.dp)).clickable {
                             showActions = false
-                            onRevert(item.turnId)
-                        }.padding(horizontal = 5.dp, vertical = 2.dp),
+                            onRevert(item.turnId ?: item.id)
+                        }.padding(horizontal = 5.dp, vertical = 3.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(3.dp),
                     ) {
@@ -766,7 +827,7 @@ fun PlanChecklistCard(
             s == "in_progress" || s == "inprogress" || s == "running"
         }
     }
-    var open by remember { mutableStateOf(!stats.allSettled) }
+    var open by remember { mutableStateOf(false) }
     LaunchedEffect(stats.allSettled) {
         if (stats.allSettled) open = false
     }

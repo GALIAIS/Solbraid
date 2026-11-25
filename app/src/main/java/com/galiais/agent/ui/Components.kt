@@ -27,9 +27,12 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
@@ -168,7 +171,7 @@ fun CrispCard(
         "glass_hairline" -> {
             bg = g.surface
             border = if (borderColor != Color.Unspecified) borderColor else g.border
-            elevation = if (g.dark) 2.dp else 2.dp
+            elevation = 2.dp
             topSpecular = true
         }
         "hardware_tactile" -> {
@@ -186,7 +189,7 @@ fun CrispCard(
 
     val outerMod = if (hardwareShadow) {
         val shadowColor = if (g.dark) Color.Black.copy(alpha = 0.85f) else g.ink.copy(alpha = 0.16f)
-        val cornerPx = d.cardRadius
+        val cornerPx = if (radius != Dp.Unspecified) d.radius(radius) else d.cardRadius
         modifier
             .fillMaxWidth()
             .padding(end = 2.dp, bottom = 2.dp)
@@ -406,7 +409,7 @@ fun PrimaryPillButton(text: String, onClick: () -> Unit, modifier: Modifier = Mo
     Button(
         onClick = onClick,
         enabled = enabled,
-        modifier = modifier.height(40.dp),
+        modifier = modifier.defaultMinSize(minHeight = 42.dp),
         shape = d.buttonShape,
         border = border,
         elevation = if (tactile) ButtonDefaults.buttonElevation(defaultElevation = 2.dp, pressedElevation = 0.dp) else ButtonDefaults.buttonElevation(0.dp, 0.dp),
@@ -416,8 +419,8 @@ fun PrimaryPillButton(text: String, onClick: () -> Unit, modifier: Modifier = Mo
             disabledContainerColor = g.surfaceSubtle,
             disabledContentColor = g.inkSubtle,
         ),
-        contentPadding = PaddingValues(horizontal = if (d.material) 24.dp else 18.dp),
-    ) { Text(text, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold) }
+        contentPadding = PaddingValues(horizontal = if (d.material) 18.dp else 16.dp, vertical = 8.dp),
+    ) { Text(text, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) }
 }
 
 @Composable
@@ -429,15 +432,15 @@ fun SecondaryPillButton(text: String, onClick: () -> Unit, modifier: Modifier = 
     OutlinedButton(
         onClick = onClick,
         enabled = enabled,
-        modifier = modifier.height(40.dp),
+        modifier = modifier.defaultMinSize(minHeight = 42.dp),
         shape = d.buttonShape,
         border = BorderStroke(if (tactile) 1.25.dp else 1.dp, if (danger) g.danger.copy(alpha = 0.5f) else g.borderStrong),
         colors = ButtonDefaults.outlinedButtonColors(
             containerColor = if (tonal) (if (danger) g.dangerTint else g.surfaceSubtle) else Color.Transparent,
             contentColor = if (danger) g.danger else if (d.material) g.accent else g.ink,
         ),
-        contentPadding = PaddingValues(horizontal = if (d.material) 24.dp else 16.dp),
-    ) { Text(text, style = MaterialTheme.typography.labelLarge) }
+        contentPadding = PaddingValues(horizontal = if (d.material) 18.dp else 16.dp, vertical = 8.dp),
+    ) { Text(text, style = MaterialTheme.typography.labelLarge, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis) }
 }
 
 @Composable
@@ -489,19 +492,20 @@ fun <T> SegmentedPillBar(
 ) {
     if (options.isEmpty()) return
     val material = D.material
-    val outer = if (material) D.buttonShape else D.shape(12.dp)
-    val inner = if (material) D.buttonShape else D.shape(9.dp)
+    val outerRadius = if (material) D.radius(12.dp) else D.radius(12.dp)
+    val outer = RoundedCornerShape(outerRadius)
+    val inner = RoundedCornerShape((outerRadius - 3.dp).coerceAtLeast(2.dp))
     val trackBg = if (material) G.surfaceFilled else G.surfaceSubtle
     val trackBorder = if (material) G.borderStrong.copy(alpha = 0.65f) else G.border
     val activeBg = if (material) G.accentContainer else G.surface
     val activeFg = if (material) G.onAccentContainer else G.ink
     val activeBorder = if (material) G.accent.copy(alpha = 0.32f) else G.border
-    val itemHeight = if (compact) 31.dp else 36.dp
+    val itemHeight = if (compact) 32.dp else 38.dp
     val gap = 3.dp
     val hPad = when {
         !fillWidth -> if (compact) 11.dp else 14.dp
         options.size >= 5 -> 3.dp
-        options.size == 4 -> 5.dp
+        options.size == 4 -> 4.dp
         else -> 8.dp
     }
     val textSize = when {
@@ -510,6 +514,7 @@ fun <T> SegmentedPillBar(
         options.size == 4 -> 12.sp
         else -> 12.5.sp
     }
+    val labelFontFamily = MaterialTheme.typography.labelMedium.fontFamily
 
     if (fillWidth) {
         val selectedIndex = options.indexOfFirst { it.first == selected }
@@ -559,6 +564,7 @@ fun <T> SegmentedPillBar(
                     ) {
                         Text(
                             text = label,
+                            fontFamily = labelFontFamily,
                             fontSize = textSize,
                             lineHeight = (textSize.value + 3f).sp,
                             fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
@@ -875,6 +881,7 @@ fun SubPageScaffold(
     onBack: () -> Unit,
     snackbar: SnackbarHostState? = null,
     loading: Boolean = false,
+    scrollable: Boolean = true,
     actions: @Composable RowScope.() -> Unit = {},
     floatingActionButton: @Composable () -> Unit = {},
     content: @Composable ColumnScope.() -> Unit,
@@ -885,12 +892,12 @@ fun SubPageScaffold(
         snackbarHost = { snackbar?.let { GaliaisSnackbarHost(it) } },
         floatingActionButton = floatingActionButton,
         topBar = {
-            Surface(color = if (D.material) MaterialTheme.colorScheme.surface else G.canvas.copy(alpha = 0.94f)) {
+            Surface(color = if (D.material) MaterialTheme.colorScheme.surface else G.canvas) {
                 Column(Modifier.fillMaxWidth().statusBarsPadding()) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(if (D.material) 64.dp else 58.dp)
+                            .height(if (D.material) 64.dp else 56.dp)
                             .padding(start = 4.dp, end = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(2.dp),
@@ -913,17 +920,19 @@ fun SubPageScaffold(
             }
         },
     ) { padding ->
+        val bodyMod = Modifier
+            .fillMaxSize()
+            .padding(padding)
+            .consumeWindowInsets(padding)
+            .imePadding()
+            .let { if (scrollable) it.verticalScroll(rememberScrollState()) else it }
+            .padding(horizontal = 16.dp, vertical = 12.dp)
         Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .imePadding()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 14.dp, vertical = 12.dp),
+            modifier = bodyMod,
             verticalArrangement = Arrangement.spacedBy(D.space(10.dp)),
         ) {
             content()
-            Spacer(Modifier.height(24.dp))
+            if (scrollable) Spacer(Modifier.height(24.dp))
         }
     }
 }
@@ -969,7 +978,7 @@ fun SettingsNavRow(
                 subtitle,
                 style = MaterialTheme.typography.bodySmall,
                 color = G.inkMuted,
-                maxLines = 1,
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
         }
@@ -1009,7 +1018,9 @@ fun SettingsToggleRow(
         }
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(title, style = MaterialTheme.typography.titleSmall, color = if (enabled) G.ink else G.inkSubtle)
-            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+            if (subtitle.isNotBlank()) {
+                Text(subtitle, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+            }
         }
         GaliaisSwitch(checked = checked, onCheckedChange = null, enabled = enabled)
     }
@@ -1052,14 +1063,18 @@ fun SearchBar(
             if (value.isNotEmpty()) {
                 Box(
                     modifier = Modifier
-                        .size(22.dp)
+                        .size(34.dp)
                         .clip(CircleShape)
-                        .background(G.surfaceSubtle)
                         .semantics { contentDescription = "清除搜索" }
                         .clickable { onValueChange("") },
                     contentAlignment = Alignment.Center,
                 ) {
-                    Icon(GaliaisIcons.Close, contentDescription = null, tint = G.inkMuted, modifier = Modifier.size(13.dp))
+                    Box(
+                        modifier = Modifier.size(22.dp).clip(CircleShape).background(G.surfaceSubtle),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(GaliaisIcons.Close, contentDescription = null, tint = G.inkMuted, modifier = Modifier.size(13.dp))
+                    }
                 }
             }
         }
@@ -1222,7 +1237,10 @@ fun GaliaisAnchoredPopover(
             tonalElevation = 0.dp,
         ) {
             Column(
-                modifier = specularMod.padding(contentPadding),
+                modifier = specularMod
+                    .heightIn(max = 360.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(contentPadding),
                 verticalArrangement = Arrangement.spacedBy(2.dp),
                 content = content,
             )

@@ -1,6 +1,7 @@
 package com.galiais.agent.ui
 
 import android.content.ClipData
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
@@ -30,16 +31,21 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -148,6 +154,15 @@ private val starterPrompts = listOf(
     "排查当前项目的构建或运行问题",
 )
 
+private data class PendingEditResend(
+    val target: TimelineItem.UserMessage,
+    val newText: String,
+    val attachments: List<ImageAttachment>,
+    val laterTurnCount: Int,
+    val hasFileEdits: Boolean,
+    val isRegenerate: Boolean,
+)
+
 @Composable
 fun ChatScreen(
     app: GaliaisApplication,
@@ -189,6 +204,12 @@ fun ChatScreen(
     var customModelDialog by remember { mutableStateOf(false) }
     var revertTarget by remember(key) { mutableStateOf<TimelineItem.UserMessage?>(null) }
     var claudeRewindTarget by remember { mutableStateOf<Pair<String, RewindPreviewResult>?>(null) }
+    var editingTarget by remember(key) { mutableStateOf<TimelineItem.UserMessage?>(null) }
+    var stashedDraftBeforeEdit by remember(key) { mutableStateOf<TextFieldValue?>(null) }
+    var stashedAttachmentsBeforeEdit by remember(key) { mutableStateOf<List<ImageAttachment>>(emptyList()) }
+    var pendingEditConfirm by remember(key) { mutableStateOf<PendingEditResend?>(null) }
+    var editRewindClaudeFiles by remember(key) { mutableStateOf(false) }
+    var editSubmitting by remember(key) { mutableStateOf(false) }
     var models by remember(key.engine, state?.providerId) { mutableStateOf<List<ModelOption>>(emptyList()) }
     var dynamicCommands by remember(key) { mutableStateOf<List<SlashCommand>>(emptyList()) }
     var inlineFileMatches by remember { mutableStateOf<List<FuzzyMatch>>(emptyList()) }
@@ -296,8 +317,8 @@ fun ChatScreen(
             if (saved.isNotEmpty()) replaceDraft(saved)
         }
     }
-    LaunchedEffect(key.route, draft, settings.keepUnsentDrafts) {
-        if (!settings.keepUnsentDrafts) return@LaunchedEffect
+    LaunchedEffect(key.route, draft, settings.keepUnsentDrafts, editingTarget?.id) {
+        if (!settings.keepUnsentDrafts || editingTarget != null) return@LaunchedEffect
         delay(280)
         app.settings.setConversationDraft(key.route, draft)
     }
@@ -550,10 +571,120 @@ fun ChatScreen(
         inlineFileMatches = remote
     }
 
+    fun computeEditImpact(target: TimelineItem.UserMessage): Triple<Int, Int, Boolean> {
+        val blockIdx = turnBlocks.indexOfFirst { it.userMessage?.id == target.id }
+        val turnNumber = if (blockIdx >= 0) blockIdx + 1 else 1
+        val laterTurnCount = if (blockIdx >= 0) (turnBlocks.lastIndex - blockIdx).coerceAtLeast(0) else 0
+        val hasFileEdits = if (blockIdx >= 0) turnBlocks.drop(blockIdx).any { it.editedFiles.isNotEmpty() } else false
+        return Triple(turnNumber, laterTurnCount, hasFileEdits)
+    }
+
+    fun beginEditMessage(target: TimelineItem.UserMessage) {
+        if (editingTarget == null) {
+            stashedDraftBeforeEdit = draftValue
+            stashedAttachmentsBeforeEdit = attachments.toList()
+        }
+        editingTarget = target
+        pendingEditConfirm = null
+        editRewindClaudeFiles = false
+        attachments.clear()
+        replaceDraft(target.text)
+        composerFocus.requestFocus()
+        keyboard?.show()
+    }
+
+    fun cancelEditMode() {
+        val restoreDraftVal = stashedDraftBeforeEdit
+        val restorePics = stashedAttachmentsBeforeEdit
+        editingTarget = null
+        pendingEditConfirm = null
+        editRewindClaudeFiles = false
+        stashedDraftBeforeEdit = null
+        stashedAttachmentsBeforeEdit = emptyList()
+        draftValue = restoreDraftVal ?: TextFieldValue("")
+        attachments.clear()
+        attachments.addAll(restorePics)
+    }
+
+    BackHandler(enabled = editingTarget != null) { cancelEditMode() }
+    LaunchedEffect(key, state?.running) {
+        if (state?.running == true && editingTarget != null) cancelEditMode()
+    }
+
+    fun executeEditAndResend(req: PendingEditResend, rewindFiles: Boolean) {
+        editingTarget = null
+        pendingEditConfirm = null
+        editRewindClaudeFiles = false
+        stashedDraftBeforeEdit = null
+        stashedAttachmentsBeforeEdit = emptyList()
+        followLatest = true
+        replaceDraft("")
+        app.settings.setConversationDraft(key.route, "")
+        attachments.clear()
+        editSubmitting = true
+        app.conversations.editAndResend(
+            key = key,
+            userMessageId = req.target.id,
+            newText = req.newText,
+            attachments = req.attachments,
+            rewindClaudeFiles = rewindFiles,
+            onMigrated = onReplaceConversation,
+            onFailedBeforeSend = {
+                editingTarget = req.target
+                replaceDraft(req.newText)
+                attachments.clear()
+                attachments.addAll(req.attachments)
+            },
+            onFinished = { editSubmitting = false },
+        )
+    }
+
+    fun triggerRegenerate(target: TimelineItem.UserMessage) {
+        val text = target.text.trim()
+        if (text.isEmpty()) {
+            beginEditMessage(target)
+            return
+        }
+        val (_, laterTurnCount, hasFileEdits) = computeEditImpact(target)
+        val req = PendingEditResend(
+            target = target,
+            newText = text,
+            attachments = emptyList(),
+            laterTurnCount = laterTurnCount,
+            hasFileEdits = hasFileEdits,
+            isRegenerate = true,
+        )
+        if (laterTurnCount > 0 || hasFileEdits || target.imageCount > 0) {
+            editRewindClaudeFiles = false
+            pendingEditConfirm = req
+        } else {
+            executeEditAndResend(req, rewindFiles = false)
+        }
+    }
+
     fun submitMessage() {
         val text = draft.trim()
         if (text.isEmpty() && attachments.isEmpty()) return
         val pics = attachments.toList()
+        val activeEdit = editingTarget
+        if (activeEdit != null) {
+            val (_, laterTurnCount, hasFileEdits) = computeEditImpact(activeEdit)
+            val req = PendingEditResend(
+                target = activeEdit,
+                newText = text,
+                attachments = pics,
+                laterTurnCount = laterTurnCount,
+                hasFileEdits = hasFileEdits,
+                isRegenerate = false,
+            )
+            if (laterTurnCount > 0 || hasFileEdits) {
+                editRewindClaudeFiles = false
+                pendingEditConfirm = req
+            } else {
+                executeEditAndResend(req, rewindFiles = false)
+            }
+            return
+        }
         followLatest = true
         replaceDraft("")
         app.settings.setConversationDraft(key.route, "")
@@ -653,13 +784,14 @@ fun ChatScreen(
 
     Scaffold(
         containerColor = Color.Transparent,
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         modifier = Modifier.fillMaxSize().galiaisCanvasBackground(),
         snackbarHost = { GaliaisSnackbarHost(snackbar) },
         topBar = {
-            Surface(color = if (D.material) MaterialTheme.colorScheme.surface else G.canvas.copy(alpha = 0.94f)) {
+            Surface(color = if (D.material) MaterialTheme.colorScheme.surface else G.canvas) {
                 Column(Modifier.fillMaxWidth().statusBarsPadding()) {
                     Row(
-                        modifier = Modifier.fillMaxWidth().height(if (D.material) 62.dp else 58.dp).padding(start = 4.dp, end = 6.dp),
+                        modifier = Modifier.fillMaxWidth().height(if (D.material) 64.dp else 56.dp).padding(start = 4.dp, end = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
@@ -687,6 +819,7 @@ fun ChatScreen(
                                         color = G.inkMuted,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f, fill = false),
                                     )
                                 }
                                 when {
@@ -695,21 +828,14 @@ fun ChatScreen(
                                         style = MaterialTheme.typography.labelSmall,
                                         color = G.danger,
                                         maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
+                                        softWrap = false,
                                     )
                                     activeProvider != null && !activeProvider.enabled -> Text(
-                                        "${activeProvider.name}(已停用)",
+                                        "已停用",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = G.warning,
                                         maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                    activeProvider != null -> Text(
-                                        activeProvider.name,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = G.inkSubtle,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
+                                        softWrap = false,
                                     )
                                 }
                                 if (state?.running == true) {
@@ -723,27 +849,27 @@ fun ChatScreen(
                             Row(
                                 modifier = Modifier
                                     .clip(D.chipShape)
-                                    .background(G.claudeTint)
+                                    .background(G.artifactTint)
                                     .clickable { showArtifactsDrawer = true }
-                                    .padding(horizontal = 9.dp, vertical = 5.dp),
+                                    .padding(horizontal = 8.dp, vertical = 5.dp),
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                horizontalArrangement = Arrangement.spacedBy(3.dp),
                             ) {
-                                Icon(GaliaisIcons.Layers, contentDescription = null, tint = G.claude, modifier = Modifier.size(13.dp))
-                                Text("产物 ${conversationArtifacts.size}", style = MaterialTheme.typography.labelSmall, color = G.claude, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                                Icon(GaliaisIcons.Layers, contentDescription = null, tint = G.artifact, modifier = Modifier.size(13.dp))
+                                Text("${conversationArtifacts.size}", style = MaterialTheme.typography.labelSmall, color = G.artifact, fontWeight = FontWeight.SemiBold, maxLines = 1)
                             }
                         }
                         if (hasDiffs) {
                             val editedFileCount = remember(fileEdits) { fileEdits.map { it.path }.distinct().size }
-                            val diffPillLabel = if (editedFileCount > 0) "改动 $editedFileCount" else "改动"
+                            val diffPillLabel = if (editedFileCount > 0) "$editedFileCount" else "改动"
                             Row(
                                 modifier = Modifier
                                     .clip(D.chipShape)
                                     .background(G.accentContainer)
                                     .clickable { showDiffs = true }
-                                    .padding(horizontal = 9.dp, vertical = 5.dp),
+                                    .padding(horizontal = 8.dp, vertical = 5.dp),
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                horizontalArrangement = Arrangement.spacedBy(3.dp),
                             ) {
                                 Icon(GaliaisIcons.FileDiff, contentDescription = null, tint = G.accent, modifier = Modifier.size(13.dp))
                                 Text(diffPillLabel, style = MaterialTheme.typography.labelSmall, color = G.accent, fontWeight = FontWeight.SemiBold, maxLines = 1)
@@ -761,7 +887,7 @@ fun ChatScreen(
                             Icon(GaliaisIcons.MoreHoriz, contentDescription = "更多操作", tint = G.inkMuted, modifier = Modifier.size(21.dp))
                         }
                     }
-                    HeaderProgressSlot(runtime.ready && (state?.loaded != true || state.reverting))
+                    HeaderProgressSlot(runtime.ready && (state?.loaded != true || state.reverting || editSubmitting))
                     val arenaSiblings = state?.arenaGroupId?.let { arenaGroups[it] }.orEmpty()
                     if (arenaSiblings.size > 1) {
                         Row(
@@ -804,7 +930,12 @@ fun ChatScreen(
             }
         },
     ) { padding ->
-        Column(Modifier.fillMaxSize().padding(padding).imePadding()) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
+        ) {
             if (!runtime.ready) {
                 Surface(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp), shape = D.shape(10.dp), color = G.dangerTint) {
                     Row(
@@ -968,8 +1099,8 @@ fun ChatScreen(
                             }
                         }
                     }
-                    val allowUndo = state?.running != true && state?.reverting != true
-                    val allowFork = AgentCatalog.capabilitiesOf(key.engine).fork && state?.running != true
+                    val allowUndo = state?.running != true && state?.reverting != true && !editSubmitting
+                    val allowFork = AgentCatalog.capabilitiesOf(key.engine).fork && state?.running != true && !editSubmitting
                     val inPlanMode = when (key.engine) {
                         EngineKind.CODEX -> (state?.collaborationMode ?: settings.codexCollaborationMode) == "plan"
                         else -> state?.permissionMode == "plan"
@@ -1017,26 +1148,25 @@ fun ChatScreen(
                             activeTurnStartedAt = state?.turnStartedAt,
                             expandByDefault = settings.expandThinking,
                             cwd = cwd,
+                            editingUserMessageId = editingTarget?.id,
                             onOpenConversation = onOpenConversation,
                             onCancelDelegation = { app.conversations.cancelDelegation(key) },
                             onQuote = { quote -> replaceDraft(if (draft.isBlank()) quote else "$draft\n$quote") },
-                            onUndoTurn = if (allowUndo) ({ user ->
-                                when (key.engine) {
-                                    EngineKind.CODEX -> user.turnId?.let { revertTarget = user }
-                                        ?: app.conversations.notify("此轮暂无可回退标识")
-                                    EngineKind.CLAUDE -> scope.launch {
-                                        try {
-                                            val preview = app.conversations.rewindClaudeFiles(key, user.id, dryRun = true)
-                                            if (!preview.canRewind) {
-                                                app.conversations.notify(preview.error ?: "此轮暂无可回滚的文件检查点")
-                                            } else {
-                                                claudeRewindTarget = user.id to preview
-                                            }
-                                        } catch (e: Exception) {
-                                            app.conversations.notify("读取检查点失败：${e.message}")
+                            onEditResend = if (allowUndo) ({ user -> beginEditMessage(user) }) else null,
+                            onRegenerate = if (allowUndo) ({ user -> triggerRegenerate(user) }) else null,
+                            onUndoTurn = if (allowUndo) ({ user -> revertTarget = user }) else null,
+                            onRewindFiles = if (allowUndo && key.engine == EngineKind.CLAUDE) ({ user ->
+                                scope.launch {
+                                    try {
+                                        val preview = app.conversations.rewindClaudeFiles(key, user.id, dryRun = true)
+                                        if (!preview.canRewind) {
+                                            app.conversations.notify(preview.error ?: "此轮暂无可回滚的文件检查点")
+                                        } else {
+                                            claudeRewindTarget = user.id to preview
                                         }
+                                    } catch (e: Exception) {
+                                        app.conversations.notify("读取检查点失败：${e.message}")
                                     }
-                                    else -> app.conversations.notify("当前 Agent 暂不支持轮次撤销")
                                 }
                             }) else null,
                             onFork = if (allowFork) ({ forkConversation() }) else null,
@@ -1218,6 +1348,7 @@ fun ChatScreen(
                                 )
                             } else VisualTransformation.None
                         }
+                        AnimatedVisibility(visible = requests.isEmpty()) {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -1229,7 +1360,6 @@ fun ChatScreen(
                                         1.0f to G.canvas,
                                     ),
                                 )
-                                .navigationBarsPadding()
                                 .padding(start = 10.dp, end = 10.dp, top = 2.dp, bottom = 6.dp),
                         ) {
                 val pluginDriverMissing = remember(key.engine.id, hostPlugins) {
@@ -1240,10 +1370,12 @@ fun ChatScreen(
                 val canSteerMode = inputEnabled && isRunning && key.engine == EngineKind.CODEX && state.activeTurnId != null
                 val fieldEnabled = inputEnabled && (!isRunning || canSteerMode)
                 val hasPayload = draft.isNotBlank() || attachments.isNotEmpty()
-                val canSend = inputEnabled && !isRunning && state.reverting != true && hasPayload
+                val canSend = inputEnabled && !isRunning && state.reverting != true && !editSubmitting && hasPayload
                 val canSteer = canSteerMode && hasPayload
+                val isEditingMode = editingTarget != null && !isRunning
                 val composerBorderColor by animateColorAsState(
                     targetValue = when {
+                        isEditingMode -> G.accent
                         canSteer -> G.codex
                         hasPayload -> G.accent.copy(alpha = 0.65f)
                         else -> G.borderStrong
@@ -1275,7 +1407,7 @@ fun ChatScreen(
                             )
                             TagPill(
                                 text = if (sendingDoc) "重试中…" else "重试发送",
-                                fg = G.onAccent,
+                                fg = G.onDanger,
                                 bg = G.danger,
                                 onClick = { if (!sendingDoc) sendDocumentWithRecovery(failedDoc) },
                             )
@@ -1304,10 +1436,77 @@ fun ChatScreen(
                     modifier = Modifier.fillMaxWidth(),
                     shape = D.composerShape,
                     color = if (D.material) MaterialTheme.colorScheme.surfaceContainerHigh else G.surface,
-                    border = if (D.material && !canSteer && !hasPayload) null else BorderStroke(1.dp, composerBorderColor),
+                    border = if (D.material && !isEditingMode && !canSteer && !hasPayload) null else BorderStroke(if (isEditingMode) 1.5.dp else 1.dp, composerBorderColor),
                     shadowElevation = if (G.dark || D.material) 0.dp else 2.dp,
                 ) {
                     Column(Modifier.padding(start = 14.dp, end = 10.dp, top = 9.dp, bottom = 7.dp)) {
+                        AnimatedVisibility(visible = isEditingMode) {
+                            editingTarget?.let { target ->
+                                val (turnNum, laterCount, _) = remember(target.id, turnBlocks.size) { computeEditImpact(target) }
+                                Surface(
+                                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                                    shape = D.shape(10.dp),
+                                    color = G.accentContainer.copy(alpha = 0.72f),
+                                    border = BorderStroke(0.75.dp, G.accent.copy(alpha = 0.35f)),
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(start = 10.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    ) {
+                                        Icon(GaliaisIcons.Edit, contentDescription = null, tint = G.accent, modifier = Modifier.size(14.dp))
+                                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                            ) {
+                                                Text(
+                                                    "编辑第 $turnNum 轮并重发",
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    color = G.accent,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    maxLines = 1,
+                                                )
+                                                if (laterCount > 0) {
+                                                    Text(
+                                                        "将重置后续 $laterCount 轮",
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = G.warning,
+                                                        maxLines = 1,
+                                                    )
+                                                } else if (target.imageCount > 0) {
+                                                    Text(
+                                                        "原图需重新添加",
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = G.inkMuted,
+                                                        maxLines = 1,
+                                                    )
+                                                }
+                                            }
+                                            if (target.text.isNotBlank()) {
+                                                Text(
+                                                    target.text.replace('\n', ' '),
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = G.inkMuted,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                )
+                                            }
+                                        }
+                                        Box(
+                                            modifier = Modifier
+                                                .size(28.dp)
+                                                .clip(CircleShape)
+                                                .semantics { contentDescription = "取消编辑" }
+                                                .clickable(role = Role.Button) { cancelEditMode() },
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            Icon(GaliaisIcons.Close, contentDescription = null, tint = G.inkMuted, modifier = Modifier.size(14.dp))
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if (pluginDriverMissing) {
                             Surface(
                                 modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
@@ -1399,6 +1598,7 @@ fun ChatScreen(
                                 Text(
                                     when {
                                         pluginDriverMissing -> "插件驱动未加载（只读历史模式）"
+                                        isEditingMode -> "修改消息内容后点击重发…"
                                         canSteerMode -> "补充指令，调整当前任务…"
                                         isRunning -> "${key.engine.label} 正在工作…"
                                         else -> "和 ${key.engine.label} 一起工作"
@@ -1859,65 +2059,68 @@ fun ChatScreen(
                                 }
                             }
 
-                            Spacer(Modifier.weight(1f, fill = true))
-
-                            // 右侧元数据（首帧即渲染占位与模型名，避免 loaded 翻 true 时底栏控件突现闪烁）
-                            if (settings.showTokenUsage) {
-                                Box {
-                                    ContextUsageRing(
-                                        ratio = state?.tokenUsage?.ratio(),
-                                        hasData = state?.tokenUsage != null,
-                                        expanded = showUsagePopover,
-                                        onClick = { showUsagePopover = true },
-                                    )
-                                    GaliaisAnchoredPopover(
-                                        expanded = showUsagePopover,
-                                        onDismissRequest = { showUsagePopover = false },
-                                        preferAbove = true,
-                                        alignEnd = true,
-                                        minWidth = 244.dp,
-                                        maxWidth = 288.dp,
-                                        contentPadding = PaddingValues(12.dp),
-                                    ) {
-                                        ContextUsagePopoverContent(
-                                            usage = state?.tokenUsage,
-                                            running = isRunning,
-                                            onCompact = {
-                                                showUsagePopover = false
-                                                app.conversations.compact(key)
-                                            },
-                                            onOpenInfo = {
-                                                showUsagePopover = false
-                                                showInfo = true
-                                            },
+                            // 右侧元数据放入单权重右对齐容器，彻底消除 Spacer 与模型触发器 1:1 抢宽导致的「. 极高」截断
+                            Row(
+                                modifier = Modifier.weight(1f),
+                                horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.End),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                if (settings.showTokenUsage) {
+                                    Box {
+                                        ContextUsageRing(
+                                            ratio = state?.tokenUsage?.ratio(),
+                                            hasData = state?.tokenUsage != null,
+                                            expanded = showUsagePopover,
+                                            onClick = { showUsagePopover = true },
                                         )
+                                        GaliaisAnchoredPopover(
+                                            expanded = showUsagePopover,
+                                            onDismissRequest = { showUsagePopover = false },
+                                            preferAbove = true,
+                                            alignEnd = true,
+                                            minWidth = 244.dp,
+                                            maxWidth = 288.dp,
+                                            contentPadding = PaddingValues(12.dp),
+                                        ) {
+                                            ContextUsagePopoverContent(
+                                                usage = state?.tokenUsage,
+                                                running = isRunning,
+                                                onCompact = {
+                                                    showUsagePopover = false
+                                                    app.conversations.compact(key)
+                                                },
+                                                onOpenInfo = {
+                                                    showUsagePopover = false
+                                                    showInfo = true
+                                                },
+                                            )
+                                        }
                                     }
                                 }
-                            }
 
-                            if (runtime.ready) {
-                                val modelShort = (currentModelOption?.label ?: state?.model ?: "默认模型")
-                                val effortShort = state?.effort?.let { effortLabel(it) }
-                                Box(Modifier.weight(1f, fill = false)) {
-                                    ComposerModelTrigger(
-                                        modelLabel = modelShort,
-                                        effortLabel = effortShort,
-                                        enabled = !isRunning && state?.loaded == true,
-                                        expanded = showModelPopover,
-                                        onClick = { showModelPopover = true },
-                                    )
-                                    GaliaisAnchoredPopover(
-                                        expanded = showModelPopover,
-                                        onDismissRequest = { showModelPopover = false },
-                                        preferAbove = true,
-                                        alignEnd = true,
-                                        minWidth = 264.dp,
-                                        maxWidth = 316.dp,
-                                        contentPadding = PaddingValues(8.dp),
-                                    ) {
-                                        ModelSwitcherPopoverContent(
-                                            engine = key.engine,
-                                            activeProvider = activeProvider,
+                                if (runtime.ready) {
+                                    val modelShort = (currentModelOption?.label ?: state?.model ?: "默认模型")
+                                    val effortShort = state?.effort?.let { effortLabel(it) }
+                                    Box(Modifier.weight(1f, fill = false)) {
+                                        ComposerModelTrigger(
+                                            modelLabel = modelShort,
+                                            effortLabel = effortShort,
+                                            enabled = !isRunning && state?.loaded == true,
+                                            expanded = showModelPopover,
+                                            onClick = { showModelPopover = true },
+                                        )
+                                        GaliaisAnchoredPopover(
+                                            expanded = showModelPopover,
+                                            onDismissRequest = { showModelPopover = false },
+                                            preferAbove = true,
+                                            alignEnd = true,
+                                            minWidth = 264.dp,
+                                            maxWidth = 316.dp,
+                                            contentPadding = PaddingValues(8.dp),
+                                        ) {
+                                            ModelSwitcherPopoverContent(
+                                                engine = key.engine,
+                                                activeProvider = activeProvider,
                                             models = effectiveModels,
                                             currentModel = state?.model,
                                             optionsContent = { ConversationModelOptions(app, key, state, currentModelOption) },
@@ -1933,6 +2136,7 @@ fun ChatScreen(
                                     }
                                 }
                             }
+                            } // 结束右侧元数据容器
                             } // 结束 weight(1f) 自适应左中区
 
                             if (canSteer) {
@@ -1944,12 +2148,12 @@ fun ChatScreen(
                                 )
                             }
                             AnimatedContent(
-                                targetState = isRunning,
-                                modifier = Modifier.size(if (D.material) 40.dp else 36.dp),
+                                targetState = Pair(isRunning, isEditingMode),
+                                modifier = Modifier.height(if (D.material) 40.dp else 36.dp),
                                 contentAlignment = Alignment.Center,
                                 transitionSpec = { (fadeIn(tween(120)) togetherWith fadeOut(tween(90))).using(null) },
                                 label = "sendStopButton",
-                            ) { running ->
+                            ) { (running, editing) ->
                                 if (running) {
                                     Box(
                                         modifier = Modifier
@@ -1961,6 +2165,32 @@ fun ChatScreen(
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         Icon(GaliaisIcons.Stop, contentDescription = null, tint = G.onDanger, modifier = Modifier.size(16.dp))
+                                    }
+                                } else if (editing) {
+                                    Row(
+                                        modifier = Modifier
+                                            .height(if (D.material) 40.dp else 36.dp)
+                                            .clip(if (D.material) D.shape(12.dp) else CircleShape)
+                                            .background(if (canSend) G.accent else G.surfaceSubtle)
+                                            .semantics { contentDescription = "确认重发消息" }
+                                            .clickable(enabled = canSend, role = Role.Button) { submitMessage() }
+                                            .padding(horizontal = 12.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                    ) {
+                                        Icon(
+                                            GaliaisIcons.Send,
+                                            contentDescription = null,
+                                            tint = if (canSend) G.onAccent else G.inkSubtle,
+                                            modifier = Modifier.size(14.dp),
+                                        )
+                                        Text(
+                                            "重发",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = if (canSend) G.onAccent else G.inkSubtle,
+                                            maxLines = 1,
+                                        )
                                     }
                                 } else {
                                     Box(
@@ -1985,6 +2215,7 @@ fun ChatScreen(
                     }
                 }
                 }
+            } // 结束 AnimatedVisibility(visible = requests.isEmpty())
             }
                     }
                 }
@@ -2083,26 +2314,84 @@ fun ChatScreen(
         )
     }
 
-    revertTarget?.let { target ->
-        AlertDialog(
-            onDismissRequest = { revertTarget = null },
-            containerColor = G.surface,
-            shape = D.dialogShape,
-            title = { Text("回退到此轮前？", color = G.ink) },
+    pendingEditConfirm?.let { req ->
+        val title = if (req.isRegenerate) "重新生成此轮回复？" else "确认编辑并重发？"
+        val scopeHint = if (req.laterTurnCount > 0) {
+            "将移除此轮及后续 ${req.laterTurnCount} 轮对话记录，并以${if (req.isRegenerate) "原消息" else "修改后的消息"}重新发送。"
+        } else {
+            "将重置本轮回复，并以${if (req.isRegenerate) "原消息" else "修改后的消息"}重新发送。"
+        }
+        val fileHint = if (key.engine == EngineKind.CLAUDE && req.hasFileEdits && editRewindClaudeFiles) {
+            "已勾选同时回滚工作区磁盘文件变更。"
+        } else {
+            "本地工作区文件不会被修改。"
+        }
+        val imageHint = if (req.isRegenerate && req.target.imageCount > 0) {
+            "\n原消息附带 ${req.target.imageCount} 张图片，直接重发不会自动附带原图；如需附带请先进入编辑模式重新选择图片。"
+        } else ""
+        GaliaisAlertDialog(
+            onDismissRequest = { pendingEditConfirm = null },
+            title = title,
             text = {
-                Text(
-                    "将移除此轮及之后的会话记录，并将这条消息的文字放回输入框。工作区文件不会还原。" +
-                        if (target.imageCount > 0) "原消息图片需重新添加。" else "",
-                    color = G.inkMuted,
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(scopeHint + fileHint + imageHint, style = MaterialTheme.typography.bodyMedium, color = G.inkMuted)
+                    if (key.engine == EngineKind.CLAUDE && req.hasFileEdits) {
+                        Surface(
+                            shape = D.shape(10.dp),
+                            color = G.surfaceSubtle,
+                            border = BorderStroke(0.75.dp, G.border),
+                        ) {
+                            Box(Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+                                SettingsToggleRow(
+                                    title = "同时回滚磁盘文件改动",
+                                    subtitle = "基于 Claude 检查点恢复此轮之后修改的文件",
+                                    checked = editRewindClaudeFiles,
+                                    onCheckedChange = { editRewindClaudeFiles = it },
+                                )
+                            }
+                        }
+                    }
+                }
             },
             confirmButton = {
                 TextButton(onClick = {
-                    revertTarget = null
-                    app.conversations.revertBeforeTurn(key, target.id)
-                }) { Text("确认回退", color = G.warning, fontWeight = FontWeight.SemiBold) }
+                    val rewind = key.engine == EngineKind.CLAUDE && req.hasFileEdits && editRewindClaudeFiles
+                    executeEditAndResend(req, rewindFiles = rewind)
+                }) {
+                    Text(
+                        if (req.isRegenerate) "重新生成" else "确认重发",
+                        color = G.accent,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
             },
-            dismissButton = { TextButton(onClick = { revertTarget = null }) { Text("取消", color = G.inkMuted) } },
+            dismissButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    if (req.isRegenerate && req.target.imageCount > 0) {
+                        TextButton(onClick = {
+                            pendingEditConfirm = null
+                            beginEditMessage(req.target)
+                        }) { Text("去编辑", color = G.accent) }
+                    }
+                    TextButton(onClick = { pendingEditConfirm = null }) { Text("取消", color = G.inkMuted) }
+                }
+            },
+        )
+    }
+
+    revertTarget?.let { target ->
+        GaliaisConfirmDialog(
+            title = "回退到此轮前？",
+            message = "将移除此轮及之后的会话记录，并将这条消息的文字放回输入框。本地工作区文件不会还原。" +
+                if (target.imageCount > 0) "原消息图片需重新添加。" else "",
+            confirmText = "确认回退",
+            danger = false,
+            onConfirm = {
+                revertTarget = null
+                if (editingTarget?.id == target.id) cancelEditMode()
+                app.conversations.revertBeforeTurn(key, target.id, onMigrated = onReplaceConversation)
+            },
+            onDismiss = { revertTarget = null },
         )
     }
 

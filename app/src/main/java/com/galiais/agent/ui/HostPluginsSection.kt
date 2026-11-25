@@ -1,24 +1,22 @@
 package com.galiais.agent.ui
 
+import android.content.ClipData
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -27,6 +25,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.platform.toClipEntry
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -52,6 +52,7 @@ fun HostPluginsSection(
     onBusy: (String?) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboard.current
     var showCorePlugins by remember { mutableStateOf(false) }
     var editingSettings by remember { mutableStateOf<HostPluginInfo?>(null) }
     var editingGrants by remember { mutableStateOf<HostPluginInfo?>(null) }
@@ -62,11 +63,10 @@ fun HostPluginsSection(
     var creatingLocal by remember { mutableStateOf(false) }
     var openingPanel by remember { mutableStateOf<Pair<String, ChatArtifact>?>(null) }
     var openingSurface by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var pendingConfirm by remember { mutableStateOf<Triple<String, String, () -> Unit>?>(null) }
 
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionLabel("Solbraid 插件内核（Host Microkernel）")
-        Spacer(Modifier.weight(1f))
-        PrimaryPillButton("+ 本地插件", enabled = runtimeReady, onClick = { creatingLocal = true })
+    SectionHeader("Solbraid 插件内核") {
+        CompactActionButton("+ 本地插件", primary = true, enabled = runtimeReady, onClick = { creatingLocal = true })
     }
 
     CrispCard(padding = PaddingValues(14.dp)) {
@@ -76,7 +76,7 @@ fun HostPluginsSection(
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 Text(
-                    "运行代际 ${hostPlugins.generationId.ifBlank { "未启动" }}",
+                    "代际 ${hostPlugins.generationId.ifBlank { "未启动" }}",
                     style = MaterialTheme.typography.titleSmall,
                     color = G.ink,
                     fontWeight = FontWeight.SemiBold,
@@ -87,25 +87,12 @@ fun HostPluginsSection(
                     bg = if (hostPlugins.safeMode) G.warningTint else G.successTint,
                 )
                 if (hostPlugins.agentControlAvailable) {
-                    TagPill(
-                        text = "Agent 自进化 MCP 已连接",
-                        fg = G.accent,
-                        bg = G.accentContainer,
-                    )
+                    TagPill("自进化 MCP", fg = G.accent, bg = G.accentContainer)
                 }
                 if (hostPlugins.studioOverrides.isNotEmpty()) {
-                    TagPill(
-                        text = "工作台热覆写 (${hostPlugins.studioOverrides.size})",
-                        fg = G.warning,
-                        bg = G.warningTint,
-                    )
+                    TagPill("工作台覆写 (${hostPlugins.studioOverrides.size})", fg = G.warning, bg = G.warningTint)
                 }
             }
-            Text(
-                "微内核双执行层（同进程受信任 + Worker 线程强杀隔离 · 20 项能力 · 14 工具 MCP），支持 Agent 热升级插件、渲染原生 Compose SDUI、扩展动态驱动/协议转换及热覆写工作台。",
-                style = MaterialTheme.typography.bodySmall,
-                color = G.inkMuted,
-            )
             if (hostPlugins.studioOverrides.isNotEmpty()) {
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     hostPlugins.studioOverrides.forEach { fileName ->
@@ -127,7 +114,7 @@ fun HostPluginsSection(
             }
             SettingsToggleRow(
                 title = "安全模式（Safe Mode）",
-                subtitle = "仅启动 ${hostPlugins.corePlugins.size.coerceAtLeast(1)} 个核心内核服务，跳过所有扩展插件以快速排障",
+                subtitle = "仅启动 ${hostPlugins.corePlugins.size.coerceAtLeast(1)} 个核心内核服务，跳过扩展插件",
                 checked = hostPlugins.safeMode,
                 enabled = runtimeReady,
                 onCheckedChange = { enable ->
@@ -140,7 +127,7 @@ fun HostPluginsSection(
                 },
             )
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                SecondaryPillButton("重载代际", enabled = runtimeReady, onClick = {
+                CompactActionButton("重载代际", enabled = runtimeReady, onClick = {
                     scope.launch {
                         onBusy("正在重新扫描并激活 Host 插件…")
                         try { app.extensions.reloadHostPlugins() }
@@ -149,12 +136,14 @@ fun HostPluginsSection(
                     }
                 })
                 if (hostPlugins.hasLastKnownGood) {
-                    SecondaryPillButton("回滚快照", enabled = runtimeReady, onClick = {
-                        scope.launch {
-                            onBusy("正在回滚至上次正常快照…")
-                            try { app.extensions.rollbackHostPlugins() }
-                            catch (e: Exception) { app.conversations.notify("回滚失败：${e.message}") }
-                            finally { onBusy(null) }
+                    CompactActionButton("回滚快照", enabled = runtimeReady, onClick = {
+                        pendingConfirm = Triple("回滚插件内核快照？", "将恢复到上次正常激活的代际快照并重新加载插件。") {
+                            scope.launch {
+                                onBusy("正在回滚至上次正常快照…")
+                                try { app.extensions.rollbackHostPlugins() }
+                                catch (e: Exception) { app.conversations.notify("回滚失败：${e.message}") }
+                                finally { onBusy(null) }
+                            }
                         }
                     })
                 }
@@ -179,28 +168,38 @@ fun HostPluginsSection(
                     "community" -> "社区"
                     else -> "本地"
                 }
+                var menuOpen by remember(plugin.id) { mutableStateOf(false) }
+                val pluginDrivers = hostPlugins.drivers.filter { it.pluginId == plugin.id }
+                val metaParts = buildList {
+                    add("v${plugin.version}")
+                    add(kindLabel)
+                    if (plugin.overriddenBuiltin) add("已覆写内置")
+                    if (plugin.isWorkerIsolated) add("线程隔离")
+                    if (plugin.commands.isNotEmpty()) add(plugin.commands.joinToString(" ") { "/${it.name}" })
+                    if (plugin.composerActions.isNotEmpty()) add("输入栏+${plugin.composerActions.size}")
+                    if (plugin.uiSlots.isNotEmpty()) add("槽位+${plugin.uiSlots.size}")
+                    if (plugin.translators.isNotEmpty()) add("协议:${plugin.translators.joinToString(",") { it.name }}")
+                    if (pluginDrivers.isNotEmpty()) add("驱动:${pluginDrivers.joinToString(",") { it.name }}")
+                    if (plugin.requiredCapabilities.isNotEmpty() || plugin.optionalCapabilities.isNotEmpty()) {
+                        add("权限 ${plugin.grantedCapabilities.size}")
+                    }
+                }
                 Column(
                     Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text(plugin.name, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
-                                TagPill("v${plugin.version}", fg = G.inkMuted, bg = G.surfaceSubtle)
-                                TagPill(kindLabel, fg = G.inkMuted, bg = G.surfaceSubtle)
-                                if (plugin.overriddenBuiltin) {
-                                    TagPill("已覆写内置", fg = G.warning, bg = G.warningTint)
-                                }
-                                if (plugin.isWorkerIsolated) {
-                                    TagPill("线程隔离", fg = G.success, bg = G.successTint)
-                                }
-                                TagPill(statusLabel, fg = statusFg, bg = statusBg)
-                            }
-                            if (plugin.description.isNotBlank()) {
-                                Text(plugin.description, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-                            }
-                        }
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            plugin.name,
+                            style = MaterialTheme.typography.titleSmall,
+                            color = G.ink,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                        TagPill(statusLabel, fg = statusFg, bg = statusBg)
+                        Box(Modifier.weight(1f))
                         GaliaisSwitch(
                             checked = plugin.enabled,
                             enabled = runtimeReady && !hostPlugins.safeMode,
@@ -211,114 +210,117 @@ fun HostPluginsSection(
                                 }
                             },
                         )
+                        Box {
+                            IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(32.dp)) {
+                                Icon(GaliaisIcons.MoreHoriz, contentDescription = "更多插件操作", tint = G.inkMuted, modifier = Modifier.size(18.dp))
+                            }
+                            GaliaisDropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                                Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    if (plugin.settingsFields.isNotEmpty()) {
+                                        GaliaisMenuRow("插件配置", onClick = { menuOpen = false; editingSettings = plugin })
+                                    }
+                                    if (plugin.requiredCapabilities.isNotEmpty() || plugin.optionalCapabilities.isNotEmpty()) {
+                                        GaliaisMenuRow("权限授权 (${plugin.grantedCapabilities.size})", onClick = { menuOpen = false; editingGrants = plugin })
+                                    }
+                                    if (runtimeReady && !hostPlugins.safeMode) {
+                                        GaliaisMenuRow("热重载插件", onClick = {
+                                            menuOpen = false
+                                            scope.launch {
+                                                onBusy("正在热载 ${plugin.name}…")
+                                                try { app.extensions.reloadSingleHostPlugin(plugin.id) }
+                                                catch (e: Exception) { app.conversations.notify("热载失败：${e.message}") }
+                                                finally { onBusy(null) }
+                                            }
+                                        })
+                                    }
+                                    if (plugin.snapshotCount > 0) {
+                                        GaliaisMenuRow("源码快照 (${plugin.snapshotCount})", onClick = {
+                                            menuOpen = false
+                                            viewingSnapshots = plugin
+                                            snapshotList = emptyList()
+                                            loadingSnapshots = true
+                                            scope.launch {
+                                                try { snapshotList = app.extensions.listHostPluginSnapshots(plugin.id) }
+                                                catch (e: Exception) { app.conversations.notify("读取快照失败：${e.message}") }
+                                                finally { loadingSnapshots = false }
+                                            }
+                                        })
+                                    }
+                                    GaliaisMenuRow("诊断与日志 (${plugin.recentLogs.size})", onClick = { menuOpen = false; viewingLogs = plugin })
+                                    if (plugin.overriddenBuiltin) {
+                                        GaliaisMenuRow("恢复原版内置", onClick = {
+                                            menuOpen = false
+                                            pendingConfirm = Triple("恢复原版内置插件？", "将移除本地覆写并恢复内置原版「${plugin.name}」。") {
+                                                scope.launch {
+                                                    onBusy("正在恢复原版内置插件…")
+                                                    try { app.extensions.restoreBuiltinHostPlugin(plugin.id) }
+                                                    catch (e: Exception) { app.conversations.notify("恢复失败：${e.message}") }
+                                                    finally { onBusy(null) }
+                                                }
+                                            }
+                                        })
+                                    }
+                                    if (plugin.isRemovable) {
+                                        GaliaisMenuRow("分享到共享仓库", onClick = { menuOpen = false; onSharePlugin(plugin.id) })
+                                        GaliaisMenuRow("卸载插件", tintOverride = G.danger, onClick = {
+                                            menuOpen = false
+                                            pendingConfirm = Triple("卸载本地插件？", "确定删除插件「${plugin.name}」及其目录文件吗？") {
+                                                scope.launch {
+                                                    try { app.extensions.removeLocalHostPlugin(plugin.id) }
+                                                    catch (e: Exception) { app.conversations.notify("卸载失败：${e.message}") }
+                                                }
+                                            }
+                                        })
+                                    }
+                                }
+                            }
+                        }
                     }
+                    if (plugin.description.isNotBlank()) {
+                        Text(plugin.description, style = MaterialTheme.typography.bodySmall, color = G.inkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    }
+                    Text(
+                        metaParts.joinToString(" · "),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = G.inkSubtle,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                     if (!plugin.error.isNullOrBlank()) {
                         Text(plugin.error, style = MaterialTheme.typography.labelSmall, color = G.danger)
                     }
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        if (plugin.commands.isNotEmpty()) {
-                            TagPill(plugin.commands.joinToString(" ") { "/${it.name}" }, fg = G.accent, bg = G.accentContainer)
-                        }
-                        if (plugin.composerActions.isNotEmpty()) {
-                            TagPill("输入栏 +${plugin.composerActions.size}", fg = G.accent, bg = G.accentContainer)
-                        }
-                        if (plugin.uiSlots.isNotEmpty()) {
-                            TagPill("槽位 +${plugin.uiSlots.size}", fg = G.accent, bg = G.accentContainer)
-                        }
-                        if (plugin.status == "active") {
-                            plugin.surfaces.forEach { surface ->
-                                TagPill(
-                                    text = "原生：${surface.title}",
-                                    fg = G.success,
-                                    bg = G.successTint,
-                                    onClick = { openingSurface = plugin.id to surface.id },
-                                )
-                            }
-                        }
-                        plugin.translators.forEach { tr ->
-                            TagPill("协议：${tr.name}", fg = G.inkMuted, bg = G.surfaceSubtle)
-                        }
-                        hostPlugins.drivers.filter { it.pluginId == plugin.id }.forEach { drv ->
-                            TagPill(
-                                text = if (drv.executable) "动态驱动：${drv.name}" else "驱动：${drv.name}",
-                                fg = G.accent,
-                                bg = G.accentContainer,
-                            )
-                        }
-                        if (plugin.requiredCapabilities.isNotEmpty() || plugin.optionalCapabilities.isNotEmpty()) {
-                            TagPill(
-                                text = "权限 ${plugin.grantedCapabilities.size} 项",
-                                fg = G.inkMuted,
-                                bg = G.surfaceSubtle,
-                                onClick = { editingGrants = plugin },
-                            )
-                        }
-                        if (plugin.settingsFields.isNotEmpty()) {
-                            TagPill("配置", fg = G.accent, bg = G.accentContainer, onClick = { editingSettings = plugin })
-                        }
-                        if (plugin.status == "active") {
-                            plugin.panels.forEach { panel ->
-                                TagPill(
-                                    text = "面板：${panel.title}",
-                                    fg = G.accent,
-                                    bg = G.accentContainer,
-                                    onClick = {
-                                        scope.launch {
-                                            onBusy("正在渲染插件面板…")
-                                            try {
-                                                val art = app.extensions.renderHostPluginPanel(plugin.id, panel.id, defaultCwd)
-                                                openingPanel = plugin.id to art
-                                            } catch (e: Exception) {
-                                                app.conversations.notify("打开面板失败：${e.message}")
-                                            } finally {
-                                                onBusy(null)
+                    val hasPrimaryActions = (plugin.status == "active" && (plugin.surfaces.isNotEmpty() || plugin.panels.isNotEmpty())) || plugin.settingsFields.isNotEmpty()
+                    if (hasPrimaryActions) {
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            if (plugin.status == "active") {
+                                plugin.surfaces.forEach { surface ->
+                                    CompactActionButton(
+                                        text = "打开 ${surface.title}",
+                                        onClick = { openingSurface = plugin.id to surface.id },
+                                    )
+                                }
+                                plugin.panels.forEach { panel ->
+                                    CompactActionButton(
+                                        text = "面板 ${panel.title}",
+                                        onClick = {
+                                            scope.launch {
+                                                onBusy("正在渲染插件面板…")
+                                                try {
+                                                    val art = app.extensions.renderHostPluginPanel(plugin.id, panel.id, defaultCwd)
+                                                    openingPanel = plugin.id to art
+                                                } catch (e: Exception) {
+                                                    app.conversations.notify("打开面板失败：${e.message}")
+                                                } finally {
+                                                    onBusy(null)
+                                                }
                                             }
-                                        }
-                                    },
-                                )
+                                        },
+                                    )
+                                }
                             }
-                        }
-                        if (runtimeReady && !hostPlugins.safeMode) {
-                            TagPill("热载", fg = G.inkMuted, bg = G.surfaceSubtle, onClick = {
-                                scope.launch {
-                                    onBusy("正在热载 ${plugin.name}…")
-                                    try { app.extensions.reloadSingleHostPlugin(plugin.id) }
-                                    catch (e: Exception) { app.conversations.notify("热载失败：${e.message}") }
-                                    finally { onBusy(null) }
-                                }
-                            })
-                        }
-                        if (plugin.snapshotCount > 0) {
-                            TagPill("快照 (${plugin.snapshotCount})", fg = G.accent, bg = G.accentContainer, onClick = {
-                                viewingSnapshots = plugin
-                                snapshotList = emptyList()
-                                loadingSnapshots = true
-                                scope.launch {
-                                    try { snapshotList = app.extensions.listHostPluginSnapshots(plugin.id) }
-                                    catch (e: Exception) { app.conversations.notify("读取快照失败：${e.message}") }
-                                    finally { loadingSnapshots = false }
-                                }
-                            })
-                        }
-                        if (plugin.overriddenBuiltin) {
-                            TagPill("恢复原版", fg = G.warning, bg = G.warningTint, onClick = {
-                                scope.launch {
-                                    onBusy("正在恢复原版内置插件…")
-                                    try { app.extensions.restoreBuiltinHostPlugin(plugin.id) }
-                                    catch (e: Exception) { app.conversations.notify("恢复失败：${e.message}") }
-                                    finally { onBusy(null) }
-                                }
-                            })
-                        }
-                        TagPill("日志 (${plugin.recentLogs.size})", fg = G.inkMuted, bg = G.surfaceSubtle, onClick = { viewingLogs = plugin })
-                        if (plugin.isRemovable) {
-                            TagPill("分享", fg = G.accent, bg = G.accentContainer, onClick = { onSharePlugin(plugin.id) })
-                            TagPill("卸载", fg = G.danger, bg = G.dangerTint, onClick = {
-                                scope.launch {
-                                    try { app.extensions.removeLocalHostPlugin(plugin.id) }
-                                    catch (e: Exception) { app.conversations.notify("卸载失败：${e.message}") }
-                                }
-                            })
+                            if (plugin.settingsFields.isNotEmpty()) {
+                                CompactActionButton("配置", onClick = { editingSettings = plugin })
+                            }
                         }
                     }
                 }
@@ -381,35 +383,26 @@ fun HostPluginsSection(
     }
 
     editingSettings?.let { plugin ->
-        GaliaisSheet(onDismissRequest = { editingSettings = null }) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .imePadding()
-                    .navigationBarsPadding()
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 16.dp)
-                    .padding(bottom = 22.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                Text("${plugin.name} · 插件配置", style = MaterialTheme.typography.titleLarge, color = G.ink)
-                Text("由插件声明的 JSON Schema 自动渲染，保存后即时生效。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-                JsonSchemaForm(
-                    formKey = "${plugin.id}:${hostPlugins.generationId}",
-                    fields = plugin.settingsFields,
-                    initialValues = plugin.settingsValues,
-                    submitLabel = "保存配置",
-                    cancelLabel = "取消",
-                    onSubmit = { obj ->
-                        editingSettings = null
-                        scope.launch {
-                            try { app.extensions.updateHostPluginSettings(plugin.id, obj) }
-                            catch (e: Exception) { app.conversations.notify("保存配置失败：${e.message}") }
-                        }
-                    },
-                    onCancel = { editingSettings = null },
-                )
-            }
+        GaliaisSheetScaffold(
+            title = "${plugin.name} · 插件配置",
+            subtitle = "由插件声明的 JSON Schema 自动渲染，保存后即时生效",
+            onDismiss = { editingSettings = null },
+        ) {
+            JsonSchemaForm(
+                formKey = "${plugin.id}:${hostPlugins.generationId}",
+                fields = plugin.settingsFields,
+                initialValues = plugin.settingsValues,
+                submitLabel = "保存配置",
+                cancelLabel = "取消",
+                onSubmit = { obj ->
+                    editingSettings = null
+                    scope.launch {
+                        try { app.extensions.updateHostPluginSettings(plugin.id, obj) }
+                        catch (e: Exception) { app.conversations.notify("保存配置失败：${e.message}") }
+                    }
+                },
+                onCancel = { editingSettings = null },
+            )
         }
     }
 
@@ -430,17 +423,31 @@ fun HostPluginsSection(
 
     viewingLogs?.let { plugin ->
         val fmt = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
-        AlertDialog(
+        val logDump = remember(plugin) {
+            buildString {
+                appendLine("ID: ${plugin.id} · 执行层: ${plugin.executionTier}")
+                if (plugin.dirPath.isNotBlank()) appendLine("目录: ${plugin.dirPath}")
+                if (plugin.grantedCapabilities.isNotEmpty()) appendLine("已授能力: ${plugin.grantedCapabilities.joinToString(", ")}")
+                plugin.recentLogs.forEach { log ->
+                    val ts = if (log.ts > 0L) fmt.format(Date(log.ts)) else "--:--:--"
+                    appendLine("[$ts ${log.level.uppercase()}] ${log.message}")
+                }
+            }.trim()
+        }
+        GaliaisAlertDialog(
+            title = "${plugin.name} · 诊断与日志",
             onDismissRequest = { viewingLogs = null },
-            containerColor = G.surface,
-            titleContentColor = G.ink,
-            textContentColor = G.ink,
-            title = { Text("${plugin.name} · 诊断与日志") },
-            text = {
-                Column(
-                    modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
+            confirmText = "复制日志",
+            onConfirm = {
+                scope.launch {
+                    clipboard.setClipEntry(ClipData.newPlainText("plugin-logs", logDump).toClipEntry())
+                    app.conversations.notify("已复制插件诊断日志")
+                }
+            },
+            dismissText = "关闭",
+        ) {
+            SelectionContainer {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text("ID: ${plugin.id}  ·  执行层: ${plugin.executionTier}", fontFamily = Mono, fontSize = 11.sp, color = G.inkMuted)
                     if (plugin.dirPath.isNotBlank()) {
                         Text("目录: ${plugin.dirPath}", fontFamily = Mono, fontSize = 11.sp, color = G.inkSubtle, maxLines = 2, overflow = TextOverflow.Ellipsis)
@@ -463,9 +470,8 @@ fun HostPluginsSection(
                         }
                     }
                 }
-            },
-            confirmButton = { TextButton(onClick = { viewingLogs = null }) { Text("关闭") } },
-        )
+            }
+        }
     }
 
     editingGrants?.let { plugin ->
@@ -486,64 +492,67 @@ fun HostPluginsSection(
 
     viewingSnapshots?.let { plugin ->
         val fmt = remember { SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()) }
-        GaliaisSheet(onDismissRequest = { viewingSnapshots = null }) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .navigationBarsPadding()
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 16.dp)
-                    .padding(bottom = 22.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                Text("${plugin.name} · 源码快照", style = MaterialTheme.typography.titleLarge, color = G.ink)
-                Text("每次由 Agent 升级或覆写前均会自动归档完整源码快照，可一键回滚至任意历史版本。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-                if (loadingSnapshots) {
-                    Text("正在读取快照记录…", style = MaterialTheme.typography.bodySmall, color = G.inkSubtle)
-                } else if (snapshotList.isEmpty()) {
-                    Text("暂无可回滚的历史快照", style = MaterialTheme.typography.bodySmall, color = G.inkSubtle)
-                } else {
-                    CrispCard(padding = PaddingValues(0.dp)) {
-                        snapshotList.forEachIndexed { idx, snap ->
-                            Row(
-                                modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                            ) {
-                                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        Text("v${snap.version}", style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
-                                        Text(
-                                            if (snap.createdAt > 0L) fmt.format(Date(snap.createdAt)) else snap.id,
-                                            fontFamily = Mono,
-                                            fontSize = 11.sp,
-                                            color = G.inkMuted,
-                                        )
-                                        TagPill("${snap.fileCount} 文件", fg = G.inkMuted, bg = G.surfaceSubtle)
-                                    }
-                                    if (snap.note.isNotBlank()) {
-                                        Text(snap.note, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-                                    }
+        GaliaisSheetScaffold(
+            title = "${plugin.name} · 源码快照",
+            subtitle = "每次由 Agent 升级或覆写前自动归档，可随时回滚",
+            onDismiss = { viewingSnapshots = null },
+        ) {
+            if (loadingSnapshots) {
+                Text("正在读取快照记录…", style = MaterialTheme.typography.bodySmall, color = G.inkSubtle)
+            } else if (snapshotList.isEmpty()) {
+                Text("暂无可回滚的历史快照", style = MaterialTheme.typography.bodySmall, color = G.inkSubtle)
+            } else {
+                CrispCard(padding = PaddingValues(0.dp)) {
+                    snapshotList.forEachIndexed { idx, snap ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Text("v${snap.version}", style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
+                                    Text(
+                                        if (snap.createdAt > 0L) fmt.format(Date(snap.createdAt)) else snap.id,
+                                        fontFamily = Mono,
+                                        fontSize = 11.sp,
+                                        color = G.inkMuted,
+                                    )
+                                    TagPill("${snap.fileCount} 文件", fg = G.inkMuted, bg = G.surfaceSubtle)
                                 }
-                                SecondaryPillButton("回滚", enabled = runtimeReady, onClick = {
-                                    viewingSnapshots = null
-                                    scope.launch {
-                                        onBusy("正在回滚 ${plugin.name} 至 v${snap.version}…")
-                                        try { app.extensions.rollbackHostPluginSnapshot(plugin.id, snap.id) }
-                                        catch (e: Exception) { app.conversations.notify("回滚失败：${e.message}") }
-                                        finally { onBusy(null) }
-                                    }
-                                })
+                                if (snap.note.isNotBlank()) {
+                                    Text(snap.note, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                                }
                             }
-                            if (idx < snapshotList.lastIndex) Hairline()
+                            CompactActionButton("回滚", enabled = runtimeReady, onClick = {
+                                viewingSnapshots = null
+                                scope.launch {
+                                    onBusy("正在回滚 ${plugin.name} 至 v${snap.version}…")
+                                    try { app.extensions.rollbackHostPluginSnapshot(plugin.id, snap.id) }
+                                    catch (e: Exception) { app.conversations.notify("回滚失败：${e.message}") }
+                                    finally { onBusy(null) }
+                                }
+                            })
                         }
+                        if (idx < snapshotList.lastIndex) Hairline()
                     }
-                }
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                    SecondaryPillButton("关闭", onClick = { viewingSnapshots = null })
                 }
             }
         }
+    }
+
+    pendingConfirm?.let { (title, message, action) ->
+        GaliaisConfirmDialog(
+            title = title,
+            message = message,
+            confirmText = "确认",
+            danger = true,
+            onConfirm = {
+                pendingConfirm = null
+                action()
+            },
+            onDismiss = { pendingConfirm = null },
+        )
     }
 
     openingSurface?.let { (pid, sid) ->
@@ -608,40 +617,26 @@ private fun HostPluginGrantsSheet(
             "deps.npm" to "受控安装插件专属第三方 npm 依赖（强制 --ignore-scripts）",
         )
     }
-    GaliaisSheet(onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .imePadding()
-                .navigationBarsPadding()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp)
-                .padding(bottom = 22.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text("${plugin.name} · 能力授权", style = MaterialTheme.typography.titleLarge, color = G.ink)
-            Text(
-                "遵循 Fail-Closed 协商：撤销必需能力（required）将阻止插件激活；撤销可选能力（optional）仅关闭对应特性。",
-                style = MaterialTheme.typography.bodySmall,
-                color = G.inkMuted,
+    GaliaisSheetScaffold(
+        title = "${plugin.name} · 能力授权",
+        subtitle = "撤销必需能力将阻止插件激活；撤销可选能力仅关闭对应特性",
+        onDismiss = onDismiss,
+        footer = {
+            SecondaryPillButton("取消", onClick = onDismiss)
+            PrimaryPillButton("保存并生效", modifier = Modifier.weight(1f), onClick = { onSave(selected.toList()) })
+        },
+    ) {
+        allDeclared.forEach { cap ->
+            val isReq = cap in plugin.requiredCapabilities
+            val checked = cap in selected
+            SettingsToggleRow(
+                title = "$cap" + if (isReq) "（必需）" else "（可选）",
+                subtitle = capDescriptions[cap] ?: "插件声明能力",
+                checked = checked,
+                onCheckedChange = { want ->
+                    selected = if (want) selected + cap else selected - cap
+                },
             )
-            allDeclared.forEach { cap ->
-                val isReq = cap in plugin.requiredCapabilities
-                val checked = cap in selected
-                SettingsToggleRow(
-                    title = "$cap" + if (isReq) "（必需）" else "（可选）",
-                    subtitle = capDescriptions[cap] ?: "插件声明能力",
-                    checked = checked,
-                    onCheckedChange = { want ->
-                        selected = if (want) selected + cap else selected - cap
-                    },
-                )
-            }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                SecondaryPillButton("取消", onClick = onDismiss)
-                Spacer(Modifier.size(8.dp))
-                PrimaryPillButton("保存并生效", onClick = { onSave(selected.toList()) })
-            }
         }
     }
 }
@@ -666,66 +661,56 @@ private fun LocalHostPluginCreateSheet(
     var description by remember { mutableStateOf("包含 /命令、Schema 设置、本地存储与 WebView 面板的本地扩展") }
     var error by remember { mutableStateOf<String?>(null) }
 
-    GaliaisSheet(onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .imePadding()
-                .navigationBarsPadding()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp)
-                .padding(bottom = 22.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text("新建本地 Host 插件", style = MaterialTheme.typography.titleLarge, color = G.ink)
-            Text("将在 ~/.galiais/plugins/<id>/ 下生成 solbraid-plugin.json 与 index.mjs 并立即热激活。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-            OutlinedTextField(
-                value = id,
-                onValueChange = { id = it.lowercase(); error = null },
-                label = { Text("插件 ID（小写字母/数字/点/短横线）") },
-                singleLine = true,
-                shape = D.fieldShape,
-                colors = galiaisTextFieldColors(),
-                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = name,
-                onValueChange = { name = it; error = null },
-                label = { Text("插件显示名称") },
-                singleLine = true,
-                shape = D.fieldShape,
-                colors = galiaisTextFieldColors(),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = description,
-                onValueChange = { description = it },
-                label = { Text("功能简介") },
-                minLines = 2,
-                maxLines = 4,
-                shape = D.fieldShape,
-                colors = galiaisTextFieldColors(),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                SecondaryPillButton("取消", onClick = onDismiss)
-                Spacer(Modifier.size(8.dp))
-                PrimaryPillButton("生成并激活", onClick = {
-                    val cleanId = id.trim()
-                    val cleanName = name.trim()
-                    if (!Regex("^[a-z0-9][a-z0-9._-]{1,63}$").matches(cleanId)) {
-                        error = "插件 ID 需 2~64 位小写字母、数字、点、短横线或下划线"
-                        return@PrimaryPillButton
-                    }
-                    if (cleanName.isBlank()) {
-                        error = "请填写插件名称"
-                        return@PrimaryPillButton
-                    }
-                    onCreate(cleanId, cleanName, description.trim())
-                })
-            }
-        }
+    GaliaisSheetScaffold(
+        title = "新建本地 Host 插件",
+        subtitle = "在 ~/.galiais/plugins/<id>/ 下生成清单与入口并热激活",
+        onDismiss = onDismiss,
+        footer = {
+            SecondaryPillButton("取消", onClick = onDismiss)
+            PrimaryPillButton("生成并激活", modifier = Modifier.weight(1f), onClick = {
+                val cleanId = id.trim()
+                val cleanName = name.trim()
+                if (!Regex("^[a-z0-9][a-z0-9._-]{1,63}$").matches(cleanId)) {
+                    error = "插件 ID 需 2~64 位小写字母、数字、点、短横线或下划线"
+                    return@PrimaryPillButton
+                }
+                if (cleanName.isBlank()) {
+                    error = "请填写插件名称"
+                    return@PrimaryPillButton
+                }
+                onCreate(cleanId, cleanName, description.trim())
+            })
+        },
+    ) {
+        OutlinedTextField(
+            value = id,
+            onValueChange = { id = it.lowercase(); error = null },
+            label = { Text("插件 ID（小写字母/数字/点/短横线）") },
+            singleLine = true,
+            shape = D.fieldShape,
+            colors = galiaisTextFieldColors(),
+            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = name,
+            onValueChange = { name = it; error = null },
+            label = { Text("插件显示名称") },
+            singleLine = true,
+            shape = D.fieldShape,
+            colors = galiaisTextFieldColors(),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = description,
+            onValueChange = { description = it },
+            label = { Text("功能简介") },
+            minLines = 2,
+            maxLines = 4,
+            shape = D.fieldShape,
+            colors = galiaisTextFieldColors(),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
     }
 }

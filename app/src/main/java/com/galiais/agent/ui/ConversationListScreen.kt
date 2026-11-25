@@ -192,13 +192,15 @@ fun ConversationListScreen(
         }
     }
 
-    Box(modifier.fillMaxSize().galiaisCanvasBackground()) {
+    var showHomeMenu by remember { mutableStateOf(false) }
+
+    Box(modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
-            // 极简页头：Wordmark + 编排 + 已归档 + 搜索 + 刷新
+            // 统一极简页头：Wordmark + 活跃编排角标 + 搜索 + 更多菜单（避免 360dp 屏截断 Solbraid）
             Row(
-                modifier = Modifier.fillMaxWidth().height(56.dp).padding(start = 18.dp, end = 6.dp),
+                modifier = Modifier.fillMaxWidth().height(if (D.material) 64.dp else 56.dp).padding(start = 16.dp, end = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 Row(
                     modifier = Modifier.weight(1f),
@@ -213,9 +215,8 @@ fun ConversationListScreen(
                     )
                     Text(
                         "Solbraid",
-                        fontSize = 19.sp,
+                        style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
-                        letterSpacing = (-0.5).sp,
                         color = G.ink,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
@@ -231,38 +232,37 @@ fun ConversationListScreen(
                     )
                     val activeTickets = tickets.count { it.active }
                     val needsAct = tickets.any { it.stage.needsAttention }
-                    TagPill(
-                        text = if (activeTickets > 0) "编排 $activeTickets" else "编排",
-                        fg = if (needsAct) G.warning else G.ink,
-                        bg = if (needsAct) G.warningTint else G.surfaceSubtle,
-                        border = if (needsAct) G.warning.copy(alpha = 0.4f) else G.border,
-                        onClick = { showSuperAgentBoard = true },
-                    )
-                }
-                if (runtime.ready) {
-                    TagPill("已归档", fg = G.inkMuted, bg = G.surfaceSubtle, border = G.border, onClick = { showArchived = true })
+                    if (activeTickets > 0 || needsAct) {
+                        CompactActionButton(
+                            text = "编排 $activeTickets",
+                            onClick = { showSuperAgentBoard = true },
+                            danger = needsAct,
+                        )
+                    }
                 }
                 if (summaries.isNotEmpty()) {
-                    IconButton(onClick = { searching = !searching; if (!searching) query = "" }, modifier = Modifier.size(36.dp)) {
+                    IconButton(onClick = { searching = !searching; if (!searching) query = "" }) {
                         Icon(
-                            GaliaisIcons.Search,
+                            if (searching) GaliaisIcons.Close else GaliaisIcons.Search,
                             contentDescription = "搜索会话",
                             tint = if (searching) G.accent else G.inkMuted,
                             modifier = Modifier.size(19.dp),
                         )
                     }
                 }
-                IconButton(
-                    onClick = { app.conversations.refresh() },
-                    enabled = runtime.ready && !loading,
-                    modifier = Modifier.size(36.dp),
-                ) {
-                    Icon(
-                        GaliaisIcons.Refresh,
-                        contentDescription = "刷新会话",
-                        tint = if (runtime.ready && !loading) G.inkMuted else G.inkSubtle,
-                        modifier = Modifier.size(19.dp),
-                    )
+                Box {
+                    IconButton(onClick = { showHomeMenu = true }) {
+                        Icon(GaliaisIcons.MoreHoriz, contentDescription = "更多", tint = G.inkMuted, modifier = Modifier.size(19.dp))
+                    }
+                    GaliaisDropdownMenu(expanded = showHomeMenu, onDismissRequest = { showHomeMenu = false }) {
+                        Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            if (runtime.ready) {
+                                GaliaisMenuRow("Super-Agent 编排看板", icon = GaliaisIcons.GitBranch, onClick = { showHomeMenu = false; showSuperAgentBoard = true })
+                                GaliaisMenuRow("已归档会话", icon = GaliaisIcons.Archive, onClick = { showHomeMenu = false; showArchived = true })
+                            }
+                            GaliaisMenuRow("刷新会话列表", icon = GaliaisIcons.Refresh, enabled = runtime.ready && !loading, onClick = { showHomeMenu = false; app.conversations.refresh() })
+                        }
+                    }
                 }
             }
             if (searching) {
@@ -764,7 +764,7 @@ fun RuntimeCard(
         }
         if (runtime.maintenance) return@CrispCard
         Spacer(Modifier.height(12.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             if (runtime.busy || runtime.ready) {
                 if (runtime.ready && onRestart != null) {
                     SecondaryPillButton("重启环境", onClick = onRestart)
@@ -797,25 +797,30 @@ private fun ConversationRow(
     var deleting by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
-    Box(modifier.padding(start = if (summary.parent != null) 18.dp else 0.dp)) {
+    val indentStart = if (summary.parent != null && groupPosition == CardGroupPos.SINGLE) 16.dp else 0.dp
+    Box(modifier.padding(start = indentStart)) {
         CrispCard(
             onClick = { open(summary.key) },
             onLongClick = { menu = true },
             padding = PaddingValues(0.dp),
             groupPosition = groupPosition,
         ) {
-            Column(Modifier.padding(D.space(14.dp)), verticalArrangement = Arrangement.spacedBy(D.space(5.dp))) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                    EngineLabel(summary.key.engine)
-                    if (summary.parent != null) {
-                        TagPill("分支/委派", fg = G.inkMuted, bg = G.surfaceSubtle)
+            Column(Modifier.padding(start = D.space(14.dp), end = D.space(8.dp), top = D.space(12.dp), bottom = D.space(12.dp)), verticalArrangement = Arrangement.spacedBy(D.space(5.dp))) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        EngineLabel(summary.key.engine)
+                        if (summary.parent != null) {
+                            TagPill("分支", fg = G.inkMuted, bg = G.surfaceSubtle)
+                        }
+                        if (hasPendingRequest) {
+                            TagPill("待确认", fg = G.warning, bg = G.warningTint)
+                        }
                     }
-                    if (hasPendingRequest) {
-                        TagPill("待确认", fg = G.warning, bg = G.warningTint)
-                    }
-                    Spacer(Modifier.weight(1f))
                     if (summary.running) PulsingDot(G.warning, size = 7.dp)
-                    Text(relativeTime(summary.updatedAt), style = MaterialTheme.typography.labelSmall, color = G.inkSubtle)
+                    Text(relativeTime(summary.updatedAt), style = MaterialTheme.typography.labelSmall, color = G.inkSubtle, maxLines = 1, softWrap = false)
+                    IconButton(onClick = { menu = true }, modifier = Modifier.size(30.dp)) {
+                        Icon(GaliaisIcons.MoreHoriz, contentDescription = "会话操作", tint = G.inkSubtle, modifier = Modifier.size(15.dp))
+                    }
                 }
                 Text(
                     summary.title,
@@ -823,8 +828,15 @@ private fun ConversationRow(
                     color = G.ink,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(end = 6.dp),
                 )
-                val preview = summary.preview.trim().replace('\n', ' ')
+                val preview = remember(summary.preview) {
+                    summary.preview
+                        .replace(Regex("""\[([^\]]+)]\([^)]+\)"""), "$1")
+                        .replace(Regex("""[*_`#]+"""), "")
+                        .replace(Regex("""\s+"""), " ")
+                        .trim()
+                }
                 if (preview.isNotEmpty() && !preview.startsWith(summary.title.take(24))) {
                     Text(
                         preview,
@@ -832,6 +844,7 @@ private fun ConversationRow(
                         color = G.inkMuted,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(end = 6.dp),
                     )
                 }
                 if (showCwd) {
@@ -843,6 +856,7 @@ private fun ConversationRow(
                             color = G.inkSubtle,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(end = 6.dp),
                         )
                     }
                 }
@@ -850,7 +864,7 @@ private fun ConversationRow(
         }
         GaliaisDropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                GaliaisMenuRow(title = "重命名", icon = GaliaisIcons.Code, onClick = { menu = false; renaming = true })
+                GaliaisMenuRow(title = "重命名", icon = GaliaisIcons.Edit, onClick = { menu = false; renaming = true })
                 if (AgentCatalog.capabilitiesOf(summary.key.engine).fork) {
                     GaliaisMenuRow(
                         title = "创建会话分支",

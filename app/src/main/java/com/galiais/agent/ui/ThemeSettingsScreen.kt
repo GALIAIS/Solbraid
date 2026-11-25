@@ -1,16 +1,21 @@
 package com.galiais.agent.ui
 
-import androidx.compose.foundation.horizontalScroll
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
@@ -26,10 +31,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.galiais.agent.GaliaisApplication
 import com.galiais.agent.engine.ThemeConfig
@@ -103,188 +107,248 @@ fun ThemeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, on
     val set: ((ThemeConfig) -> ThemeConfig) -> Unit = { app.settings.updateTheme(it) }
     var hexTarget by remember { mutableStateOf<String?>(null) }
     var savingCustom by remember { mutableStateOf(false) }
+    var confirmReset by remember { mutableStateOf(false) }
     var selectedCategory by rememberSaveable { mutableStateOf("全部") }
+    var activeTab by rememberSaveable { mutableStateOf("presets") }
+    var showPreview by rememberSaveable { mutableStateOf(true) }
 
     val matchedPreset = remember(t) { ThemePresetCatalog.matchPreset(t) }
     val categories = remember(customThemes.size) {
         if (customThemes.isNotEmpty()) ThemePresetCatalog.CATEGORIES + "我的收藏" else ThemePresetCatalog.CATEGORIES
     }
     if (selectedCategory !in categories) selectedCategory = "全部"
+    val filteredPresets = remember(selectedCategory) {
+        if (selectedCategory == "我的收藏") emptyList()
+        else ThemePresetCatalog.PRESETS.filter { selectedCategory == "全部" || it.category == selectedCategory }
+    }
 
     SubPageScaffold(
         title = "主题与外观",
         onBack = onBack,
         snackbar = snackbar,
+        scrollable = false,
         actions = {
             TextButton(onClick = {
                 set { ThemePresetCatalog.randomHarmoniousMix(it) }
             }) { Text("随机", color = G.accent, fontWeight = FontWeight.SemiBold) }
-            TextButton(onClick = {
-                app.settings.resetTheme(keepStyle = true)
-                app.conversations.notify("已恢复默认外观设置")
-            }) { Text("重置", color = G.inkMuted, fontWeight = FontWeight.Medium) }
+            TextButton(onClick = { confirmReset = true }) { Text("重置", color = G.inkMuted, fontWeight = FontWeight.Medium) }
         },
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            SectionLabel(
-                text = matchedPreset?.let { "实时预览 · ${it.name}" } ?: "实时预览 · 自定义混搭",
+            Text(
+                text = matchedPreset?.let { "预览 · ${it.name}" } ?: "预览 · 自定义混搭",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                color = G.ink,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
-            TagPill("存为我的主题", fg = G.accent, bg = G.accentContainer, onClick = { savingCustom = true })
+            TagPill(
+                text = if (showPreview) "收起预览" else "展开预览",
+                fg = G.inkMuted,
+                bg = G.surfaceSubtle,
+                onClick = { showPreview = !showPreview },
+            )
+            TagPill("收藏", fg = G.accent, bg = G.accentContainer, onClick = { savingCustom = true })
         }
-        ThemePreview()
-
-        SectionLabel("一键主题预设（24 套${if (customThemes.isNotEmpty()) " + ${customThemes.size} 收藏" else ""}）")
-        GaliaisScrollableTabBar(
-            options = categories.map { it to it },
-            selected = selectedCategory,
-            onSelect = { selectedCategory = it },
-        )
-        Row(
-            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            if (selectedCategory == "我的收藏" || selectedCategory == "全部") {
-                customThemes.forEach { slot ->
-                    val dark = slot.config.mode == "dark" || (slot.config.mode == "system" && G.dark)
-                    val previewColors = galiaisColors(slot.config, dark)
-                    val matched = t == slot.config
-                    ThemePresetCard(
-                        title = slot.name,
-                        subtitle = "我的收藏",
-                        bg = previewColors.canvas,
-                        card = previewColors.surface,
-                        accent = previewColors.accent,
-                        selected = matched,
-                        modeTag = when (slot.config.mode) { "dark" -> "深"; "light" -> "浅"; else -> "自" },
-                        onClick = { if (!matched) set { slot.config } },
-                        onDelete = {
-                            app.settings.deleteCustomTheme(slot.id)
-                            app.conversations.notify("已删除「${slot.name}」")
-                        },
-                    )
-                }
-            }
-            if (selectedCategory != "我的收藏") {
-                ThemePresetCatalog.PRESETS
-                    .filter { selectedCategory == "全部" || it.category == selectedCategory }
-                    .forEach { preset ->
-                        val matched = matchedPreset?.id == preset.id
-                        ThemePresetCard(
-                            title = preset.name,
-                            subtitle = preset.subtitle,
-                            bg = Color(preset.previewCanvas.toInt()),
-                            card = Color(preset.previewSurface.toInt()),
-                            accent = Color(preset.previewAccent.toInt()),
-                            selected = matched,
-                            modeTag = when (preset.config.mode) { "dark" -> "深"; "light" -> "浅"; else -> "自" },
-                            onClick = {
-                                if (!matched) set {
-                                    preset.config.copy(fontScale = it.fontScale, codeFontScale = it.codeFontScale)
-                                }
-                            },
-                        )
-                    }
-            }
-        }
-
-        SectionLabel("界面风格与明暗")
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            StyleOptionCard(
-                title = "Solbraid 模块化",
-                subtitle = "12 套基底 + 7 维自由拼装",
-                material = false,
-                selected = !t.isMaterial,
-                onClick = { set { it.copy(style = ThemeConfig.STYLE_GALIAIS) } },
-                modifier = Modifier.weight(1f),
-            )
-            StyleOptionCard(
-                title = "Material 3",
-                subtitle = "支持壁纸动态取色（Material You）",
-                material = true,
-                selected = t.isMaterial,
-                onClick = { set { it.copy(style = ThemeConfig.STYLE_MATERIAL) } },
-                modifier = Modifier.weight(1f),
-            )
+        AnimatedExpandable(expanded = showPreview) {
+            ThemePreview()
         }
         SegmentedPillBar(
-            options = listOf("system" to "跟随系统", "light" to "浅色", "dark" to "深色"),
-            selected = t.mode,
-            onSelect = { mode -> set { it.copy(mode = mode) } },
+            options = listOf("presets" to "预设", "color" to "色彩", "style" to "外观", "typo" to "排版"),
+            selected = activeTab,
+            onSelect = { activeTab = it },
         )
-
-        SectionLabel("色彩与基底")
-        if (t.isMaterial) MaterialColorSection(t, set, onCustom = { hexTarget = "seed" })
-        else GaliaisColorSection(t, set, onCustom = { hexTarget = "accent" })
-
-        SectionLabel("7 大外观维度自由混搭")
-        CrispCard {
-            AxisChipBlock("1. 底部导航形态", "切换 5 种底栏结构，分体模式自带快捷新建钮", navBarOptions, D.navBarStyle) { v -> set { it.copy(navBarStyle = v) } }
-            Hairline(Modifier.padding(vertical = 13.dp))
-            AxisChipBlock("2. 卡片容器材质", "调整卡片微光边、工业硬影、柔影或分组填充", cardOptions, D.cardStyle) { v -> set { it.copy(cardStyle = v) } }
-            Hairline(Modifier.padding(vertical = 13.dp))
-            AxisChipBlock("3. 画布环境纹理", "在纯净底色上叠加点阵、纸感微光或顶部光晕", textureOptions, t.canvasTexture) { v -> set { it.copy(canvasTexture = v) } }
-            Hairline(Modifier.padding(vertical = 13.dp))
-            AxisChipBlock("4. 按钮几何形态", "控制主次按钮的圆角轮廓与色块质感", buttonOptions, t.buttonStyle) { v -> set { it.copy(buttonStyle = v) } }
-            Hairline(Modifier.padding(vertical = 13.dp))
-            AxisChipBlock("5. 审批拦截卡片", "高风险命令确认卡的视觉强调方式", approvalOptions, t.approvalStyle) { v -> set { it.copy(approvalStyle = v) } }
-            Hairline(Modifier.padding(vertical = 13.dp))
-            AxisChipBlock("6. 会话列表布局", "切换独立卡片、IDE 纵线折叠树或首尾拼接", listLayoutOptions, t.listLayout) { v -> set { it.copy(listLayout = v) } }
-            Hairline(Modifier.padding(vertical = 13.dp))
-            AxisChipBlock("7. 字体排印性格", "调整标题与标签的字形风格", typoOptions, t.typographyStyle) { v -> set { it.copy(typographyStyle = v) } }
-        }
-
-        SectionLabel("圆角与密度")
-        CrispCard {
-            OptionBlock("圆角尺度", "微调所有卡片、输入框与标签的圆润程度") {
-                SegmentedPillBar(
-                    options = listOf(0.4f to "锐利", 0.75f to "精密", 1f to "标准", 1.3f to "圆润"),
-                    selected = listOf(0.4f, 0.75f, 1f, 1.3f).minBy { abs(it - t.corner) },
-                    onSelect = { v -> set { it.copy(corner = v) } },
-                )
-            }
-            Hairline(Modifier.padding(vertical = 13.dp))
-            OptionBlock("界面密度", "调整列表、卡片与消息的内外间距") {
-                SegmentedPillBar(
-                    options = listOf("compact" to "紧凑", "standard" to "标准", "relaxed" to "宽松"),
-                    selected = t.density,
-                    onSelect = { v -> set { it.copy(density = v) } },
-                )
-            }
-        }
-
-        SectionLabel("文字")
-        CrispCard {
-            ScaleSlider("界面字号", t.fontScale, 0.85f, 1.3f, steps = 8) { v -> set { it.copy(fontScale = v) } }
-            Hairline(Modifier.padding(vertical = 12.dp))
-            ScaleSlider("代码字号", t.codeFontScale, 0.8f, 1.4f, steps = 11) { v -> set { it.copy(codeFontScale = v) } }
-        }
-
-        SectionLabel("代码与会话")
-        CrispCard {
-            OptionBlock("代码配色", "作用于代码块、终端输出与文件预览") {
-                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    CodeThemeCard(CodePalettes.resolve("auto", t.isMaterial, G.dark), "自动", t.codeTheme == "auto") { set { it.copy(codeTheme = "auto") } }
-                    CodePalettes.all.forEach { p ->
-                        CodeThemeCard(p, p.label, t.codeTheme == p.id) { set { it.copy(codeTheme = p.id) } }
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(D.space(10.dp)),
+        ) {
+            Crossfade(targetState = activeTab, animationSpec = tween(120), label = "themeTab") { tab ->
+                Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(D.space(10.dp))) {
+                    when (tab) {
+                        "presets" -> {
+                            SectionLabel("一键主题预设（24 套${if (customThemes.isNotEmpty()) " + ${customThemes.size} 收藏" else ""}）")
+                            GaliaisScrollableTabBar(
+                                options = categories.map { it to it },
+                                selected = selectedCategory,
+                                onSelect = { selectedCategory = it },
+                            )
+                            LazyRow(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                if (selectedCategory == "我的收藏" || selectedCategory == "全部") {
+                                    items(customThemes, key = { "custom:${it.id}" }) { slot ->
+                                        val dark = slot.config.mode == "dark" || (slot.config.mode == "system" && G.dark)
+                                        val previewColors = galiaisColors(slot.config, dark)
+                                        val matched = t == slot.config
+                                        ThemePresetCard(
+                                            title = slot.name,
+                                            subtitle = "我的收藏",
+                                            bg = previewColors.canvas,
+                                            card = previewColors.surface,
+                                            accent = previewColors.accent,
+                                            selected = matched,
+                                            modeTag = when (slot.config.mode) { "dark" -> "深"; "light" -> "浅"; else -> "自" },
+                                            onClick = { if (!matched) set { slot.config } },
+                                            onDelete = {
+                                                app.settings.deleteCustomTheme(slot.id)
+                                                app.conversations.notify("已删除「${slot.name}」")
+                                            },
+                                        )
+                                    }
+                                }
+                                items(filteredPresets, key = { "preset:${it.id}" }) { preset ->
+                                    val matched = matchedPreset?.id == preset.id
+                                    ThemePresetCard(
+                                        title = preset.name,
+                                        subtitle = preset.subtitle,
+                                        bg = Color(preset.previewCanvas.toInt()),
+                                        card = Color(preset.previewSurface.toInt()),
+                                        accent = Color(preset.previewAccent.toInt()),
+                                        selected = matched,
+                                        modeTag = when (preset.config.mode) { "dark" -> "深"; "light" -> "浅"; else -> "自" },
+                                        onClick = {
+                                            if (!matched) set {
+                                                preset.config.copy(fontScale = it.fontScale, codeFontScale = it.codeFontScale)
+                                            }
+                                        },
+                                    )
+                                }
+                            }
+                            SectionLabel("界面风格与明暗")
+                            Row(
+                                modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Max),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                StyleOptionCard(
+                                    title = "Solbraid 模块化",
+                                    subtitle = "12 套基底 + 7 维自由拼装",
+                                    material = false,
+                                    selected = !t.isMaterial,
+                                    onClick = { set { it.copy(style = ThemeConfig.STYLE_GALIAIS) } },
+                                    modifier = Modifier.weight(1f).fillMaxHeight(),
+                                )
+                                StyleOptionCard(
+                                    title = "Material 3",
+                                    subtitle = "支持壁纸动态取色（Material You）",
+                                    material = true,
+                                    selected = t.isMaterial,
+                                    onClick = { set { it.copy(style = ThemeConfig.STYLE_MATERIAL) } },
+                                    modifier = Modifier.weight(1f).fillMaxHeight(),
+                                )
+                            }
+                            SegmentedPillBar(
+                                options = listOf("system" to "跟随系统", "light" to "浅色", "dark" to "深色"),
+                                selected = t.mode,
+                                onSelect = { mode -> set { it.copy(mode = mode) } },
+                            )
+                        }
+                        "color" -> {
+                            SectionLabel("色彩与基底")
+                            if (t.isMaterial) MaterialColorSection(t, set, onCustom = { hexTarget = "seed" })
+                            else GaliaisColorSection(t, set, onCustom = { hexTarget = "accent" })
+                        }
+                        "style" -> {
+                            SectionLabel("7 大外观维度自由混搭")
+                            CrispCard {
+                                AxisChipBlock("1. 底部导航形态", "切换 5 种底栏结构，分体模式自带快捷新建钮", navBarOptions, D.navBarStyle) { v -> set { it.copy(navBarStyle = v) } }
+                                Hairline(Modifier.padding(vertical = 13.dp))
+                                AxisChipBlock("2. 卡片容器材质", "调整卡片微光边、工业硬影、柔影或分组填充", cardOptions, D.cardStyle) { v -> set { it.copy(cardStyle = v) } }
+                                Hairline(Modifier.padding(vertical = 13.dp))
+                                AxisChipBlock("3. 画布环境纹理", "在纯净底色上叠加点阵、纸感微光或顶部光晕", textureOptions, t.canvasTexture) { v -> set { it.copy(canvasTexture = v) } }
+                                Hairline(Modifier.padding(vertical = 13.dp))
+                                AxisChipBlock("4. 按钮几何形态", "控制主次按钮的圆角轮廓与色块质感", buttonOptions, t.buttonStyle) { v -> set { it.copy(buttonStyle = v) } }
+                                Hairline(Modifier.padding(vertical = 13.dp))
+                                AxisChipBlock("5. 审批拦截卡片", "高风险命令确认卡的视觉强调方式", approvalOptions, t.approvalStyle) { v -> set { it.copy(approvalStyle = v) } }
+                                Hairline(Modifier.padding(vertical = 13.dp))
+                                AxisChipBlock("6. 会话列表布局", "切换独立卡片、IDE 纵线折叠树或首尾拼接", listLayoutOptions, t.listLayout) { v -> set { it.copy(listLayout = v) } }
+                                Hairline(Modifier.padding(vertical = 13.dp))
+                                AxisChipBlock("7. 字体排印性格", "调整标题与标签的字形风格", typoOptions, t.typographyStyle) { v -> set { it.copy(typographyStyle = v) } }
+                            }
+                            SectionLabel("圆角与密度")
+                            CrispCard {
+                                OptionBlock("圆角尺度", "微调所有卡片、输入框与标签的圆润程度") {
+                                    SegmentedPillBar(
+                                        options = listOf(0.4f to "锐利", 0.75f to "精密", 1f to "标准", 1.3f to "圆润"),
+                                        selected = listOf(0.4f, 0.75f, 1f, 1.3f).minBy { abs(it - t.corner) },
+                                        onSelect = { v -> set { it.copy(corner = v) } },
+                                    )
+                                }
+                                Hairline(Modifier.padding(vertical = 13.dp))
+                                OptionBlock("界面密度", "调整列表、卡片与消息的内外间距") {
+                                    SegmentedPillBar(
+                                        options = listOf("compact" to "紧凑", "standard" to "标准", "relaxed" to "宽松"),
+                                        selected = t.density,
+                                        onSelect = { v -> set { it.copy(density = v) } },
+                                    )
+                                }
+                            }
+                        }
+                        else -> {
+                            SectionLabel("文字")
+                            CrispCard {
+                                ScaleSlider("界面字号", t.fontScale, 0.85f, 1.3f, steps = 8) { v -> set { it.copy(fontScale = v) } }
+                                Hairline(Modifier.padding(vertical = 12.dp))
+                                ScaleSlider("代码字号", t.codeFontScale, 0.8f, 1.4f, steps = 11) { v -> set { it.copy(codeFontScale = v) } }
+                            }
+                            SectionLabel("代码与会话")
+                            CrispCard {
+                                OptionBlock("代码配色", "作用于代码块、终端输出与文件预览") {
+                                    LazyRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        item(key = "auto") {
+                                            CodeThemeCard(CodePalettes.resolve("auto", t.isMaterial, G.dark), "自动", t.codeTheme == "auto") { set { it.copy(codeTheme = "auto") } }
+                                        }
+                                        items(CodePalettes.all, key = { it.id }) { p ->
+                                            CodeThemeCard(p, p.label, t.codeTheme == p.id) { set { it.copy(codeTheme = p.id) } }
+                                        }
+                                    }
+                                }
+                                Hairline(Modifier.padding(vertical = 13.dp))
+                                SettingsToggleRow(
+                                    title = "显示代码行号",
+                                    subtitle = "在代码块与文件预览左侧显示行号",
+                                    checked = t.codeLineNumbers,
+                                    onCheckedChange = { v -> set { it.copy(codeLineNumbers = v) } },
+                                )
+                                Hairline(Modifier.padding(vertical = 13.dp))
+                                OptionBlock("用户消息样式", "自动：Solbraid 使用中性色，Material 3 使用主题色") {
+                                    SegmentedPillBar(
+                                        options = listOf("auto" to "自动", "neutral" to "中性", "accent" to "强调色"),
+                                        selected = t.bubbleStyle,
+                                        onSelect = { v -> set { it.copy(bubbleStyle = v) } },
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }
-            Hairline(Modifier.padding(vertical = 13.dp))
-            ToggleRow("显示代码行号", "在代码块与文件预览左侧显示行号", t.codeLineNumbers) { v -> set { it.copy(codeLineNumbers = v) } }
-            Hairline(Modifier.padding(vertical = 13.dp))
-            OptionBlock("用户消息样式", "自动：Solbraid 使用中性色，Material 3 使用主题色") {
-                SegmentedPillBar(
-                    options = listOf("auto" to "自动", "neutral" to "中性", "accent" to "强调色"),
-                    selected = t.bubbleStyle,
-                    onSelect = { v -> set { it.copy(bubbleStyle = v) } },
-                )
-            }
+            Spacer(Modifier.height(24.dp))
         }
+    }
+
+    if (confirmReset) {
+        GaliaisConfirmDialog(
+            title = "恢复默认外观设置？",
+            message = "将重置当前色彩、7 维外观与排版设置，已收藏的主题槽位不受影响。",
+            confirmText = "恢复默认",
+            danger = true,
+            onConfirm = {
+                confirmReset = false
+                app.settings.resetTheme(keepStyle = true)
+                app.conversations.notify("已恢复默认外观设置")
+            },
+            onDismiss = { confirmReset = false },
+        )
     }
 
     if (savingCustom) {
@@ -339,12 +403,13 @@ private fun MaterialColorSection(t: ThemeConfig, set: ((ThemeConfig) -> ThemeCon
     val dynamicAvailable = dynamicColorSupported()
     val dynamicActive = dynamicAvailable && t.dynamicColor
     CrispCard {
-        ToggleRow(
+        SettingsToggleRow(
             title = "动态取色（Material You）",
             subtitle = if (dynamicAvailable) "跟随系统壁纸自动生成配色" else "需要 Android 12 及以上，当前设备使用主题色",
             checked = dynamicActive,
             enabled = dynamicAvailable,
-        ) { v -> set { it.copy(dynamicColor = v) } }
+            onCheckedChange = { v -> set { it.copy(dynamicColor = v) } },
+        )
         Spacer(Modifier.height(14.dp))
         SchemeRolesStrip()
         Hairline(Modifier.padding(vertical = 14.dp))
@@ -444,25 +509,6 @@ private fun OptionBlock(title: String, subtitle: String? = null, content: @Compo
         }
         Spacer(Modifier.height(10.dp))
         content()
-    }
-}
-
-@Composable
-private fun ToggleRow(title: String, subtitle: String, checked: Boolean, enabled: Boolean = true, onChange: (Boolean) -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(D.shape(10.dp))
-            .toggleable(value = checked, enabled = enabled, role = Role.Switch, onValueChange = onChange),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Column(Modifier.weight(1f)) {
-            Text(title, style = MaterialTheme.typography.titleSmall, color = if (enabled) G.ink else G.inkSubtle)
-            Spacer(Modifier.height(2.dp))
-            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-        }
-        GaliaisSwitch(checked = checked, onCheckedChange = null, enabled = enabled)
     }
 }
 

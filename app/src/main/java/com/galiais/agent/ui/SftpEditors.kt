@@ -5,12 +5,16 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.AlertDialog
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -26,6 +30,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.toClipEntry
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.galiais.agent.GaliaisApplication
 import com.galiais.agent.engine.SshHostConfig
@@ -103,31 +108,45 @@ fun SftpEntryActionDialog(app: GaliaisApplication, host: SshHostConfig, entry: S
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val title = when (action) { "rename" -> "重命名"; "chmod" -> "修改权限"; else -> "删除" }
-    AlertDialog(onDismissRequest = { if (!busy) onDismiss() }, title = { Text(title + " · " + entry.name) },
+    GaliaisAlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        title = title + " · " + entry.name,
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (action == "delete") Text(if (entry.directory) "仅可删除空目录，删除后无法恢复。" else "删除后无法恢复。")
-                else OutlinedTextField(value, { value = it }, enabled = !busy, label = { Text(if (action == "chmod") "八进制权限，例如 644" else "新名称") },
-                    modifier = Modifier.fillMaxWidth(), singleLine = true)
-                error?.let { Text(it, color = G.danger) }
+                if (action == "delete") Text(if (entry.directory) "仅可删除空目录，删除后无法恢复。" else "删除后无法恢复。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                else OutlinedTextField(
+                    value = value,
+                    onValueChange = { value = it },
+                    enabled = !busy,
+                    label = { Text(if (action == "chmod") "八进制权限，例如 644" else "新名称") },
+                    shape = D.fieldShape,
+                    colors = galiaisTextFieldColors(),
+                    textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
+                error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
             }
         },
-        confirmButton = { TextButton(enabled = !busy, onClick = {
-            busy = true
-            scope.launch {
-                try {
-                    when (action) {
-                        "rename" -> app.envSsh.sftpRename(host, entry.path, value)
-                        "chmod" -> app.envSsh.sftpChmod(host, entry.path, value.trim())
-                        else -> app.envSsh.sftpDelete(host, entry.path, entry.directory)
-                    }
-                    onComplete()
-                } catch (cancel: CancellationException) { throw cancel }
-                catch (e: Exception) { error = e.message ?: "操作失败" }
-                finally { busy = false }
-            }
-        }) { Text(if (busy) "处理中" else title, color = if (action == "delete") G.danger else G.accent) } },
-        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("取消") } })
+        confirmButton = {
+            TextButton(enabled = !busy, onClick = {
+                busy = true
+                scope.launch {
+                    try {
+                        when (action) {
+                            "rename" -> app.envSsh.sftpRename(host, entry.path, value)
+                            "chmod" -> app.envSsh.sftpChmod(host, entry.path, value.trim())
+                            else -> app.envSsh.sftpDelete(host, entry.path, entry.directory)
+                        }
+                        onComplete()
+                    } catch (cancel: CancellationException) { throw cancel }
+                    catch (e: Exception) { error = e.message ?: "操作失败" }
+                    finally { busy = false }
+                }
+            }) { Text(if (busy) "处理中" else title, color = if (action == "delete") G.danger else G.accent, fontWeight = FontWeight.SemiBold) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("取消", color = G.inkMuted) } },
+    )
 }
 
 @Composable
@@ -156,12 +175,29 @@ fun SftpTextEditor(app: GaliaisApplication, host: SshHostConfig, path: String, o
     fun dismiss() { if (!busy) { if (text != original) confirmDiscard = true else onDismiss() } }
     LaunchedEffect(host.id, path) { read() }
     GaliaisSheet(onDismissRequest = ::dismiss) {
-        Column(Modifier.fillMaxWidth().imePadding().navigationBarsPadding().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text(path, fontFamily = Mono, style = MaterialTheme.typography.titleSmall)
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(path, fontFamily = Mono, style = MaterialTheme.typography.titleSmall, color = G.ink)
             HeaderProgressSlot(busy)
             error?.let { Text(it, color = G.danger, style = MaterialTheme.typography.bodySmall) }
-            OutlinedTextField(text, { text = it }, enabled = !busy && revision != null, modifier = Modifier.fillMaxWidth().heightIn(min = 200.dp, max = 420.dp),
-                label = { Text("UTF-8 文本") }, minLines = 8, maxLines = 18, textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono))
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                enabled = !busy && revision != null,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 200.dp, max = 420.dp),
+                label = { Text("UTF-8 文本") },
+                minLines = 8,
+                maxLines = 18,
+                shape = D.fieldShape,
+                colors = galiaisTextFieldColors(),
+                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
+            )
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 PrimaryPillButton("保存", enabled = !busy && revision != null && text != original, onClick = {
                     busy = true
@@ -184,11 +220,18 @@ fun SftpTextEditor(app: GaliaisApplication, host: SshHostConfig, path: String, o
             }
         }
     }
-    if (confirmDiscard) AlertDialog(onDismissRequest = { confirmDiscard = false; reloadAfterDiscard = false },
-        title = { Text("放弃未保存的修改？") },
-        confirmButton = { TextButton(onClick = {
-            confirmDiscard = false
-            if (reloadAfterDiscard) { reloadAfterDiscard = false; scope.launch { read() } } else onDismiss()
-        }) { Text("放弃修改", color = G.danger) } },
-        dismissButton = { TextButton(onClick = { confirmDiscard = false; reloadAfterDiscard = false }) { Text("保留") } })
+    if (confirmDiscard) {
+        GaliaisConfirmDialog(
+            title = "放弃未保存的修改？",
+            message = "当前文件有未保存的编辑内容，放弃后将无法恢复。",
+            confirmText = "放弃修改",
+            dismissText = "保留",
+            danger = true,
+            onConfirm = {
+                confirmDiscard = false
+                if (reloadAfterDiscard) { reloadAfterDiscard = false; scope.launch { read() } } else onDismiss()
+            },
+            onDismiss = { confirmDiscard = false; reloadAfterDiscard = false },
+        )
+    }
 }

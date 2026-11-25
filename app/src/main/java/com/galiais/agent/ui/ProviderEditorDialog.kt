@@ -10,32 +10,30 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.BottomSheetDefaults
-import androidx.compose.material3.Checkbox
-import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -232,8 +230,7 @@ fun ProviderEditorDialog(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .imePadding()
-                .navigationBarsPadding(),
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp),
@@ -341,28 +338,15 @@ fun ProviderEditorDialog(
 
                 // 协议选择器
                 Box {
-                    Surface(
+                    val activeTranslator = pluginTranslators.firstOrNull { "plugin:${it.id}" == customProtocolId }
+                    val protoLabel = if (customProtocolId.startsWith("plugin:")) {
+                        "插件协议：${activeTranslator?.name ?: customProtocolId.removePrefix("plugin:")}"
+                    } else protocol.label
+                    PickerField(
+                        label = "接口协议",
+                        value = protoLabel,
                         onClick = { protocolMenu = true },
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = D.shape(12.dp),
-                        color = G.surfaceSubtle,
-                        border = BorderStroke(0.75.dp, G.border),
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text("接口协议", style = MaterialTheme.typography.labelSmall, color = G.inkMuted)
-                                val activeTranslator = pluginTranslators.firstOrNull { "plugin:${it.id}" == customProtocolId }
-                                val protoLabel = if (customProtocolId.startsWith("plugin:")) {
-                                    "插件协议：${activeTranslator?.name ?: customProtocolId.removePrefix("plugin:")}"
-                                } else protocol.label
-                                Text(protoLabel, style = MaterialTheme.typography.bodyMedium, color = G.ink, fontWeight = FontWeight.Medium)
-                            }
-                            Icon(GaliaisIcons.ChevronDown, contentDescription = "切换协议", tint = G.inkMuted, modifier = Modifier.size(16.dp))
-                        }
-                    }
+                    )
                     GaliaisDropdownMenu(expanded = protocolMenu, onDismissRequest = { protocolMenu = false }) {
                         Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                             ProviderProtocol.entries.forEach { item ->
@@ -480,24 +464,11 @@ fun ProviderEditorDialog(
 
                 // 认证方式
                 Box {
-                    Surface(
+                    PickerField(
+                        label = "认证方式",
+                        value = authMode.label,
                         onClick = { authMenu = true },
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = D.shape(12.dp),
-                        color = G.surfaceSubtle,
-                        border = BorderStroke(0.75.dp, G.border),
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text("认证方式", style = MaterialTheme.typography.labelSmall, color = G.inkMuted)
-                                Text(authMode.label, style = MaterialTheme.typography.bodySmall, color = G.ink)
-                            }
-                            Icon(GaliaisIcons.ChevronDown, contentDescription = "更改认证", tint = G.inkMuted, modifier = Modifier.size(16.dp))
-                        }
-                    }
+                    )
                     GaliaisDropdownMenu(expanded = authMenu, onDismissRequest = { authMenu = false }) {
                         Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                             ProviderAuthMode.entries.forEach { item ->
@@ -582,18 +553,25 @@ fun ProviderEditorDialog(
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         models.forEach { m ->
                             Surface(
-                                onClick = { models.remove(m) },
                                 shape = D.shape(999.dp),
                                 color = G.surfaceSubtle,
                                 border = BorderStroke(0.75.dp, G.border),
                             ) {
                                 Row(
-                                    modifier = Modifier.padding(start = 10.dp, end = 7.dp, top = 5.dp, bottom = 5.dp),
+                                    modifier = Modifier.padding(start = 10.dp, end = 4.dp, top = 3.dp, bottom = 3.dp),
                                     verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(2.dp),
                                 ) {
-                                    Text(m, fontFamily = Mono, fontSize = 11.5.sp, color = G.ink)
-                                    Icon(GaliaisIcons.Close, contentDescription = "移除", tint = G.inkMuted, modifier = Modifier.size(13.dp))
+                                    Text(m, fontFamily = Mono, fontSize = 11.5.sp, color = G.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Box(
+                                        modifier = Modifier
+                                            .size(22.dp)
+                                            .clip(CircleShape)
+                                            .clickable(role = Role.Button) { models.remove(m) },
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Icon(GaliaisIcons.Close, contentDescription = "移除模型 $m", tint = G.inkMuted, modifier = Modifier.size(12.dp))
+                                    }
                                 }
                             }
                         }
@@ -656,7 +634,9 @@ fun ProviderEditorDialog(
                 if (!runtime.ready) {
                     Text("启动运行环境后可在线拉取模型与推理实测。", style = MaterialTheme.typography.bodySmall, color = G.inkSubtle)
                 }
-                HeaderProgressSlot(loading = busy)
+                if (busy) {
+                    GaliaisProgressBar(thin = true)
+                }
                 statusText?.let {
                     Surface(
                         Modifier.fillMaxWidth(),
@@ -738,18 +718,25 @@ fun ProviderEditorDialog(
                                     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                         backupKeys.forEachIndexed { idx, secret ->
                                             Surface(
-                                                onClick = { backupKeys.removeAt(idx) },
                                                 shape = D.shape(999.dp),
                                                 color = G.surfaceSubtle,
                                                 border = BorderStroke(0.75.dp, G.border),
                                             ) {
                                                 Row(
-                                                    modifier = Modifier.padding(start = 10.dp, end = 7.dp, top = 5.dp, bottom = 5.dp),
+                                                    modifier = Modifier.padding(start = 10.dp, end = 4.dp, top = 3.dp, bottom = 3.dp),
                                                     verticalAlignment = Alignment.CenterVertically,
-                                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                                    horizontalArrangement = Arrangement.spacedBy(2.dp),
                                                 ) {
                                                     Text("#${idx + 2} ${maskApiKey(secret)}", fontFamily = Mono, fontSize = 11.5.sp, color = G.ink)
-                                                    Icon(GaliaisIcons.Close, contentDescription = "移除备用密钥", tint = G.inkMuted, modifier = Modifier.size(13.dp))
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .size(22.dp)
+                                                            .clip(CircleShape)
+                                                            .clickable(role = Role.Button) { backupKeys.removeAt(idx) },
+                                                        contentAlignment = Alignment.Center,
+                                                    ) {
+                                                        Icon(GaliaisIcons.Close, contentDescription = "移除备用密钥", tint = G.inkMuted, modifier = Modifier.size(12.dp))
+                                                    }
                                                 }
                                             }
                                         }
@@ -876,68 +863,75 @@ internal fun RemoteModelPickerDialog(remote: List<String>, existing: Set<String>
         val q = query.trim().lowercase()
         if (q.isEmpty()) remote else remote.filter { it.lowercase().contains(q) }
     }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = G.surface,
-        shape = D.dialogShape,
-        title = { Text("选择模型（${selected.size}/${remote.size}）", color = G.ink) },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(
-                    value = query,
-                    onValueChange = { query = it },
-                    label = { Text("筛选模型") },
-                    singleLine = true,
-                    shape = D.fieldShape,
-                    colors = galiaisTextFieldColors(),
-                    modifier = Modifier.fillMaxWidth(),
+    GaliaisSheetScaffold(
+        title = "选择远端模型",
+        subtitle = "已选 ${selected.size} / 共 ${remote.size} 个模型",
+        onDismiss = onDismiss,
+        scrollable = false,
+        footer = {
+            SecondaryPillButton("取消", onClick = onDismiss)
+            PrimaryPillButton(
+                text = "添加所选 (${selected.size})",
+                modifier = Modifier.weight(1f),
+                enabled = selected.isNotEmpty(),
+                onClick = { onConfirm(selected.toList()) },
+            )
+        },
+    ) {
+        SearchBar(
+            value = query,
+            onValueChange = { query = it },
+            placeholder = "按模型 ID 或系列筛选…",
+        )
+        LazyRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            items(listOf("gpt", "claude", "gemini", "deepseek", "qwen")) { family ->
+                SelectableChip(
+                    text = family,
+                    selected = query.equals(family, ignoreCase = true),
+                    onClick = { query = if (query.equals(family, ignoreCase = true)) "" else family },
                 )
+            }
+            item {
+                TagPill("全选当前", fg = G.accent, bg = G.accentContainer, onClick = {
+                    filtered.take(60).forEach { if (it !in selected) selected.add(it) }
+                })
+            }
+            if (selected.isNotEmpty()) {
+                item {
+                    TagPill("清空", fg = G.inkMuted, bg = G.surfaceSubtle, onClick = { selected.clear() })
+                }
+            }
+        }
+        LazyColumn(
+            modifier = Modifier.fillMaxWidth().heightIn(max = 360.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            items(filtered, key = { it }) { id ->
+                val checked = id in selected
                 Row(
-                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(D.shape(8.dp))
+                        .toggleable(checked, role = Role.Checkbox) { if (it) selected.add(id) else selected.remove(id) }
+                        .padding(vertical = 4.dp, horizontal = 2.dp),
                 ) {
-                    listOf("gpt", "claude", "gemini", "deepseek", "qwen").forEach { family ->
-                        SelectableChip(
-                            text = family,
-                            selected = query.equals(family, ignoreCase = true),
-                            onClick = { query = if (query.equals(family, ignoreCase = true)) "" else family },
-                        )
-                    }
-                    TagPill("全选当前结果", fg = G.accent, bg = G.accentContainer, onClick = {
-                        filtered.take(40).forEach { if (it !in selected) selected.add(it) }
-                    })
-                    if (selected.isNotEmpty()) {
-                        TagPill("清空", fg = G.inkMuted, bg = G.surfaceSubtle, onClick = { selected.clear() })
-                    }
-                }
-                Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
-                    filtered.take(150).forEach { id ->
-                        val checked = id in selected
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(D.shape(8.dp))
-                                .toggleable(checked, role = Role.Checkbox) { if (it) selected.add(id) else selected.remove(id) }
-                                .padding(vertical = 2.dp),
-                        ) {
-                            GaliaisCheckbox(checked)
-                            Text(id, fontFamily = Mono, style = MaterialTheme.typography.bodySmall, color = G.ink)
-                        }
-                    }
-                    if (filtered.size > 150) {
-                        Text("仅显示前 150 条，请输入关键词缩小范围。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-                    }
+                    GaliaisCheckbox(checked)
+                    Text(
+                        id,
+                        fontFamily = Mono,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = G.ink,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
                 }
             }
-        },
-        confirmButton = {
-            TextButton(onClick = { onConfirm(selected.toList()) }) {
-                Text("添加所选模型", color = G.ink, fontWeight = FontWeight.SemiBold)
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("取消", color = G.inkMuted) }
-        },
-    )
+        }
+    }
 }

@@ -11,18 +11,23 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SnackbarHostState
@@ -79,6 +84,7 @@ fun EnvironmentHubScreen(
     var scopeFilter by remember { mutableStateOf("all") }
     var varSearch by remember { mutableStateOf("") }
     var editingVar by remember { mutableStateOf<EnvVarEntry?>(null) }
+    var deletingVar by remember { mutableStateOf<EnvVarEntry?>(null) }
     var creatingVar by remember { mutableStateOf(false) }
     var presetSeed by remember { mutableStateOf<EnvPresetTemplate?>(null) }
     var showImportDotEnv by remember { mutableStateOf(false) }
@@ -149,52 +155,62 @@ fun EnvironmentHubScreen(
     val enabledCount = envConfig.vars.count { it.enabled }
     val secretCount = envConfig.vars.count { it.secret }
 
-    SubPageScaffold(title = "环境中心", onBack = onBack, snackbar = snackbar, loading = syncing || dotEnvLoading) {
-        CrispCard(padding = PaddingValues(14.dp)) {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Icon(GaliaisIcons.Wrench, contentDescription = null, tint = G.accent, modifier = Modifier.size(18.dp))
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text("全 Agent · 终端统一开发环境变量", style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
-                        Text(
-                            "启用 $enabledCount 条（加密 $secretCount）· PATH +${envConfig.extraPaths.size} · 别名 ${envConfig.aliases.size}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = G.inkMuted,
-                        )
-                    }
-                }
-                Text(
-                    "环境配置用于新启动的 Agent、MCP 和终端。已有会话需重新连接。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = G.inkMuted,
+    SubPageScaffold(
+        title = "环境中心",
+        onBack = onBack,
+        snackbar = snackbar,
+        loading = syncing || dotEnvLoading,
+        actions = {
+            if (runtime.ready) {
+                CompactActionButton("快照", onClick = { showSnapshot = true })
+                CompactActionButton(
+                    text = if (syncing) "同步中…" else "同步",
+                    primary = true,
+                    enabled = !syncing,
+                    onClick = {
+                        scope.launch {
+                            try {
+                                app.envSsh.syncEnvironmentNow(force = true)
+                                app.conversations.notify("环境配置已同步到 Linux 运行时")
+                            } catch (e: Exception) {
+                                app.conversations.notify("同步失败：${e.message}")
+                            }
+                        }
+                    },
                 )
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            }
+        },
+    ) {
+        if (!runtime.ready || syncError != null) {
+            CrispCard(padding = PaddingValues(12.dp), background = if (syncError != null) G.dangerTint else G.surfaceSubtle) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            if (syncError != null) "配置尚未生效：$syncError" else "本地运行环境未就绪",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (syncError != null) G.danger else G.ink,
+                        )
+                        if (!runtime.ready) {
+                            Text("启动后将自动把环境变量与 Shell 配置同步至 Linux 运行时。", style = MaterialTheme.typography.labelSmall, color = G.inkMuted)
+                        }
+                    }
                     if (!runtime.ready) {
                         PrimaryPillButton(
-                            text = if (runtime.busy) "运行环境启动中…" else "立即启动运行环境",
+                            text = if (runtime.busy) "启动中…" else "启动",
                             enabled = runtime.bound && !runtime.busy,
                             onClick = app.runtime::start,
                         )
-                    } else {
-                        PrimaryPillButton(
-                            text = if (syncing) "同步中…" else "立即同步",
-                            enabled = !syncing,
-                            onClick = {
-                                scope.launch {
-                                    try {
-                                        app.envSsh.syncEnvironmentNow(force = true)
-                                        app.conversations.notify("环境配置已同步到 Linux 运行时")
-                                    } catch (e: Exception) {
-                                        app.conversations.notify("同步失败：${e.message}")
-                                    }
-                                }
-                            },
-                        )
-                        SecondaryPillButton("生效环境快照", onClick = { showSnapshot = true })
                     }
                 }
-                syncError?.let { Text("配置尚未生效：$it", style = MaterialTheme.typography.bodySmall, color = G.danger) }
             }
+        } else {
+            Text(
+                "启用 $enabledCount 条（加密 $secretCount）· PATH +${envConfig.extraPaths.size} · 别名 ${envConfig.aliases.size} · 适用于新启动的 Agent 与终端",
+                style = MaterialTheme.typography.labelSmall,
+                color = G.inkMuted,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
 
         SegmentedPillBar(
@@ -250,39 +266,47 @@ fun EnvironmentHubScreen(
                     }
                 } else {
                     filtered.forEach { item ->
-                        CrispCard(padding = PaddingValues(13.dp)) {
-                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                            Text(item.key, fontFamily = Mono, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = G.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                            if (item.secret) TagPill("Secret", fg = G.warning, bg = G.warningTint)
-                                            TagPill(
-                                                if (item.scope == "global") "全局" else item.scope.removePrefix("project:").substringAfterLast('/'),
-                                                fg = G.inkMuted,
-                                                bg = G.surfaceSubtle,
-                                            )
-                                        }
+                        CrispCard(
+                            padding = PaddingValues(start = 13.dp, end = 6.dp, top = 11.dp, bottom = 11.dp),
+                            onClick = { editingVar = item },
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                         Text(
-                                            if (item.secret) {
-                                                if (app.envSsh.hasEnvSecret(item.id)) "••••••••（Android Keystore 加密存储）" else "（未填写 Secret 值）"
-                                            } else item.value.ifBlank { "(空值)" },
+                                            item.key,
                                             fontFamily = Mono,
-                                            fontSize = 11.5.sp,
-                                            color = G.inkMuted,
-                                            maxLines = 2,
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = G.ink,
+                                            maxLines = 1,
                                             overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f, fill = false),
                                         )
-                                        if (item.note.isNotBlank()) {
-                                            Text(item.note, style = MaterialTheme.typography.bodySmall, color = G.inkSubtle)
-                                        }
+                                        if (item.secret) TagPill("Secret", fg = G.warning, bg = G.warningTint)
+                                        TagPill(
+                                            if (item.scope == "global") "全局" else item.scope.removePrefix("project:").substringAfterLast('/'),
+                                            fg = G.inkMuted,
+                                            bg = G.surfaceSubtle,
+                                        )
                                     }
-                                    GaliaisSwitch(checked = item.enabled, onCheckedChange = { app.envSsh.toggleEnvVar(item.id, it) })
+                                    Text(
+                                        if (item.secret) {
+                                            if (app.envSsh.hasEnvSecret(item.id)) "••••••••（Android Keystore 加密存储）" else "（未填写 Secret 值）"
+                                        } else item.value.ifBlank { "(空值)" },
+                                        fontFamily = Mono,
+                                        fontSize = 11.5.sp,
+                                        color = G.inkMuted,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    if (item.note.isNotBlank()) {
+                                        Text(item.note, style = MaterialTheme.typography.bodySmall, color = G.inkSubtle, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    }
                                 }
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    TagPill("编辑", fg = G.accent, bg = G.accentContainer, onClick = { editingVar = item })
-                                    Spacer(Modifier.weight(1f))
-                                    TagPill("删除", fg = G.danger, bg = G.dangerTint, onClick = { app.envSsh.deleteEnvVar(item.id) })
+                                GaliaisSwitch(checked = item.enabled, onCheckedChange = { app.envSsh.toggleEnvVar(item.id, it) })
+                                IconButton(onClick = { deletingVar = item }, modifier = Modifier.size(34.dp)) {
+                                    Icon(GaliaisIcons.Trash, contentDescription = "删除变量", tint = G.danger, modifier = Modifier.size(16.dp))
                                 }
                             }
                         }
@@ -527,17 +551,32 @@ fun EnvironmentHubScreen(
         Spacer(Modifier.height(16.dp))
     }
 
+    deletingVar?.let { target ->
+        GaliaisConfirmDialog(
+            title = "删除环境变量？",
+            message = "将删除变量「${target.key}」${if (target.secret) "及其加密保存的 Secret 值" else ""}，不会影响已有运行中进程。",
+            confirmText = "删除",
+            danger = true,
+            onConfirm = {
+                app.envSsh.deleteEnvVar(target.id)
+                deletingVar = null
+            },
+            onDismiss = { deletingVar = null },
+        )
+    }
+
     pendingDotEnvRead?.let { target ->
-        AlertDialog(
-            onDismissRequest = { pendingDotEnvRead = null },
-            title = { Text("放弃未保存的修改？") },
-            text = { Text("将重新读取所选项目的 .env 文件。") },
-            confirmButton = { TextButton(onClick = {
+        GaliaisConfirmDialog(
+            title = "放弃未保存的修改？",
+            message = "将重新读取所选项目的 .env 文件，当前未保存改动会丢失。",
+            confirmText = "重新读取",
+            danger = true,
+            onConfirm = {
                 pendingDotEnvRead = null
                 selectedDotEnvCwd = target
                 dotEnvReload++
-            }) { Text("重新读取") } },
-            dismissButton = { TextButton(onClick = { pendingDotEnvRead = null }) { Text("取消") } },
+            },
+            onDismiss = { pendingDotEnvRead = null },
         )
     }
 
@@ -595,8 +634,7 @@ private fun EnvVarEditorSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .imePadding()
-                .navigationBarsPadding()
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp)
                 .padding(bottom = 22.dp),
@@ -641,8 +679,14 @@ private fun EnvVarEditorSheet(
                 )
             }
             if (secret && initial?.secret == true && app.envSsh.hasEnvSecret(initial.id)) {
-                SettingsToggleRow(title = "清除已保存的敏感值", subtitle = "", checked = clearSecret,
-                    onCheckedChange = { clearSecret = it; if (it) value = "" })
+                CrispCard(padding = PaddingValues(0.dp)) {
+                    SettingsToggleRow(
+                        title = "清除已保存的敏感值",
+                        subtitle = "",
+                        checked = clearSecret,
+                        onCheckedChange = { clearSecret = it; if (it) value = "" },
+                    )
+                }
             }
             Text("生效范围", style = MaterialTheme.typography.labelMedium, color = G.inkMuted)
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -703,12 +747,14 @@ private fun DotEnvImportDialog(
     var autoSecret by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
 
-    AlertDialog(
+    GaliaisAlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = G.surface,
-        title = { Text("批量导入 .env 变量", color = G.ink) },
+        title = "批量导入 .env 变量",
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     SelectableChip("全局", selected = scopeTag == "global", onClick = { scopeTag = "global" })
                     projectPaths.take(4).forEach { p ->
@@ -728,12 +774,14 @@ private fun DotEnvImportDialog(
                     textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
                     modifier = Modifier.fillMaxWidth(),
                 )
-                SettingsToggleRow(
-                    title = "敏感键自动加密",
-                    subtitle = "含 TOKEN / SECRET / KEY / PASSWORD 时自动存为 Keystore Secret",
-                    checked = autoSecret,
-                    onCheckedChange = { autoSecret = it },
-                )
+                CrispCard(padding = PaddingValues(0.dp)) {
+                    SettingsToggleRow(
+                        title = "敏感键自动加密",
+                        subtitle = "含 TOKEN / SECRET / KEY / PASSWORD 时自动存为 Keystore Secret",
+                        checked = autoSecret,
+                        onCheckedChange = { autoSecret = it },
+                    )
+                }
                 error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
             }
         },
@@ -741,7 +789,7 @@ private fun DotEnvImportDialog(
             TextButton(onClick = {
                 try { onImport(raw, scopeTag, autoSecret) }
                 catch (e: Exception) { error = e.message ?: "导入失败" }
-            }) { Text("导入", color = G.accent) }
+            }) { Text("导入", color = G.accent, fontWeight = FontWeight.SemiBold) }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("取消", color = G.inkMuted) }
@@ -784,7 +832,7 @@ private fun RuntimeEnvSnapshotSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .navigationBarsPadding()
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
                 .padding(horizontal = 16.dp)
                 .padding(bottom = 18.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -798,20 +846,20 @@ private fun RuntimeEnvSnapshotSheet(
                 }
             }
             SearchBar(value = query, onValueChange = { query = it }, placeholder = "搜索变量名或值…")
+            HeaderProgressSlot(loading)
             error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 160.dp, max = 420.dp)
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                if (loading) {
-                    Text("正在读取生效环境变量…", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-                } else if (filtered.isEmpty()) {
-                    Text("没有匹配的变量。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-                } else {
-                    filtered.forEach { item ->
+            if (loading) {
+                Text("正在读取生效环境变量…", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+            } else if (filtered.isEmpty()) {
+                Text("没有匹配的变量。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 160.dp, max = 440.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    items(filtered, key = { it.key }) { item ->
                         CrispCard(padding = PaddingValues(horizontal = 11.dp, vertical = 8.dp)) {
                             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {

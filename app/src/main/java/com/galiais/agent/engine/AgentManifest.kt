@@ -70,16 +70,16 @@ data class AgentCapabilities(
         val CLAUDE = AgentCapabilities(
             streaming = true, approval = true, reasoning = true, plan = true, diff = true,
             images = true, modes = true, models = true, effort = true, steer = false,
-            revert = false, fork = true, archive = false, slashCommands = true, mcp = true,
+            revert = true, fork = true, archive = false, slashCommands = true, mcp = true,
             skills = true, delegation = true, customProvider = true,
         )
         val ACP_DEFAULT = AgentCapabilities(
             streaming = true, approval = true, reasoning = true, plan = true, diff = true,
-            images = true, modes = true, models = true, effort = false, slashCommands = true,
+            images = true, modes = true, models = true, effort = false, revert = true, slashCommands = true,
             mcp = true, customProvider = true,
         )
         val BRIDGE_DEFAULT = AgentCapabilities(
-            streaming = true, approval = false, reasoning = false, models = true, customProvider = true,
+            streaming = true, approval = false, reasoning = false, models = true, revert = true, customProvider = true,
         )
 
         fun fromJson(obj: JSONObject?, fallback: AgentCapabilities = BRIDGE_DEFAULT): AgentCapabilities {
@@ -420,7 +420,7 @@ object BuiltInAgents {
         capabilities = AgentCapabilities(
             streaming = true, approval = true, reasoning = true, plan = true, diff = true,
             images = true, modes = true, models = true, effort = true, steer = false,
-            revert = false, fork = false, archive = false, slashCommands = true,
+            revert = true, fork = false, archive = false, slashCommands = true,
             mcp = true, skills = true, delegation = true, customProvider = true,
         ),
     )

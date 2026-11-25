@@ -264,35 +264,44 @@ fun SessionInfoSheet(
                 }
             }
 
-            SectionLabel("会话操作")
+            SectionLabel("模型与上下文")
             CrispCard(padding = PaddingValues(0.dp)) {
                 val running = state?.running == true
                 SheetActionRow(GaliaisIcons.Plug, "切换服务商与模型", "更换本会话使用的服务商、模型或推理档位", enabled = !running, onClick = { onDismiss(); onSwitchProviderModel() })
-                Hairline()
-                SheetActionRow(GaliaisIcons.Edit, "重命名会话", "修改当前会话标题", onClick = { onDismiss(); onRename() })
-                Hairline()
+                Hairline(Modifier.padding(start = 48.dp))
                 SheetActionRow(GaliaisIcons.Compress, "压缩上下文", "总结早期消息，减少上下文占用", enabled = !running, onClick = { onDismiss(); onCompact() })
                 if (onFork != null) {
-                    Hairline()
+                    Hairline(Modifier.padding(start = 48.dp))
                     SheetActionRow(GaliaisIcons.GitBranch, "创建会话分支", "沿用当前上下文创建新会话", enabled = !running, onClick = { onDismiss(); onFork() })
                 }
-                if (onArchive != null) {
-                    Hairline()
-                    SheetActionRow(GaliaisIcons.Archive, "归档会话", "移入归档列表，可从会话页恢复", enabled = !running, onClick = { onDismiss(); onArchive() })
-                }
-                Hairline()
+                Hairline(Modifier.padding(start = 48.dp))
                 SheetActionRow(GaliaisIcons.ShieldCheck, "代码审查", "审查当前工作区的未提交代码改动", enabled = !running, onClick = { onDismiss(); onReview() })
-                Hairline()
+            }
+
+            SectionLabel("导出与工作区")
+            CrispCard(padding = PaddingValues(0.dp)) {
                 SheetActionRow(GaliaisIcons.Copy, "复制会话 Markdown", "复制已加载的会话内容，较长的工具输出会截断", onClick = { onDismiss(); onExportCopy() })
                 if (state?.summary?.cwd != null) {
-                    Hairline()
+                    Hairline(Modifier.padding(start = 48.dp))
                     SheetActionRow(GaliaisIcons.FilePlus, "导出 Markdown 到工作区", "保存为当前目录下的 .md 文件", onClick = { onDismiss(); onExportSave() })
                 }
                 if (onOpenDirectory != null) {
-                    Hairline()
+                    Hairline(Modifier.padding(start = 48.dp))
                     SheetActionRow(GaliaisIcons.Folder, "打开工作目录", "浏览、编辑或查看 Git 改动", onClick = { onDismiss(); onOpenDirectory() })
                 }
-                Hairline()
+            }
+
+            SectionLabel("会话管理")
+            CrispCard(padding = PaddingValues(0.dp)) {
+                val running = state?.running == true
+                SheetActionRow(GaliaisIcons.Edit, "重命名会话", "修改当前会话标题", onClick = { onDismiss(); onRename() })
+                if (onArchive != null) {
+                    Hairline(Modifier.padding(start = 48.dp))
+                    SheetActionRow(GaliaisIcons.Archive, "归档会话", "移入归档列表，可从会话页恢复", enabled = !running, onClick = { onDismiss(); onArchive() })
+                }
+            }
+
+            CrispCard(padding = PaddingValues(0.dp)) {
                 SheetActionRow(GaliaisIcons.Trash, "删除此会话", "仅删除会话记录，不影响工作区文件", danger = true, onClick = { onDismiss(); onDelete() })
             }
         }
@@ -361,7 +370,7 @@ fun reasoningSummaryOptions(engine: EngineKind): List<Pair<String, String>> = wh
 @Composable
 fun AgentOptionChips(title: String, options: List<Pair<String?, String>>, selected: String?, onSelect: (String?) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        SectionLabel(title)
+        Text(title, style = MaterialTheme.typography.titleSmall, color = G.ink)
         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             options.forEach { (value, label) ->
                 SelectableChip(label, selected = value == selected, onClick = { onSelect(value) })
@@ -467,7 +476,11 @@ private fun TokenUsageCard(usage: TokenUsage) {
                     color = G.inkMuted,
                 )
             }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 StatCell("总输入", usage.inputTokens)
                 StatCell("未缓存", usage.uncachedInputTokens)
                 StatCell("缓存读", usage.cachedInputTokens)

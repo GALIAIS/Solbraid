@@ -7,6 +7,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -18,13 +19,11 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -60,11 +59,11 @@ fun ThemePreview() {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(D.space(9.dp)),
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(D.space(7.dp)),
         ) {
             CrispCard(
-                padding = PaddingValues(D.space(12.dp)),
+                padding = PaddingValues(D.space(10.dp)),
                 groupPosition = if (D.listLayout == "grouped") CardGroupPos.FIRST else CardGroupPos.SINGLE,
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -72,7 +71,7 @@ fun ThemePreview() {
                     Text("模块化主题预览", style = MaterialTheme.typography.titleSmall, color = G.ink, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                     TagPill("运行中", fg = G.success, bg = G.successTint)
                 }
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(6.dp))
                 Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
                     Surface(
                         shape = D.shape(16.dp),
@@ -83,11 +82,11 @@ fun ThemePreview() {
                             "7 个外观维度实时自由混搭",
                             style = MaterialTheme.typography.bodyMedium,
                             color = G.onUserBubble,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
                         )
                     }
                 }
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(6.dp))
                 CodeBlock("fun mix(axes: Int = 7) = \"17,000+ styles\"", "kotlin")
             }
 
@@ -97,9 +96,14 @@ fun ThemePreview() {
             ) {
                 Text("./gradlew :app:assembleArm64Debug", fontFamily = Mono, fontSize = 11.5.sp, color = G.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    PrimaryPillButton("批准执行", onClick = {})
-                    SecondaryPillButton("拒绝", onClick = {}, danger = true)
-                    Spacer(Modifier.weight(1f))
+                    FlowRow(
+                        modifier = Modifier.weight(1f),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        PrimaryPillButton("批准执行", onClick = {})
+                        SecondaryPillButton("拒绝", onClick = {}, danger = true)
+                    }
                     GaliaisSwitch(checked = true, onCheckedChange = {})
                 }
             }
@@ -329,7 +333,7 @@ fun ThemePresetCard(
                         modeTag,
                         fontSize = 9.sp,
                         color = if (ColorEngine.relativeLuminance(bg) > 0.36) Color(0xFF18181B) else Color(0xFFF3F4F8),
-                        modifier = Modifier.align(Alignment.TopEnd),
+                        modifier = Modifier.align(Alignment.BottomStart),
                     )
                 }
             }
@@ -343,14 +347,14 @@ fun ThemePresetCard(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(4.dp)
-                    .size(20.dp)
+                    .size(24.dp)
                     .clip(CircleShape)
-                    .background(G.surface.copy(alpha = 0.92f))
+                    .background(G.surface.copy(alpha = 0.94f))
                     .border(0.75.dp, G.borderStrong, CircleShape)
                     .clickable(onClick = onDelete),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(GaliaisIcons.Close, contentDescription = "删除收藏主题", tint = G.inkMuted, modifier = Modifier.size(11.dp))
+                Icon(GaliaisIcons.Close, contentDescription = "删除收藏主题", tint = G.inkMuted, modifier = Modifier.size(12.dp))
             }
         }
     }
@@ -361,17 +365,17 @@ fun ThemePresetCard(
 fun SchemeRolesStrip() {
     val s = MaterialTheme.colorScheme
     val roles = listOf(
-        Triple("Primary", s.primary, s.onPrimary),
-        Triple("Secondary", s.secondary, s.onSecondary),
-        Triple("Tertiary", s.tertiary, s.onTertiary),
-        Triple("Container", s.primaryContainer, s.onPrimaryContainer),
-        Triple("Surface", s.surfaceContainerHighest, s.onSurface),
-        Triple("Error", s.error, s.onError),
+        Triple("主色", s.primary, s.onPrimary),
+        Triple("辅色", s.secondary, s.onSecondary),
+        Triple("三色", s.tertiary, s.onTertiary),
+        Triple("容器", s.primaryContainer, s.onPrimaryContainer),
+        Triple("表面", s.surfaceContainerHighest, s.onSurface),
+        Triple("错误", s.error, s.onError),
     )
     Row(Modifier.fillMaxWidth().clip(D.shape(12.dp)), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
         roles.forEach { (name, bg, fg) ->
-            Box(Modifier.weight(1f).height(54.dp).background(bg).padding(5.dp), contentAlignment = Alignment.BottomStart) {
-                Text(name, fontSize = 8.5.sp, color = fg, maxLines = 1, overflow = TextOverflow.Clip)
+            Box(Modifier.weight(1f).height(52.dp).background(bg).padding(6.dp), contentAlignment = Alignment.BottomStart) {
+                Text(name, fontSize = 10.sp, color = fg, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
     }
@@ -389,33 +393,32 @@ fun parseHexColor(text: String): Long? {
 fun HexColorDialog(title: String, initial: Long, onDismiss: () -> Unit, onConfirm: (Long) -> Unit) {
     var value by remember { mutableStateOf(initial.toHex()) }
     val parsed = parseHexColor(value)
-    AlertDialog(
+    GaliaisAlertDialog(
+        title = title,
         onDismissRequest = onDismiss,
-        containerColor = G.surface,
-        shape = D.dialogShape,
-        title = { Text(title, color = G.ink) },
-        text = {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Box(Modifier.size(48.dp).clip(D.shape(12.dp)).background(parsed?.let { Color(it.toInt()) } ?: G.surfaceSubtle)
-                    .border(1.dp, G.border, D.shape(12.dp)))
-                OutlinedTextField(
-                    value = value,
-                    onValueChange = { value = it.take(7) },
-                    label = { Text("HEX，如 #0F8A68") },
-                    singleLine = true,
-                    isError = parsed == null,
-                    shape = D.fieldShape,
-                    colors = galiaisTextFieldColors(),
-                    textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
-                    modifier = Modifier.weight(1f),
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = { parsed?.let(onConfirm) }, enabled = parsed != null) {
-                Text("应用", color = if (parsed != null) G.accent else G.inkSubtle, fontWeight = FontWeight.SemiBold)
-            }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消", color = G.inkMuted) } },
-    )
+        confirmText = "应用",
+        confirmEnabled = parsed != null,
+        onConfirm = { parsed?.let(onConfirm) },
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Box(
+                Modifier
+                    .size(48.dp)
+                    .clip(D.shape(12.dp))
+                    .background(parsed?.let { Color(it.toInt()) } ?: G.surfaceSubtle)
+                    .border(1.dp, G.border, D.shape(12.dp)),
+            )
+            OutlinedTextField(
+                value = value,
+                onValueChange = { value = it.take(7) },
+                label = { Text("HEX，如 #0F8A68") },
+                singleLine = true,
+                isError = parsed == null,
+                shape = D.fieldShape,
+                colors = galiaisTextFieldColors(),
+                textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
 }

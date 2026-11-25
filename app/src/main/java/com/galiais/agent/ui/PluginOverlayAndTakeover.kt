@@ -7,18 +7,24 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
@@ -42,13 +48,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.toClipEntry
-import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.galiais.agent.GaliaisApplication
@@ -96,17 +103,21 @@ fun PluginGlobalOverlayLayer(
         val density = LocalDensity.current
         val scope = rememberCoroutineScope()
         val pluginNav = LocalPluginNavigator.current
-        Box(
+        val bottomChrome = LocalBottomChromeInset.current
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxSize()
                 .statusBarsPadding()
                 .navigationBarsPadding()
-                .padding(horizontal = 12.dp, vertical = 10.dp),
+                .padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = bottomChrome.coerceAtLeast(10.dp)),
         ) {
+            val containerW = constraints.maxWidth.toFloat()
+            val containerH = constraints.maxHeight.toFloat()
             overlaySlots.forEach { slot ->
                 val slotKey = "${slot.pluginId}:${slot.id}"
                 var dragX by remember(slotKey) { mutableFloatStateOf(0f) }
                 var dragY by remember(slotKey) { mutableFloatStateOf(0f) }
+                var itemSize by remember(slotKey) { mutableStateOf(IntSize.Zero) }
                 var collapsed by remember(slotKey) { mutableStateOf(false) }
                 var cardRefreshSeq by remember(slotKey) { mutableIntStateOf(0) }
                 var cardPayload by remember(slotKey) { mutableStateOf<HostPluginSduiPayload?>(null) }
@@ -148,22 +159,51 @@ fun PluginGlobalOverlayLayer(
                     }
                 }
 
+                val align = parseOverlayAlignment(slot.alignment)
                 val baseOffsetX = with(density) { slot.offsetX.dp.toPx() }
                 val baseOffsetY = with(density) { slot.offsetY.dp.toPx() }
+                val itemW = itemSize.width.toFloat().coerceAtLeast(1f)
+                val itemH = itemSize.height.toFloat().coerceAtLeast(1f)
+                val availW = (containerW - itemW).coerceAtLeast(0f)
+                val availH = (containerH - itemH).coerceAtLeast(0f)
+                val minX = when (align) {
+                    Alignment.TopStart, Alignment.CenterStart, Alignment.BottomStart -> 0f
+                    Alignment.TopCenter, Alignment.Center, Alignment.BottomCenter -> -availW / 2f
+                    else -> -availW
+                }
+                val maxX = minX + availW
+                val minY = when (align) {
+                    Alignment.TopStart, Alignment.TopCenter, Alignment.TopEnd -> 0f
+                    Alignment.CenterStart, Alignment.Center, Alignment.CenterEnd -> -availH / 2f
+                    else -> -availH
+                }
+                val maxY = minY + availH
+                val clampedX = (baseOffsetX + dragX).coerceIn(minX, maxX)
+                val clampedY = (baseOffsetY + dragY).coerceIn(minY, maxY)
+
                 val dragMod = if (slot.draggable) {
-                    Modifier.pointerInput(slotKey) {
-                        detectDragGestures { change, dragAmount ->
+                    Modifier.pointerInput(slotKey, minX, maxX, minY, maxY, isCardMode, collapsed) {
+                        detectDragGestures(
+                            onDragEnd = {
+                                if (!isCardMode || collapsed) {
+                                    val cur = (baseOffsetX + dragX).coerceIn(minX, maxX)
+                                    val snap = if (cur - minX < maxX - cur) minX else maxX
+                                    dragX = snap - baseOffsetX
+                                }
+                            },
+                        ) { change, dragAmount ->
                             change.consume()
-                            dragX += dragAmount.x
-                            dragY += dragAmount.y
+                            dragX = (baseOffsetX + dragX + dragAmount.x).coerceIn(minX, maxX) - baseOffsetX
+                            dragY = (baseOffsetY + dragY + dragAmount.y).coerceIn(minY, maxY) - baseOffsetY
                         }
                     }
                 } else Modifier
 
                 Box(
                     modifier = Modifier
-                        .align(parseOverlayAlignment(slot.alignment))
-                        .offset { IntOffset((baseOffsetX + dragX).roundToInt(), (baseOffsetY + dragY).roundToInt()) }
+                        .align(align)
+                        .offset { IntOffset(clampedX.roundToInt(), clampedY.roundToInt()) }
+                        .onSizeChanged { itemSize = it }
                         .then(dragMod),
                 ) {
                     val liveCard = cardPayload
@@ -176,7 +216,7 @@ fun PluginGlobalOverlayLayer(
                                 border = BorderStroke(1.dp, G.borderStrong),
                                 shadowElevation = 8.dp,
                             ) {
-                                Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                         Box(Modifier.size(7.dp).clip(CircleShape).background(G.accent))
                                         Text(
@@ -199,6 +239,7 @@ fun PluginGlobalOverlayLayer(
                                         onOpenSurface = { pid, sid -> openingSurface = pid to sid },
                                         onOpenPanel = { pid, art -> openingPanel = pid to art },
                                         onRefresh = { cardRefreshSeq += 1 },
+                                        embedded = true,
                                     )
                                 }
                             }
@@ -207,7 +248,7 @@ fun PluginGlobalOverlayLayer(
                             Surface(
                                 onClick = { triggerOverlay() },
                                 modifier = Modifier.size(48.dp),
-                                shape = CircleShape,
+                                shape = D.fabShape,
                                 color = G.accent,
                                 contentColor = G.onAccent,
                                 shadowElevation = 8.dp,
@@ -360,25 +401,39 @@ fun PluginFullPageRouteScreen(
         }
     }
 
-    Column(Modifier.fillMaxSize().galiaisCanvasBackground().statusBarsPadding().navigationBarsPadding()) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .galiaisCanvasBackground()
+            .statusBarsPadding()
+            .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
+    ) {
         Row(
-            modifier = Modifier.fillMaxWidth().height(56.dp).padding(start = 6.dp, end = 8.dp),
+            modifier = Modifier.fillMaxWidth().height(if (D.material) 64.dp else 56.dp).padding(start = 4.dp, end = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            IconButton(onClick = onBack, modifier = Modifier.size(38.dp)) {
+            IconButton(onClick = onBack) {
                 Icon(GaliaisIcons.ArrowBack, contentDescription = "返回", tint = G.ink, modifier = Modifier.size(20.dp))
             }
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text(payload?.title?.ifBlank { surfaceId } ?: surfaceId, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = G.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        payload?.title?.ifBlank { surfaceId } ?: surfaceId,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = G.ink,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
                     TagPill("原生页面", fg = G.accent, bg = G.accentContainer)
                 }
                 payload?.subtitle?.takeIf { it.isNotBlank() }?.let {
                     Text(it, fontFamily = Mono, fontSize = 11.sp, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
-            IconButton(onClick = { reloadSeq += 1 }, enabled = !loading, modifier = Modifier.size(36.dp)) {
+            IconButton(onClick = { reloadSeq += 1 }, enabled = !loading) {
                 Icon(GaliaisIcons.Refresh, contentDescription = "刷新", tint = if (loading) G.inkSubtle else G.inkMuted, modifier = Modifier.size(19.dp))
             }
         }
@@ -387,7 +442,7 @@ fun PluginFullPageRouteScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 14.dp, vertical = 12.dp),
+                .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             when {
@@ -439,6 +494,7 @@ fun PluginPageTakeoverHost(
         return
     }
     var bypassTakeover by remember(activeSlot.pluginId, activeSlot.id) { mutableStateOf(false) }
+    val bottomChrome = LocalBottomChromeInset.current
 
     if (bypassTakeover) {
         Box(Modifier.fillMaxSize()) {
@@ -448,7 +504,7 @@ fun PluginPageTakeoverHost(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .navigationBarsPadding()
-                    .padding(bottom = 74.dp),
+                    .padding(bottom = bottomChrome + 10.dp),
                 shape = CircleShape,
                 color = G.accentContainer,
                 border = BorderStroke(0.75.dp, G.accent.copy(alpha = 0.5f)),
@@ -459,50 +515,34 @@ fun PluginPageTakeoverHost(
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.SemiBold,
                     color = G.accent,
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                 )
             }
         }
         return
     }
 
-    Column(modifier.fillMaxSize().galiaisCanvasBackground()) {
-        Surface(
-            modifier = Modifier.fillMaxWidth().let { if (onBack != null) it.statusBarsPadding() else it },
-            color = G.accentContainer.copy(alpha = 0.65f),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                if (onBack != null) {
-                    Icon(
-                        GaliaisIcons.ArrowBack,
-                        contentDescription = "返回",
-                        tint = G.ink,
-                        modifier = Modifier
-                            .size(20.dp)
-                            .clip(CircleShape)
-                            .clickable(role = Role.Button, onClick = onBack),
-                    )
-                }
-                Text(
-                    "插件「${activeSlot.label.ifBlank { activeSlot.pluginId }}」已接管本页",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = G.onAccentContainer,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                TagPill("切回原版", fg = G.ink, bg = G.surface, border = G.border, onClick = { bypassTakeover = true })
-            }
-        }
+    Column(
+        modifier
+            .fillMaxSize()
+            .galiaisCanvasBackground()
+            .let { if (onBack != null) it.windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)) else it },
+    ) {
+        GaliaisTopBar(
+            title = activeSlot.label.ifBlank { activeSlot.pluginId },
+            subtitle = "由插件接管本页",
+            onBack = onBack,
+            applyStatusBarPadding = onBack != null,
+            actions = {
+                TagPill("切回原版", fg = G.ink, bg = G.surfaceSubtle, border = G.border, onClick = { bypassTakeover = true })
+            },
+        )
         PluginFullTabScreen(
             app = app,
             slot = activeSlot,
             cwd = cwd,
             modifier = Modifier.weight(1f).fillMaxWidth(),
+            showTopBar = false,
         )
     }
 }

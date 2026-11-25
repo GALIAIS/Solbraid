@@ -9,15 +9,18 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
@@ -295,7 +298,7 @@ internal fun ComposerFormatToolbar(
     indentStr: String,
     onValueChange: (TextFieldValue) -> Unit,
     onInsertMention: (() -> Unit)? = null,
-    onExpandEditor: () -> Unit,
+    onExpandEditor: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     Row(
@@ -320,7 +323,7 @@ internal fun ComposerFormatToolbar(
         TagPill("代码块", fg = G.ink, bg = chipBg, border = chipBorder, onClick = {
             onValueChange(wrapComposerSelection(value, "```\n", "\n```", ""))
         })
-        TagPill("\$公式\$", fg = G.claude, bg = G.claudeTint, onClick = {
+        TagPill("\$公式\$", fg = G.artifact, bg = G.artifactTint, onClick = {
             onValueChange(wrapComposerSelection(value, "$", "$", "x"))
         })
         TagPill("引用", fg = G.inkMuted, bg = chipBg, border = chipBorder, onClick = {
@@ -335,7 +338,9 @@ internal fun ComposerFormatToolbar(
         if (onInsertMention != null) {
             TagPill("@文件", fg = G.accent, bg = G.accentContainer, onClick = onInsertMention)
         }
-        TagPill("全屏", fg = G.accent, bg = G.accentContainer, onClick = onExpandEditor)
+        if (onExpandEditor != null) {
+            TagPill("全屏", fg = G.accent, bg = G.accentContainer, onClick = onExpandEditor)
+        }
     }
 }
 
@@ -426,10 +431,17 @@ internal fun ExpandedComposerDialog(
 
     Dialog(
         onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false, dismissOnClickOutside = false),
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            dismissOnClickOutside = false,
+            decorFitsSystemWindows = false,
+        ),
     ) {
         Surface(
-            modifier = Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding(),
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
             color = G.canvas,
         ) {
             Column(Modifier.fillMaxSize()) {
@@ -475,7 +487,7 @@ internal fun ExpandedComposerDialog(
                         value = value,
                         indentStr = settings.tabIndentString(),
                         onValueChange = onValueChange,
-                        onExpandEditor = onDismiss,
+                        onExpandEditor = null,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                     )
                     Hairline()

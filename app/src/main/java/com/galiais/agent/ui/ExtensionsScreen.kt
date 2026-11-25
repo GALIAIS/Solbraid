@@ -3,7 +3,6 @@ package com.galiais.agent.ui
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,13 +13,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SnackbarHostState
@@ -83,6 +76,7 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
     var secretPluginTarget by remember { mutableStateOf<ManagedPlugin?>(null) }
     var sharePrefill by remember { mutableStateOf<Pair<String, String>?>(null) }
     var busyMessage by remember { mutableStateOf<String?>(null) }
+    var pendingConfirm by remember { mutableStateOf<Triple<String, String, () -> Unit>?>(null) }
     val probingIds = remember { mutableStateMapOf<String, Boolean>() }
     fun shareToRegistry(kind: String, id: String) {
         sharePrefill = kind to id
@@ -128,21 +122,18 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
             }
         },
     ) {
-        CrispCard(padding = PaddingValues(12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text("全 Agent 统一资源库", style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
+        if (!runtime.ready) {
+            CrispCard(background = G.surfaceSubtle, padding = PaddingValues(12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
-                        if (runtime.ready)
-                            "单源管理指令（CLAUDE.md / AGENTS.md / GEMINI.md）、MCP、技能、子代理、钩子与插件包，自动无侵入同步到三大内置 CLI。"
-                        else
-                            "运行环境未启动，启动后可安装共享仓库资源、加载插件与同步 MCP / 技能。",
+                        "运行环境未启动，启动后可安装共享仓库资源、加载插件与同步 MCP / 技能。",
                         style = MaterialTheme.typography.bodySmall,
                         color = G.inkMuted,
+                        modifier = Modifier.weight(1f),
                     )
-                }
-                if (!runtime.ready && !runtime.busy && runtime.bound) {
-                    TagPill("启动环境", fg = G.onAccent, bg = G.accent, onClick = app.runtime::start)
+                    if (!runtime.busy && runtime.bound) {
+                        TagPill("启动环境", fg = G.onAccent, bg = G.accent, onClick = app.runtime::start)
+                    }
                 }
             }
         }
@@ -187,9 +178,8 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
             }
 
             "instructions" -> {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Column(Modifier.weight(1f)) { SectionLabel("全局指令集（自动同步三端）") }
-                    PrimaryPillButton("+ 新建指令", onClick = { creatingInstruction = true })
+                SectionHeader("全局指令集（自动同步三端）") {
+                    CompactActionButton("+ 新建指令", primary = true, onClick = { creatingInstruction = true })
                 }
                 if (registry.instructions.isEmpty()) {
                     CrispCard {
@@ -207,7 +197,7 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
                             ) {
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                        Text(item.title, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
+                                        Text(item.title, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                         Text(item.content.lines().firstOrNull().orEmpty(), style = MaterialTheme.typography.bodySmall, color = G.inkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                     }
                                     GaliaisSwitch(checked = item.enabled, onCheckedChange = { app.extensions.toggleInstruction(item.id, it) })
@@ -216,7 +206,11 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
                                     TagPill(if ("all" in item.targets) "全部 Agent" else item.targets.joinToString(" · "), fg = G.inkMuted, bg = G.surfaceSubtle)
                                     Spacer(Modifier.weight(1f))
                                     TagPill("分享", fg = G.accent, bg = G.accentContainer, onClick = { shareToRegistry("instruction", item.id) })
-                                    TagPill("删除", fg = G.danger, bg = G.dangerTint, onClick = { app.extensions.deleteInstruction(item.id) })
+                                    TagPill("删除", fg = G.danger, bg = G.dangerTint, onClick = {
+                                        pendingConfirm = Triple("删除全局指令？", "确定删除「${item.title}」并从三端同步移除吗？") {
+                                            app.extensions.deleteInstruction(item.id)
+                                        }
+                                    })
                                 }
                             }
                             if (idx < registry.instructions.lastIndex) Hairline()
@@ -226,10 +220,8 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
             }
 
             "subagents" -> {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    SectionLabel("共享子代理（.claude / .codex / .agents）")
-                    Spacer(Modifier.weight(1f))
-                    PrimaryPillButton("+ 新建子代理", onClick = { creatingSubagent = true })
+                SectionHeader("共享子代理") {
+                    CompactActionButton("+ 新建子代理", primary = true, onClick = { creatingSubagent = true })
                 }
                 if (registry.subagents.isEmpty()) {
                     CrispCard {
@@ -248,18 +240,22 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                            Text(ag.name, fontFamily = Mono, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
+                                            Text(ag.name, fontFamily = Mono, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                                             if (ag.model.isNotBlank()) TagPill(ag.model, fg = G.accent, bg = G.accentContainer)
                                         }
                                         if (ag.description.isNotBlank()) Text(ag.description, style = MaterialTheme.typography.bodySmall, color = G.inkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                     }
                                     GaliaisSwitch(checked = ag.enabled, onCheckedChange = { app.extensions.toggleSubagent(ag.id, it) })
                                 }
-                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                                     TagPill(if ("all" in ag.targets) "全部 Agent" else ag.targets.joinToString(" · "), fg = G.inkMuted, bg = G.surfaceSubtle)
                                     Spacer(Modifier.weight(1f))
                                     TagPill("分享", fg = G.accent, bg = G.accentContainer, onClick = { shareToRegistry("subagent", ag.id) })
-                                    TagPill("删除", fg = G.danger, bg = G.dangerTint, onClick = { app.extensions.deleteSubagent(ag.id) })
+                                    TagPill("删除", fg = G.danger, bg = G.dangerTint, onClick = {
+                                        pendingConfirm = Triple("删除子代理？", "确定删除子代理「${ag.name}」并同步清理三端文件吗？") {
+                                            app.extensions.deleteSubagent(ag.id)
+                                        }
+                                    })
                                 }
                             }
                             if (idx < registry.subagents.lastIndex) Hairline()
@@ -269,10 +265,8 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
             }
 
             "hooks" -> {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    SectionLabel("生命周期钩子（Hooks）")
-                    Spacer(Modifier.weight(1f))
-                    PrimaryPillButton("+ 新建钩子", onClick = { creatingHook = true })
+                SectionHeader("生命周期钩子（Hooks）") {
+                    CompactActionButton("+ 新建钩子", primary = true, onClick = { creatingHook = true })
                 }
                 if (registry.hooks.isEmpty()) {
                     CrispCard {
@@ -288,18 +282,22 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                            Text(hook.name, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
+                                            Text(hook.name, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                                             TagPill(hook.event, fg = G.accent, bg = G.accentContainer)
                                         }
                                         Text(hook.command, fontFamily = Mono, fontSize = 11.sp, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                     }
                                     GaliaisSwitch(checked = hook.enabled, onCheckedChange = { app.extensions.toggleHook(hook.id, it) })
                                 }
-                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                                     TagPill("匹配 ${hook.matcher}", fg = G.inkMuted, bg = G.surfaceSubtle)
                                     Spacer(Modifier.weight(1f))
                                     TagPill("分享", fg = G.accent, bg = G.accentContainer, onClick = { shareToRegistry("hook", hook.id) })
-                                    TagPill("删除", fg = G.danger, bg = G.dangerTint, onClick = { app.extensions.deleteHook(hook.id) })
+                                    TagPill("删除", fg = G.danger, bg = G.dangerTint, onClick = {
+                                        pendingConfirm = Triple("删除生命周期钩子？", "确定删除钩子「${hook.name}」吗？") {
+                                            app.extensions.deleteHook(hook.id)
+                                        }
+                                    })
                                 }
                             }
                             if (idx < registry.hooks.lastIndex) Hairline()
@@ -309,10 +307,8 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
             }
 
             "mcp" -> {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    SectionLabel("已托管 MCP 服务器")
-                    Spacer(Modifier.weight(1f))
-                    PrimaryPillButton("+ 添加 MCP", onClick = { creatingMcp = true })
+                SectionHeader("已托管 MCP 服务器") {
+                    CompactActionButton("+ 添加 MCP", primary = true, onClick = { creatingMcp = true })
                 }
                 if (registry.mcpServers.isEmpty()) {
                     CrispCard {
@@ -336,7 +332,7 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                            Text(srv.name, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            Text(srv.name, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                                             TagPill(srv.transport.uppercase(), fg = G.inkMuted, bg = G.surfaceSubtle)
                                             srv.pluginId?.let { TagPill("插件", fg = G.accent, bg = G.accentContainer) }
                                         }
@@ -345,7 +341,7 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
                                     }
                                     GaliaisSwitch(checked = srv.enabled, onCheckedChange = { app.extensions.toggleMcp(srv.id, it) })
                                 }
-                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                     val targetLabel = if ("all" in srv.targets) "全部 Agent" else srv.targets.joinToString(" · ")
                                     TagPill(targetLabel, fg = G.inkMuted, bg = G.surfaceSubtle)
                                     if (probe != null) {
@@ -355,7 +351,6 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
                                             bg = if (probe.ok) G.successTint else G.dangerTint,
                                         )
                                     }
-                                    Spacer(Modifier.weight(1f))
                                     TagPill(
                                         text = if (probing) "探测中…" else "测速",
                                         fg = G.accent,
@@ -374,7 +369,11 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
                                     )
                                     if (srv.pluginId == null) {
                                         TagPill("分享", fg = G.accent, bg = G.accentContainer, onClick = { shareToRegistry("mcp", srv.id) })
-                                        TagPill("删除", fg = G.danger, bg = G.dangerTint, onClick = { app.extensions.deleteMcp(srv.id) })
+                                        TagPill("删除", fg = G.danger, bg = G.dangerTint, onClick = {
+                                            pendingConfirm = Triple("删除 MCP 服务器？", "确定删除「${srv.name}」及其加密密钥吗？") {
+                                                app.extensions.deleteMcp(srv.id)
+                                            }
+                                        })
                                     }
                                 }
                                 if (probe != null && !probe.ok && probe.message.isNotBlank()) {
@@ -388,11 +387,9 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
             }
 
             "skills" -> {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    SectionLabel("托管技能库（SKILL.md）")
-                    Spacer(Modifier.weight(1f))
-                    SecondaryPillButton("GitHub 导入", enabled = runtime.ready, onClick = { importSkillDialog = true })
-                    PrimaryPillButton("+ 新建", enabled = runtime.ready, onClick = { creatingSkill = true })
+                SectionHeader("托管技能库") {
+                    CompactActionButton("GitHub", enabled = runtime.ready, onClick = { importSkillDialog = true })
+                    CompactActionButton("+ 新建", primary = true, enabled = runtime.ready, onClick = { creatingSkill = true })
                 }
                 if (registry.skills.isEmpty()) {
                     CrispCard {
@@ -414,7 +411,7 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
                             ) {
                                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        Text(sk.name, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.Medium)
+                                        Text(sk.name, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                                         TagPill(
                                             when (sk.source) {
                                                 "github" -> "GitHub"
@@ -461,10 +458,8 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
                     onBusy = { busyMessage = it },
                 )
 
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    SectionLabel("已安装插件包（MCP / Skills 套件）")
-                    Spacer(Modifier.weight(1f))
-                    PrimaryPillButton("GitHub 安装", enabled = runtime.ready, onClick = { importPluginDialog = true })
+                SectionHeader("插件包（MCP / Skills）") {
+                    CompactActionButton("GitHub 安装", primary = true, enabled = runtime.ready, onClick = { importPluginDialog = true })
                 }
                 if (registry.plugins.isEmpty()) {
                     CrispCard {
@@ -482,26 +477,27 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                            Text(plugin.name, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
+                                            Text(plugin.name, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                                             TagPill("v${plugin.version}", fg = G.inkMuted, bg = G.surfaceSubtle)
                                         }
                                         if (plugin.description.isNotBlank()) {
-                                            Text(plugin.description, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                                            Text(plugin.description, style = MaterialTheme.typography.bodySmall, color = G.inkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                         }
                                     }
                                     GaliaisSwitch(checked = plugin.enabled, onCheckedChange = { app.extensions.togglePlugin(plugin.id, it) })
                                 }
-                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                     if (pMcps > 0) TagPill("$pMcps MCP", fg = G.accent, bg = G.accentContainer)
                                     if (pSkills > 0) TagPill("$pSkills 技能", fg = G.inkMuted, bg = G.surfaceSubtle)
                                     if (plugin.commands.isNotEmpty()) TagPill("${plugin.commands.size} 指令", fg = G.inkMuted, bg = G.surfaceSubtle)
-                                    Spacer(Modifier.weight(1f))
                                     if (plugin.requiredSecrets.isNotEmpty()) {
                                         TagPill("配置密钥", fg = G.accent, bg = G.accentContainer, onClick = { secretPluginTarget = plugin })
                                     }
                                     TagPill("分享", fg = G.accent, bg = G.accentContainer, onClick = { shareToRegistry("plugin_pack", plugin.id) })
                                     TagPill("卸载", fg = G.danger, bg = G.dangerTint, onClick = {
-                                        scope.launch { app.extensions.uninstallPlugin(plugin.id) }
+                                        pendingConfirm = Triple("卸载插件包？", "将卸载「${plugin.name}」及其关联的 MCP、技能与指令。") {
+                                            scope.launch { app.extensions.uninstallPlugin(plugin.id) }
+                                        }
                                     })
                                 }
                             }
@@ -514,6 +510,20 @@ fun ExtensionsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, onBac
                 }
             }
         }
+    }
+
+    pendingConfirm?.let { (title, message, action) ->
+        GaliaisConfirmDialog(
+            title = title,
+            message = message,
+            confirmText = "确认",
+            danger = true,
+            onConfirm = {
+                pendingConfirm = null
+                action()
+            },
+            onDismiss = { pendingConfirm = null },
+        )
     }
 
     if (creatingMcp || editingMcp != null) {
@@ -628,159 +638,139 @@ private fun McpEditorSheet(
     var selectedTargets by remember { mutableStateOf((initial?.targets ?: listOf("codex", "claude")).filterNot { it == "all" }.toSet()) }
     var error by remember { mutableStateOf<String?>(null) }
 
-    GaliaisSheet(onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .imePadding()
-                .navigationBarsPadding()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp)
-                .padding(bottom = 22.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text(if (initial == null) "添加 MCP 服务器" else "编辑 MCP · ${initial.name}", style = MaterialTheme.typography.titleLarge, color = G.ink)
-            SegmentedPillBar(
-                options = listOf("stdio" to "Stdio 本地进程", "http" to "HTTP / SSE 远程"),
-                selected = transport,
-                onSelect = { transport = it },
-            )
-            OutlinedTextField(
-                value = name,
-                onValueChange = { name = it; if (initial == null) idDraft = it.lowercase().replace(Regex("[^a-z0-9_-]+"), "-").trim('-') },
-                label = { Text("显示名称") },
-                singleLine = true,
-                shape = D.fieldShape,
-                colors = galiaisTextFieldColors(),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            if (transport == "stdio") {
-                OutlinedTextField(
-                    value = command,
-                    onValueChange = { command = it.trim() },
-                    label = { Text("启动命令（如 npx / uvx / node）") },
-                    singleLine = true,
-                    shape = D.fieldShape,
-                    colors = galiaisTextFieldColors(),
-                    textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = argsText,
-                    onValueChange = { argsText = it },
-                    label = { Text("命令参数（空格分隔）") },
-                    singleLine = true,
-                    shape = D.fieldShape,
-                    colors = galiaisTextFieldColors(),
-                    textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            } else {
-                OutlinedTextField(
-                    value = url,
-                    onValueChange = { url = it.trim() },
-                    label = { Text("服务端 URL（https://...）") },
-                    singleLine = true,
-                    shape = D.fieldShape,
-                    colors = galiaisTextFieldColors(),
-                    textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-            OutlinedTextField(
-                value = envText,
-                onValueChange = { envText = it },
-                label = { Text(if (transport == "http") "附加 Headers（每行 Key=Value）" else "普通环境变量（每行 KEY=VALUE）") },
-                minLines = 2,
-                maxLines = 4,
-                shape = D.fieldShape,
-                colors = galiaisTextFieldColors(),
-                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = secretKeyName,
-                onValueChange = { secretKeyName = it.trim() },
-                label = { Text(if (transport == "http") "加密 Header 名称（可选，如 Authorization）" else "加密密钥环境变量名（可选，如 GITHUB_TOKEN）") },
-                singleLine = true,
-                shape = D.fieldShape,
-                colors = galiaisTextFieldColors(),
-                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            if (secretKeyName.isNotBlank()) {
-                val alreadySaved = initial != null && app.settings.hasExtensionSecret(initial.id, secretKeyName)
-                OutlinedTextField(
-                    value = secretKeyValue,
-                    onValueChange = { secretKeyValue = it },
-                    label = { Text(if (alreadySaved) "密钥值（已加密保存，留空保持不变）" else "密钥值（Android Keystore 加密存储）") },
-                    singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
-                    shape = D.fieldShape,
-                    colors = galiaisTextFieldColors(),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-            Text("生效 Agent", style = MaterialTheme.typography.labelMedium, color = G.inkMuted)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                SelectableChip("全部 Agent", selected = targetAll, onClick = { targetAll = true })
-                listOf("codex" to "Codex", "claude" to "Claude Code", "antigravity" to "Antigravity").forEach { (id, label) ->
-                    val picked = !targetAll && id in selectedTargets
-                    SelectableChip(label, selected = picked, onClick = {
-                        targetAll = false
-                        selectedTargets = if (id in selectedTargets) selectedTargets - id else selectedTargets + id
-                    })
+    GaliaisSheetScaffold(
+        title = if (initial == null) "添加 MCP 服务器" else "编辑 MCP · ${initial.name}",
+        onDismiss = onDismiss,
+        footer = {
+            SecondaryPillButton("取消", onClick = onDismiss)
+            PrimaryPillButton("保存并同步", modifier = Modifier.weight(1f), onClick = {
+                val cleanName = name.trim()
+                if (cleanName.isBlank()) { error = "请填写名称"; return@PrimaryPillButton }
+                val slug = (initial?.id ?: idDraft).trim()
+                    .ifBlank { cleanName.lowercase().replace(Regex("[^a-z0-9_-]+"), "-").trim('-') }
+                val cleanId = slug.ifBlank { "mcp-${java.util.UUID.randomUUID().toString().take(8)}" }
+                if (transport == "stdio" && command.isBlank()) { error = "请填写启动命令"; return@PrimaryPillButton }
+                if (transport == "http" && url.isBlank()) { error = "请填写服务 URL"; return@PrimaryPillButton }
+                val kv = linkedMapOf<String, String>()
+                envText.lineSequence().map { it.trim() }.filter { it.contains('=') }.forEach { line ->
+                    val i = line.indexOf('=')
+                    val k = line.substring(0, i).trim()
+                    if (k.isNotEmpty()) kv[k] = line.substring(i + 1).trim()
                 }
-            }
-            error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                SecondaryPillButton("取消", onClick = onDismiss)
-                Spacer(Modifier.size(8.dp))
-                PrimaryPillButton("保存并同步", onClick = {
-                    val cleanName = name.trim()
-                    if (cleanName.isBlank()) { error = "请填写名称"; return@PrimaryPillButton }
-                    val slug = (initial?.id ?: idDraft).trim()
-                        .ifBlank { cleanName.lowercase().replace(Regex("[^a-z0-9_-]+"), "-").trim('-') }
-                    val cleanId = slug.ifBlank { "mcp-${java.util.UUID.randomUUID().toString().take(8)}" }
-                    if (transport == "stdio" && command.isBlank()) { error = "请填写启动命令"; return@PrimaryPillButton }
-                    if (transport == "http" && url.isBlank()) { error = "请填写服务 URL"; return@PrimaryPillButton }
-                    val kv = linkedMapOf<String, String>()
-                    envText.lineSequence().map { it.trim() }.filter { it.contains('=') }.forEach { line ->
-                        val i = line.indexOf('=')
-                        val k = line.substring(0, i).trim()
-                        if (k.isNotEmpty()) kv[k] = line.substring(i + 1).trim()
-                    }
-                    val targets = if (targetAll || selectedTargets.isEmpty()) listOf("all") else selectedTargets.toList()
-                    val mergedSecretEnvKeys = if (transport == "stdio") {
-                        val existingExtra = initial?.secretEnvKeys.orEmpty().drop(1)
-                        (listOfNotNull(secretKeyName.takeIf { it.isNotBlank() }) + existingExtra).distinct()
-                    } else emptyList()
-                    val mergedSecretHeaderKeys = if (transport == "http") {
-                        val existingExtra = initial?.secretHeaderKeys.orEmpty().drop(1)
-                        (listOfNotNull(secretKeyName.takeIf { it.isNotBlank() }) + existingExtra).distinct()
-                    } else emptyList()
-                    val srv = ManagedMcpServer(
-                        id = cleanId,
-                        name = cleanName,
-                        transport = transport,
-                        command = if (transport == "stdio") command else null,
-                        args = if (transport == "stdio") argsText.trim().split(Regex("\\s+")).filter { it.isNotBlank() } else emptyList(),
-                        url = if (transport == "http") url else null,
-                        env = if (transport == "stdio") kv else emptyMap(),
-                        secretEnvKeys = mergedSecretEnvKeys,
-                        headers = if (transport == "http") kv else emptyMap(),
-                        secretHeaderKeys = mergedSecretHeaderKeys,
-                        enabled = initial?.enabled ?: true,
-                        scope = initial?.scope ?: "global",
-                        targets = targets,
-                        pluginId = initial?.pluginId,
-                    )
-                    val secrets = if (secretKeyName.isNotBlank() && secretKeyValue.isNotBlank()) mapOf(secretKeyName to secretKeyValue.trim()) else emptyMap()
-                    app.extensions.upsertMcp(srv, secrets)
-                    onDismiss()
-                })
-            }
+                val targets = if (targetAll || selectedTargets.isEmpty()) listOf("all") else selectedTargets.toList()
+                val mergedSecretEnvKeys = if (transport == "stdio") {
+                    val existingExtra = initial?.secretEnvKeys.orEmpty().drop(1)
+                    (listOfNotNull(secretKeyName.takeIf { it.isNotBlank() }) + existingExtra).distinct()
+                } else emptyList()
+                val mergedSecretHeaderKeys = if (transport == "http") {
+                    val existingExtra = initial?.secretHeaderKeys.orEmpty().drop(1)
+                    (listOfNotNull(secretKeyName.takeIf { it.isNotBlank() }) + existingExtra).distinct()
+                } else emptyList()
+                val srv = ManagedMcpServer(
+                    id = cleanId,
+                    name = cleanName,
+                    transport = transport,
+                    command = if (transport == "stdio") command else null,
+                    args = if (transport == "stdio") argsText.trim().split(Regex("\\s+")).filter { it.isNotBlank() } else emptyList(),
+                    url = if (transport == "http") url else null,
+                    env = if (transport == "stdio") kv else emptyMap(),
+                    secretEnvKeys = mergedSecretEnvKeys,
+                    headers = if (transport == "http") kv else emptyMap(),
+                    secretHeaderKeys = mergedSecretHeaderKeys,
+                    enabled = initial?.enabled ?: true,
+                    scope = initial?.scope ?: "global",
+                    targets = targets,
+                    pluginId = initial?.pluginId,
+                )
+                val secrets = if (secretKeyName.isNotBlank() && secretKeyValue.isNotBlank()) mapOf(secretKeyName to secretKeyValue.trim()) else emptyMap()
+                app.extensions.upsertMcp(srv, secrets)
+                onDismiss()
+            })
+        },
+    ) {
+        SegmentedPillBar(
+            options = listOf("stdio" to "Stdio 本地进程", "http" to "HTTP / SSE 远程"),
+            selected = transport,
+            onSelect = { transport = it },
+        )
+        OutlinedTextField(
+            value = name,
+            onValueChange = { name = it; if (initial == null) idDraft = it.lowercase().replace(Regex("[^a-z0-9_-]+"), "-").trim('-') },
+            label = { Text("显示名称") },
+            singleLine = true,
+            shape = D.fieldShape,
+            colors = galiaisTextFieldColors(),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        if (transport == "stdio") {
+            OutlinedTextField(
+                value = command,
+                onValueChange = { command = it.trim() },
+                label = { Text("启动命令（如 npx / uvx / node）") },
+                singleLine = true,
+                shape = D.fieldShape,
+                colors = galiaisTextFieldColors(),
+                textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = argsText,
+                onValueChange = { argsText = it },
+                label = { Text("命令参数（空格分隔）") },
+                singleLine = true,
+                shape = D.fieldShape,
+                colors = galiaisTextFieldColors(),
+                textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        } else {
+            OutlinedTextField(
+                value = url,
+                onValueChange = { url = it.trim() },
+                label = { Text("服务端 URL（https://...）") },
+                singleLine = true,
+                shape = D.fieldShape,
+                colors = galiaisTextFieldColors(),
+                textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
+                modifier = Modifier.fillMaxWidth(),
+            )
         }
+        OutlinedTextField(
+            value = envText,
+            onValueChange = { envText = it },
+            label = { Text(if (transport == "http") "附加 Headers（每行 Key=Value）" else "普通环境变量（每行 KEY=VALUE）") },
+            minLines = 2,
+            maxLines = 4,
+            shape = D.fieldShape,
+            colors = galiaisTextFieldColors(),
+            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = secretKeyName,
+            onValueChange = { secretKeyName = it.trim() },
+            label = { Text(if (transport == "http") "加密 Header 名称（可选，如 Authorization）" else "加密密钥环境变量名（可选，如 GITHUB_TOKEN）") },
+            singleLine = true,
+            shape = D.fieldShape,
+            colors = galiaisTextFieldColors(),
+            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        if (secretKeyName.isNotBlank()) {
+            val alreadySaved = initial != null && app.settings.hasExtensionSecret(initial.id, secretKeyName)
+            OutlinedTextField(
+                value = secretKeyValue,
+                onValueChange = { secretKeyValue = it },
+                label = { Text(if (alreadySaved) "密钥值（已加密保存，留空保持不变）" else "密钥值（Android Keystore 加密存储）") },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                shape = D.fieldShape,
+                colors = galiaisTextFieldColors(),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        TargetAgentsPicker(targetAll, selectedTargets) { all, set -> targetAll = all; selectedTargets = set }
+        error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
     }
 }
 
@@ -796,92 +786,98 @@ private fun SkillEditorSheet(
     var body by remember { mutableStateOf(initial?.body ?: "") }
     var saving by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
 
-    GaliaisSheet(onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .imePadding()
-                .navigationBarsPadding()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp)
-                .padding(bottom = 22.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text(if (initial == null) "新建技能 (SKILL.md)" else "编辑技能 · ${initial.name}", style = MaterialTheme.typography.titleLarge, color = G.ink)
-            OutlinedTextField(
-                value = name,
-                onValueChange = { name = it },
-                label = { Text("技能名称（建议英文短横线，如 compose-audit）") },
-                singleLine = true,
-                shape = D.fieldShape,
-                colors = galiaisTextFieldColors(),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = desc,
-                onValueChange = { desc = it },
-                label = { Text("触发描述（告诉 Agent 何时调用该技能）") },
-                singleLine = true,
-                shape = D.fieldShape,
-                colors = galiaisTextFieldColors(),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = body,
-                onValueChange = { body = it },
-                label = { Text("技能正文（Markdown 规范与步骤）") },
-                minLines = 6,
-                maxLines = 12,
-                shape = D.fieldShape,
-                colors = galiaisTextFieldColors(),
-                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (initial != null && initial.pluginId == null) {
-                    TextButton(enabled = !saving && !deleting, onClick = {
-                        deleting = true
-                        error = null
-                        scope.launch {
-                            try {
-                                app.extensions.deleteSkill(initial.id)
-                                onDismiss()
-                            } catch (cancel: CancellationException) {
-                                throw cancel
-                            } catch (e: Exception) {
-                                error = e.message ?: "技能删除失败，请重试"
-                            } finally {
-                                deleting = false
-                            }
-                        }
-                    }) { Text(if (deleting) "删除中…" else "删除", color = G.danger) }
+    GaliaisSheetScaffold(
+        title = if (initial == null) "新建技能 (SKILL.md)" else "编辑技能 · ${initial.name}",
+        onDismiss = onDismiss,
+        footer = {
+            if (initial != null && initial.pluginId == null) {
+                TextButton(enabled = !saving && !deleting, onClick = { confirmDelete = true }) {
+                    Text(if (deleting) "删除中…" else "删除", color = G.danger)
                 }
-                Spacer(Modifier.weight(1f))
-                SecondaryPillButton("取消", onClick = onDismiss)
-                PrimaryPillButton(if (saving) "保存中…" else "保存并同步", enabled = !saving && !deleting, onClick = {
-                    if (name.isBlank() || body.isBlank()) { error = "请填写技能名称和正文"; return@PrimaryPillButton }
-                    saving = true; error = null
-                    scope.launch {
-                        try {
-                            app.extensions.saveLocalSkill(
-                                id = initial?.id,
-                                name = name.trim(),
-                                description = desc.trim(),
-                                body = body,
-                                targets = initial?.targets ?: listOf("all"),
-                            )
-                            onDismiss()
-                        } catch (e: Exception) {
-                            error = e.message
-                            saving = false
-                        }
-                    }
-                })
             }
-        }
+            Spacer(Modifier.weight(1f))
+            SecondaryPillButton("取消", onClick = onDismiss)
+            PrimaryPillButton(if (saving) "保存中…" else "保存并同步", enabled = !saving && !deleting, onClick = {
+                if (name.isBlank() || body.isBlank()) { error = "请填写技能名称和正文"; return@PrimaryPillButton }
+                saving = true; error = null
+                scope.launch {
+                    try {
+                        app.extensions.saveLocalSkill(
+                            id = initial?.id,
+                            name = name.trim(),
+                            description = desc.trim(),
+                            body = body,
+                            targets = initial?.targets ?: listOf("all"),
+                        )
+                        onDismiss()
+                    } catch (e: Exception) {
+                        error = e.message
+                        saving = false
+                    }
+                }
+            })
+        },
+    ) {
+        OutlinedTextField(
+            value = name,
+            onValueChange = { name = it },
+            label = { Text("技能名称（建议英文短横线，如 compose-audit）") },
+            singleLine = true,
+            shape = D.fieldShape,
+            colors = galiaisTextFieldColors(),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = desc,
+            onValueChange = { desc = it },
+            label = { Text("触发描述（告诉 Agent 何时调用该技能）") },
+            singleLine = true,
+            shape = D.fieldShape,
+            colors = galiaisTextFieldColors(),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = body,
+            onValueChange = { body = it },
+            label = { Text("技能正文（Markdown 规范与步骤）") },
+            minLines = 6,
+            maxLines = 12,
+            shape = D.fieldShape,
+            colors = galiaisTextFieldColors(),
+            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
+    }
+
+    if (confirmDelete && initial != null) {
+        GaliaisConfirmDialog(
+            title = "删除技能？",
+            message = "确定删除本地技能「${initial.name}」并同步移除其 SKILL.md 文件吗？",
+            confirmText = "删除",
+            danger = true,
+            onConfirm = {
+                confirmDelete = false
+                deleting = true
+                error = null
+                scope.launch {
+                    try {
+                        app.extensions.deleteSkill(initial.id)
+                        onDismiss()
+                    } catch (cancel: CancellationException) {
+                        throw cancel
+                    } catch (e: Exception) {
+                        error = e.message ?: "技能删除失败，请重试"
+                    } finally {
+                        deleting = false
+                    }
+                }
+            },
+            onDismiss = { confirmDelete = false },
+        )
     }
 }
 
@@ -896,36 +892,27 @@ private fun PluginSecretsDialog(
     onSave: (Map<String, String>) -> Unit,
 ) {
     val values = remember(specs) { mutableStateMapOf<String, String>() }
-    AlertDialog(
+    GaliaisAlertDialog(
+        title = title,
         onDismissRequest = onDismiss,
-        containerColor = G.surface,
-        shape = D.dialogShape,
-        title = { Text(title, color = G.ink) },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                specs.forEach { spec ->
-                    val saved = app.settings.hasExtensionSecret(bucket, spec.key)
-                    OutlinedTextField(
-                        value = values[spec.key] ?: "",
-                        onValueChange = { values[spec.key] = it },
-                        label = { Text(if (saved) "${spec.label}（已保存，留空不变）" else spec.label) },
-                        supportingText = if (spec.hint.isNotBlank()) ({ Text(spec.hint, style = MaterialTheme.typography.labelSmall) }) else null,
-                        singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
-                        shape = D.fieldShape,
-                        colors = galiaisTextFieldColors(),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = {
-                onSave(values.filterValues { it.isNotBlank() }.mapValues { it.value.trim() })
-            }) { Text(confirmText, color = G.accent, fontWeight = FontWeight.SemiBold) }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消", color = G.inkMuted) } },
-    )
+        confirmText = confirmText,
+        onConfirm = { onSave(values.filterValues { it.isNotBlank() }.mapValues { it.value.trim() }) },
+    ) {
+        specs.forEach { spec ->
+            val saved = app.settings.hasExtensionSecret(bucket, spec.key)
+            OutlinedTextField(
+                value = values[spec.key] ?: "",
+                onValueChange = { values[spec.key] = it },
+                label = { Text(if (saved) "${spec.label}（已保存，留空不变）" else spec.label) },
+                supportingText = if (spec.hint.isNotBlank()) ({ Text(spec.hint, style = MaterialTheme.typography.labelSmall) }) else null,
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                shape = D.fieldShape,
+                colors = galiaisTextFieldColors(),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
 }
 
 @Composable
@@ -959,39 +946,34 @@ private fun InstructionEditorDialog(
     var selectedTargets by remember { mutableStateOf((initial?.targets ?: listOf("codex", "claude", "antigravity")).filterNot { it == "all" }.toSet()) }
     var error by remember { mutableStateOf<String?>(null) }
 
-    GaliaisSheet(onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier.fillMaxWidth().imePadding().navigationBarsPadding()
-                .verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = 22.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text(if (initial == null) "新建全局指令块" else "编辑指令 · ${initial.title}", style = MaterialTheme.typography.titleLarge, color = G.ink)
-            Text("自动以标记区块无损同步到 CLAUDE.md / AGENTS.md / GEMINI.md，不覆盖你手写的内容。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-            OutlinedTextField(
-                value = title, onValueChange = { title = it },
-                label = { Text("指令标题（如：中文回复与代码规范）") }, singleLine = true,
-                shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = content, onValueChange = { content = it },
-                label = { Text("指令正文（Markdown）") }, minLines = 5, maxLines = 10,
-                shape = D.fieldShape, colors = galiaisTextFieldColors(),
-                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth(),
-            )
-            TargetAgentsPicker(targetAll, selectedTargets) { all, set -> targetAll = all; selectedTargets = set }
-            error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                SecondaryPillButton("取消", onClick = onDismiss)
-                Spacer(Modifier.size(8.dp))
-                PrimaryPillButton("保存并同步", onClick = {
-                    val t = title.trim(); val c = content.trim()
-                    if (t.isBlank() || c.isBlank()) { error = "请填写标题和指令正文"; return@PrimaryPillButton }
-                    val id = initial?.id ?: ("inst-" + System.currentTimeMillis().toString(36))
-                    val targets = if (targetAll || selectedTargets.isEmpty()) listOf("all") else selectedTargets.toList()
-                    onSave(ManagedInstruction(id = id, title = t, content = c, enabled = initial?.enabled ?: true, targets = targets))
-                })
-            }
-        }
+    GaliaisSheetScaffold(
+        title = if (initial == null) "新建全局指令块" else "编辑指令 · ${initial.title}",
+        subtitle = "无损同步到 CLAUDE.md / AGENTS.md / GEMINI.md，不覆盖手写内容",
+        onDismiss = onDismiss,
+        footer = {
+            SecondaryPillButton("取消", onClick = onDismiss)
+            PrimaryPillButton("保存并同步", modifier = Modifier.weight(1f), onClick = {
+                val t = title.trim(); val c = content.trim()
+                if (t.isBlank() || c.isBlank()) { error = "请填写标题和指令正文"; return@PrimaryPillButton }
+                val id = initial?.id ?: ("inst-" + System.currentTimeMillis().toString(36))
+                val targets = if (targetAll || selectedTargets.isEmpty()) listOf("all") else selectedTargets.toList()
+                onSave(ManagedInstruction(id = id, title = t, content = c, enabled = initial?.enabled ?: true, targets = targets))
+            })
+        },
+    ) {
+        OutlinedTextField(
+            value = title, onValueChange = { title = it },
+            label = { Text("指令标题（如：中文回复与代码规范）") }, singleLine = true,
+            shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = content, onValueChange = { content = it },
+            label = { Text("指令正文（Markdown）") }, minLines = 5, maxLines = 10,
+            shape = D.fieldShape, colors = galiaisTextFieldColors(),
+            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth(),
+        )
+        TargetAgentsPicker(targetAll, selectedTargets) { all, set -> targetAll = all; selectedTargets = set }
+        error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
     }
 }
 
@@ -1009,50 +991,45 @@ private fun SubagentEditorDialog(
     var selectedTargets by remember { mutableStateOf((initial?.targets ?: listOf("codex", "claude", "antigravity")).filterNot { it == "all" }.toSet()) }
     var error by remember { mutableStateOf<String?>(null) }
 
-    GaliaisSheet(onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier.fillMaxWidth().imePadding().navigationBarsPadding()
-                .verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = 22.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text(if (initial == null) "新建子代理 (Subagent)" else "编辑子代理 · ${initial.name}", style = MaterialTheme.typography.titleLarge, color = G.ink)
-            Text("自动同步至 .claude/agents、.codex/agents 与 .agents/agents 目录，三端原生复用。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-            OutlinedTextField(
-                value = name, onValueChange = { name = it },
-                label = { Text("子代理名称（建议英文短横线，如 code-reviewer）") }, singleLine = true,
-                shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = description, onValueChange = { description = it },
-                label = { Text("职责描述（告诉主代理何时委派）") }, singleLine = true,
-                shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = model, onValueChange = { model = it.trim() },
-                label = { Text("推荐模型（可选，留空继承主会话）") }, singleLine = true,
-                shape = D.fieldShape, colors = galiaisTextFieldColors(),
-                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = prompt, onValueChange = { prompt = it },
-                label = { Text("系统提示词（System Prompt）") }, minLines = 5, maxLines = 10,
-                shape = D.fieldShape, colors = galiaisTextFieldColors(),
-                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth(),
-            )
-            TargetAgentsPicker(targetAll, selectedTargets) { all, set -> targetAll = all; selectedTargets = set }
-            error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                SecondaryPillButton("取消", onClick = onDismiss)
-                Spacer(Modifier.size(8.dp))
-                PrimaryPillButton("保存并同步", onClick = {
-                    val n = name.trim(); val p = prompt.trim()
-                    if (n.isBlank() || p.isBlank()) { error = "请填写子代理名称和系统提示词"; return@PrimaryPillButton }
-                    val id = initial?.id ?: n.lowercase().replace(Regex("[^a-z0-9_-]+"), "-").trim('-').ifBlank { "sub-${System.currentTimeMillis().toString(36)}" }
-                    val targets = if (targetAll || selectedTargets.isEmpty()) listOf("all") else selectedTargets.toList()
-                    onSave(ManagedSubagent(id = id, name = n, description = description.trim(), model = model.trim(), prompt = p, enabled = initial?.enabled ?: true, targets = targets))
-                })
-            }
-        }
+    GaliaisSheetScaffold(
+        title = if (initial == null) "新建子代理 (Subagent)" else "编辑子代理 · ${initial.name}",
+        subtitle = "自动同步至 .claude/agents、.codex/agents 与 .agents/agents 目录",
+        onDismiss = onDismiss,
+        footer = {
+            SecondaryPillButton("取消", onClick = onDismiss)
+            PrimaryPillButton("保存并同步", modifier = Modifier.weight(1f), onClick = {
+                val n = name.trim(); val p = prompt.trim()
+                if (n.isBlank() || p.isBlank()) { error = "请填写子代理名称和系统提示词"; return@PrimaryPillButton }
+                val id = initial?.id ?: n.lowercase().replace(Regex("[^a-z0-9_-]+"), "-").trim('-').ifBlank { "sub-${System.currentTimeMillis().toString(36)}" }
+                val targets = if (targetAll || selectedTargets.isEmpty()) listOf("all") else selectedTargets.toList()
+                onSave(ManagedSubagent(id = id, name = n, description = description.trim(), model = model.trim(), prompt = p, enabled = initial?.enabled ?: true, targets = targets))
+            })
+        },
+    ) {
+        OutlinedTextField(
+            value = name, onValueChange = { name = it },
+            label = { Text("子代理名称（建议英文短横线，如 code-reviewer）") }, singleLine = true,
+            shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = description, onValueChange = { description = it },
+            label = { Text("职责描述（告诉主代理何时委派）") }, singleLine = true,
+            shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = model, onValueChange = { model = it.trim() },
+            label = { Text("推荐模型（可选，留空继承主会话）") }, singleLine = true,
+            shape = D.fieldShape, colors = galiaisTextFieldColors(),
+            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = prompt, onValueChange = { prompt = it },
+            label = { Text("系统提示词（System Prompt）") }, minLines = 5, maxLines = 10,
+            shape = D.fieldShape, colors = galiaisTextFieldColors(),
+            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth(),
+        )
+        TargetAgentsPicker(targetAll, selectedTargets) { all, set -> targetAll = all; selectedTargets = set }
+        error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
     }
 }
 
@@ -1070,49 +1047,44 @@ private fun HookEditorDialog(
     var selectedTargets by remember { mutableStateOf((initial?.targets ?: listOf("codex", "claude", "antigravity")).filterNot { it == "all" }.toSet()) }
     var error by remember { mutableStateOf<String?>(null) }
 
-    GaliaisSheet(onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier.fillMaxWidth().imePadding().navigationBarsPadding()
-                .verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = 22.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text(if (initial == null) "新建生命周期钩子 (Hook)" else "编辑钩子 · ${initial.name}", style = MaterialTheme.typography.titleLarge, color = G.ink)
-            OutlinedTextField(
-                value = name, onValueChange = { name = it },
-                label = { Text("钩子名称（如：提交后格式化）") }, singleLine = true,
-                shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth(),
-            )
-            Text("触发事件", style = MaterialTheme.typography.labelMedium, color = G.inkMuted)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf("PreToolUse", "PostToolUse", "Stop", "SessionStart").forEach { ev ->
-                    SelectableChip(ev, selected = event == ev, onClick = { event = ev })
-                }
-            }
-            OutlinedTextField(
-                value = matcher, onValueChange = { matcher = it.trim() },
-                label = { Text("工具匹配器 Matcher（如 * / Edit|Write / Bash）") }, singleLine = true,
-                shape = D.fieldShape, colors = galiaisTextFieldColors(),
-                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = command, onValueChange = { command = it },
-                label = { Text("执行 Shell 命令") }, minLines = 2, maxLines = 5,
-                shape = D.fieldShape, colors = galiaisTextFieldColors(),
-                textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth(),
-            )
-            TargetAgentsPicker(targetAll, selectedTargets) { all, set -> targetAll = all; selectedTargets = set }
-            error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                SecondaryPillButton("取消", onClick = onDismiss)
-                Spacer(Modifier.size(8.dp))
-                PrimaryPillButton("保存并同步", onClick = {
-                    val n = name.trim(); val cmd = command.trim()
-                    if (n.isBlank() || cmd.isBlank()) { error = "请填写名称和命令"; return@PrimaryPillButton }
-                    val id = initial?.id ?: ("hook-" + System.currentTimeMillis().toString(36))
-                    val targets = if (targetAll || selectedTargets.isEmpty()) listOf("all") else selectedTargets.toList()
-                    onSave(ManagedHook(id = id, name = n, event = event, matcher = matcher.ifBlank { "*" }, command = cmd, enabled = initial?.enabled ?: true, targets = targets))
-                })
+    GaliaisSheetScaffold(
+        title = if (initial == null) "新建生命周期钩子 (Hook)" else "编辑钩子 · ${initial.name}",
+        onDismiss = onDismiss,
+        footer = {
+            SecondaryPillButton("取消", onClick = onDismiss)
+            PrimaryPillButton("保存并同步", modifier = Modifier.weight(1f), onClick = {
+                val n = name.trim(); val cmd = command.trim()
+                if (n.isBlank() || cmd.isBlank()) { error = "请填写名称和命令"; return@PrimaryPillButton }
+                val id = initial?.id ?: ("hook-" + System.currentTimeMillis().toString(36))
+                val targets = if (targetAll || selectedTargets.isEmpty()) listOf("all") else selectedTargets.toList()
+                onSave(ManagedHook(id = id, name = n, event = event, matcher = matcher.ifBlank { "*" }, command = cmd, enabled = initial?.enabled ?: true, targets = targets))
+            })
+        },
+    ) {
+        OutlinedTextField(
+            value = name, onValueChange = { name = it },
+            label = { Text("钩子名称（如：提交后格式化）") }, singleLine = true,
+            shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth(),
+        )
+        Text("触发事件", style = MaterialTheme.typography.labelMedium, color = G.inkMuted)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf("PreToolUse", "PostToolUse", "Stop", "SessionStart").forEach { ev ->
+                SelectableChip(ev, selected = event == ev, onClick = { event = ev })
             }
         }
+        OutlinedTextField(
+            value = matcher, onValueChange = { matcher = it.trim() },
+            label = { Text("工具匹配器 Matcher（如 * / Edit|Write / Bash）") }, singleLine = true,
+            shape = D.fieldShape, colors = galiaisTextFieldColors(),
+            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = command, onValueChange = { command = it },
+            label = { Text("执行 Shell 命令") }, minLines = 2, maxLines = 5,
+            shape = D.fieldShape, colors = galiaisTextFieldColors(),
+            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono), modifier = Modifier.fillMaxWidth(),
+        )
+        TargetAgentsPicker(targetAll, selectedTargets) { all, set -> targetAll = all; selectedTargets = set }
+        error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
     }
 }

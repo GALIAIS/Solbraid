@@ -300,6 +300,133 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
         )
     }
 
+    /**
+     * 将 Claude Code 会话历史回退到指定用户消息之前（用于编辑重发与轮次撤销）：
+     * - 若前面仍有历史轮次：使用官方 `sdk.forkSession(..., { upToMessageId })` 生成截断后的干净分支并回收旧会话；
+     * - 若回退的是第 1 轮：销毁旧会话并按原配置重建全新会话；
+     * - 若目标消息尚未落盘（例如上次发送失败）：原地清理本地时间线即可。
+     */
+    suspend fun revertBeforeTurn(
+        key: ConversationKey,
+        userMessageId: String,
+        userTurnIndex: Int,
+        retainedItems: List<TimelineItem>,
+        retainedDurations: Map<String, Long>,
+        rewindFiles: Boolean = false,
+    ): ConversationKey {
+        val current = repo.state(key) ?: error("会话不存在")
+        val cwd = current.summary.cwd ?: settings.state.value.defaultCwd
+        if (rewindFiles && key.id !in connected) {
+            runCatching { ensureOpen(key) }
+        }
+        val res = call(
+            "session/revertBefore",
+            jsonOf(
+                "sessionId" to key.id,
+                "beforeMessageId" to userMessageId,
+                "userTurnIndex" to userTurnIndex,
+                "cwd" to cwd,
+                "title" to current.summary.title.takeUnless { it in setOf("新会话", "未命名会话") },
+                "rewindFiles" to rewindFiles,
+            ),
+        )
+        return when (res.optString("mode")) {
+            "forked" -> {
+                val newId = res.getString("sessionId")
+                val newKey = key(newId)
+                val remappedUserUuids = res.optJSONArray("userMessageUuids")?.strings().orEmpty()
+                val oldToNewUserId = mutableMapOf<String, String>()
+                var userIdx = 0
+                val remappedItems = retainedItems.map { item ->
+                    if (item is TimelineItem.UserMessage) {
+                        val mappedUuid = remappedUserUuids.getOrNull(userIdx++)
+                        if (!mappedUuid.isNullOrBlank()) {
+                            oldToNewUserId[item.id] = mappedUuid
+                            item.copy(id = mappedUuid)
+                        } else item
+                    } else item
+                }
+                val remappedDurations = buildMap {
+                    retainedDurations.forEach { (k, v) -> put(oldToNewUserId[k] ?: k, v) }
+                }
+                connected -= key.id
+                sessionCumulativeTokens.remove(key.id)
+                claudeTasks.remove(key.id)
+                latestPlanFile.remove(key.id)
+                settings.setClaudeSessionProvider(newKey.id, current.providerId)
+                settings.setClaudeSessionProvider(key.id, null)
+                settings.removeConversationOptions(key)
+                repo.update(newKey) {
+                    ConversationState(
+                        summary = current.summary.copy(
+                            key = newKey,
+                            updatedAt = System.currentTimeMillis(),
+                        ),
+                        items = remappedItems,
+                        loaded = true,
+                        running = false,
+                        activeTurnId = null,
+                        providerId = current.providerId,
+                        model = current.model,
+                        effort = current.effort,
+                        permissionMode = current.permissionMode,
+                        reasoningSummary = current.reasoningSummary,
+                        fastMode = current.fastMode,
+                        turnDurations = remappedDurations,
+                        arenaGroupId = current.arenaGroupId,
+                    )
+                }
+                repo.persistOptions(newKey)
+                repo.remove(key)
+                newKey
+            }
+            "reset" -> {
+                connected -= key.id
+                sessionCumulativeTokens.remove(key.id)
+                claudeTasks.remove(key.id)
+                latestPlanFile.remove(key.id)
+                settings.setClaudeSessionProvider(key.id, null)
+                settings.removeConversationOptions(key)
+                val newKey = create(
+                    cwd = cwd,
+                    options = CreateOptions(
+                        providerId = current.providerId ?: "",
+                        model = current.model,
+                        parent = current.summary.parent,
+                        allowDelegation = settings.state.value.delegationEnabled && current.summary.parent == null,
+                    ),
+                )
+                repo.update(newKey) { st ->
+                    st.copy(
+                        effort = current.effort,
+                        permissionMode = current.permissionMode,
+                        reasoningSummary = current.reasoningSummary,
+                        fastMode = current.fastMode,
+                        arenaGroupId = current.arenaGroupId,
+                    )
+                }
+                repo.persistOptions(newKey)
+                repo.remove(key)
+                newKey
+            }
+            else -> {
+                repo.update(key) { st ->
+                    st.copy(
+                        items = retainedItems,
+                        running = false,
+                        activeTurnId = null,
+                        turnStartedAt = null,
+                        turnDurations = retainedDurations,
+                        turnDiff = null,
+                        plan = emptyList(),
+                        planExplanation = null,
+                    )
+                }
+                key
+            }
+        }
+    }
+
     /** 读取官方 Claude Code 上下文用量与最大窗口，同步到会话 TokenUsage。 */
     suspend fun refreshContextUsage(key: ConversationKey): JSONObject? {
         if (key.id !in connected) return null

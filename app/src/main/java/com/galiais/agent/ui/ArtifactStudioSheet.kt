@@ -28,15 +28,19 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
@@ -94,14 +98,14 @@ fun InlineArtifactCard(
     modifier: Modifier = Modifier,
 ) {
     val accent = when (artifact.kind) {
-        ArtifactKind.LATEX, ArtifactKind.MATH -> G.claude
+        ArtifactKind.LATEX, ArtifactKind.MATH -> G.artifact
         ArtifactKind.MERMAID, ArtifactKind.SVG -> G.codex
         ArtifactKind.CHART -> G.success
         ArtifactKind.HTML, ArtifactKind.REACT -> G.accent
         else -> G.inkMuted
     }
     val tint = when (artifact.kind) {
-        ArtifactKind.LATEX, ArtifactKind.MATH -> G.claudeTint
+        ArtifactKind.LATEX, ArtifactKind.MATH -> G.artifactTint
         ArtifactKind.MERMAID, ArtifactKind.SVG -> G.codexTint
         ArtifactKind.CHART -> G.successTint
         ArtifactKind.HTML, ArtifactKind.REACT -> G.accentContainer
@@ -302,10 +306,18 @@ fun ArtifactStudioSheet(
 
     Dialog(
         onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false, dismissOnClickOutside = false),
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            dismissOnClickOutside = false,
+            decorFitsSystemWindows = false,
+        ),
     ) {
+        var moreActionsMenu by remember { mutableStateOf(false) }
         Surface(
-            modifier = Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding(),
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
             color = G.canvas,
         ) {
             Column(Modifier.fillMaxSize()) {
@@ -364,25 +376,30 @@ fun ArtifactStudioSheet(
                 // 主画布区：单实例 WebView 持久保活且尺寸恒定，源码层平滑覆盖不销毁不隐藏 WebView，彻底消除闪烁
                 Box(Modifier.weight(1f).fillMaxWidth()) {
                     Column(Modifier.fillMaxSize()) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            Text("视口", style = MaterialTheme.typography.labelSmall, color = G.inkMuted)
-                            SegmentedPillBar(
-                                options = listOf("auto" to "自适应", "mobile" to "手机 375", "desktop" to "桌面"),
-                                selected = viewport,
-                                onSelect = { viewport = it },
-                                fillWidth = false,
-                                compact = true,
-                            )
-                            Spacer(Modifier.weight(1f))
-                            if (editableContent != current.content) {
-                                TagPill("已编辑", fg = G.warning, bg = G.warningTint)
+                        val supportsViewport = current.kind in setOf(ArtifactKind.HTML, ArtifactKind.REACT)
+                        if (supportsViewport || editableContent != current.content) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                if (supportsViewport) {
+                                    Text("视口", style = MaterialTheme.typography.labelSmall, color = G.inkMuted)
+                                    SegmentedPillBar(
+                                        options = listOf("auto" to "自适应", "mobile" to "手机", "desktop" to "桌面"),
+                                        selected = viewport,
+                                        onSelect = { viewport = it },
+                                        fillWidth = false,
+                                        compact = true,
+                                    )
+                                }
+                                Spacer(Modifier.weight(1f))
+                                if (editableContent != current.content) {
+                                    TagPill("已编辑", fg = G.warning, bg = G.warningTint)
+                                }
                             }
+                            Hairline()
                         }
-                        Hairline()
                         Box(Modifier.weight(1f).fillMaxWidth()) {
                             AndroidView(
                                 modifier = Modifier.fillMaxSize(),
@@ -552,29 +569,78 @@ fun ArtifactStudioSheet(
                 }
 
                 Hairline()
-                // 底部动作条：复制 / 重置 / 刷新 / 控制台 / 导出 PDF / 分享 / 原生 TeX 编译 / 保存到工作区
+                // 底部精简动作条：保留 3 个高频主操作，其余归入右侧「⋯」溢出菜单，避免 10 个药丸横向盲滑
+                val wsFiles = remember { WorkspaceFiles(app.runtime, app.envSsh) }
                 Row(
-                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 9.dp),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    TagPill("复制源码", fg = G.ink, bg = G.surfaceSubtle, border = G.border, onClick = {
-                        scope.launch {
-                            clipboard.setClipEntry(ClipData.newPlainText(current.title, editableContent).toClipEntry())
-                            app.conversations.notify("已复制 ${current.title} 源码")
+                    if (app.runtime.snapshot.value.ready) {
+                        if (savePath != null) {
+                            CompactActionButton(
+                                text = "保存",
+                                icon = GaliaisIcons.Check,
+                                primary = true,
+                                onClick = {
+                                    scope.launch {
+                                        runCatching {
+                                            wsFiles.write(savePath, editableContent)
+                                            app.conversations.notify("已写回 $savePath")
+                                        }.onFailure { app.conversations.notify("保存失败：${it.message}") }
+                                    }
+                                },
+                            )
+                        } else {
+                            CompactActionButton(
+                                text = "保存工作区",
+                                icon = GaliaisIcons.Download,
+                                primary = true,
+                                onClick = {
+                                    scope.launch {
+                                        val targetDir = (cwd ?: app.settings.state.value.defaultCwd).trimEnd('/')
+                                        val safeName = current.identifier.replace(Regex("[^a-zA-Z0-9._-]+"), "_").ifBlank { "artifact" }
+                                        val outDir = "$targetDir/artifacts"
+                                        val path = "$outDir/$safeName.${current.kind.extension}"
+                                        runCatching {
+                                            wsFiles.createDirectory(outDir)
+                                            wsFiles.write(path, editableContent)
+                                            app.conversations.notify("已保存到 $path")
+                                        }.onFailure { app.conversations.notify("保存失败：${it.message}") }
+                                    }
+                                },
+                            )
                         }
-                    })
-                    if (editableContent != current.content) {
-                        TagPill("重置源码", fg = G.warning, bg = G.warningTint, onClick = {
-                            setEditableContent(current.content)
-                            consoleLogs = emptyList()
-                        })
                     }
                     if (tab == 0) {
-                        TagPill("刷新", fg = G.ink, bg = G.surfaceSubtle, border = G.border, onClick = {
-                            consoleLogs = emptyList()
-                            renderNonce++
-                        })
+                        CompactActionButton(
+                            text = "导出 PDF",
+                            icon = GaliaisIcons.FileLines,
+                            onClick = {
+                                val wv = webViewRef
+                                if (wv == null) {
+                                    app.conversations.notify("预览视图尚未加载完成")
+                                } else {
+                                    runCatching {
+                                        val pm = context.getSystemService(Context.PRINT_SERVICE) as PrintManager
+                                        val safeJob = current.title.replace(Regex("[^a-zA-Z0-9\\u4e00-\\u9fa5_-]+"), "_").ifBlank { "Solbraid_Artifact" }
+                                        val adapter = wv.createPrintDocumentAdapter(safeJob)
+                                        pm.print(safeJob, adapter, PrintAttributes.Builder().setMediaSize(PrintAttributes.MediaSize.ISO_A4).build())
+                                    }.onFailure { app.conversations.notify("导出 PDF 失败：${it.message}") }
+                                }
+                            },
+                        )
+                    } else {
+                        CompactActionButton(
+                            text = "复制源码",
+                            icon = GaliaisIcons.Copy,
+                            onClick = {
+                                scope.launch {
+                                    clipboard.setClipEntry(ClipData.newPlainText(current.title, editableContent).toClipEntry())
+                                    app.conversations.notify("已复制 ${current.title} 源码")
+                                }
+                            },
+                        )
                     }
                     if (supportsConsole || consoleLogs.isNotEmpty()) {
                         TagPill(
@@ -585,108 +651,139 @@ fun ArtifactStudioSheet(
                             onClick = { showConsole = !showConsole },
                         )
                     }
-                    if (tab == 0) {
-                        TagPill("导出 PDF / 打印", fg = G.accent, bg = G.accentContainer, onClick = {
-                            val wv = webViewRef
-                            if (wv == null) {
-                                app.conversations.notify("预览视图尚未加载完成")
-                            } else {
-                                runCatching {
-                                    val pm = context.getSystemService(Context.PRINT_SERVICE) as PrintManager
-                                    val safeJob = current.title.replace(Regex("[^a-zA-Z0-9\\u4e00-\\u9fa5_-]+"), "_").ifBlank { "Solbraid_Artifact" }
-                                    val adapter = wv.createPrintDocumentAdapter(safeJob)
-                                    pm.print(safeJob, adapter, PrintAttributes.Builder().setMediaSize(PrintAttributes.MediaSize.ISO_A4).build())
-                                }.onFailure { app.conversations.notify("导出 PDF 失败：${it.message}") }
-                            }
-                        })
-                    }
-                    TagPill("分享", fg = G.ink, bg = G.surfaceSubtle, border = G.border, onClick = {
-                        runCatching {
-                            val send = Intent(Intent.ACTION_SEND).apply {
-                                type = "text/plain"
-                                putExtra(Intent.EXTRA_SUBJECT, "${current.title}.${current.kind.extension}")
-                                putExtra(Intent.EXTRA_TEXT, editableContent)
-                            }
-                            context.startActivity(Intent.createChooser(send, "分享 ${current.title}"))
-                        }.onFailure { app.conversations.notify("分享失败：${it.message}") }
-                    })
-                    if (current.kind == ArtifactKind.LATEX && app.runtime.snapshot.value.ready) {
-                        TagPill(
-                            text = if (compilingNative) "TeX 编译中…" else "Linux TeX 编译",
-                            fg = G.claude,
-                            bg = G.claudeTint,
-                            onClick = if (!compilingNative) {
-                                {
-                                    compilingNative = true
-                                    compileLog = null
-                                    scope.launch {
-                                        try {
-                                            val safeName = current.identifier.replace(Regex("[^a-zA-Z0-9._-]+"), "_")
-                                            val res = app.conversations.hub.compileLatex(editableContent, cwd ?: app.settings.state.value.defaultCwd, safeName)
-                                            compileLog = res.log.ifBlank { null }
-                                            if (res.ok && res.pdfPath != null) {
-                                                app.conversations.notify("已用 ${res.engine} 编译生成 ${res.pdfPath}")
-                                            } else {
-                                                app.conversations.notify(if (!res.nativeAvailable) "未安装原生 TeX，请直接点「导出 PDF / 打印」离线出稿" else "TeX 编译失败，请查看日志")
-                                            }
-                                        } catch (e: Exception) {
-                                            compileLog = e.message
-                                            app.conversations.notify("编译失败：${e.message}")
-                                        } finally {
-                                            compilingNative = false
-                                        }
-                                    }
-                                }
-                            } else null,
-                        )
-                    }
-                    if (app.runtime.snapshot.value.ready) {
-                        val wsFiles = remember { WorkspaceFiles(app.runtime, app.envSsh) }
-                        if (savePath != null) {
-                            TagPill("保存原文件", fg = G.onAccent, bg = G.accent, onClick = {
-                                scope.launch {
-                                    runCatching {
-                                        wsFiles.write(savePath, editableContent)
-                                        app.conversations.notify("已写回 $savePath")
-                                    }.onFailure { app.conversations.notify("保存失败：${it.message}") }
-                                }
-                            })
+                    Spacer(Modifier.weight(1f))
+                    Box {
+                        IconButton(onClick = { moreActionsMenu = true }) {
+                            Icon(GaliaisIcons.MoreHoriz, contentDescription = "更多操作", tint = G.inkMuted, modifier = Modifier.size(20.dp))
                         }
-                        TagPill("保存到工作区", fg = G.success, bg = G.successTint, onClick = {
-                            scope.launch {
-                                val targetDir = (cwd ?: app.settings.state.value.defaultCwd).trimEnd('/')
-                                val safeName = current.identifier.replace(Regex("[^a-zA-Z0-9._-]+"), "_").ifBlank { "artifact" }
-                                val outDir = "$targetDir/artifacts"
-                                val path = "$outDir/$safeName.${current.kind.extension}"
-                                runCatching {
-                                    wsFiles.createDirectory(outDir)
-                                    wsFiles.write(path, editableContent)
-                                    app.conversations.notify("已保存到 $path")
-                                }.onFailure { app.conversations.notify("保存失败：${it.message}") }
-                            }
-                        })
-                        studioSlots.take(3).forEach { slot ->
-                            TagPill(
-                                text = slot.badge.ifBlank { slot.label.ifBlank { slot.id } },
-                                fg = G.accent,
-                                bg = G.accentContainer,
-                                onClick = {
-                                    scope.launch {
-                                        try {
-                                            when {
-                                                !slot.surfaceId.isNullOrBlank() -> openingSlotSurface = slot.pluginId to slot.surfaceId
-                                                !slot.command.isNullOrBlank() -> {
-                                                    val res = app.extensions.runHostPluginCommand(slot.pluginId, slot.command, args = editableContent.take(4096), cwd = cwd)
-                                                    app.conversations.notify(res.message.ifBlank { "${slot.label.ifBlank { slot.id }} 已执行" })
-                                                }
-                                                else -> app.conversations.notify("工具栏槽位未绑定命令或原生页面")
-                                            }
-                                        } catch (e: Exception) {
-                                            app.conversations.notify("插件工具栏动作失败：${e.message}")
+                        GaliaisDropdownMenu(expanded = moreActionsMenu, onDismissRequest = { moreActionsMenu = false }) {
+                            Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                GaliaisMenuRow(
+                                    title = "复制源码",
+                                    icon = GaliaisIcons.Copy,
+                                    onClick = {
+                                        moreActionsMenu = false
+                                        scope.launch {
+                                            clipboard.setClipEntry(ClipData.newPlainText(current.title, editableContent).toClipEntry())
+                                            app.conversations.notify("已复制 ${current.title} 源码")
                                         }
+                                    },
+                                )
+                                if (tab == 0) {
+                                    GaliaisMenuRow(
+                                        title = "重新渲染预览",
+                                        icon = GaliaisIcons.Refresh,
+                                        onClick = {
+                                            moreActionsMenu = false
+                                            consoleLogs = emptyList()
+                                            renderNonce++
+                                        },
+                                    )
+                                }
+                                if (editableContent != current.content) {
+                                    GaliaisMenuRow(
+                                        title = "重置源码更改",
+                                        icon = GaliaisIcons.Undo,
+                                        tintOverride = G.warning,
+                                        onClick = {
+                                            moreActionsMenu = false
+                                            setEditableContent(current.content)
+                                            consoleLogs = emptyList()
+                                        },
+                                    )
+                                }
+                                GaliaisMenuRow(
+                                    title = "分享源码",
+                                    icon = GaliaisIcons.Share,
+                                    onClick = {
+                                        moreActionsMenu = false
+                                        runCatching {
+                                            val send = Intent(Intent.ACTION_SEND).apply {
+                                                type = "text/plain"
+                                                putExtra(Intent.EXTRA_SUBJECT, "${current.title}.${current.kind.extension}")
+                                                putExtra(Intent.EXTRA_TEXT, editableContent)
+                                            }
+                                            context.startActivity(Intent.createChooser(send, "分享 ${current.title}"))
+                                        }.onFailure { app.conversations.notify("分享失败：${it.message}") }
+                                    },
+                                )
+                                if (current.kind == ArtifactKind.LATEX && app.runtime.snapshot.value.ready) {
+                                    GaliaisMenuRow(
+                                        title = if (compilingNative) "TeX 编译中…" else "Linux 原生 TeX 编译",
+                                        icon = GaliaisIcons.Terminal,
+                                        tintOverride = G.artifact,
+                                        onClick = {
+                                            if (compilingNative) return@GaliaisMenuRow
+                                            moreActionsMenu = false
+                                            compilingNative = true
+                                            compileLog = null
+                                            scope.launch {
+                                                try {
+                                                    val safeName = current.identifier.replace(Regex("[^a-zA-Z0-9._-]+"), "_")
+                                                    val res = app.conversations.hub.compileLatex(editableContent, cwd ?: app.settings.state.value.defaultCwd, safeName)
+                                                    compileLog = res.log.ifBlank { null }
+                                                    if (res.ok && res.pdfPath != null) {
+                                                        app.conversations.notify("已用 ${res.engine} 编译生成 ${res.pdfPath}")
+                                                    } else {
+                                                        app.conversations.notify(if (!res.nativeAvailable) "未安装原生 TeX，请直接点「导出 PDF」离线出稿" else "TeX 编译失败，请查看日志")
+                                                    }
+                                                } catch (e: Exception) {
+                                                    compileLog = e.message
+                                                    app.conversations.notify("编译失败：${e.message}")
+                                                } finally {
+                                                    compilingNative = false
+                                                }
+                                            }
+                                        },
+                                    )
+                                }
+                                if (savePath != null && app.runtime.snapshot.value.ready) {
+                                    GaliaisMenuRow(
+                                        title = "另存到 artifacts/ 目录",
+                                        icon = GaliaisIcons.Folder,
+                                        onClick = {
+                                            moreActionsMenu = false
+                                            scope.launch {
+                                                val targetDir = (cwd ?: app.settings.state.value.defaultCwd).trimEnd('/')
+                                                val safeName = current.identifier.replace(Regex("[^a-zA-Z0-9._-]+"), "_").ifBlank { "artifact" }
+                                                val outDir = "$targetDir/artifacts"
+                                                val path = "$outDir/$safeName.${current.kind.extension}"
+                                                runCatching {
+                                                    wsFiles.createDirectory(outDir)
+                                                    wsFiles.write(path, editableContent)
+                                                    app.conversations.notify("已保存到 $path")
+                                                }.onFailure { app.conversations.notify("保存失败：${it.message}") }
+                                            }
+                                        },
+                                    )
+                                }
+                                if (studioSlots.isNotEmpty() && app.runtime.snapshot.value.ready) {
+                                    Hairline(Modifier.padding(vertical = 2.dp))
+                                    studioSlots.take(4).forEach { slot ->
+                                        GaliaisMenuRow(
+                                            title = slot.badge.ifBlank { slot.label.ifBlank { slot.id } },
+                                            icon = GaliaisIcons.Sparkles,
+                                            onClick = {
+                                                moreActionsMenu = false
+                                                scope.launch {
+                                                    try {
+                                                        when {
+                                                            !slot.surfaceId.isNullOrBlank() -> openingSlotSurface = slot.pluginId to slot.surfaceId
+                                                            !slot.command.isNullOrBlank() -> {
+                                                                val res = app.extensions.runHostPluginCommand(slot.pluginId, slot.command, args = editableContent.take(4096), cwd = cwd)
+                                                                app.conversations.notify(res.message.ifBlank { "${slot.label.ifBlank { slot.id }} 已执行" })
+                                                            }
+                                                            else -> app.conversations.notify("工具栏槽位未绑定命令或原生页面")
+                                                        }
+                                                    } catch (e: Exception) {
+                                                        app.conversations.notify("插件工具栏动作失败：${e.message}")
+                                                    }
+                                                }
+                                            },
+                                        )
                                     }
-                                },
-                            )
+                                }
+                            }
                         }
                     }
                 }
@@ -750,11 +847,11 @@ fun VisualTemplatePickerSheet(
             CrispCard(
                 onClick = { onDismiss(); onOpenLatexScratchpad() },
                 padding = PaddingValues(12.dp),
-                background = G.claudeTint,
-                borderColor = G.claude.copy(alpha = 0.35f),
+                background = G.artifactTint,
+                borderColor = G.artifact.copy(alpha = 0.35f),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Icon(GaliaisIcons.FileLines, contentDescription = null, tint = G.claude, modifier = Modifier.size(20.dp))
+                    Icon(GaliaisIcons.FileLines, contentDescription = null, tint = G.artifact, modifier = Modifier.size(20.dp))
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         Text("打开离线 LaTeX 编译器", style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
                         Text(
@@ -764,7 +861,7 @@ fun VisualTemplatePickerSheet(
                             color = G.inkMuted,
                         )
                     }
-                    TagPill("立即使用", fg = G.claude, bg = G.surface)
+                    TagPill("立即使用", fg = G.artifact, bg = G.surface)
                 }
             }
 
@@ -783,7 +880,15 @@ fun VisualTemplatePickerSheet(
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    Text(tpl.title, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
+                                    Text(
+                                        tpl.title,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = G.ink,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f, fill = false),
+                                    )
                                     TagPill(tpl.kind.label, fg = G.accent, bg = G.accentContainer)
                                 }
                                 Text(tpl.subtitle, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
@@ -817,7 +922,7 @@ fun ConversationArtifactsSheet(
         ) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("会话产物（${artifacts.size}）", style = MaterialTheme.typography.titleMedium, color = G.ink, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                TagPill("LaTeX 编译器", fg = G.claude, bg = G.claudeTint, onClick = { onDismiss(); onOpenLatexScratchpad() })
+                TagPill("LaTeX 编译器", fg = G.artifact, bg = G.artifactTint, onClick = { onDismiss(); onOpenLatexScratchpad() })
             }
             if (artifacts.isEmpty()) {
                 CrispCard {

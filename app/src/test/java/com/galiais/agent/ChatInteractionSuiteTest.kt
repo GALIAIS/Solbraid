@@ -1,5 +1,7 @@
 package com.galiais.agent
 
+import com.galiais.agent.engine.AgentCatalog
+import com.galiais.agent.engine.EngineKind
 import com.galiais.agent.engine.ItemStatus
 import com.galiais.agent.engine.PlanStep
 import com.galiais.agent.engine.TimelineItem
@@ -160,5 +162,29 @@ class ChatInteractionSuiteTest {
         assertEquals(1, blocks[0].planItems.size)
         assertEquals(1, blocks[0].traceItems.size)
         assertEquals("a1", blocks[0].finalMessage?.id)
+    }
+
+    @Test
+    fun `all built-in agents advertise revert capability for edit-and-resend`() {
+        assertTrue(AgentCatalog.capabilitiesOf(EngineKind.CODEX).revert)
+        assertTrue(AgentCatalog.capabilitiesOf(EngineKind.CLAUDE).revert)
+        assertTrue(AgentCatalog.capabilitiesOf(EngineKind.of("antigravity")).revert)
+        assertTrue(AgentCatalog.capabilitiesOf(EngineKind.of("custom-external")).revert)
+    }
+
+    @Test
+    fun `groupIntoTurnBlocks preserves trailing error notice on failed turn for resend actions`() {
+        val items = listOf(
+            TimelineItem.UserMessage("u1", "第一轮问题"),
+            TimelineItem.AgentMessage("a1", "第一轮答复"),
+            TimelineItem.UserMessage("u2", "第二轮提问"),
+            TimelineItem.Notice("err-u2", "网络连接超时", error = true),
+        )
+        val blocks = groupIntoTurnBlocks(items, emptyMap(), running = false)
+        assertEquals(2, blocks.size)
+        assertEquals("u2", blocks[1].userMessage?.id)
+        assertNull(blocks[1].finalMessage)
+        assertEquals(1, blocks[1].trailingNotices.size)
+        assertTrue(blocks[1].trailingNotices[0].error)
     }
 }

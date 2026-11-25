@@ -1,17 +1,12 @@
 package com.galiais.agent.ui
 
-import android.content.ClipData
-import android.graphics.BitmapFactory
+import android.content.Intent
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,22 +16,22 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -48,18 +43,19 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.toClipEntry
-import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -67,15 +63,53 @@ import androidx.compose.ui.unit.sp
 import com.galiais.agent.GaliaisApplication
 import com.galiais.agent.engine.ArtifactKind
 import com.galiais.agent.engine.ChatArtifact
-import com.galiais.agent.engine.DEFAULT_WORKSPACE
-import com.galiais.agent.engine.FileEntry
-import com.galiais.agent.engine.FilePreview
-import com.galiais.agent.engine.FuzzyMatch
-import com.galiais.agent.engine.WorkspaceArchive
 import com.galiais.agent.engine.WorkspaceFiles
+import com.galiais.agent.engine.fs.ClipboardMode
+import com.galiais.agent.engine.fs.ExternalStorageBridge
+import com.galiais.agent.engine.fs.FileNode
+import com.galiais.agent.engine.fs.FileRef
+import com.galiais.agent.engine.fs.FileScope
+import com.galiais.agent.engine.fs.LocalFsHelper
+import com.galiais.agent.engine.fs.MediaFilter
+import com.galiais.agent.engine.fs.MountInfo
+import com.galiais.agent.engine.fs.SearchHit
+import com.galiais.agent.engine.fs.TextCodec
+import com.galiais.agent.engine.fs.ViewMode
+import com.galiais.agent.engine.fs.ViewerCategory
+import com.galiais.agent.engine.fs.compressInPlace
+import com.galiais.agent.engine.fs.compressToZipUri
+import com.galiais.agent.engine.fs.exportSingleFileToUri
+import com.galiais.agent.engine.fs.extractArchive
+import com.galiais.agent.engine.fs.importExternalFolderTree
+import com.galiais.agent.engine.fs.importExternalUris
+import com.galiais.agent.engine.fs.joinVfsPath
+import com.galiais.agent.engine.fs.normalizeVfsPath
+import com.galiais.agent.engine.fs.pasteClipboard
+import com.galiais.agent.engine.fs.search
+import com.galiais.agent.ui.files.BatchRenameDialog
+import com.galiais.agent.ui.files.CodeEditorDialog
+import com.galiais.agent.ui.files.CompactRootStatusBar
+import com.galiais.agent.ui.files.CreateAndImportSheet
+import com.galiais.agent.ui.files.DiskUsageAnalyzerSheet
+import com.galiais.agent.ui.files.ExportFileSheet
+import com.galiais.agent.ui.files.FileActionSheet
+import com.galiais.agent.ui.files.FileBookmarksAndTrashSheet
+import com.galiais.agent.ui.files.FileListRow
+import com.galiais.agent.ui.files.FilePropertiesSheet
+import com.galiais.agent.ui.files.FilterAndSortTray
+import com.galiais.agent.ui.files.MediaGridTile
+import com.galiais.agent.ui.files.MultiSelectActionBar
+import com.galiais.agent.ui.files.PathAndUtilityBar
+import com.galiais.agent.ui.files.ScopeSegmentedHeader
+import com.galiais.agent.ui.files.TabCounterButton
+import com.galiais.agent.ui.files.TabManagerSheet
+import com.galiais.agent.ui.files.TransferDock
+import com.galiais.agent.ui.files.TwoFileDiffSheet
+import com.galiais.agent.ui.files.UniversalFileViewerDialog
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
+/** 全功能四域文件管理器主页面（Editorial Craft 轻盈分层架构 + 单手拇指 FAB + 全格式查看与专业代码编辑）。 */
 @Composable
 fun FilesScreen(
     app: GaliaisApplication,
@@ -87,650 +121,843 @@ fun FilesScreen(
     onUseDirectory: (String) -> Unit,
     onReferenceFile: (cwd: String, file: String) -> Unit,
 ) {
+    val fm = app.fileManager
     val runtime by app.runtime.snapshot.collectAsState()
-    val files = remember { WorkspaceFiles(app.runtime, app.envSsh) }
-    val clipboard = LocalClipboard.current
-    var path by rememberSaveable { mutableStateOf(DEFAULT_WORKSPACE) }
-    var entries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
-    var preview by remember { mutableStateOf<Pair<String, FilePreview>?>(null) }
-    var editingText by remember { mutableStateOf<String?>(null) }
-    var saving by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<String?>(null) }
-    var loading by remember { mutableStateOf(false) }
-    var creatingDir by remember { mutableStateOf(false) }
-    var creatingFile by remember { mutableStateOf(false) }
-    var renaming by remember { mutableStateOf<FileEntry?>(null) }
-    var deleting by remember { mutableStateOf<FileEntry?>(null) }
-    var studioTarget by remember { mutableStateOf<Pair<ChatArtifact, String>?>(null) }
-    var searching by remember { mutableStateOf(false) }
-    var searchQuery by remember { mutableStateOf("") }
-    var searchResults by remember { mutableStateOf<List<FuzzyMatch>>(emptyList()) }
-    var showGit by remember { mutableStateOf(false) }
-    var showPreview by remember { mutableStateOf(false) }
-    var showHeaderMore by remember { mutableStateOf(false) }
-    var openingPluginSurface by remember { mutableStateOf<Pair<String, String>?>(null) }
-    var openingPluginPanel by remember { mutableStateOf<Pair<String, ChatArtifact>?>(null) }
-    var reload by remember { mutableIntStateOf(0) }
+    val rootAvailable by app.runtime.rootAvailable.collectAsState()
+    val tabs by fm.tabs.collectAsState()
+    val activeTabId by fm.activeTabId.collectAsState()
+    val clipboard by fm.clipboard.collectAsState()
+    val transfers by fm.transfers.collectAsState()
+    val sortField by fm.sortField.collectAsState()
+    val sortAsc by fm.sortAsc.collectAsState()
+    val viewMode by fm.viewMode.collectAsState()
+    val showHidden by fm.showHidden.collectAsState()
+    val rootWriteUnlocked by fm.rootWriteUnlocked.collectAsState()
+    val backupOnRootEdit by fm.backupOnRootEdit.collectAsState()
+    val pendingSharedUris by fm.pendingSharedUris.collectAsState()
+
+    val activeTab = tabs.firstOrNull { it.id == activeTabId } ?: tabs.first()
+    val activeScope = activeTab.scope
+    val path = activeTab.path
+    val hasRoot = rootAvailable == true
+
+    val legacyFiles = remember { WorkspaceFiles(app.runtime, app.envSsh) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
 
-    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+    var entries by remember { mutableStateOf<List<FileNode>>(emptyList()) }
+    var gitStatuses by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var mountInfo by remember { mutableStateOf<MountInfo?>(null) }
+    var loading by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var reload by remember { mutableIntStateOf(0) }
+    var mediaFilter by remember { mutableStateOf(MediaFilter.ALL) }
+    var showFilterTray by remember { mutableStateOf(false) }
+
+    // 多选态
+    var selectedPaths by remember(activeTabId, path) { mutableStateOf<Set<String>>(emptySet()) }
+    val selectionMode = selectedPaths.isNotEmpty()
+
+    // 搜索态（文件名搜索 + 全文 Grep 搜索）
+    var searching by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
+    var searchContentMode by remember { mutableStateOf(false) }
+    var searchRegex by remember { mutableStateOf(false) }
+    var searchResults by remember { mutableStateOf<List<SearchHit>>(emptyList()) }
+    var searchBusy by remember { mutableStateOf(false) }
+
+    // 编辑器与全格式查看器路由态
+    var editorTarget by remember { mutableStateOf<Pair<FileRef, Int?>?>(null) }
+    var viewerTarget by remember { mutableStateOf<FileRef?>(null) }
+
+    // 各类抽屉与弹窗态
+    var showHeaderMore by remember { mutableStateOf(false) }
+    var showCreateSheet by remember { mutableStateOf(false) }
+    var showTabSheet by remember { mutableStateOf(false) }
+    var actionSheetNode by remember { mutableStateOf<FileNode?>(null) }
+    var showBookmarksSheet by remember { mutableStateOf(false) }
+    var showDiskUsage by remember { mutableStateOf(false) }
+    var showGit by remember { mutableStateOf(false) }
+    var showPreview by remember { mutableStateOf(false) }
+    var showManualPath by remember { mutableStateOf(false) }
+    var creatingFile by remember { mutableStateOf(false) }
+    var creatingDir by remember { mutableStateOf(false) }
+    var creatingSymlink by remember { mutableStateOf(false) }
+    var renamingNode by remember { mutableStateOf<FileNode?>(null) }
+    var propertiesNode by remember { mutableStateOf<FileNode?>(null) }
+    var exportTarget by remember { mutableStateOf<FileRef?>(null) }
+    var deleteTargets by remember { mutableStateOf<List<FileRef>?>(null) }
+    var batchRenameTargets by remember { mutableStateOf<List<FileRef>?>(null) }
+    var compressTargets by remember { mutableStateOf<List<FileRef>?>(null) }
+    var diffTargets by remember { mutableStateOf<Pair<FileRef, FileRef>?>(null) }
+    var pendingSaveAsRef by remember { mutableStateOf<FileRef?>(null) }
+    var pendingZipExportRefs by remember { mutableStateOf<List<FileRef>?>(null) }
+    var openingPluginSurface by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var openingPluginPanel by remember { mutableStateOf<Pair<String, ChatArtifact>?>(null) }
+
+    // SAF 启动器
+    val uploadFilesLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        scope.launch {
+            runCatching { fm.importExternalUris(uris, activeScope, path, extractZip = false) }
+                .onSuccess { app.conversations.notify(it); reload++ }
+                .onFailure { error = "上传失败：${it.message}" }
+        }
+    }
+    val uploadZipLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
-            loading = true; error = null
-            try {
-                val msg = WorkspaceArchive.importUriToDirectory(context, uri, path, files)
-                app.conversations.notify(msg)
-                reload++
-            } catch (e: Exception) {
-                error = "导入失败：${e.message}"
-            }
-            loading = false
+            runCatching { fm.importExternalUris(listOf(uri), activeScope, path, extractZip = true) }
+                .onSuccess { app.conversations.notify(it); reload++ }
+                .onFailure { error = "ZIP 导入失败：${it.message}" }
+        }
+    }
+    val uploadFolderLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { treeUri ->
+        if (treeUri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            runCatching { fm.importExternalFolderTree(treeUri, activeScope, path) }
+                .onSuccess { app.conversations.notify(it); reload++ }
+                .onFailure { error = "文件夹上传失败：${it.message}" }
+        }
+    }
+    val mountSafLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { treeUri ->
+        if (treeUri == null) return@rememberLauncherForActivityResult
+        runCatching {
+            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            context.contentResolver.takePersistableUriPermission(treeUri, flags)
+        }
+        val name = ExternalStorageBridge.queryDisplayName(context, treeUri)
+        val mounted = fm.mountSafTree(treeUri, name)
+        app.conversations.notify("已挂载外部目录：$name")
+        fm.navigate(FileScope.ANDROID_STORAGE, "saf://${mounted.id}")
+    }
+    val saveAsLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
+        val target = pendingSaveAsRef
+        pendingSaveAsRef = null
+        if (uri == null || target == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            runCatching { fm.exportSingleFileToUri(target, uri) }
+                .onSuccess { app.conversations.notify("已另存为：${target.name}") }
+                .onFailure { app.conversations.notify("另存为失败：${it.message}") }
+        }
+    }
+    val exportZipLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        val refs = pendingZipExportRefs
+        pendingZipExportRefs = null
+        if (uri == null || refs.isNullOrEmpty()) return@rememberLauncherForActivityResult
+        scope.launch {
+            runCatching { fm.compressToZipUri(refs, uri, excludeBuildDirs = refs.size == 1 && refs.first().path == path) }
+                .onSuccess { cnt -> app.conversations.notify("已打包导出 $cnt 个文件为 ZIP") }
+                .onFailure { app.conversations.notify("导出 ZIP 失败：${it.message}") }
         }
     }
 
-    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
-        scope.launch {
-            loading = true; error = null
-            try {
-                val count = WorkspaceArchive.exportDirectoryToZipUri(context, uri, path, files)
-                app.conversations.notify("已导出 $count 个文件为 ZIP")
-            } catch (e: Exception) {
-                error = "导出失败：${e.message}"
-            }
-            loading = false
-        }
-    }
-
+    LaunchedEffect(Unit) { app.runtime.probeRoot() }
     LaunchedEffect(requestedPath) {
         if (!requestedPath.isNullOrBlank() && requestedPath.startsWith("/")) {
-            path = requestedPath
-            preview = null
-            editingText = null
+            fm.navigate(FileScope.LINUX_WORKSPACE, requestedPath)
             onConsumeRequestedPath()
         }
     }
 
-    LaunchedEffect(path, runtime.ready, reload) {
-        if (!runtime.ready) return@LaunchedEffect
+    // 加载目录内容、挂载点信息与 Git 角标（切换域时先清空上一域旧列表，避免短暂残影）
+    var lastLoadedScope by remember { mutableStateOf(activeScope) }
+    LaunchedEffect(activeScope, path, sortField, sortAsc, showHidden, reload, hasRoot) {
+        if (lastLoadedScope != activeScope) {
+            entries = emptyList()
+            mountInfo = null
+            gitStatuses = emptyMap()
+            lastLoadedScope = activeScope
+        }
         loading = true; error = null
-        try { entries = files.list(path) } catch (failure: Exception) { error = failure.message; entries = emptyList() }
-        loading = false
-    }
-
-    LaunchedEffect(searching, searchQuery, path, runtime.ready) {
-        if (!searching || !runtime.ready || searchQuery.isBlank()) {
-            searchResults = emptyList()
-            return@LaunchedEffect
-        }
-        delay(220)
-        searchResults = try { files.fuzzySearch(searchQuery.trim(), path) } catch (_: Exception) { emptyList() }
-    }
-
-    var confirmDiscardEdit by remember { mutableStateOf(false) }
-    var saveConflict by remember { mutableStateOf<Pair<String, String>?>(null) }
-    val origPreviewText = (preview?.second as? FilePreview.Text)?.content
-    val hasUnsavedEdit = editingText != null && editingText != origPreviewText
-    val parent = path.substringBeforeLast('/', "").ifEmpty { "/" }
-    val goBack: () -> Unit = {
-        when {
-            editingText != null -> if (hasUnsavedEdit) confirmDiscardEdit = true else editingText = null
-            preview != null -> preview = null
-            searching -> { searching = false; searchQuery = "" }
-            path != "/" -> path = parent
-        }
-    }
-    BackHandler(enabled = editingText != null || preview != null || searching || path != "/") { goBack() }
-
-    fun performSave(filePath: String, content: String, force: Boolean = false) {
-        saving = true; error = null
-        scope.launch {
-            try {
-                if (!force && origPreviewText != null) {
-                    val latest = try { files.read(filePath) } catch (_: Exception) { null }
-                    when (latest) {
-                        is FilePreview.Text -> {
-                            if (latest.content != origPreviewText && latest.content != content) {
-                                saveConflict = filePath to latest.content
-                                saving = false
-                                return@launch
+        try {
+            entries = fm.list(activeScope, path)
+            mountInfo = if (activeScope.isRootElevated) fm.queryMountInfo(activeScope, path) else null
+            gitStatuses = if (runtime.ready && activeScope in setOf(FileScope.LINUX_WORKSPACE, FileScope.LINUX_ROOT)) {
+                runCatching {
+                    val res = legacyFiles.exec(listOf("git", "-c", "core.quotepath=false", "status", "--porcelain", "-uall"), path, timeoutMs = 4_000)
+                    if (res.exitCode != 0) emptyMap()
+                    else buildMap {
+                        res.stdout.lineSequence().forEach { line ->
+                            if (line.length >= 4) {
+                                val code = line.substring(0, 2).trim().take(1)
+                                val rel = line.substring(3).trim().removeSurrounding("\"").substringBefore('/')
+                                if (rel.isNotBlank() && code.isNotBlank()) put(rel, code)
                             }
                         }
-                        is FilePreview.Image, is FilePreview.Binary -> {
-                            error = "保存中止：文件已被外部修改为非文本格式，请返回后重新打开"
-                            saving = false
-                            return@launch
-                        }
-                        null -> Unit
                     }
-                }
-                files.write(filePath, content)
-                preview = filePath to FilePreview.Text(content, truncated = false)
-                editingText = null
-                saveConflict = null
-                app.conversations.notify("已保存 ${filePath.substringAfterLast('/')}")
-            } catch (e: Exception) { error = "保存失败：${e.message}" }
-            saving = false
-        }
-    }
-
-    fun openFile(fullPath: String, startEdit: Boolean = false) {
-        scope.launch {
-            loading = true; error = null
-            try {
-                val read = files.read(fullPath)
-                preview = fullPath to read
-                editingText = if (startEdit && read is FilePreview.Text && !read.truncated) read.content else null
-            } catch (failure: Exception) { error = failure.message }
+                }.getOrDefault(emptyMap())
+            } else emptyMap()
+        } catch (e: Exception) {
+            error = e.message ?: "读取目录失败"
+            entries = emptyList()
+        } finally {
             loading = false
         }
     }
 
-    Column(modifier.fillMaxSize().galiaisCanvasBackground().imePadding()) {
-        Row(
-            modifier = Modifier.fillMaxWidth().height(if (D.material) 64.dp else 56.dp)
-                .padding(start = if (preview != null || searching || path != "/") 4.dp else 18.dp, end = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(2.dp),
-        ) {
-            if (preview != null || searching || path != "/") {
-                IconButton(onClick = goBack) {
-                    Icon(GaliaisIcons.ArrowBack, contentDescription = "返回上一级", tint = G.ink, modifier = Modifier.size(20.dp))
-                }
-            }
-            Text(
-                preview?.first?.substringAfterLast('/') ?: "工作区文件",
-                style = MaterialTheme.typography.titleLarge,
-                color = G.ink,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
-            )
-            if (preview == null && runtime.ready) {
-                IconButton(onClick = { searching = !searching; if (!searching) searchQuery = "" }, modifier = Modifier.size(36.dp)) {
-                    Icon(GaliaisIcons.Search, contentDescription = "搜索文件", tint = if (searching) G.accent else G.inkMuted, modifier = Modifier.size(19.dp))
-                }
-                IconButton(onClick = { onOpenTerminal(path) { reload++ } }, modifier = Modifier.size(36.dp)) {
-                    Icon(GaliaisIcons.Terminal, contentDescription = "终端", tint = G.inkMuted, modifier = Modifier.size(19.dp))
-                }
-                IconButton(onClick = { reload++ }, enabled = !loading, modifier = Modifier.size(36.dp)) {
-                    Icon(GaliaisIcons.Refresh, contentDescription = "刷新文件", tint = if (!loading) G.inkMuted else G.inkSubtle, modifier = Modifier.size(19.dp))
-                }
-                Box {
-                    IconButton(onClick = { showHeaderMore = true }, modifier = Modifier.size(36.dp)) {
-                        Icon(GaliaisIcons.MoreHoriz, contentDescription = "更多工具", tint = G.inkMuted, modifier = Modifier.size(19.dp))
+    // 双模搜索防抖
+    LaunchedEffect(searching, searchQuery, searchContentMode, searchRegex, activeScope, path) {
+        if (!searching || searchQuery.isBlank()) { searchResults = emptyList(); return@LaunchedEffect }
+        delay(220)
+        searchBusy = true
+        searchResults = runCatching { fm.search(activeScope, path, searchQuery, contentSearch = searchContentMode, useRegex = searchRegex) }
+            .getOrDefault(emptyList())
+        searchBusy = false
+    }
+
+    fun openNodeSmart(node: FileNode) {
+        if (node.isDirectory) {
+            fm.navigate(node.scope, node.path)
+            return
+        }
+        fm.recordRecent(node.ref)
+        val cat = TextCodec.classifyFile(node.name, ByteArray(0))
+        if (cat == ViewerCategory.TEXT_CODE) editorTarget = node.ref to null else viewerTarget = node.ref
+    }
+
+    val parentPath = remember(path) {
+        if (path.startsWith("saf://")) path.substringBeforeLast('/') else normalizeVfsPath(path).substringBeforeLast('/').ifEmpty { "/" }
+    }
+    val canGoParent = path != "/" && !path.matches(Regex("^saf://[^/]+$"))
+    BackHandler(enabled = selectionMode || searching || activeTab.backStack.isNotEmpty() || canGoParent) {
+        when {
+            selectionMode -> selectedPaths = emptySet()
+            searching -> { searching = false; searchQuery = "" }
+            activeTab.backStack.isNotEmpty() -> fm.goBack()
+            canGoParent -> fm.navigate(activeScope, parentPath)
+        }
+    }
+
+    val visibleEntries = remember(entries, mediaFilter, gitStatuses) {
+        entries
+            .filter { TextCodec.matchesMediaFilter(it, mediaFilter) }
+            .map { n -> val st = gitStatuses[n.name]; if (st != null) n.copy(gitStatus = st) else n }
+    }
+    val dirEntries = remember(visibleEntries) { visibleEntries.filter { it.isDirectory } }
+    val fileEntries = remember(visibleEntries) { visibleEntries.filter { !it.isDirectory } }
+    val siblingImages = remember(entries) {
+        entries.filter { !it.isDirectory && it.extension in setOf("png", "jpg", "jpeg", "webp", "gif", "bmp", "heic", "avif") }.map { it.ref }
+    }
+
+    Box(modifier.fillMaxSize().galiaisCanvasBackground()) {
+        Column(Modifier.fillMaxSize()) {
+            // ── 第 1 层：极简对齐页头（统一 56/64dp，与会话/SSH 页视觉节奏完全一致） ──
+            Row(
+                modifier = Modifier.fillMaxWidth().height(if (D.material) 64.dp else 56.dp).padding(start = if (selectionMode || activeTab.backStack.isNotEmpty() || canGoParent) 6.dp else 16.dp, end = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                if (selectionMode) {
+                    IconButton(onClick = { selectedPaths = emptySet() }, modifier = Modifier.size(38.dp)) {
+                        Icon(GaliaisIcons.Close, contentDescription = "退出多选", tint = G.ink, modifier = Modifier.size(18.dp))
                     }
-                    GaliaisDropdownMenu(expanded = showHeaderMore, onDismissRequest = { showHeaderMore = false }) {
-                        Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            GaliaisMenuRow(title = "Git 改动与提交", icon = GaliaisIcons.GitBranch, onClick = { showHeaderMore = false; showGit = true })
-                            GaliaisMenuRow(title = "SSH 工作台", icon = GaliaisIcons.Server, onClick = { showHeaderMore = false; onOpenSsh() })
-                            GaliaisMenuRow(title = "本地网页预览", icon = GaliaisIcons.Globe, onClick = { showHeaderMore = false; showPreview = true })
+                    Text("已选 ${selectedPaths.size} 项", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = G.ink, modifier = Modifier.weight(1f))
+                    TagPill("全选", fg = G.accent, bg = G.accentContainer, onClick = { selectedPaths = visibleEntries.map { it.path }.toSet() })
+                    Spacer(Modifier.size(4.dp))
+                    TagPill("反选", fg = G.inkMuted, bg = G.surfaceSubtle, border = G.border, onClick = {
+                        val all = visibleEntries.map { it.path }.toSet()
+                        selectedPaths = all - selectedPaths
+                    })
+                    Spacer(Modifier.size(6.dp))
+                } else {
+                    if (activeTab.backStack.isNotEmpty() || canGoParent) {
+                        IconButton(
+                            onClick = { if (activeTab.backStack.isNotEmpty()) fm.goBack() else if (canGoParent) fm.navigate(activeScope, parentPath) },
+                            modifier = Modifier.size(36.dp),
+                        ) {
+                            Icon(GaliaisIcons.ArrowBack, contentDescription = "返回上级", tint = G.ink, modifier = Modifier.size(18.dp))
+                        }
+                    }
+                    Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("文件", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, color = G.ink)
+                        if (visibleEntries.isNotEmpty()) {
+                            Text("${visibleEntries.size} 项", style = MaterialTheme.typography.labelSmall, color = G.inkMuted, modifier = Modifier.padding(bottom = 2.dp))
+                        }
+                    }
+                    Spacer(Modifier.weight(1f))
+                    IconButton(onClick = { searching = !searching; if (!searching) searchQuery = "" }, modifier = Modifier.size(36.dp)) {
+                        Icon(if (searching) GaliaisIcons.Close else GaliaisIcons.Search, contentDescription = "搜索", tint = if (searching) G.accent else G.inkMuted, modifier = Modifier.size(18.dp))
+                    }
+                    TabCounterButton(count = tabs.size, onClick = { showTabSheet = true })
+                    IconButton(onClick = { showBookmarksSheet = true }, modifier = Modifier.size(36.dp)) {
+                        Icon(GaliaisIcons.BookOpen, contentDescription = "书签与回收站", tint = G.inkMuted, modifier = Modifier.size(18.dp))
+                    }
+                    Box {
+                        IconButton(onClick = { showHeaderMore = true }, modifier = Modifier.size(36.dp)) {
+                            Icon(GaliaisIcons.MoreHoriz, contentDescription = "更多工具", tint = G.inkMuted, modifier = Modifier.size(18.dp))
+                        }
+                        GaliaisDropdownMenu(expanded = showHeaderMore, onDismissRequest = { showHeaderMore = false }) {
+                            Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                GaliaisMenuRow("刷新当前目录", icon = GaliaisIcons.Refresh, onClick = { showHeaderMore = false; reload++ })
+                                GaliaisMenuRow(if (showHidden) "隐藏 .点文件" else "显示 .点文件", icon = GaliaisIcons.Info, onClick = { showHeaderMore = false; fm.setShowHidden(!showHidden) })
+                                GaliaisMenuRow("磁盘空间占用分析", icon = GaliaisIcons.Activity, onClick = { showHeaderMore = false; showDiskUsage = true })
+                                GaliaisMenuRow("挂载外部手机目录 (SAF)", icon = GaliaisIcons.FolderSearch, onClick = { showHeaderMore = false; mountSafLauncher.launch(null) })
+                                if (runtime.ready && activeScope in setOf(FileScope.LINUX_WORKSPACE, FileScope.LINUX_ROOT)) {
+                                    GaliaisMenuRow("在此打开终端", icon = GaliaisIcons.Terminal, onClick = { showHeaderMore = false; onOpenTerminal(path) { reload++ } })
+                                    GaliaisMenuRow("Git 改动与提交", icon = GaliaisIcons.GitBranch, onClick = { showHeaderMore = false; showGit = true })
+                                }
+                                GaliaisMenuRow("SSH 远程主机", icon = GaliaisIcons.Server, onClick = { showHeaderMore = false; onOpenSsh() })
+                                if (runtime.ready) {
+                                    GaliaisMenuRow("实时 Web 预览", icon = GaliaisIcons.Globe, onClick = { showHeaderMore = false; showPreview = true })
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
-        HeaderProgressSlot(loading || saving)
+            HeaderProgressSlot(loading || searchBusy)
 
-        if (!runtime.ready) {
-            Box(Modifier.fillMaxSize().padding(20.dp), contentAlignment = Alignment.Center) {
-                CrispCard {
-                    Column(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
+            // ── 第 2 层：统一四域分段条（单标签时不占额外行） ──────────────────
+            Spacer(Modifier.height(4.dp))
+            ScopeSegmentedHeader(
+                tabs = tabs,
+                activeTabId = activeTabId,
+                activeScope = activeScope,
+                onSwitchScope = { sc ->
+                    if (sc == FileScope.HOST_ROOT && !hasRoot) {
+                        app.runtime.probeRoot()
+                        app.conversations.notify("正在检测手机 Root 权限（su）…")
+                    }
+                    fm.switchScope(sc)
+                },
+                onSelectTab = fm::selectTab,
+                onOpenNewTab = { fm.openTab(activeScope, path) },
+                onCloseTab = fm::closeTab,
+            )
+
+            // ── 传输进度与上下文提示（全部按需显现，常态 0dp 零负担） ──────────
+            TransferDock(jobs = transfers, onCancel = fm::cancelTransfer, onDismiss = fm::dismissTransfer)
+
+            if (pendingSharedUris.isNotEmpty()) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 3.dp),
+                    shape = D.shape(10.dp),
+                    color = G.successTint,
+                    border = BorderStroke(0.75.dp, G.success.copy(alpha = 0.5f)),
+                ) {
+                    Row(Modifier.padding(horizontal = 10.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("收到 ${pendingSharedUris.size} 个分享文件，保存到此处？", style = MaterialTheme.typography.labelSmall, color = G.ink, modifier = Modifier.weight(1f))
+                        TagPill("保存", fg = G.onAccent, bg = G.success, onClick = {
+                            val uris = fm.consumeSharedUris()
+                            scope.launch {
+                                runCatching { fm.importExternalUris(uris, activeScope, path) }
+                                    .onSuccess { app.conversations.notify(it); reload++ }
+                                    .onFailure { app.conversations.notify("保存分享失败：${it.message}") }
+                            }
+                        })
+                        TagPill("忽略", fg = G.inkMuted, bg = G.surface, onClick = { fm.consumeSharedUris() })
+                    }
+                }
+            }
+
+            // ── 双模搜索态 vs 正常目录浏览态 ──────────────────────────────────
+            if (searching) {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SearchBar(
+                        value = searchQuery,
+                        onValueChange = { searchQuery = it },
+                        placeholder = if (searchContentMode) "在当前目录全文 Grep 搜索代码/正文…" else "按文件名递归搜索当前目录…",
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        SelectableChip("文件名", selected = !searchContentMode, onClick = { searchContentMode = false })
+                        SelectableChip("全文 Grep", selected = searchContentMode, onClick = { searchContentMode = true })
+                        SelectableChip("正则 .*", selected = searchRegex, onClick = { searchRegex = !searchRegex })
+                    }
+                }
+                LazyColumn(
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 4.dp, bottom = 24.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    if (searchResults.isEmpty() && searchQuery.isNotBlank() && !searchBusy) {
+                        item {
+                            Text("未找到与「$searchQuery」匹配的结果。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted, modifier = Modifier.padding(16.dp))
+                        }
+                    }
+                    itemsIndexed(searchResults, key = { idx, h -> "${h.path}:${h.lineNumber}:$idx" }) { _, hit ->
+                        val hitRef = FileRef(hit.scope, hit.path)
+                        CrispCard(
+                            padding = PaddingValues(horizontal = 12.dp, vertical = 9.dp),
+                            onClick = {
+                                if (hit.isDirectory) {
+                                    searching = false; searchQuery = ""
+                                    fm.navigate(hit.scope, hit.path)
+                                } else if (hit.lineNumber != null) {
+                                    editorTarget = hitRef to hit.lineNumber
+                                } else {
+                                    openNodeSmart(FileNode(hit.scope, hit.path, hit.name, isDirectory = false, size = hit.size))
+                                }
+                            },
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(hit.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold, color = G.ink, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                                hit.lineNumber?.let { TagPill("L$it", fg = G.accent, bg = G.accentContainer) }
+                            }
+                            Text(hit.path, fontFamily = Mono, fontSize = 10.5.sp, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            hit.previewLine?.let { Text(it, fontFamily = Mono, fontSize = 11.sp, color = G.ink, maxLines = 2, overflow = TextOverflow.Ellipsis) }
+                        }
+                    }
+                }
+            } else {
+                // ── 第 2.5 层：一体化路径面包屑 + 筛选/视图工具栏 ──────────────
+                PathAndUtilityBar(
+                    path = path,
+                    viewMode = viewMode,
+                    filterActive = mediaFilter != MediaFilter.ALL,
+                    filterExpanded = showFilterTray,
+                    onNavigate = { fm.navigate(activeScope, it) },
+                    onManualPath = { showManualPath = true },
+                    onToggleFilterTray = { showFilterTray = !showFilterTray },
+                    onCycleViewMode = {
+                        val next = when (viewMode) {
+                            ViewMode.DETAILED -> ViewMode.COMPACT
+                            ViewMode.COMPACT -> ViewMode.GRID
+                            ViewMode.GRID -> ViewMode.DETAILED
+                        }
+                        fm.setViewMode(next)
+                    },
+                )
+
+                FilterAndSortTray(
+                    visible = showFilterTray,
+                    mediaFilter = mediaFilter,
+                    sortField = sortField,
+                    sortAsc = sortAsc,
+                    showHidden = showHidden,
+                    onSelectFilter = { mediaFilter = it },
+                    onSelectSort = { fm.setSort(it) },
+                    onToggleHidden = { fm.setShowHidden(!showHidden) },
+                )
+                if (!showFilterTray && mediaFilter != MediaFilter.ALL) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        Text(
-                            if (runtime.busy) "正在准备运行环境" else "本地运行环境未就绪",
-                            style = MaterialTheme.typography.titleSmall,
-                            color = G.ink,
+                        TagPill(
+                            text = "已筛选：${mediaFilter.label}  ×",
+                            fg = G.accent,
+                            bg = G.accentContainer,
+                            onClick = { mediaFilter = MediaFilter.ALL },
                         )
-                        Text(
-                            if (runtime.busy || runtime.state == "error") runtime.message
-                            else "启动运行环境后即可浏览、搜索和编辑工作区项目文件。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (runtime.state == "error") G.danger else G.inkMuted,
-                        )
-                        if (runtime.busy) {
-                            GaliaisProgressBar(thin = false, progress = runtime.progress)
-                        } else {
-                            PrimaryPillButton(
-                                text = if (runtime.state == "error") "重新启动" else "立即启动运行环境",
-                                enabled = runtime.bound,
-                                onClick = app.runtime::start,
+                    }
+                }
+
+                if (activeScope.isRootElevated) {
+                    CompactRootStatusBar(
+                        scope = activeScope,
+                        mountInfo = mountInfo,
+                        writeUnlocked = rootWriteUnlocked,
+                        backupOnEdit = backupOnRootEdit,
+                        onToggleUnlock = { fm.setRootWriteUnlocked(!rootWriteUnlocked) },
+                        onToggleBackup = { fm.setBackupOnRootEdit(!backupOnRootEdit) },
+                    )
+                }
+
+                if (activeScope == FileScope.ANDROID_STORAGE && !LocalFsHelper.hasAllFilesAccess(context) && !hasRoot && !path.startsWith("saf://")) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 3.dp),
+                        shape = D.shape(10.dp),
+                        color = G.accentContainer.copy(alpha = 0.55f),
+                        border = BorderStroke(0.75.dp, G.accent.copy(alpha = 0.4f)),
+                    ) {
+                        Row(Modifier.padding(horizontal = 10.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("授予所有文件权限或挂载 SAF 目录即可免 Root 读写", style = MaterialTheme.typography.labelSmall, color = G.ink, modifier = Modifier.weight(1f))
+                            TagPill("去授权", fg = G.onAccent, bg = G.accent, onClick = { ExternalStorageBridge.openAllFilesPermissionSettings(context) })
+                            TagPill("SAF", fg = G.accent, bg = G.surface, border = G.accent.copy(alpha = 0.4f), onClick = { mountSafLauncher.launch(null) })
+                        }
+                    }
+                }
+
+                if (activeScope == FileScope.LINUX_WORKSPACE && !runtime.ready && entries.isEmpty() && !loading && error != null) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 3.dp),
+                        shape = D.shape(10.dp),
+                        color = G.surfaceSubtle,
+                        border = BorderStroke(0.75.dp, G.border),
+                    ) {
+                        Row(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("Linux 工作区尚未初始化，可一键启动运行环境", style = MaterialTheme.typography.labelSmall, color = G.inkMuted, modifier = Modifier.weight(1f))
+                            TagPill("启动环境", fg = G.onAccent, bg = G.accent, onClick = { app.runtime.start() })
+                        }
+                    }
+                }
+
+                PluginSlotActionBar(
+                    app = app,
+                    slotName = "files.toolbar",
+                    cwd = path,
+                    scrollable = true,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp),
+                    onOpenSurface = { pid, sid -> openingPluginSurface = pid to sid },
+                    onOpenPanel = { pid, art -> openingPluginPanel = pid to art },
+                )
+                PluginSlotBannerColumn(
+                    app = app,
+                    slotName = "files.banner",
+                    cwd = path,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 3.dp),
+                    onOpenSurface = { pid, sid -> openingPluginSurface = pid to sid },
+                    onOpenPanel = { pid, art -> openingPluginPanel = pid to art },
+                )
+
+                error?.let { msg ->
+                    Surface(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
+                        shape = D.shape(10.dp),
+                        color = G.dangerTint,
+                        border = BorderStroke(0.75.dp, G.danger.copy(alpha = 0.45f)),
+                    ) {
+                        Row(Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(msg, style = MaterialTheme.typography.bodySmall, color = G.danger, modifier = Modifier.weight(1f))
+                            TagPill("重试", fg = G.onAccent, bg = G.danger, onClick = { app.runtime.probeRoot(); reload++ })
+                        }
+                    }
+                }
+
+                // ── 主文件区域（占屏幕 78%+ 黄金空间，懒加载 120fps 分组卡片） ───
+                if (viewMode == ViewMode.GRID) {
+                    LazyVerticalGrid(
+                        columns = GridCells.Fixed(3),
+                        modifier = Modifier.weight(1f).fillMaxWidth(),
+                        contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 96.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        items(visibleEntries, key = { it.path }) { node ->
+                            val sel = node.path in selectedPaths
+                            MediaGridTile(
+                                app = app,
+                                node = node,
+                                selectionMode = selectionMode,
+                                selected = sel,
+                                onClick = {
+                                    if (selectionMode) selectedPaths = if (sel) selectedPaths - node.path else selectedPaths + node.path
+                                    else openNodeSmart(node)
+                                },
+                                onLongClick = { selectedPaths = if (sel) selectedPaths - node.path else selectedPaths + node.path },
+                                onOpenActions = { actionSheetNode = node },
                             )
                         }
-                    }
-                }
-            }
-            return@Column
-        }
-
-        val shown = preview
-        if (shown != null) {
-            Column(Modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(shown.first, fontFamily = Mono, fontSize = 11.5.sp, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                val draft = editingText
-                if (draft != null) {
-                    val prefs = RPrefs
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        PrimaryPillButton("保存文件", enabled = !saving, onClick = {
-                            performSave(shown.first, draft, force = false)
-                        })
-                        SecondaryPillButton("取消编辑", enabled = !saving, onClick = {
-                            if (hasUnsavedEdit) confirmDiscardEdit = true else editingText = null
-                        })
-                        TagPill(
-                            text = "缩进 +${prefs.editorTabSize}",
-                            fg = G.inkMuted,
-                            bg = G.surfaceSubtle,
-                            border = G.border,
-                            onClick = { editingText = draft + " ".repeat(prefs.editorTabSize) },
-                        )
-                        TagPill(
-                            text = if (prefs.fileEditorWordWrap) "换行:开" else "换行:关",
-                            fg = G.inkMuted,
-                            bg = G.surfaceSubtle,
-                            border = G.border,
-                            onClick = { app.settings.setFileEditorWordWrap(!prefs.fileEditorWordWrap) },
-                        )
-                    }
-                    error?.let {
-                        Surface(Modifier.fillMaxWidth(), shape = D.shape(10.dp), color = G.dangerTint) {
-                            Text(it, color = G.danger, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(10.dp))
-                        }
-                    }
-                    Surface(
-                        modifier = Modifier.weight(1f).fillMaxWidth(),
-                        shape = D.codeShape,
-                        color = G.codeBg,
-                        border = BorderStroke(1.dp, G.accent.copy(alpha = 0.6f)),
-                    ) {
-                        BasicTextField(
-                            value = draft,
-                            onValueChange = { editingText = it },
-                            textStyle = TextStyle(
-                                fontFamily = Mono,
-                                fontSize = D.codeSize(12.5f),
-                                lineHeight = D.codeSize(19f),
-                                color = G.codeInk,
-                            ),
-                            cursorBrush = SolidColor(G.accent),
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .verticalScroll(rememberScrollState())
-                                .let { m -> if (prefs.fileEditorWordWrap) m else m.horizontalScroll(rememberScrollState()) }
-                                .padding(14.dp),
-                        )
                     }
                 } else {
-                    val visualKind = remember(shown.first) { visualArtifactKindForFile(shown.first) }
-                    Row(
-                        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    val listState = rememberLazyListState()
+                    LaunchedEffect(activeTabId, activeScope, path) { listState.scrollToItem(0) }
+                    val showSectionHeaders = dirEntries.isNotEmpty() && fileEntries.isNotEmpty()
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.weight(1f).fillMaxWidth(),
+                        contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 6.dp, bottom = 96.dp),
                     ) {
-                        if (shown.second is FilePreview.Text && !(shown.second as FilePreview.Text).truncated) {
-                            TagPill(
-                                text = "编辑",
-                                fg = G.onAccent,
-                                bg = G.accent,
-                                onClick = { editingText = (shown.second as FilePreview.Text).content },
-                            )
+                        if (visibleEntries.isEmpty() && !loading && error == null) {
+                            item(key = "empty") {
+                                Column(
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 56.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    Icon(GaliaisIcons.Folder, contentDescription = null, tint = G.inkSubtle, modifier = Modifier.size(34.dp))
+                                    Text(if (mediaFilter == MediaFilter.ALL) "当前目录为空" else "该分类下暂无文件", style = MaterialTheme.typography.bodyMedium, color = G.inkMuted)
+                                    Text("点击右下角 + 可新建文件、目录或从外部上传", style = MaterialTheme.typography.labelSmall, color = G.inkSubtle)
+                                }
+                            }
                         }
-                        if (shown.second is FilePreview.Text && visualKind != null) {
-                            TagPill(
-                                text = if (visualKind == ArtifactKind.LATEX) "离线编译预览" else "可视化预览",
-                                fg = G.claude,
-                                bg = G.claudeTint,
-                                onClick = {
-                                    val txt = (shown.second as FilePreview.Text).content
-                                    val fname = shown.first.substringAfterLast('/')
-                                    studioTarget = ChatArtifact(
-                                        id = "file:${shown.first}",
-                                        identifier = fname.substringBeforeLast('.').ifBlank { "file" },
-                                        title = fname,
-                                        kind = visualKind,
-                                        language = fname.substringAfterLast('.', visualKind.extension),
-                                        content = txt,
-                                    ) to shown.first
+                        if (showSectionHeaders) {
+                            item(key = "sec_dirs") { SectionLabel("文件夹 · ${dirEntries.size}") }
+                        }
+                        itemsIndexed(dirEntries, key = { _, n -> "d:${n.path}" }) { idx, node ->
+                            GroupedFileItemWrapper(
+                                isFirst = idx == 0,
+                                isLast = idx == dirEntries.lastIndex,
+                                showDividerBelow = idx < dirEntries.lastIndex,
+                                compact = viewMode == ViewMode.COMPACT,
+                            ) {
+                                val sel = node.path in selectedPaths
+                                FileListRow(
+                                    node = node,
+                                    viewMode = viewMode,
+                                    selectionMode = selectionMode,
+                                    selected = sel,
+                                    onClick = { openNodeSmart(node) },
+                                    onLongClick = { selectedPaths = if (sel) selectedPaths - node.path else selectedPaths + node.path },
+                                    onOpenActions = { actionSheetNode = node },
+                                )
+                            }
+                        }
+                        if (showSectionHeaders) {
+                            item(key = "sec_files") { SectionLabel("文件 · ${fileEntries.size}", modifier = Modifier.padding(top = 6.dp)) }
+                        }
+                        itemsIndexed(fileEntries, key = { _, n -> "f:${n.path}" }) { idx, node ->
+                            GroupedFileItemWrapper(
+                                isFirst = idx == 0,
+                                isLast = idx == fileEntries.lastIndex,
+                                showDividerBelow = idx < fileEntries.lastIndex,
+                                compact = viewMode == ViewMode.COMPACT,
+                            ) {
+                                val sel = node.path in selectedPaths
+                                FileListRow(
+                                    node = node,
+                                    viewMode = viewMode,
+                                    selectionMode = selectionMode,
+                                    selected = sel,
+                                    onClick = { openNodeSmart(node) },
+                                    onLongClick = { selectedPaths = if (sel) selectedPaths - node.path else selectedPaths + node.path },
+                                    onOpenActions = { actionSheetNode = node },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 底部拇指黄金区：多选操作坞 OR 智能剪贴板粘贴条 + 悬浮 + FAB ──────
+        if (selectionMode) {
+            val chosenRefs = remember(selectedPaths, visibleEntries) {
+                visibleEntries.filter { it.path in selectedPaths }.map { it.ref }
+            }
+            val chosenFiles = remember(selectedPaths, visibleEntries) {
+                visibleEntries.filter { it.path in selectedPaths && !it.isDirectory }.map { it.ref }
+            }
+            MultiSelectActionBar(
+                count = chosenRefs.size,
+                canDiffTwo = chosenFiles.size == 2,
+                onCopy = { fm.setClipboard(ClipboardMode.COPY, chosenRefs); selectedPaths = emptySet(); app.conversations.notify("已复制 ${chosenRefs.size} 项") },
+                onCut = { fm.setClipboard(ClipboardMode.CUT, chosenRefs); selectedPaths = emptySet(); app.conversations.notify("已剪切 ${chosenRefs.size} 项") },
+                onCompress = { compressTargets = chosenRefs; selectedPaths = emptySet() },
+                onBatchRename = { batchRenameTargets = chosenRefs; selectedPaths = emptySet() },
+                onDiffTwo = { if (chosenFiles.size == 2) { diffTargets = chosenFiles[0] to chosenFiles[1]; selectedPaths = emptySet() } },
+                onExportZip = {
+                    pendingZipExportRefs = chosenRefs
+                    selectedPaths = emptySet()
+                    exportZipLauncher.launch("solbraid_selection.zip")
+                },
+                onDelete = { deleteTargets = chosenRefs; selectedPaths = emptySet() },
+                modifier = Modifier.align(Alignment.BottomCenter),
+            )
+        } else if (!searching) {
+            Row(
+                modifier = Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                clipboard?.let { cb ->
+                    Surface(
+                        shape = RoundedCornerShape(999.dp),
+                        color = G.success,
+                        shadowElevation = 5.dp,
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            val verb = if (cb.mode == ClipboardMode.CUT) "移动到此" else "粘贴到此"
+                            Text(
+                                "$verb (${cb.items.size})",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.SemiBold,
+                                color = G.onAccent,
+                                modifier = Modifier.clickable {
+                                    scope.launch {
+                                        runCatching { fm.pasteClipboard(activeScope, path) }
+                                            .onSuccess { cnt -> app.conversations.notify("已粘贴 $cnt 项"); reload++ }
+                                            .onFailure { app.conversations.notify("粘贴失败：${it.message}") }
+                                    }
                                 },
                             )
-                        }
-                        TagPill(
-                            text = "在新会话中引用",
-                            fg = G.ink,
-                            bg = G.surface,
-                            border = G.borderStrong,
-                            onClick = {
-                                val dir = shown.first.substringBeforeLast('/', "").ifEmpty { "/" }
-                                onReferenceFile(dir, shown.first.substringAfterLast('/'))
-                            },
-                        )
-                        TagPill(
-                            text = "复制路径",
-                            fg = G.ink,
-                            bg = G.surface,
-                            border = G.borderStrong,
-                            onClick = {
-                                scope.launch {
-                                    clipboard.setClipEntry(ClipData.newPlainText("path", shown.first).toClipEntry())
-                                    app.conversations.notify("已复制路径")
-                                }
-                            },
-                        )
-                    }
-                    when (val content = shown.second) {
-                        is FilePreview.Image -> {
-                            val bmp = remember(content.bytes) {
-                                runCatching {
-                                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                                    BitmapFactory.decodeByteArray(content.bytes, 0, content.bytes.size, bounds)
-                                    var sample = 1
-                                    while (bounds.outWidth / sample > 2048 || bounds.outHeight / sample > 2048) sample *= 2
-                                    BitmapFactory.decodeByteArray(content.bytes, 0, content.bytes.size, BitmapFactory.Options().apply { inSampleSize = sample })
-                                }.getOrNull()
-                            }
-                            if (bmp == null) {
-                                CrispCard(padding = PaddingValues(20.dp)) {
-                                    Text("图片解码失败（${content.bytes.size} 字节）。", style = MaterialTheme.typography.bodyMedium, color = G.inkMuted)
-                                }
-                            } else {
-                                Surface(
-                                    modifier = Modifier.weight(1f).fillMaxWidth(),
-                                    shape = D.codeShape,
-                                    color = G.surface,
-                                    border = BorderStroke(1.dp, G.border),
-                                ) {
-                                    Column(Modifier.fillMaxSize()) {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth().background(G.surfaceSubtle).padding(horizontal = 12.dp, vertical = 8.dp),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                        ) {
-                                            Text(content.mime.substringAfter('/').uppercase(), fontFamily = Mono, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = G.inkMuted)
-                                            Spacer(Modifier.weight(1f))
-                                            Text("${bmp.width} × ${bmp.height} · ${(content.bytes.size / 1024).coerceAtLeast(1)} KB", fontFamily = Mono, fontSize = 11.sp, color = G.inkMuted)
-                                        }
-                                        Box(Modifier.weight(1f).fillMaxWidth().padding(12.dp), contentAlignment = Alignment.Center) {
-                                            Image(
-                                                bitmap = bmp.asImageBitmap(),
-                                                contentDescription = shown.first.substringAfterLast('/'),
-                                                contentScale = ContentScale.Fit,
-                                                modifier = Modifier.fillMaxSize(),
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        is FilePreview.Binary -> {
-                            CrispCard(padding = PaddingValues(20.dp)) {
-                                Text("二进制文件，${content.bytes} 字节，无法预览文本。", style = MaterialTheme.typography.bodyMedium, color = G.inkMuted)
-                            }
-                        }
-                        is FilePreview.Text -> {
-                            val lang = remember(shown.first) { detectLanguage(shown.first) }
-                            val palette = D.code
-                            val highlighted = remember(content.content, lang, palette) { SyntaxHighlight.highlight(content.content, lang, palette) }
-                            val lineCount = remember(content.content) { content.content.count { it == '\n' } + 1 }
-                            Surface(
-                                modifier = Modifier.weight(1f).fillMaxWidth(),
-                                shape = D.codeShape,
-                                color = G.codeBg,
-                                border = BorderStroke(1.dp, G.codeBorder),
+                            Box(
+                                modifier = Modifier
+                                    .size(24.dp)
+                                    .clip(CircleShape)
+                                    .background(G.onAccent.copy(alpha = 0.2f))
+                                    .clickable { fm.clearClipboard() },
+                                contentAlignment = Alignment.Center,
                             ) {
-                                Column(Modifier.fillMaxSize()) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().background(G.codeHeader).padding(horizontal = 12.dp, vertical = 8.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                    ) {
-                                        Text((lang ?: "text").uppercase(), fontFamily = Mono, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = G.codeMuted)
-                                        Spacer(Modifier.weight(1f))
-                                        Text(
-                                            "$lineCount 行" + if (content.truncated) " · 仅显示前 256 KB" else "",
-                                            fontFamily = Mono,
-                                            fontSize = 11.sp,
-                                            color = G.codeMuted,
-                                        )
-                                    }
-                                    SelectionContainer {
-                                        Box(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-                                            CodeContent(highlighted, contentPadding = 14.dp, softWrap = RPrefs.fileEditorWordWrap)
-                                        }
-                                    }
-                                }
+                                Icon(GaliaisIcons.Close, contentDescription = "清空剪贴板", tint = G.onAccent, modifier = Modifier.size(13.dp))
                             }
                         }
                     }
                 }
-            }
-            return@Column
-        }
-
-        if (searching) {
-            SearchBar(
-                value = searchQuery,
-                onValueChange = { searchQuery = it },
-                placeholder = "在 $path 下搜索文件名…",
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-            )
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                if (searchQuery.isNotBlank() && searchResults.isEmpty()) {
-                    item {
-                        Box(Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) {
-                            Text("未找到匹配文件", style = MaterialTheme.typography.bodyMedium, color = G.inkMuted)
-                        }
-                    }
-                }
-                itemsIndexed(searchResults, key = { idx, match -> "${match.path}#$idx" }) { _, match ->
-                    CrispCard(
-                        onClick = {
-                            val full = if (match.path.startsWith("/")) match.path else path.trimEnd('/') + "/" + match.path
-                            openFile(full)
-                        },
-                        padding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
-                    ) {
-                        Text(match.fileName.ifBlank { match.path.substringAfterLast('/') }, style = MaterialTheme.typography.titleSmall, color = G.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(match.path, fontFamily = Mono, fontSize = 11.5.sp, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Surface(
+                    onClick = { showCreateSheet = true },
+                    shape = D.fabShape,
+                    color = G.accent,
+                    shadowElevation = 6.dp,
+                    modifier = Modifier.size(52.dp).semantics { contentDescription = "新建与上传" },
+                ) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Icon(GaliaisIcons.Add, contentDescription = null, tint = G.onAccent, modifier = Modifier.size(22.dp))
                     }
                 }
             }
-            return@Column
         }
+    }
 
-        BreadcrumbBar(path = path, onNavigate = { path = it })
-        Row(
-            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 14.dp, vertical = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            TagPill("添加为项目", fg = G.accent, bg = G.accentContainer, onClick = { onUseDirectory(path) })
-            TagPill("导入文件或 ZIP", fg = G.ink, bg = G.surface, border = G.borderStrong, onClick = { importLauncher.launch(arrayOf("*/*")) })
-            TagPill("导出 ZIP", fg = G.ink, bg = G.surface, border = G.borderStrong, onClick = {
-                val baseName = path.trimEnd('/').substringAfterLast('/').ifBlank { "workspace" }
-                exportLauncher.launch("$baseName.zip")
-            })
-            TagPill("新建文件", fg = G.ink, bg = G.surface, border = G.borderStrong, onClick = { creatingFile = true })
-            TagPill("新建文件夹", fg = G.ink, bg = G.surface, border = G.borderStrong, onClick = { creatingDir = true })
-            PluginSlotActionBar(
-                app = app,
-                slotName = "files.toolbar",
-                cwd = path,
-                onOpenSurface = { pid, sid -> openingPluginSurface = pid to sid },
-                onOpenPanel = { pid, art -> openingPluginPanel = pid to art },
-            )
-        }
+    // ── 单文件操作抽屉 / 新建导入抽屉 / 多标签管理抽屉 ────────────────────────
 
-        PluginSlotBannerColumn(
+    actionSheetNode?.let { node ->
+        val isZip = !node.isDirectory && node.extension in setOf("zip", "jar", "apk", "aar")
+        val isTextFile = !node.isDirectory && TextCodec.classifyFile(node.name, ByteArray(0)) == ViewerCategory.TEXT_CODE
+        FileActionSheet(
+            node = node,
+            isTextFile = isTextFile,
+            onPrimaryOpen = { openNodeSmart(node) },
+            onOpenEditor = { editorTarget = node.ref to null },
+            onExport = { exportTarget = node.ref },
+            onCopy = { fm.setClipboard(ClipboardMode.COPY, listOf(node.ref)); app.conversations.notify("已复制：${node.name}") },
+            onCut = { fm.setClipboard(ClipboardMode.CUT, listOf(node.ref)); app.conversations.notify("已剪切：${node.name}") },
+            onDuplicate = {
+                scope.launch {
+                    runCatching { fm.duplicate(node.ref) }
+                        .onSuccess { app.conversations.notify("已创建副本：${it.name}"); reload++ }
+                        .onFailure { app.conversations.notify("创建副本失败：${it.message}") }
+                }
+            },
+            onRename = { renamingNode = node },
+            onCompress = { compressTargets = listOf(node.ref) },
+            onExtract = if (isZip) ({
+                scope.launch {
+                    val subName = node.name.substringBeforeLast('.', "").ifBlank { "${node.name}_extracted" }
+                    val targetDir = joinVfsPath(path, subName)
+                    runCatching { fm.extractArchive(node.ref, activeScope, targetDir) }
+                        .onSuccess { cnt -> app.conversations.notify("已解压 $cnt 个文件到 $subName"); reload++ }
+                        .onFailure { app.conversations.notify("解压失败：${it.message}") }
+                }
+            }) else null,
+            onProperties = { propertiesNode = node },
+            onReference = if (activeScope in setOf(FileScope.LINUX_WORKSPACE, FileScope.LINUX_ROOT)) ({
+                onReferenceFile(path, node.name)
+            }) else null,
+            onStartMultiSelect = { selectedPaths = selectedPaths + node.path },
+            onDelete = { deleteTargets = listOf(node.ref) },
+            onDismiss = { actionSheetNode = null },
+        )
+    }
+
+    if (showCreateSheet) {
+        CreateAndImportSheet(
+            scope = activeScope,
+            path = path,
+            runtimeReady = runtime.ready,
+            onUploadMultiFiles = { uploadFilesLauncher.launch(arrayOf("*/*")) },
+            onUploadFolderTree = { uploadFolderLauncher.launch(null) },
+            onUploadZipExtract = { uploadZipLauncher.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream", "*/*")) },
+            onMountSafTree = { mountSafLauncher.launch(null) },
+            onCreateFile = { creatingFile = true },
+            onCreateDir = { creatingDir = true },
+            onCreateSymlink = { creatingSymlink = true },
+            onBookmarkDir = {
+                fm.addBookmark(path.substringAfterLast('/').ifEmpty { activeScope.shortLabel }, activeScope, path)
+                app.conversations.notify("已收藏当前目录")
+            },
+            onExportDirZip = {
+                pendingZipExportRefs = listOf(FileRef(activeScope, path))
+                val dirName = path.substringAfterLast('/').ifBlank { activeScope.id }
+                exportZipLauncher.launch("$dirName.zip")
+            },
+            onUseAsProject = if (activeScope in setOf(FileScope.LINUX_WORKSPACE, FileScope.LINUX_ROOT)) ({ onUseDirectory(path) }) else null,
+            onOpenTerminal = null,
+            onOpenGit = null,
+            onOpenDiskUsage = null,
+            onDismiss = { showCreateSheet = false },
+        )
+    }
+
+    if (showTabSheet) {
+        TabManagerSheet(
+            tabs = tabs,
+            activeTabId = activeTabId,
+            onSelectTab = fm::selectTab,
+            onCloseTab = fm::closeTab,
+            onOpenNewTab = { fm.openTab(activeScope, path) },
+            onDismiss = { showTabSheet = false },
+        )
+    }
+
+    // ── 编辑器 / 查看器 / 属性 / 书签 / 磁盘分析 / 导出 / 插件浮层 ────────────
+
+    editorTarget?.let { (ref, initLine) ->
+        CodeEditorDialog(
             app = app,
-            slotName = "files.banner",
-            cwd = path,
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp),
-            onOpenSurface = { pid, sid -> openingPluginSurface = pid to sid },
-            onOpenPanel = { pid, art -> openingPluginPanel = pid to art },
-        )
-
-        error?.let {
-            Surface(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp), shape = D.shape(10.dp), color = G.dangerTint) {
-                Text(it, color = G.danger, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(10.dp))
-            }
-        }
-
-        LazyColumn(
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 4.dp, bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(0.dp),
-        ) {
-            if (path != "/") {
-                item(key = "parent") {
-                    FileRow(name = "..", badge = "↑", isDir = true, isFirst = true, isLast = entries.isEmpty(), onClick = { path = parent })
-                }
-            }
-            itemsIndexed(entries, key = { _, e -> e.path }) { index, entry ->
-                val isFirst = path == "/" && index == 0
-                val isLast = index == entries.lastIndex
-                FileRow(
-                    name = entry.name,
-                    badge = if (entry.directory) "DIR" else fileExtBadge(entry.name),
-                    isDir = entry.directory,
-                    isFirst = isFirst,
-                    isLast = isLast,
-                    onClick = {
-                        if (entry.directory) path = entry.path
-                        else openFile(entry.path)
-                    },
-                    onRename = { renaming = entry },
-                    onDelete = { deleting = entry },
-                    onReference = if (entry.directory) null else ({ onReferenceFile(path, entry.name) }),
-                )
-            }
-        }
-    }
-
-    if (creatingFile) {
-        TextInputDialog("新建文件", "", onDismiss = { creatingFile = false }) { name ->
-            creatingFile = false
-            val clean = name.trim()
-            if (clean.isBlank() || clean.contains('/') || clean == "." || clean == "..") { error = "文件名无效"; return@TextInputDialog }
-            if (entries.any { it.name == clean }) { error = "「$clean」已存在，请更换名称以免覆盖"; return@TextInputDialog }
-            val full = path.trimEnd('/') + "/" + clean
-            scope.launch {
-                try {
-                    files.write(full, "")
-                    reload++
-                    openFile(full, startEdit = true)
-                } catch (failure: Exception) { error = failure.message }
-            }
-        }
-    }
-
-    if (confirmDiscardEdit) {
-        AlertDialog(
-            onDismissRequest = { confirmDiscardEdit = false },
-            containerColor = G.surface,
-            shape = D.dialogShape,
-            title = { Text("放弃未保存的更改？", color = G.ink) },
-            text = { Text("当前文件编辑内容尚未保存，离开后修改将丢失。", color = G.inkMuted) },
-            confirmButton = {
-                TextButton(onClick = { confirmDiscardEdit = false; editingText = null }) {
-                    Text("放弃更改", color = G.danger, fontWeight = FontWeight.SemiBold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmDiscardEdit = false }) {
-                    Text("继续编辑", color = G.inkMuted)
-                }
-            },
+            fileRef = ref,
+            initialLine = initLine,
+            onDismiss = { editorTarget = null },
+            onSaved = { reload++ },
+            onSendToAgent = if (ref.scope in setOf(FileScope.LINUX_WORKSPACE, FileScope.LINUX_ROOT)) ({ cwd, reference ->
+                editorTarget = null
+                onReferenceFile(cwd, reference)
+            }) else null,
+            onSaveExternal = { r -> exportTarget = r },
         )
     }
 
-    if (creatingDir) {
-        TextInputDialog("新建文件夹", "", onDismiss = { creatingDir = false }) { name ->
-            creatingDir = false
-            if (name.contains('/') || name == "." || name == "..") { error = "文件夹名称无效"; return@TextInputDialog }
-            scope.launch {
-                try { files.createDirectory(path.trimEnd('/') + "/" + name); reload++ } catch (failure: Exception) { error = failure.message }
-            }
-        }
-    }
-
-    renaming?.let { target ->
-        TextInputDialog("重命名", target.name, onDismiss = { renaming = null }) { nextName ->
-            renaming = null
-            val clean = nextName.trim()
-            if (clean.isBlank() || clean.contains('/') || clean == "." || clean == "..") {
-                error = "名称无效"
-                return@TextInputDialog
-            }
-            if (clean == target.name) return@TextInputDialog
-            val dir = target.path.substringBeforeLast('/', "").ifEmpty { "/" }
-            val dst = if (dir == "/") "/$clean" else "$dir/$clean"
-            scope.launch {
-                try {
-                    files.rename(target.path, dst)
-                    app.conversations.notify("已重命名为 $clean")
-                    reload++
-                } catch (failure: Exception) {
-                    error = "重命名失败：${failure.message}"
-                }
-            }
-        }
-    }
-
-    deleting?.let { target ->
-        AlertDialog(
-            onDismissRequest = { deleting = null },
-            containerColor = G.surface,
-            shape = D.dialogShape,
-            title = { Text("删除${if (target.directory) "文件夹" else "文件"}？", color = G.ink) },
-            text = { Text("将删除 ${target.path}。此操作无法撤销。", color = G.inkMuted) },
-            confirmButton = {
-                TextButton(onClick = {
-                    val toDelete = target; deleting = null
-                    scope.launch {
-                        try { files.remove(toDelete.path, toDelete.directory); reload++ } catch (failure: Exception) { error = failure.message }
-                    }
-                }) { Text("删除", color = G.danger, fontWeight = FontWeight.SemiBold) }
-            },
-            dismissButton = { TextButton(onClick = { deleting = null }) { Text("取消", color = G.inkMuted) } },
+    viewerTarget?.let { ref ->
+        UniversalFileViewerDialog(
+            app = app,
+            fileRef = ref,
+            siblingImages = siblingImages.ifEmpty { listOf(ref) },
+            onOpenInEditor = { r -> viewerTarget = null; editorTarget = r to null },
+            onSaveExternal = { r -> exportTarget = r },
+            onExtracted = { reload++ },
+            onDismiss = { viewerTarget = null },
         )
     }
 
-    saveConflict?.let { (conflictPath, latestDiskContent) ->
-        AlertDialog(
-            onDismissRequest = { saveConflict = null },
-            containerColor = G.surface,
-            title = { Text("文件已被外部修改", color = G.ink) },
-            text = {
-                Text(
-                    "在你编辑期间，Agent 或终端已修改了 ${conflictPath.substringAfterLast('/')}。直接覆盖可能会丢失新写入的内容。",
-                    color = G.inkMuted,
-                )
-            },
-            confirmButton = {
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    TextButton(onClick = {
-                        saveConflict = null
-                        preview = conflictPath to FilePreview.Text(latestDiskContent, truncated = false)
-                        editingText = latestDiskContent
-                        app.conversations.notify("已重新加载磁盘最新内容")
-                    }) { Text("加载最新", color = G.accent, fontWeight = FontWeight.SemiBold) }
-                    TextButton(onClick = {
-                        val draftToWrite = editingText
-                        saveConflict = null
-                        if (draftToWrite != null) performSave(conflictPath, draftToWrite, force = true)
-                    }) { Text("强制覆盖", color = G.danger, fontWeight = FontWeight.SemiBold) }
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { saveConflict = null }) { Text("取消", color = G.inkMuted) }
-            },
+    propertiesNode?.let { node ->
+        FilePropertiesSheet(
+            app = app,
+            node = node,
+            onJumpToPath = { sc, targetPath -> fm.navigate(sc, targetPath) },
+            onChanged = { reload++ },
+            onDismiss = { propertiesNode = null },
         )
+    }
+
+    if (showBookmarksSheet) {
+        FileBookmarksAndTrashSheet(
+            app = app,
+            onNavigate = { sc, targetPath -> fm.navigate(sc, targetPath) },
+            onOpenRecentFile = { ref -> openNodeSmart(FileNode(ref.scope, ref.path, ref.name, isDirectory = false)) },
+            onMountSafTree = { mountSafLauncher.launch(null) },
+            onRestored = { reload++ },
+            onDismiss = { showBookmarksSheet = false },
+        )
+    }
+
+    if (showDiskUsage) {
+        DiskUsageAnalyzerSheet(
+            app = app,
+            scope = activeScope,
+            path = path,
+            onOpenDir = { sc, targetPath -> fm.navigate(sc, targetPath) },
+            onDismiss = { showDiskUsage = false },
+        )
+    }
+
+    batchRenameTargets?.let { refs ->
+        BatchRenameDialog(app = app, refs = refs, onDone = { reload++ }, onDismiss = { batchRenameTargets = null })
+    }
+
+    diffTargets?.let { (a, b) ->
+        TwoFileDiffSheet(app = app, first = a, second = b, onDismiss = { diffTargets = null })
+    }
+
+    exportTarget?.let { ref ->
+        ExportFileSheet(
+            app = app,
+            fileRef = ref,
+            onSaveAsDocument = { r -> pendingSaveAsRef = r; saveAsLauncher.launch(r.name) },
+            onDismiss = { exportTarget = null },
+        )
+    }
+
+    if (showGit) {
+        GitOverviewSheet(files = legacyFiles, cwd = path, onNotify = app.conversations::notify, onDismiss = { showGit = false; reload++ })
+    }
+    if (showPreview) {
+        LivePreviewSheet(app = app, onDismiss = { showPreview = false })
     }
 
     PluginSlotOverlayHost(
@@ -741,158 +968,229 @@ fun FilesScreen(
         onOpenSurface = { openingPluginSurface = it },
         onOpenPanel = { openingPluginPanel = it },
     )
-    if (showGit) GitOverviewSheet(files, path, onNotify = app.conversations::notify, onDismiss = { showGit = false; reload++ })
-    if (showPreview) LivePreviewSheet(app, onDismiss = { showPreview = false })
-    studioTarget?.let { (art, filePath) ->
-        ArtifactStudioSheet(
-            app = app,
-            artifacts = listOf(art),
-            initialArtifactId = art.id,
-            cwd = path,
-            savePath = filePath,
-            onDismiss = {
-                studioTarget = null
-                openFile(filePath)
+
+    // ── 基础文本输入与确认弹窗 ──────────────────────────────────────────────
+
+    if (creatingFile) {
+        SingleInputDialog("新建文件", "文件名（如 notes.md、app.py）", confirmLabel = "创建并编辑", onConfirm = { name ->
+            val ref = FileRef(activeScope, joinVfsPath(path, name))
+            scope.launch {
+                runCatching { fm.createEmptyFile(ref) }
+                    .onSuccess { reload++; editorTarget = ref to null }
+                    .onFailure { app.conversations.notify("创建失败：${it.message}") }
+            }
+        }) { creatingFile = false }
+    }
+
+    if (creatingDir) {
+        SingleInputDialog("新建文件夹", "文件夹名称", confirmLabel = "创建", onConfirm = { name ->
+            scope.launch {
+                runCatching { fm.mkdir(activeScope, joinVfsPath(path, name)) }
+                    .onSuccess { app.conversations.notify("已创建目录：$name"); reload++ }
+                    .onFailure { app.conversations.notify("创建失败：${it.message}") }
+            }
+        }) { creatingDir = false }
+    }
+
+    if (creatingSymlink) {
+        var linkName by remember { mutableStateOf("") }
+        var targetPath by remember { mutableStateOf("") }
+        GaliaisAlertDialog(
+            onDismissRequest = { creatingSymlink = false },
+            title = "创建符号链接 (ln -s)",
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(value = linkName, onValueChange = { linkName = it }, label = { Text("链接名称") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = targetPath, onValueChange = { targetPath = it }, label = { Text("指向目标路径") }, singleLine = true, shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth())
+                }
             },
+            confirmButton = {
+                TextButton(enabled = linkName.isNotBlank() && targetPath.isNotBlank(), onClick = {
+                    val ln = linkName.trim(); val tg = targetPath.trim(); creatingSymlink = false
+                    scope.launch {
+                        runCatching { fm.createSymlink(activeScope, path, ln, tg) }
+                            .onSuccess { app.conversations.notify("已创建软链接：$ln"); reload++ }
+                            .onFailure { app.conversations.notify("创建软链接失败：${it.message}") }
+                    }
+                }) { Text("创建", color = G.accent, fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = { TextButton(onClick = { creatingSymlink = false }) { Text("取消", color = G.inkMuted) } },
         )
     }
-}
 
-@Composable
-private fun BreadcrumbBar(path: String, onNavigate: (String) -> Unit) {
-    val parts = remember(path) { path.split('/').filter { it.isNotEmpty() } }
-    Row(
-        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 14.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
-    ) {
-        BreadcrumbSegment("/", active = parts.isEmpty()) { onNavigate("/") }
-        var acc = ""
-        parts.forEachIndexed { idx, segment ->
-            acc += "/$segment"
-            val target = acc
-            if (idx > 0) Text("/", fontFamily = Mono, fontSize = 12.sp, color = G.inkSubtle, modifier = Modifier.padding(horizontal = 2.dp))
-            BreadcrumbSegment(segment, active = idx == parts.lastIndex) { onNavigate(target) }
-        }
+    renamingNode?.let { node ->
+        SingleInputDialog("重命名", "新名称", initialValue = node.name, onConfirm = { next ->
+            scope.launch {
+                runCatching { fm.rename(node.ref, next) }
+                    .onSuccess { app.conversations.notify("已重命名为 $next"); reload++ }
+                    .onFailure { app.conversations.notify("重命名失败：${it.message}") }
+            }
+        }) { renamingNode = null }
+    }
+
+    deleteTargets?.let { refs ->
+        val canTrash = !activeScope.isRootElevated
+        var moveToTrash by remember(refs) { mutableStateOf(canTrash) }
+        GaliaisAlertDialog(
+            onDismissRequest = { deleteTargets = null },
+            title = "确认删除 (${refs.size} 项)",
+            titleColor = G.danger,
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        if (refs.size == 1) "即将删除「${refs.first().name}」。" else "即将删除选中的 ${refs.size} 个项目（含目录内容）。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = G.ink,
+                    )
+                    if (canTrash) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().clickable { moveToTrash = !moveToTrash },
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            GaliaisCheckbox(moveToTrash)
+                            Text("移入回收站（可在书签 → 回收站中一键还原）", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                        }
+                    } else {
+                        Text("Root 域删除会直接从文件系统永久移除，请谨慎确认。", style = MaterialTheme.typography.labelSmall, color = G.danger)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val toDelete = refs; val trash = moveToTrash; deleteTargets = null
+                    scope.launch {
+                        var ok = 0; var lastErr: String? = null
+                        toDelete.forEach { r ->
+                            runCatching { fm.delete(r, moveToTrash = trash) }.onSuccess { ok++ }.onFailure { lastErr = it.message }
+                        }
+                        if (lastErr != null) app.conversations.notify("已删除 $ok 项，失败：$lastErr")
+                        else app.conversations.notify(if (trash) "已移入回收站（$ok 项）" else "已永久删除 $ok 项")
+                        reload++
+                    }
+                }) { Text(if (moveToTrash) "移入回收站" else "永久删除", color = G.danger, fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = { TextButton(onClick = { deleteTargets = null }) { Text("取消", color = G.inkMuted) } },
+        )
+    }
+
+    compressTargets?.let { refs ->
+        val defaultName = if (refs.size == 1) "${refs.first().name}.zip" else "archive.zip"
+        SingleInputDialog("压缩为 ZIP", "压缩包文件名", initialValue = defaultName, confirmLabel = "开始压缩", onConfirm = { zipName ->
+            scope.launch {
+                runCatching { fm.compressInPlace(refs, activeScope, path, zipName) }
+                    .onSuccess { created -> app.conversations.notify("已压缩为：${created.name}"); reload++ }
+                    .onFailure { app.conversations.notify("压缩失败：${it.message}") }
+            }
+        }) { compressTargets = null }
+    }
+
+    if (showManualPath) {
+        SingleInputDialog("跳转到指定路径", "输入绝对路径（当前域：${activeScope.shortLabel}）", initialValue = path, confirmLabel = "前往", onConfirm = { target ->
+            fm.navigate(activeScope, target)
+        }) { showManualPath = false }
     }
 }
 
+/** 懒加载分组卡片行容器：响应主题 cardStyle，呈现无双倍粗边框的一体化分组卡片与动态内缩极细分割线。 */
 @Composable
-private fun BreadcrumbSegment(label: String, active: Boolean, onClick: () -> Unit) {
-    Text(
-        label,
-        fontFamily = Mono,
-        fontSize = 12.5.sp,
-        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
-        color = if (active) G.ink else G.inkMuted,
-        modifier = Modifier.clip(D.shape(6.dp)).clickable(enabled = !active, onClick = onClick).padding(horizontal = 5.dp, vertical = 2.dp),
-    )
-}
-
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-private fun FileRow(
-    name: String,
-    badge: String,
-    isDir: Boolean,
+private fun GroupedFileItemWrapper(
     isFirst: Boolean,
     isLast: Boolean,
-    onClick: () -> Unit,
-    onRename: (() -> Unit)? = null,
-    onDelete: (() -> Unit)? = null,
-    onReference: (() -> Unit)? = null,
+    showDividerBelow: Boolean,
+    compact: Boolean = false,
+    content: @Composable () -> Unit,
 ) {
-    var menu by remember { mutableStateOf(false) }
+    val r = D.cardRadius
+    val borderColor = G.border
+    val borderWidth = D.borderWidth
+    val showBorder = D.cardStyle !in setOf("filled", "elevated")
+    val bgColor = when (D.cardStyle) {
+        "filled" -> G.surfaceFilled
+        "elevated" -> G.surfaceElevated
+        else -> G.surface
+    }
     val shape = RoundedCornerShape(
-        topStart = if (isFirst) D.radius(14.dp) else 0.dp,
-        topEnd = if (isFirst) D.radius(14.dp) else 0.dp,
-        bottomStart = if (isLast) D.radius(14.dp) else 0.dp,
-        bottomEnd = if (isLast) D.radius(14.dp) else 0.dp,
+        topStart = if (isFirst) r else 0.dp,
+        topEnd = if (isFirst) r else 0.dp,
+        bottomStart = if (isLast) r else 0.dp,
+        bottomEnd = if (isLast) r else 0.dp,
     )
-    Box {
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(shape)
-                .combinedClickable(onClick = onClick, onLongClick = if (onDelete != null || onReference != null || onRename != null) ({ menu = true }) else null),
-            shape = shape,
-            color = G.surface,
-            border = BorderStroke(0.5.dp, G.border),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = D.space(12.dp)),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                val entryIcon = when {
-                    isDir && name == ".." -> GaliaisIcons.ArrowBack
-                    isDir -> GaliaisIcons.Folder
-                    badge in setOf("KT", "JAVA", "JS", "MJS", "CJS", "TS", "TSX", "PY", "SH", "JSON", "TOML", "YAML", "YML", "XML", "HTML", "CSS", "RS", "GO", "C", "CPP", "MD") -> GaliaisIcons.Code
-                    else -> GaliaisIcons.File
-                }
-                Box(
-                    modifier = Modifier
-                        .size(32.dp)
-                        .clip(D.shape(8.dp))
-                        .background(if (isDir) G.codexTint else G.surfaceSubtle),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(
-                        entryIcon,
-                        contentDescription = null,
-                        tint = if (isDir) G.codex else G.inkMuted,
-                        modifier = Modifier.size(16.dp),
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clipToBounds()
+            .let { mod ->
+                if (!showBorder) mod else mod.drawWithContent {
+                    drawContent()
+                    val strokePx = borderWidth.toPx()
+                    val half = strokePx / 2f
+                    val rPx = r.toPx()
+                    val topExt = if (isFirst) 0f else rPx + strokePx
+                    val botExt = if (isLast) 0f else rPx + strokePx
+                    drawRoundRect(
+                        color = borderColor,
+                        topLeft = Offset(half, half - topExt),
+                        size = Size(size.width - strokePx, size.height - strokePx + topExt + botExt),
+                        cornerRadius = CornerRadius(rPx, rPx),
+                        style = Stroke(width = strokePx),
                     )
                 }
-                Text(
-                    name,
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = if (isDir) FontWeight.Medium else FontWeight.Normal,
-                    color = G.ink,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                if (!isDir && badge != "FILE") {
-                    TagPill(badge, fg = G.inkMuted, bg = G.surfaceSubtle)
-                }
-                if (isDir && name != "..") {
-                    Icon(GaliaisIcons.ChevronRight, contentDescription = null, tint = G.inkSubtle, modifier = Modifier.size(16.dp))
-                }
-            }
-        }
-        GaliaisDropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-            Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                onReference?.let { GaliaisMenuRow(title = "在新会话中引用", icon = GaliaisIcons.AtSign, onClick = { menu = false; it() }) }
-                onRename?.let { GaliaisMenuRow(title = "重命名", icon = GaliaisIcons.FilePen, onClick = { menu = false; it() }) }
-                onDelete?.let { GaliaisMenuRow(title = "删除", icon = GaliaisIcons.Close, danger = true, onClick = { menu = false; it() }) }
+            },
+        shape = shape,
+        color = bgColor,
+    ) {
+        Column(Modifier.fillMaxWidth()) {
+            content()
+            if (showDividerBelow) {
+                Hairline(Modifier.padding(start = if (compact) 52.dp else 58.dp, end = 12.dp))
             }
         }
     }
 }
 
-internal fun visualArtifactKindForFile(path: String): ArtifactKind? = when (path.substringAfterLast('.', "").lowercase()) {
-    "html", "htm" -> ArtifactKind.HTML
-    "svg" -> ArtifactKind.SVG
-    "md", "markdown" -> ArtifactKind.MARKDOWN
-    "tex", "latex" -> ArtifactKind.LATEX
-    "mmd", "mermaid" -> ArtifactKind.MERMAID
-    "csv", "tsv" -> ArtifactKind.CSV
-    "jsx", "tsx" -> ArtifactKind.REACT
-    else -> null
+@Composable
+private fun SingleInputDialog(
+    title: String,
+    label: String,
+    initialValue: String = "",
+    confirmLabel: String = "确定",
+    onConfirm: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var value by remember { mutableStateOf(initialValue) }
+    GaliaisAlertDialog(
+        onDismissRequest = onDismiss,
+        title = title,
+        text = {
+            OutlinedTextField(
+                value = value,
+                onValueChange = { value = it },
+                label = { Text(label) },
+                singleLine = true,
+                shape = D.fieldShape,
+                colors = galiaisTextFieldColors(),
+                modifier = Modifier.fillMaxWidth().imePadding(),
+            )
+        },
+        confirmButton = {
+            TextButton(enabled = value.isNotBlank(), onClick = { val v = value.trim(); onDismiss(); onConfirm(v) }) {
+                Text(confirmLabel, color = G.accent, fontWeight = FontWeight.SemiBold)
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消", color = G.inkMuted) } },
+    )
 }
 
-private fun fileExtBadge(name: String): String {
-    val ext = name.substringAfterLast('.', "").uppercase()
-    return when {
-        name.startsWith(".") && !name.drop(1).contains('.') -> "CFG"
-        ext.isEmpty() || ext.length > 4 -> "FILE"
-        else -> ext
+/** 识别可进入可视化画布预览的文件后缀（供文件页、编辑器与 Agent 文件预览共用）。 */
+internal fun visualArtifactKindForFile(path: String): ArtifactKind? {
+    val ext = path.substringAfterLast('/', path).substringAfterLast('.', "").lowercase()
+    return when (ext) {
+        "html", "htm" -> ArtifactKind.HTML
+        "svg" -> ArtifactKind.SVG
+        "mmd", "mermaid" -> ArtifactKind.MERMAID
+        "tex", "latex" -> ArtifactKind.LATEX
+        "md", "markdown" -> ArtifactKind.MARKDOWN
+        else -> null
     }
-}
-
-private fun detectLanguage(path: String): String? {
-    val base = path.substringAfterLast('/')
-    if (base in setOf(".bashrc", ".bash_logout", ".profile", ".zshrc", "Makefile", "Dockerfile")) return "sh"
-    return SyntaxHighlight.languageFromPath(path)
 }

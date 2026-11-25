@@ -12,14 +12,18 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -46,6 +50,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.toClipEntry
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -209,8 +214,7 @@ fun PluginSduiSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .imePadding()
-                .navigationBarsPadding()
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp)
                 .padding(bottom = 24.dp),
@@ -223,6 +227,9 @@ fun PluginSduiSheet(
                             payload?.title?.ifBlank { surfaceId } ?: surfaceId,
                             style = MaterialTheme.typography.titleLarge,
                             color = G.ink,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
                         )
                         TagPill("原生 SDUI", fg = G.accent, bg = G.accentContainer)
                     }
@@ -245,7 +252,7 @@ fun PluginSduiSheet(
     }
 }
 
-/** 直接渲染已预加载好的首页插件 SDUI 卡片（不占位、支持全量交互动作）。 */
+/** 直接渲染已预加载好的首页插件 SDUI 卡片（不占位、支持全量交互动作；embedded=true 时不套外层 CrispCard）。 */
 @Composable
 fun PluginSduiBannerCard(
     app: GaliaisApplication,
@@ -257,6 +264,7 @@ fun PluginSduiBannerCard(
     onOpenPanel: (pluginId: String, artifact: ChatArtifact) -> Unit,
     onRefresh: () -> Unit,
     onInjectPrompt: ((String) -> Unit)? = null,
+    embedded: Boolean = false,
 ) {
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboard.current
@@ -264,11 +272,11 @@ fun PluginSduiBannerCard(
     val formState = remember(pluginId, slotId) { mutableStateMapOf<String, Any>() }
     if (payload.hidden || payload.nodes.isEmpty()) return
 
-    CrispCard(padding = PaddingValues(13.dp)) {
+    val innerContent: @Composable () -> Unit = {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             if (payload.title.isNotBlank()) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text(payload.title, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
+                    Text(payload.title, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                     TagPill("插件", fg = G.accent, bg = G.accentContainer)
                 }
             }
@@ -338,6 +346,7 @@ fun PluginSduiBannerCard(
             }
         }
     }
+    if (embedded) innerContent() else CrispCard(padding = PaddingValues(13.dp)) { innerContent() }
 }
 
 /** 通用工具栏/顶栏/快捷条插件槽位：无插件注册时零渲染、零占位。 */
@@ -495,6 +504,7 @@ fun PluginFullTabScreen(
     slot: HostPluginUiSlot,
     cwd: String?,
     modifier: Modifier = Modifier,
+    showTopBar: Boolean = true,
 ) {
     val runtime by app.runtime.snapshot.collectAsState()
     val hostPlugins by app.extensions.hostPlugins.collectAsState()
@@ -579,24 +589,34 @@ fun PluginFullTabScreen(
         }
     }
 
+    val bottomChrome = LocalBottomChromeInset.current
     Column(modifier.fillMaxSize().galiaisCanvasBackground()) {
-        Row(
-            modifier = Modifier.fillMaxWidth().height(if (D.material) 64.dp else 56.dp).padding(start = 18.dp, end = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Column(Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text(payload?.title?.ifBlank { slot.label } ?: slot.label, style = MaterialTheme.typography.titleLarge, color = G.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    TagPill("插件", fg = G.accent, bg = G.accentContainer)
+        if (showTopBar) {
+            Row(
+                modifier = Modifier.fillMaxWidth().height(if (D.material) 64.dp else 56.dp).padding(start = 16.dp, end = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            payload?.title?.ifBlank { slot.label } ?: slot.label,
+                            style = MaterialTheme.typography.titleLarge,
+                            color = G.ink,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                        TagPill("插件", fg = G.accent, bg = G.accentContainer)
+                    }
+                    val sub = payload?.subtitle?.ifBlank { slot.description } ?: slot.description
+                    if (sub.isNotBlank()) {
+                        Text(sub, style = MaterialTheme.typography.labelSmall, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
                 }
-                val sub = payload?.subtitle?.ifBlank { slot.description } ?: slot.description
-                if (sub.isNotBlank()) {
-                    Text(sub, style = MaterialTheme.typography.labelSmall, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                IconButton(onClick = { reloadSeq += 1 }, enabled = !loading, modifier = Modifier.size(38.dp)) {
+                    Icon(GaliaisIcons.Refresh, contentDescription = "刷新插件页", tint = if (loading) G.inkSubtle else G.inkMuted, modifier = Modifier.size(19.dp))
                 }
-            }
-            IconButton(onClick = { reloadSeq += 1 }, enabled = !loading, modifier = Modifier.size(36.dp)) {
-                Icon(GaliaisIcons.Refresh, contentDescription = "刷新插件页", tint = if (loading) G.inkSubtle else G.inkMuted, modifier = Modifier.size(19.dp))
             }
         }
         HeaderProgressSlot(loading)
@@ -604,7 +624,7 @@ fun PluginFullTabScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 14.dp, vertical = 12.dp),
+                .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             when {
@@ -630,7 +650,7 @@ fun PluginFullTabScreen(
                 }
                 !loading -> Text("该插件暂未输出可展示节点。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
             }
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(bottomChrome + 16.dp))
         }
     }
 
@@ -669,6 +689,7 @@ internal fun PluginSduiNode(
         "row" -> {
             val kids = node.arr("children").objects()
             val equalWeight = kids.isNotEmpty() && kids.all { it.optString("type") == "metric" }
+            val autoWeight = kids.size in 2..3 && kids.all { it.optString("type") in setOf("metric", "card", "column", "section", "text", "progress") }
             val hasButtonsOrBadges = kids.any { it.optString("type") in setOf("button", "badge") }
             if (hasButtonsOrBadges && !equalWeight) {
                 FlowRow(modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -677,7 +698,7 @@ internal fun PluginSduiNode(
             } else {
                 Row(modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     kids.forEach { child ->
-                        PluginSduiNode(child, formState, onAction, modifier = if (equalWeight) Modifier.weight(1f) else Modifier)
+                        PluginSduiNode(child, formState, onAction, modifier = if (equalWeight || autoWeight) Modifier.weight(1f) else Modifier)
                     }
                 }
             }
@@ -715,10 +736,10 @@ internal fun PluginSduiNode(
             val (fg, _) = sduiToneColors(node.optString("tone", "accent"))
             Surface(modifier = modifier, shape = D.shape(12.dp), color = G.surfaceSubtle, border = BorderStroke(0.75.dp, G.border)) {
                 Column(Modifier.fillMaxWidth().padding(horizontal = 11.dp, vertical = 9.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(node.optString("value", "0"), style = MaterialTheme.typography.titleLarge, color = fg, fontWeight = FontWeight.Bold, maxLines = 1)
+                    Text(node.optString("value", "0"), style = MaterialTheme.typography.titleLarge, color = fg, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text(node.optString("label"), style = MaterialTheme.typography.labelSmall, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     node.optString("delta").takeIf { it.isNotBlank() }?.let {
-                        Text(it, fontFamily = Mono, fontSize = 10.sp, color = G.inkSubtle, maxLines = 1)
+                        Text(it, fontFamily = Mono, fontSize = 10.sp, color = G.inkSubtle, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 }
             }
@@ -728,7 +749,7 @@ internal fun PluginSduiNode(
             val frac = node.optDouble("value", 0.0).toFloat().coerceIn(0f, 1f)
             Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text(node.optString("label"), style = MaterialTheme.typography.labelSmall, color = G.ink, modifier = Modifier.weight(1f))
+                    Text(node.optString("label"), style = MaterialTheme.typography.labelSmall, color = G.ink, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text("${(frac * 100).toInt()}%", fontFamily = Mono, fontSize = 11.sp, color = G.inkMuted)
                 }
                 LinearProgressIndicator(
@@ -739,14 +760,25 @@ internal fun PluginSduiNode(
                 )
             }
         }
-        "kv" -> Row(modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(node.optString("key"), style = MaterialTheme.typography.bodySmall, color = G.inkMuted, modifier = Modifier.weight(1f))
-            Text(node.optString("value"), fontFamily = Mono, fontSize = 12.sp, color = G.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        "kv" -> Row(modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(node.optString("key"), style = MaterialTheme.typography.bodySmall, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(0.45f))
+            Text(node.optString("value"), fontFamily = Mono, fontSize = 12.sp, color = G.ink, maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.End, modifier = Modifier.weight(0.55f))
         }
-        "code" -> Box(
-            modifier = modifier.fillMaxWidth().clip(D.shape(10.dp)).background(G.surfaceSubtle).padding(10.dp),
+        "code" -> Surface(
+            modifier = modifier.fillMaxWidth(),
+            shape = D.codeShape,
+            color = G.codeBg,
+            border = BorderStroke(0.75.dp, G.codeBorder),
         ) {
-            Text(node.optString("text"), fontFamily = Mono, fontSize = 11.sp, color = G.ink)
+            SelectionContainer {
+                Text(
+                    node.optString("text"),
+                    fontFamily = Mono,
+                    fontSize = D.codeSize(11.5f),
+                    color = G.codeInk,
+                    modifier = Modifier.horizontalScroll(rememberScrollState()).padding(10.dp),
+                )
+            }
         }
         "list" -> Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             node.arr("items").objects().forEach { item ->
@@ -775,7 +807,7 @@ internal fun PluginSduiNode(
             val act = node.optJSONObject("action") ?: JSONObject()
             when (node.optString("style")) {
                 "primary" -> PrimaryPillButton(label, onClick = { onAction(act) })
-                "danger" -> TagPill(label, fg = G.danger, bg = G.dangerTint, onClick = { onAction(act) })
+                "danger" -> SecondaryPillButton(label, danger = true, onClick = { onAction(act) })
                 else -> SecondaryPillButton(label, onClick = { onAction(act) })
             }
         }

@@ -1,0 +1,674 @@
+package com.galiais.agent.engine.fs
+
+import android.app.Application
+import android.content.Context
+import android.net.Uri
+import android.os.Environment
+import android.provider.DocumentsContract
+import com.galiais.agent.engine.AppSettings
+import com.galiais.agent.engine.DEFAULT_WORKSPACE
+import com.galiais.agent.engine.RUNTIME_MODE_PROOT
+import com.galiais.agent.engine.RUNTIME_MODE_ROOT
+import com.galiais.agent.engine.RuntimeClient
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * Solbraid 统一多域虚拟文件系统仓库：
+ * - 管理四域存储（Linux 工作区 / Linux Root / 手机宿主 Root / 手机外部存储与 SAF 目录）；
+ * - 容器内遇到权限受限目录时（Root 模式下）自动透明提权至常驻 `RootFsDaemon`，杜绝无权限报错；
+ * - 提供多标签页、跨存储域剪贴板、后台流式传输队列、书签、回收站、编码读写、归档、全文搜索与磁盘分析。
+ */
+class UnifiedFileRepository(
+    val app: Application,
+    val runtime: RuntimeClient,
+    val settings: AppSettings,
+) {
+    internal val rootDaemon = RootFsDaemon(app)
+    private val prefs = app.getSharedPreferences("solbraid-files-v2", Context.MODE_PRIVATE)
+    private val cancelFlags = ConcurrentHashMap<String, AtomicBoolean>()
+
+    private val tabsFlow = MutableStateFlow(
+        listOf(FileTab(scope = FileScope.LINUX_WORKSPACE, path = settings.state.value.defaultCwd)),
+    )
+    val tabs: StateFlow<List<FileTab>> = tabsFlow.asStateFlow()
+
+    private val activeTabIdFlow = MutableStateFlow(tabsFlow.value.first().id)
+    val activeTabId: StateFlow<String> = activeTabIdFlow.asStateFlow()
+
+    private val clipboardFlow = MutableStateFlow<FileClipboard?>(null)
+    val clipboard: StateFlow<FileClipboard?> = clipboardFlow.asStateFlow()
+
+    private val transfersFlow = MutableStateFlow<List<TransferJob>>(emptyList())
+    val transfers: StateFlow<List<TransferJob>> = transfersFlow.asStateFlow()
+
+    private val bookmarksFlow = MutableStateFlow(loadBookmarks())
+    val bookmarks: StateFlow<List<FileBookmark>> = bookmarksFlow.asStateFlow()
+
+    private val recentFilesFlow = MutableStateFlow<List<FileRef>>(emptyList())
+    val recentFiles: StateFlow<List<FileRef>> = recentFilesFlow.asStateFlow()
+
+    private val trashFlow = MutableStateFlow(loadTrash())
+    val trashItems: StateFlow<List<TrashEntry>> = trashFlow.asStateFlow()
+
+    private val safTreesFlow = MutableStateFlow(loadSafTrees())
+    val mountedSafTrees: StateFlow<List<MountedSafTree>> = safTreesFlow.asStateFlow()
+
+    private val pendingSharedUrisFlow = MutableStateFlow<List<Uri>>(emptyList())
+    val pendingSharedUris: StateFlow<List<Uri>> = pendingSharedUrisFlow.asStateFlow()
+
+    private val sortFieldFlow = MutableStateFlow(
+        SortField.entries.firstOrNull { it.name == prefs.getString("sort.field", null) } ?: SortField.NAME,
+    )
+    val sortField: StateFlow<SortField> = sortFieldFlow.asStateFlow()
+
+    private val sortAscFlow = MutableStateFlow(prefs.getBoolean("sort.asc", true))
+    val sortAsc: StateFlow<Boolean> = sortAscFlow.asStateFlow()
+
+    private val viewModeFlow = MutableStateFlow(
+        ViewMode.entries.firstOrNull { it.name == prefs.getString("view.mode", null) } ?: ViewMode.DETAILED,
+    )
+    val viewMode: StateFlow<ViewMode> = viewModeFlow.asStateFlow()
+
+    private val showHiddenFlow = MutableStateFlow(prefs.getBoolean("show.hidden", true))
+    val showHidden: StateFlow<Boolean> = showHiddenFlow.asStateFlow()
+
+    private val rootWriteUnlockedFlow = MutableStateFlow(false)
+    val rootWriteUnlocked: StateFlow<Boolean> = rootWriteUnlockedFlow.asStateFlow()
+
+    private val backupOnRootEditFlow = MutableStateFlow(prefs.getBoolean("root.backup", true))
+    val backupOnRootEdit: StateFlow<Boolean> = backupOnRootEditFlow.asStateFlow()
+
+    private val runtimeMode: String get() = settings.state.value.effectiveRuntimeMode
+    private val hasRoot: Boolean get() = runtime.rootAvailable.value == true
+    val activeTab: FileTab get() = tabsFlow.value.firstOrNull { it.id == activeTabIdFlow.value } ?: tabsFlow.value.first()
+
+    // ── 标签页与导航管理 ──────────────────────────────────────────────────
+
+    fun selectTab(tabId: String) {
+        if (tabsFlow.value.any { it.id == tabId }) activeTabIdFlow.value = tabId
+    }
+
+    fun openTab(scope: FileScope = activeTab.scope, path: String = scope.defaultRoot) {
+        val norm = normalizeVfsPath(path)
+        val tab = FileTab(scope = scope, path = norm)
+        tabsFlow.value = (tabsFlow.value + tab).takeLast(8)
+        activeTabIdFlow.value = tab.id
+    }
+
+    fun closeTab(tabId: String) {
+        val current = tabsFlow.value
+        if (current.size <= 1) return
+        val next = current.filterNot { it.id == tabId }
+        tabsFlow.value = next
+        if (activeTabIdFlow.value == tabId) activeTabIdFlow.value = next.last().id
+    }
+
+    fun navigate(scope: FileScope, path: String) {
+        val norm = normalizeVfsPath(path)
+        updateActiveTab { cur ->
+            if (cur.scope == scope && cur.path == norm) cur
+            else cur.copy(
+                scope = scope,
+                path = norm,
+                backStack = (cur.backStack + "${cur.scope.id}|${cur.path}").takeLast(32),
+                forwardStack = emptyList(),
+            )
+        }
+    }
+
+    fun switchScope(scope: FileScope) {
+        val targetPath = when (scope) {
+            FileScope.LINUX_WORKSPACE -> settings.state.value.defaultCwd
+            FileScope.ANDROID_STORAGE -> Environment.getExternalStorageDirectory().absolutePath
+            else -> scope.defaultRoot
+        }
+        navigate(scope, targetPath)
+    }
+
+    fun goBack(): Boolean {
+        val cur = activeTab
+        val prev = cur.backStack.lastOrNull() ?: return false
+        val prevScope = FileScope.of(prev.substringBefore('|'))
+        val prevPath = prev.substringAfter('|', "/")
+        updateActiveTab {
+            it.copy(
+                scope = prevScope,
+                path = prevPath,
+                backStack = it.backStack.dropLast(1),
+                forwardStack = (it.forwardStack + "${it.scope.id}|${it.path}").takeLast(32),
+            )
+        }
+        return true
+    }
+
+    fun goForward(): Boolean {
+        val cur = activeTab
+        val next = cur.forwardStack.lastOrNull() ?: return false
+        val nextScope = FileScope.of(next.substringBefore('|'))
+        val nextPath = next.substringAfter('|', "/")
+        updateActiveTab {
+            it.copy(
+                scope = nextScope,
+                path = nextPath,
+                backStack = (it.backStack + "${it.scope.id}|${it.path}").takeLast(32),
+                forwardStack = it.forwardStack.dropLast(1),
+            )
+        }
+        return true
+    }
+
+    private fun updateActiveTab(transform: (FileTab) -> FileTab) {
+        val id = activeTabIdFlow.value
+        tabsFlow.value = tabsFlow.value.map { if (it.id == id) transform(it) else it }
+    }
+
+    // ── 视图偏好 / 剪贴板 / 书签 / SAF / 分享接收 ─────────────────────────
+
+    fun setSort(field: SortField, ascending: Boolean = if (field == sortFieldFlow.value) !sortAscFlow.value else true) {
+        sortFieldFlow.value = field
+        sortAscFlow.value = ascending
+        prefs.edit().putString("sort.field", field.name).putBoolean("sort.asc", ascending).apply()
+    }
+
+    fun setViewMode(mode: ViewMode) {
+        viewModeFlow.value = mode
+        prefs.edit().putString("view.mode", mode.name).apply()
+    }
+
+    fun setShowHidden(show: Boolean) {
+        showHiddenFlow.value = show
+        prefs.edit().putBoolean("show.hidden", show).apply()
+    }
+
+    fun setRootWriteUnlocked(unlocked: Boolean) { rootWriteUnlockedFlow.value = unlocked }
+
+    fun setBackupOnRootEdit(enabled: Boolean) {
+        backupOnRootEditFlow.value = enabled
+        prefs.edit().putBoolean("root.backup", enabled).apply()
+    }
+
+    fun setClipboard(mode: ClipboardMode, items: List<FileRef>) {
+        if (items.isEmpty()) return
+        clipboardFlow.value = FileClipboard(mode, items.distinct())
+    }
+
+    fun clearClipboard() { clipboardFlow.value = null }
+
+    fun recordRecent(ref: FileRef) {
+        recentFilesFlow.value = (listOf(ref) + recentFilesFlow.value.filterNot { it == ref }).take(24)
+    }
+
+    fun enqueueSharedUris(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        pendingSharedUrisFlow.value = (pendingSharedUrisFlow.value + uris).distinct()
+    }
+
+    fun consumeSharedUris(): List<Uri> {
+        val cur = pendingSharedUrisFlow.value
+        pendingSharedUrisFlow.value = emptyList()
+        return cur
+    }
+
+    fun addBookmark(title: String, scope: FileScope, path: String) {
+        val norm = normalizeVfsPath(path)
+        val existing = bookmarksFlow.value.filterNot { it.builtIn }
+        if (existing.any { it.scope == scope && it.path == norm }) return
+        val next = existing + FileBookmark(UUID.randomUUID().toString().take(8), title.ifBlank { norm.substringAfterLast('/').ifEmpty { "/" } }, scope, norm, false)
+        saveCustomBookmarks(next)
+    }
+
+    fun removeBookmark(id: String) {
+        saveCustomBookmarks(bookmarksFlow.value.filterNot { it.builtIn || it.id == id })
+    }
+
+    fun mountSafTree(uri: Uri, displayName: String): MountedSafTree {
+        val id = UUID.randomUUID().toString().take(8)
+        val entry = MountedSafTree(id, uri.toString(), displayName.ifBlank { "外部目录" })
+        val next = safTreesFlow.value.filterNot { it.uriString == entry.uriString } + entry
+        safTreesFlow.value = next
+        val arr = JSONArray().apply { next.forEach { put(it.toJson()) } }
+        prefs.edit().putString("saf.trees", arr.toString()).apply()
+        return entry
+    }
+
+    fun unmountSafTree(id: String) {
+        val next = safTreesFlow.value.filterNot { it.id == id }
+        safTreesFlow.value = next
+        val arr = JSONArray().apply { next.forEach { put(it.toJson()) } }
+        prefs.edit().putString("saf.trees", arr.toString()).apply()
+    }
+
+    fun cancelTransfer(jobId: String) {
+        cancelFlags[jobId]?.set(true)
+    }
+
+    fun dismissTransfer(jobId: String) {
+        transfersFlow.value = transfersFlow.value.filterNot { it.id == jobId && !it.active }
+    }
+
+    internal fun physicalPathFor(scope: FileScope, virtualPath: String): String =
+        LocalFsHelper.resolvePhysicalFile(app, scope, virtualPath, runtimeMode).absolutePath
+
+    internal fun usesRootBackend(scope: FileScope): Boolean = when (scope) {
+        FileScope.HOST_ROOT -> true
+        FileScope.LINUX_ROOT -> runtimeMode == RUNTIME_MODE_ROOT
+        FileScope.LINUX_WORKSPACE -> false
+        FileScope.ANDROID_STORAGE -> false
+    }
+
+    internal fun assertWriteAllowed(scope: FileScope, virtualPath: String) {
+        val norm = normalizeVfsPath(virtualPath)
+        if (scope == FileScope.HOST_ROOT && rootDaemon.isProtectedSystemPath(norm) && !rootWriteUnlockedFlow.value) {
+            throw IllegalStateException("系统保护分区（$norm）当前处于只读保护状态，请先在顶部保护条解锁「允许写入系统区」后再操作")
+        }
+    }
+
+    private fun builtInBookmarks(): List<FileBookmark> {
+        val sdcard = Environment.getExternalStorageDirectory().absolutePath
+        return listOf(
+            FileBookmark("bi_ws", "默认工作区", FileScope.LINUX_WORKSPACE, DEFAULT_WORKSPACE, true),
+            FileBookmark("bi_home", "Linux Home", FileScope.LINUX_WORKSPACE, "/home/agent", true),
+            FileBookmark("bi_lroot", "Linux 根目录 /", FileScope.LINUX_ROOT, "/", true),
+            FileBookmark("bi_sd", "手机内部存储", FileScope.ANDROID_STORAGE, sdcard, true),
+            FileBookmark("bi_dl", "手机下载 Download", FileScope.ANDROID_STORAGE, "$sdcard/Download", true),
+            FileBookmark("bi_dcim", "手机相册 DCIM", FileScope.ANDROID_STORAGE, "$sdcard/DCIM", true),
+            FileBookmark("bi_hroot", "手机宿主 Root /", FileScope.HOST_ROOT, "/", true),
+            FileBookmark("bi_adb", "Root 模块 /data/adb", FileScope.HOST_ROOT, "/data/adb", true),
+        )
+    }
+
+    private fun loadBookmarks(): List<FileBookmark> {
+        val custom = runCatching {
+            val raw = prefs.getString("bookmarks.custom", null) ?: return@runCatching emptyList()
+            val arr = JSONArray(raw)
+            (0 until arr.length()).mapNotNull { FileBookmark.fromJson(arr.getJSONObject(it)) }
+        }.getOrDefault(emptyList())
+        return builtInBookmarks() + custom
+    }
+
+    private fun saveCustomBookmarks(custom: List<FileBookmark>) {
+        val arr = JSONArray().apply { custom.forEach { put(it.toJson()) } }
+        prefs.edit().putString("bookmarks.custom", arr.toString()).apply()
+        bookmarksFlow.value = builtInBookmarks() + custom
+    }
+
+    private fun loadSafTrees(): List<MountedSafTree> = runCatching {
+        val raw = prefs.getString("saf.trees", null) ?: return@runCatching emptyList()
+        val arr = JSONArray(raw)
+        (0 until arr.length()).mapNotNull { MountedSafTree.fromJson(arr.getJSONObject(it)) }
+    }.getOrDefault(emptyList())
+
+    private fun loadTrash(): List<TrashEntry> = runCatching {
+        val raw = prefs.getString("trash.entries", null) ?: return@runCatching emptyList()
+        val arr = JSONArray(raw)
+        (0 until arr.length()).mapNotNull { TrashEntry.fromJson(arr.getJSONObject(it)) }
+            .filter { File(it.trashFilePath).exists() }
+    }.getOrDefault(emptyList())
+
+    internal fun saveTrash(entries: List<TrashEntry>) {
+        trashFlow.value = entries
+        val arr = JSONArray().apply { entries.forEach { put(it.toJson()) } }
+        prefs.edit().putString("trash.entries", arr.toString()).apply()
+    }
+
+    internal suspend fun <T> runTrackedTransfer(
+        title: String,
+        totalItems: Int = 1,
+        totalBytes: Long = -1L,
+        block: suspend (
+            cancelled: AtomicBoolean,
+            report: (item: String, doneItems: Int, bytesCopied: Long) -> Unit,
+        ) -> T,
+    ): T {
+        val job = TransferJob(title = title, totalItems = totalItems, totalBytes = totalBytes)
+        val cancel = AtomicBoolean(false)
+        cancelFlags[job.id] = cancel
+        transfersFlow.value = (transfersFlow.value + job).takeLast(12)
+        val startedAt = System.currentTimeMillis()
+        try {
+            val result = block(cancel) { item, done, bytes ->
+                val elapsedSec = ((System.currentTimeMillis() - startedAt) / 1000.0).coerceAtLeast(0.1)
+                val speed = (bytes / elapsedSec).toLong()
+                updateTransfer(job.id) {
+                    it.copy(currentItem = item, doneItems = done, bytesCopied = bytes, speedBytesPerSec = speed)
+                }
+            }
+            updateTransfer(job.id) { it.copy(phase = TransferPhase.COMPLETED, doneItems = it.totalItems) }
+            return result
+        } catch (e: InterruptedException) {
+            updateTransfer(job.id) { it.copy(phase = TransferPhase.CANCELLED, error = "已取消") }
+            throw e
+        } catch (e: Exception) {
+            updateTransfer(job.id) { it.copy(phase = TransferPhase.FAILED, error = e.message ?: "传输失败") }
+            throw e
+        } finally {
+            cancelFlags.remove(job.id)
+        }
+    }
+
+    private fun updateTransfer(id: String, transform: (TransferJob) -> TransferJob) {
+        transfersFlow.value = transfersFlow.value.map { if (it.id == id) transform(it) else it }
+    }
+
+    // ── 核心目录枚举与元数据（自动透明提权，永不误报无权限） ────────────────
+
+    suspend fun list(scope: FileScope, path: String): List<FileNode> = withContext(Dispatchers.IO) {
+        val norm = normalizeVfsPath(path)
+        if (scope == FileScope.ANDROID_STORAGE && norm.startsWith("saf://")) {
+            return@withContext listSafPath(norm)
+        }
+        val phys = physicalPathFor(scope, norm)
+        val rawNodes = when {
+            usesRootBackend(scope) -> rootDaemon.listDirectory(phys, scope, norm)
+            scope == FileScope.ANDROID_STORAGE && !LocalFsHelper.hasAllFilesAccess(app) && hasRoot ->
+                rootDaemon.listDirectory(phys, scope, norm)
+            else -> {
+                val local = LocalFsHelper.listLocalDirectoryOrNull(File(phys), scope, norm)
+                when {
+                    local != null && !(scope == FileScope.ANDROID_STORAGE && !LocalFsHelper.hasAllFilesAccess(app) && local.isEmpty()) -> local
+                    hasRoot -> rootDaemon.listDirectory(phys, scope, norm)
+                    scope == FileScope.ANDROID_STORAGE && !LocalFsHelper.hasAllFilesAccess(app) ->
+                        throw IllegalStateException("尚未授予「所有文件访问权限」，请点击上方按钮授权或挂载外部 SAF 目录")
+                    else -> throw IllegalStateException("无权访问目录或目录不存在：$norm")
+                }
+            }
+        }
+        applySortAndFilter(rawNodes)
+    }
+
+    private fun listSafPath(safPath: String): List<FileNode> {
+        val withoutScheme = safPath.removePrefix("saf://")
+        val treeId = withoutScheme.substringBefore('/')
+        val tree = safTreesFlow.value.firstOrNull { it.id == treeId }
+            ?: throw IllegalStateException("外部目录挂载已失效，请重新选择目录")
+        val treeUri = Uri.parse(tree.uriString)
+        val docIdEncoded = withoutScheme.substringAfter('/', "")
+        val docId = if (docIdEncoded.isEmpty()) DocumentsContract.getTreeDocumentId(treeUri) else Uri.decode(docIdEncoded)
+        return applySortAndFilter(LocalFsHelper.listSafChildren(app, treeUri, docId, "saf://$treeId"))
+    }
+
+    private fun applySortAndFilter(nodes: List<FileNode>): List<FileNode> {
+        val hidden = showHiddenFlow.value
+        val filtered = if (hidden) nodes else nodes.filterNot { it.name.startsWith(".") }
+        val field = sortFieldFlow.value
+        val asc = sortAscFlow.value
+        val cmp = Comparator<FileNode> { a, b ->
+            if (a.isDirectory != b.isDirectory) return@Comparator if (a.isDirectory) -1 else 1
+            val raw = when (field) {
+                SortField.NAME -> a.name.lowercase().compareTo(b.name.lowercase())
+                SortField.SIZE -> a.size.compareTo(b.size)
+                SortField.MODIFIED -> a.lastModifiedMs.compareTo(b.lastModifiedMs)
+                SortField.EXTENSION -> a.extension.compareTo(b.extension).let { if (it != 0) it else a.name.lowercase().compareTo(b.name.lowercase()) }
+            }
+            if (asc) raw else -raw
+        }
+        return filtered.sortedWith(cmp)
+    }
+
+    suspend fun stat(ref: FileRef): FileNode = withContext(Dispatchers.IO) {
+        val norm = ref.normalizedPath
+        val phys = physicalPathFor(ref.scope, norm)
+        if (usesRootBackend(ref.scope)) {
+            rootDaemon.statNode(phys, ref.scope, norm)
+        } else {
+            runCatching { LocalFsHelper.statLocalFile(File(phys), ref.scope, norm) }
+                .getOrElse { if (hasRoot) rootDaemon.statNode(phys, ref.scope, norm) else throw it }
+        }
+    }
+
+    suspend fun queryMountInfo(scope: FileScope, path: String): MountInfo? = withContext(Dispatchers.IO) {
+        if (!hasRoot && usesRootBackend(scope)) return@withContext null
+        val phys = physicalPathFor(scope, path)
+        if (hasRoot) runCatching { rootDaemon.queryMountInfo(phys) }.getOrNull() else null
+    }
+
+    suspend fun computeDirStats(ref: FileRef): DirStats = withContext(Dispatchers.IO) {
+        val phys = physicalPathFor(ref.scope, ref.normalizedPath)
+        if (usesRootBackend(ref.scope) || !File(phys).canRead()) {
+            rootDaemon.computeDirStats(phys)
+        } else {
+            var bytes = 0L; var files = 0; var dirs = 0
+            fun walk(f: File, depth: Int) {
+                if (depth > 64) return
+                val list = f.listFiles() ?: return
+                for (c in list) {
+                    if (c.isDirectory) { dirs++; walk(c, depth + 1) }
+                    else if (c.isFile) { files++; bytes += c.length() }
+                }
+            }
+            walk(File(phys), 0)
+            DirStats(bytes, files, dirs)
+        }
+    }
+
+    /** 将任意存储域的文件准备为本地可直接读的 File（普通文件零拷贝返回原路径，Root/SAF 文件高速暂存到缓存）。 */
+    suspend fun stageReadableFile(ref: FileRef, maxBytes: Long = -1L): File = withContext(Dispatchers.IO) {
+        val norm = ref.normalizedPath
+        if (ref.scope == FileScope.ANDROID_STORAGE && norm.startsWith("saf://")) {
+            val withoutScheme = norm.removePrefix("saf://")
+            val treeId = withoutScheme.substringBefore('/')
+            val docId = Uri.decode(withoutScheme.substringAfter('/'))
+            val tree = safTreesFlow.value.firstOrNull { it.id == treeId } ?: error("SAF 挂载已失效")
+            val dst = File(File(app.cacheDir, "file-viewer").apply { mkdirs() }, ExternalStorageBridge.sanitizeFilename(docId.substringAfterLast('/')))
+            LocalFsHelper.openSafInput(app, Uri.parse(tree.uriString), docId).use { input ->
+                dst.outputStream().use { input.copyTo(it) }
+            }
+            return@withContext dst
+        }
+        val phys = File(physicalPathFor(ref.scope, norm))
+        if (!usesRootBackend(ref.scope) && phys.isFile && phys.canRead() && (maxBytes <= 0L || phys.length() <= maxBytes)) {
+            return@withContext phys
+        }
+        val viewerDir = File(app.cacheDir, "file-viewer").apply { mkdirs() }
+        val safeName = ExternalStorageBridge.sanitizeFilename(ref.name)
+        val outFile = File(viewerDir, "${UUID.randomUUID().toString().take(6)}_$safeName")
+        if (phys.isFile && phys.canRead()) {
+            phys.inputStream().use { input ->
+                outFile.outputStream().use { out ->
+                    if (maxBytes > 0L) {
+                        val buf = ByteArray(65_536)
+                        var remain = maxBytes
+                        while (remain > 0L) {
+                            val n = input.read(buf, 0, minOf(buf.size.toLong(), remain).toInt())
+                            if (n <= 0) break
+                            out.write(buf, 0, n)
+                            remain -= n
+                        }
+                    } else input.copyTo(out)
+                }
+            }
+            outFile
+        } else if (hasRoot) {
+            rootDaemon.stageFileToReadable(phys.absolutePath, outFile, maxBytes)
+            outFile
+        } else {
+            throw IllegalStateException("无权读取文件：${ref.path}")
+        }
+    }
+
+    /** 将本地暂存文件写入任意目标路径（Root 路径自动原子提交并完整保留原权限、属主和 SELinux 上下文）。 */
+    suspend fun writeLocalFileTo(ref: FileRef, stagedSrc: File) = withContext(Dispatchers.IO) {
+        assertWriteAllowed(ref.scope, ref.normalizedPath)
+        val phys = File(physicalPathFor(ref.scope, ref.normalizedPath))
+        val needRoot = usesRootBackend(ref.scope) || (!phys.parentFile.let { it != null && it.canWrite() } && hasRoot) || (phys.exists() && !phys.canWrite() && hasRoot)
+        if (needRoot) {
+            rootDaemon.commitStagedFileAtomic(stagedSrc, phys.absolutePath, createBackup = backupOnRootEditFlow.value && ref.scope.isRootElevated)
+        } else {
+            phys.parentFile?.mkdirs()
+            val tmp = File(phys.parentFile, ".${phys.name}.solbraid.${UUID.randomUUID().toString().take(6)}")
+            try {
+                stagedSrc.inputStream().use { input -> tmp.outputStream().use { input.copyTo(it); it.fd.sync() } }
+                if (!tmp.renameTo(phys)) {
+                    stagedSrc.inputStream().use { input -> phys.outputStream().use { input.copyTo(it); it.fd.sync() } }
+                    tmp.delete()
+                }
+            } catch (e: Exception) {
+                tmp.delete()
+                throw e
+            }
+        }
+    }
+
+    suspend fun readTextDocument(ref: FileRef, encodingOverride: TextEncoding? = null, maxBytes: Long = 2L * 1024 * 1024): Pair<DecodedTextDocument, String> =
+        withContext(Dispatchers.IO) {
+            val node = runCatching { stat(ref) }.getOrNull()
+            val totalSize = node?.size ?: -1L
+            val truncated = totalSize > maxBytes
+            val staged = stageReadableFile(ref, maxBytes = if (truncated) maxBytes else -1L)
+            val bytes = staged.readBytes()
+            val doc = TextCodec.decodeBytes(bytes, encodingOverride, totalBytes = if (totalSize >= 0L) totalSize else bytes.size.toLong(), truncated = truncated)
+            val rev = "${node?.lastModifiedMs ?: staged.lastModified()}:${node?.size ?: bytes.size}"
+            doc to rev
+        }
+
+    suspend fun writeTextDocument(ref: FileRef, text: String, encoding: TextEncoding, lineEnding: LineEnding): String =
+        withContext(Dispatchers.IO) {
+            val bytes = TextCodec.encodeText(text, encoding, lineEnding)
+            val tmp = rootDaemon.newStageFile("edit-")
+            try {
+                tmp.writeBytes(bytes)
+                writeLocalFileTo(ref, tmp)
+            } finally {
+                tmp.delete()
+            }
+            val node = runCatching { stat(ref) }.getOrNull()
+            "${node?.lastModifiedMs ?: System.currentTimeMillis()}:${node?.size ?: bytes.size}"
+        }
+
+    // ── 基本目录/文件/权限/链接/回收站操作 ─────────────────────────────────
+
+    suspend fun mkdir(scope: FileScope, path: String) = withContext(Dispatchers.IO) {
+        val norm = normalizeVfsPath(path)
+        assertWriteAllowed(scope, norm)
+        val phys = File(physicalPathFor(scope, norm))
+        if (usesRootBackend(scope) || !phys.mkdirs()) {
+            if (phys.isDirectory) return@withContext
+            if (hasRoot) rootDaemon.mkdir(phys.absolutePath) else error("无法创建文件夹：$norm")
+        }
+    }
+
+    suspend fun createEmptyFile(ref: FileRef) = withContext(Dispatchers.IO) {
+        val tmp = rootDaemon.newStageFile("empty-")
+        try { writeLocalFileTo(ref, tmp) } finally { tmp.delete() }
+    }
+
+    suspend fun rename(ref: FileRef, newName: String): FileRef = withContext(Dispatchers.IO) {
+        val dstPath = joinVfsPath(ref.parentPath, newName)
+        assertWriteAllowed(ref.scope, ref.normalizedPath)
+        assertWriteAllowed(ref.scope, dstPath)
+        require(!rootDaemon.isUnremovablePath(ref.scope, ref.normalizedPath)) { "不允许重命名受保护的系统或工作区根目录" }
+        val srcFile = File(physicalPathFor(ref.scope, ref.normalizedPath))
+        val dstFile = File(physicalPathFor(ref.scope, dstPath))
+        if (usesRootBackend(ref.scope) || !srcFile.renameTo(dstFile)) {
+            if (hasRoot) rootDaemon.rename(srcFile.absolutePath, dstFile.absolutePath)
+            else error("重命名失败，请检查目标是否已存在或权限不足")
+        }
+        FileRef(ref.scope, dstPath)
+    }
+
+    suspend fun duplicate(ref: FileRef): FileRef = withContext(Dispatchers.IO) {
+        val parent = ref.parentPath
+        val base = ref.name
+        val stem = base.substringBeforeLast('.', base)
+        val ext = base.substringAfterLast('.', "").let { if (it == base || it.isEmpty()) "" else ".$it" }
+        var idx = 1
+        var candidate = joinVfsPath(parent, "${stem}_copy$ext")
+        while (runCatching { stat(FileRef(ref.scope, candidate)); true }.getOrDefault(false)) {
+            idx++
+            candidate = joinVfsPath(parent, "${stem}_copy$idx$ext")
+        }
+        val dstRef = FileRef(ref.scope, candidate)
+        copySingleRef(ref, dstRef, AtomicBoolean(false)) {}
+        dstRef
+    }
+
+    suspend fun delete(ref: FileRef, moveToTrash: Boolean = false) = withContext(Dispatchers.IO) {
+        val norm = ref.normalizedPath
+        assertWriteAllowed(ref.scope, norm)
+        require(!rootDaemon.isUnremovablePath(ref.scope, norm)) { "不允许删除系统核心目录或默认工作区根目录：$norm" }
+        val phys = File(physicalPathFor(ref.scope, norm))
+        if (moveToTrash && !ref.scope.isRootElevated && phys.exists() && phys.canWrite()) {
+            val trashDir = File(app.filesDir, "file-trash").apply { mkdirs() }
+            val id = UUID.randomUUID().toString().take(10)
+            val trashTarget = File(trashDir, "${id}_${ExternalStorageBridge.sanitizeFilename(ref.name)}")
+            val isDir = phys.isDirectory
+            val size = if (isDir) 0L else phys.length()
+            if (phys.renameTo(trashTarget)) {
+                val entry = TrashEntry(id, ref.scope, norm, ref.name, isDir, size, System.currentTimeMillis(), trashTarget.absolutePath)
+                saveTrash(listOf(entry) + trashFlow.value)
+                return@withContext
+            }
+        }
+        if (usesRootBackend(ref.scope) || !phys.deleteRecursively()) {
+            if (phys.exists()) {
+                if (hasRoot) rootDaemon.remove(phys.absolutePath) else error("删除失败：$norm")
+            }
+        }
+    }
+
+    suspend fun restoreTrash(entry: TrashEntry) = withContext(Dispatchers.IO) {
+        val src = File(entry.trashFilePath)
+        check(src.exists()) { "回收站文件已不存在" }
+        val dst = File(physicalPathFor(entry.originalScope, entry.originalPath))
+        dst.parentFile?.mkdirs()
+        val finalDst = if (dst.exists()) ExternalStorageBridge.uniqueFile(dst.parentFile!!, dst.name) else dst
+        if (!src.renameTo(finalDst)) {
+            if (src.isDirectory) { src.copyRecursively(finalDst, overwrite = false); src.deleteRecursively() }
+            else { src.copyTo(finalDst, overwrite = false); src.delete() }
+        }
+        saveTrash(trashFlow.value.filterNot { it.id == entry.id })
+    }
+
+    suspend fun emptyTrash() = withContext(Dispatchers.IO) {
+        trashFlow.value.forEach { runCatching { File(it.trashFilePath).deleteRecursively() } }
+        saveTrash(emptyList())
+    }
+
+    suspend fun chmod(ref: FileRef, octal: String, recursive: Boolean) = withContext(Dispatchers.IO) {
+        assertWriteAllowed(ref.scope, ref.normalizedPath)
+        val phys = physicalPathFor(ref.scope, ref.normalizedPath)
+        if (usesRootBackend(ref.scope) || hasRoot) {
+            rootDaemon.chmod(phys, octal, recursive)
+        } else {
+            val mode = octal.trim().toInt(8)
+            android.system.Os.chmod(phys, mode)
+        }
+    }
+
+    suspend fun chown(ref: FileRef, ownerSpec: String, recursive: Boolean) = withContext(Dispatchers.IO) {
+        assertWriteAllowed(ref.scope, ref.normalizedPath)
+        check(hasRoot) { "修改文件属主（chown）需要 Root 权限" }
+        rootDaemon.chown(physicalPathFor(ref.scope, ref.normalizedPath), ownerSpec, recursive)
+    }
+
+    suspend fun chcon(ref: FileRef, contextSpec: String, recursive: Boolean) = withContext(Dispatchers.IO) {
+        assertWriteAllowed(ref.scope, ref.normalizedPath)
+        check(hasRoot) { "修改 SELinux 上下文（chcon）需要 Root 权限" }
+        rootDaemon.chcon(physicalPathFor(ref.scope, ref.normalizedPath), contextSpec, recursive)
+    }
+
+    suspend fun createSymlink(scope: FileScope, dirPath: String, linkName: String, target: String) = withContext(Dispatchers.IO) {
+        val linkVPath = joinVfsPath(dirPath, linkName)
+        assertWriteAllowed(scope, linkVPath)
+        val phys = physicalPathFor(scope, linkVPath)
+        if (usesRootBackend(scope)) rootDaemon.createSymlink(target, phys)
+        else runCatching { android.system.Os.symlink(target, phys) }.getOrElse {
+            if (hasRoot) rootDaemon.createSymlink(target, phys) else throw it
+        }
+    }
+
+    suspend fun computeHashes(ref: FileRef): FileHashes = withContext(Dispatchers.IO) {
+        val f = stageReadableFile(ref)
+        TextCodec.computeHashes(f)
+    }
+}

@@ -107,8 +107,9 @@ fun GaliaisApp(app: GaliaisApplication) {
         app.conversations.messages.collectLatest { text ->
             snackbar.currentSnackbarData?.dismiss()
             val showJob = launch { snackbar.showSnackbar(text, duration = SnackbarDuration.Indefinite) }
+            val holdMs = if (text.contains("失败") || text.contains("异常") || text.contains("错误") || text.length > 28) 3800L else 2400L
             try {
-                delay(1800)
+                delay(holdMs)
             } finally {
                 snackbar.currentSnackbarData?.dismiss()
                 showJob.cancel()
@@ -127,6 +128,15 @@ fun GaliaisApp(app: GaliaisApplication) {
         safeNavigate("chat/${key.route}")
     }
     var tab by rememberSaveable { mutableIntStateOf(0) }
+    val pendingSharedUris by app.fileManager.pendingSharedUris.collectAsState()
+    LaunchedEffect(pendingSharedUris) {
+        if (pendingSharedUris.isNotEmpty()) {
+            tab = 2
+            if (navigation.currentBackStackEntry?.destination?.route != "home") {
+                navigation.popBackStack("home", inclusive = false)
+            }
+        }
+    }
     val hostPlugins by app.extensions.hostPlugins.collectAsState()
     val navTabSlots = remember(hostPlugins) { app.extensions.activePluginUiSlots("nav.tab").take(2) }
     val extraNavLabels = remember(navTabSlots) { navTabSlots.map { it.label.take(4) } }
@@ -166,9 +176,16 @@ fun GaliaisApp(app: GaliaisApplication) {
         safeNavigate("plugin/$ep/$es")
     }
 
+    val bottomChromeInset = when (currentLogicalRoute) {
+        "home", "ssh", "files", "settings", "nav.tab" -> 78.dp
+        "chat" -> 96.dp
+        else -> 0.dp
+    }
+
     CompositionLocalProvider(
         LocalRenderPrefs provides settings,
         LocalPluginNavigator provides openPluginFullPage,
+        LocalBottomChromeInset provides bottomChromeInset,
     ) {
     Box(Modifier.fillMaxSize().background(G.canvas)) {
         NavHost(
@@ -297,6 +314,7 @@ fun GaliaisApp(app: GaliaisApplication) {
                 AgentsScreen(
                     app = app,
                     modifier = Modifier.fillMaxSize(),
+                    snackbar = snackbar,
                     onOpenAgent = { id -> safeNavigate("agent/${java.net.URLEncoder.encode(id, "UTF-8").replace("+", "%20")}") },
                     onBack = ::safePopBack,
                 )
@@ -320,7 +338,7 @@ fun GaliaisApp(app: GaliaisApplication) {
             composable("settings/workspace") { WorkspaceSettingsScreen(app, snackbar, onBack = ::safePopBack) }
             composable("settings/runtime") { RuntimeSettingsScreen(app, snackbar, onBack = ::safePopBack) }
             composable("settings/selfbuild") { SelfBuildSettingsScreen(app, snackbar, onBack = ::safePopBack) }
-            composable("settings/about") { AboutSettingsScreen(app, onBack = ::safePopBack) }
+            composable("settings/about") { AboutSettingsScreen(app, snackbar = snackbar, onBack = ::safePopBack) }
 
             composable("terminal") {
                 val req = terminalRequest
@@ -436,7 +454,7 @@ fun GaliaisBottomBar(
     when (d.navBarStyle) {
         "m3_expressive" -> {
             val container = if (d.material) MaterialTheme.colorScheme.surfaceContainer else g.surfaceFilled
-            val topShape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp)
+            val topShape = RoundedCornerShape(topStart = d.radius(20.dp), topEnd = d.radius(20.dp))
             Surface(color = container, shape = topShape) {
                 BoxWithConstraints(
                     modifier = Modifier
@@ -500,9 +518,10 @@ fun GaliaisBottomBar(
                     border = BorderStroke(1.25.dp, g.borderStrong),
                     shadowElevation = if (g.dark) 2.dp else 3.dp,
                 ) {
-                    BoxWithConstraints(Modifier.fillMaxWidth().height(54.dp)) {
-                        val slotW = maxWidth / allTabs.size
-                        val slotX by animateDpAsState(slotW * safeIndex, slideSpec, label = "hwSlot")
+                    BoxWithConstraints(Modifier.fillMaxWidth().height(58.dp)) {
+                        val dividerTotal = 1.dp * (allTabs.size - 1).coerceAtLeast(0)
+                        val slotW = ((maxWidth - dividerTotal) / allTabs.size).coerceAtLeast(0.dp)
+                        val slotX by animateDpAsState((slotW + 1.dp) * safeIndex, slideSpec, label = "hwSlot")
                         Box(
                             modifier = Modifier
                                 .offset(x = slotX)
@@ -614,17 +633,32 @@ fun GaliaisBottomBar(
                                         .padding(horizontal = 4.dp),
                                     contentAlignment = Alignment.Center,
                                 ) {
-                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                        Icon(item.icon, contentDescription = null, tint = if (active) g.accent else g.inkSubtle, modifier = Modifier.size(17.dp))
-                                        Text(
-                                            item.label,
-                                            style = MaterialTheme.typography.labelMedium,
-                                            fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
-                                            color = if (active) g.accent else g.inkSubtle,
-                                            maxLines = 1,
-                                            softWrap = false,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
+                                    if (allTabs.size >= 5) {
+                                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                            Icon(item.icon, contentDescription = null, tint = if (active) g.accent else g.inkSubtle, modifier = Modifier.size(16.dp))
+                                            Text(
+                                                item.label,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+                                                color = if (active) g.accent else g.inkSubtle,
+                                                maxLines = 1,
+                                                softWrap = false,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                    } else {
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                            Icon(item.icon, contentDescription = null, tint = if (active) g.accent else g.inkSubtle, modifier = Modifier.size(17.dp))
+                                            Text(
+                                                item.label,
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+                                                color = if (active) g.accent else g.inkSubtle,
+                                                maxLines = 1,
+                                                softWrap = false,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -667,7 +701,7 @@ private fun FloatingDockTrack(
         border = BorderStroke(1.dp, g.border),
         shadowElevation = if (g.dark) 6.dp else 8.dp,
     ) {
-        BoxWithConstraints(modifier = Modifier.fillMaxWidth().padding(4.dp).height(46.dp)) {
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth().padding(4.dp).height(50.dp)) {
             val slotW = maxWidth / tabItems.size
             val pillX by animateDpAsState(
                 targetValue = slotW * selectedIndex,

@@ -31,15 +31,18 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -58,6 +61,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -79,6 +83,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -380,9 +385,16 @@ fun TerminalSheet(app: GaliaisApplication, cwd: String, sshHost: SshHostConfig? 
         label = "termCanvasReveal",
     )
 
+    CompositionLocalProvider(LocalGaliaisColors provides darkTerminalGaliaisColors()) {
     Box(Modifier.fillMaxSize().background(TermCanvasBg)) {
-        Column(Modifier.fillMaxSize().background(TermChromeBg).statusBarsPadding().navigationBarsPadding().imePadding()) {
-            // 1. 顶部曜石工具栏（48dp）：返回 + 状态点/会话标题 + 新建(+) + 一键结束(×) + 命令条 + 更多菜单
+        Column(
+            Modifier
+                .fillMaxSize()
+                .background(TermChromeBg)
+                .statusBarsPadding()
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
+        ) {
+            // 1. 顶部曜石工具栏（48dp）：返回 + 状态点/会话标题 + 新建(+) + 命令条 + 更多菜单
             Row(
                 modifier = Modifier.fillMaxWidth().height(48.dp).background(TermChromeBg).padding(horizontal = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -500,29 +512,10 @@ fun TerminalSheet(app: GaliaisApplication, cwd: String, sshHost: SshHostConfig? 
                     }
                 }
 
-                // 直接结束当前终端按钮（无需进入三级菜单，已退出状态单点即关）
-                if (selected != null && runtime.ready) {
-                    Box(
-                        modifier = Modifier
-                            .size(32.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Color(0xFF28191F))
-                            .clickable(role = Role.Button) { requestCloseSession(selected) },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(
-                            GaliaisIcons.Close,
-                            contentDescription = "结束当前终端",
-                            tint = TermRed,
-                            modifier = Modifier.size(15.dp),
-                        )
-                    }
-                }
-
                 // 命令直发栏开关（中文输入法友好）
                 Box(
                     modifier = Modifier
-                        .size(32.dp)
+                        .size(34.dp)
                         .clip(RoundedCornerShape(8.dp))
                         .background(if (showCommandBar) TermKeyActiveBg else Color.Transparent)
                         .clickable { showCommandBar = !showCommandBar },
@@ -600,8 +593,8 @@ fun TerminalSheet(app: GaliaisApplication, cwd: String, sshHost: SshHostConfig? 
                 }
             }
 
-            // 2. 常驻多会话胶囊标签栏（1 个会话即显示，便于一键关闭当前标签或一键新建新标签）
-            if (sessions.isNotEmpty()) {
+            // 2. 多会话胶囊标签栏（仅 2 个及以上会话时显示，单会话释放 36dp 终端高度）
+            if (sessions.size > 1) {
                 val tabListState = rememberLazyListState()
                 val activeTabIndex = remember(sessions, selectedId) { sessions.indexOfFirst { it.id == selectedId } }
                 LaunchedEffect(activeTabIndex, sessions.size) {
@@ -629,7 +622,7 @@ fun TerminalSheet(app: GaliaisApplication, cwd: String, sshHost: SshHostConfig? 
                                     selectedId = session.id
                                     error = null
                                 }
-                                .padding(start = 9.dp, end = if (runtime.ready) 6.dp else 9.dp, top = 5.dp, bottom = 5.dp),
+                                .padding(start = 9.dp, end = if (runtime.ready) 4.dp else 9.dp, top = 4.dp, bottom = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp),
                         ) {
@@ -649,16 +642,20 @@ fun TerminalSheet(app: GaliaisApplication, cwd: String, sshHost: SshHostConfig? 
                                 modifier = Modifier.widthIn(max = 132.dp),
                             )
                             if (runtime.ready) {
-                                Icon(
-                                    GaliaisIcons.Close,
-                                    contentDescription = "关闭终端",
-                                    tint = if (active) TermInk.copy(alpha = 0.72f) else TermMuted.copy(alpha = 0.65f),
+                                Box(
                                     modifier = Modifier
-                                        .size(14.dp)
+                                        .size(22.dp)
                                         .clip(CircleShape)
-                                        .clickable { requestCloseSession(session) }
-                                        .padding(1.dp),
-                                )
+                                        .clickable { requestCloseSession(session) },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Icon(
+                                        GaliaisIcons.Close,
+                                        contentDescription = "关闭终端",
+                                        tint = if (active) TermInk.copy(alpha = 0.72f) else TermMuted.copy(alpha = 0.65f),
+                                        modifier = Modifier.size(12.dp),
+                                    )
+                                }
                             }
                         }
                     }
@@ -683,11 +680,11 @@ fun TerminalSheet(app: GaliaisApplication, cwd: String, sshHost: SshHostConfig? 
             }
 
             // 3. 轻量状态微信息条（目录 + 网格行列 + 快捷复制/粘贴）
+            Box(Modifier.fillMaxWidth().height(0.5.dp).background(TermBorder))
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(TermBarBg)
-                    .border(0.5.dp, TermBorder)
                     .padding(horizontal = 12.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -870,17 +867,11 @@ fun TerminalSheet(app: GaliaisApplication, cwd: String, sshHost: SshHostConfig? 
                                     "可新建本地 Shell 或快速连接 SSH 主机，离开页面后进程仍会在后台保持运行。",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = TermMuted,
+                                    textAlign = TextAlign.Center,
                                 )
                                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                                     PrimaryPillButton("新建本地终端", enabled = runtime.ready && !connecting, onClick = { open(cwd, null) })
-                                    Surface(
-                                        onClick = onDismiss,
-                                        shape = RoundedCornerShape(99.dp),
-                                        color = TermKeyBg,
-                                        border = BorderStroke(0.75.dp, TermBorder),
-                                    ) {
-                                        Text("返回", fontSize = 13.sp, color = TermInk, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
-                                    }
+                                    SecondaryPillButton("返回", onClick = onDismiss)
                                 }
                                 val quickProjects = appSettings.projects.filter { it != cwd }.take(4)
                                 if (quickProjects.isNotEmpty() || sshHosts.isNotEmpty()) {
@@ -896,13 +887,19 @@ fun TerminalSheet(app: GaliaisApplication, cwd: String, sshHost: SshHostConfig? 
                                                 color = TermBarBg,
                                                 border = BorderStroke(0.75.dp, TermBorder),
                                             ) {
-                                                Text(
-                                                    "📁 ${projectDisplayName(dir)}",
-                                                    fontFamily = Mono,
-                                                    fontSize = 11.5.sp,
-                                                    color = TermInk,
+                                                Row(
                                                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                                )
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                                ) {
+                                                    Icon(GaliaisIcons.Folder, contentDescription = null, tint = TermAccent, modifier = Modifier.size(13.dp))
+                                                    Text(
+                                                        projectDisplayName(dir),
+                                                        fontFamily = Mono,
+                                                        fontSize = 11.5.sp,
+                                                        color = TermInk,
+                                                    )
+                                                }
                                             }
                                         }
                                         sshHosts.take(4).forEach { host ->
@@ -932,11 +929,11 @@ fun TerminalSheet(app: GaliaisApplication, cwd: String, sshHost: SshHostConfig? 
 
             // 5. 可选中文输入法友好直发命令条（支持历史命令 ↑/↓ 回溯）
             if (showCommandBar) {
+                Box(Modifier.fillMaxWidth().height(0.5.dp).background(TermBorder))
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(TermBarBg)
-                        .border(0.5.dp, TermBorder)
                         .padding(horizontal = 10.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -970,6 +967,13 @@ fun TerminalSheet(app: GaliaisApplication, cwd: String, sshHost: SshHostConfig? 
                             historyIndex = nextIdx
                             commandLine = commandHistory[nextIdx]
                         }
+                        if (historyIndex >= 0) {
+                            TermKeycap("↓", enabled = usable) {
+                                val nextIdx = historyIndex - 1
+                                historyIndex = nextIdx
+                                commandLine = if (nextIdx >= 0) commandHistory[nextIdx] else ""
+                            }
+                        }
                     }
                     Box(
                         modifier = Modifier
@@ -985,11 +989,11 @@ fun TerminalSheet(app: GaliaisApplication, cwd: String, sshHost: SshHostConfig? 
             }
 
             // 6. 单行硬件键帽辅助栏（贴合软键盘上方，右侧固定键盘唤起按钮）
+            Box(Modifier.fillMaxWidth().height(0.5.dp).background(TermBorder))
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(TermChromeBg)
-                    .border(0.5.dp, TermBorder)
                     .padding(horizontal = 6.dp, vertical = 5.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(5.dp),
@@ -1105,6 +1109,7 @@ fun TerminalSheet(app: GaliaisApplication, cwd: String, sshHost: SshHostConfig? 
         onOpenSurface = { openingPluginSurface = it },
         onOpenPanel = { openingPluginPanel = it },
     )
+    }
 }
 
 @Composable

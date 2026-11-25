@@ -43,6 +43,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -198,7 +199,7 @@ fun ElapsedTimerText(startedAt: Long, color: Color = G.inkMuted, modifier: Modif
     LaunchedEffect(startedAt) {
         while (true) {
             now = System.currentTimeMillis()
-            delay(250)
+            delay(100)
         }
     }
     val elapsedMs = (now - startedAt).coerceAtLeast(0L)
@@ -208,5 +209,11 @@ fun ElapsedTimerText(startedAt: Long, color: Color = G.inkMuted, modifier: Modif
         val sec = elapsedMs / 1000L
         "${sec / 60}m ${String.format(java.util.Locale.US, "%02d", sec % 60)}s"
     }
-    Text(label, fontFamily = Mono, fontSize = 11.5.sp, color = color, modifier = modifier)
+    Text(
+        text = label,
+        style = TextStyle(fontFamily = Mono, fontSize = 11.5.sp, fontFeatureSettings = "tnum"),
+        color = color,
+        maxLines = 1,
+        modifier = modifier,
+    )
 }

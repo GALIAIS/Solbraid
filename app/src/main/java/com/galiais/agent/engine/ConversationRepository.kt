@@ -697,32 +697,161 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
         if (key.engine == EngineKind.CODEX) sendRecoverably(key, text, attachments, steer = true)
         else error("当前引擎不支持运行中插话，请先中断后再发送")
     }
-    fun revertBeforeTurn(key: ConversationKey, userMessageId: String) = launchOperation("回退轮次失败") {
-        check(key.engine == EngineKind.CODEX) { "当前 Agent 不支持会话回退" }
+    fun isEditableUserMessage(item: TimelineItem.UserMessage): Boolean =
+        !item.id.startsWith("steer-")
+
+    private suspend fun revertBeforeTurnInternal(
+        key: ConversationKey,
+        userMessageId: String,
+        rewindClaudeFiles: Boolean,
+        restoreToComposer: Boolean,
+    ): Pair<ConversationKey, TimelineItem.UserMessage> {
         val current = state(key) ?: error("会话不存在")
-        check(current.loaded && !current.running && !current.reverting && key !in sending) { "请等待当前操作完成后再回退" }
-        val message = current.items.firstOrNull { it.id == userMessageId } as? TimelineItem.UserMessage
+        check(current.loaded && !current.running && !current.reverting && key !in sending) { "请等待当前操作完成后再继续" }
+        val turnStart = current.items.indexOfFirst { it.id == userMessageId }
+        val message = current.items.getOrNull(turnStart) as? TimelineItem.UserMessage
             ?: error("此轮消息已变更，请重新选择")
-        val turnId = message.turnId ?: error("此轮暂无可回退标识")
-        val turnStart = current.items.indexOfFirst { it is TimelineItem.UserMessage && it.turnId == turnId }
+        require(isEditableUserMessage(message)) { "运行中插话不支持单独编辑重发，请编辑该轮主消息" }
+        val userTurnIndex = current.items.take(turnStart).count { it is TimelineItem.UserMessage && isEditableUserMessage(it) }
         val retained = current.items.take(turnStart)
         val retainedIds = retained.flatMap { item ->
             listOfNotNull(item.id, (item as? TimelineItem.UserMessage)?.turnId)
         }.toSet()
+        val retainedDurations = current.turnDurations.filterKeys { id -> id in retainedIds }
         update(key) { it.copy(reverting = true) }
+        var resolvedKey = key
         try {
-            val summary = codex.revertBeforeTurn(key, turnId)
-            // 服务端确认后直接保留已加载历史的前缀，避免二次读取失败掩盖回退成功。
-            if (state(key) == null) return@launchOperation
-            update(key) {
-                it.copy(summary = summary, items = retained, running = false, activeTurnId = null,
-                    turnStartedAt = null, turnDurations = it.turnDurations.filterKeys { id -> id in retainedIds },
-                    turnDiff = null, tokenUsage = null, plan = emptyList(), planExplanation = null,
-                    revertedMessage = message)
+            when (key.engine) {
+                EngineKind.CODEX -> {
+                    val targetTurnId = message.turnId ?: current.items.drop(turnStart + 1)
+                        .firstNotNullOfOrNull { (it as? TimelineItem.UserMessage)?.turnId }
+                    val updatedSummary = if (targetTurnId != null) {
+                        codex.revertBeforeTurn(key, targetTurnId)
+                    } else {
+                        current.summary.copy(
+                            title = if (retained.isEmpty()) "新会话" else current.summary.title,
+                            updatedAt = System.currentTimeMillis(),
+                        )
+                    }
+                    if (state(key) != null) {
+                        update(key) {
+                            it.copy(
+                                summary = if (retained.isEmpty()) updatedSummary.copy(title = "新会话") else updatedSummary,
+                                items = retained,
+                                running = false,
+                                activeTurnId = null,
+                                turnStartedAt = null,
+                                turnDurations = retainedDurations,
+                                turnDiff = null,
+                                tokenUsage = null,
+                                plan = emptyList(),
+                                planExplanation = null,
+                                focusText = null,
+                                reverting = false,
+                                revertedMessage = if (restoreToComposer) message else null,
+                            )
+                        }
+                    }
+                }
+                EngineKind.CLAUDE -> {
+                    resolvedKey = claude.revertBeforeTurn(
+                        key = key,
+                        userMessageId = message.id,
+                        userTurnIndex = userTurnIndex,
+                        retainedItems = retained,
+                        retainedDurations = retainedDurations,
+                        rewindFiles = rewindClaudeFiles,
+                    )
+                    if (restoreToComposer && state(resolvedKey) != null) {
+                        update(resolvedKey) { it.copy(revertedMessage = message) }
+                    }
+                }
+                else -> {
+                    hub.adapterFor(key.engine).revertBeforeTurn(key, message.id, userTurnIndex)
+                    if (state(key) != null) {
+                        update(key) {
+                            it.copy(
+                                summary = if (retained.isEmpty()) {
+                                    it.summary.copy(title = "新会话", preview = "", updatedAt = System.currentTimeMillis())
+                                } else {
+                                    it.summary.copy(updatedAt = System.currentTimeMillis())
+                                },
+                                items = retained,
+                                running = false,
+                                activeTurnId = null,
+                                turnStartedAt = null,
+                                turnDurations = retainedDurations,
+                                turnDiff = null,
+                                tokenUsage = null,
+                                plan = emptyList(),
+                                planExplanation = null,
+                                focusText = null,
+                                reverting = false,
+                                revertedMessage = if (restoreToComposer) message else null,
+                            )
+                        }
+                    }
+                }
             }
-            notify(if (message.imageCount > 0) "会话已回退，请重新添加原消息图片" else "会话已回退，本地文件未回退")
+            return resolvedKey to message
         } finally {
             if (state(key) != null) update(key) { it.copy(reverting = false) }
+            if (resolvedKey != key && state(resolvedKey) != null) update(resolvedKey) { it.copy(reverting = false) }
+        }
+    }
+
+    fun revertBeforeTurn(
+        key: ConversationKey,
+        userMessageId: String,
+        onMigrated: (ConversationKey) -> Unit = {},
+    ) = launchOperation("回退轮次失败") {
+        val (nextKey, message) = revertBeforeTurnInternal(
+            key = key,
+            userMessageId = userMessageId,
+            rewindClaudeFiles = false,
+            restoreToComposer = true,
+        )
+        if (nextKey != key) onMigrated(nextKey)
+        notify(if (message.imageCount > 0) "会话已回退，请重新添加原消息图片" else "会话已回退到此轮前，本地文件未改动")
+    }
+
+    /**
+     * 全引擎统一的「编辑并重发 / 重新生成」：
+     * 先回退至目标用户消息之前（Codex 原生 thread/revert、Claude 官方 forkSession/reset、Antigravity/外部 Agent 历史截断并桥接上下文），
+     * 若会话标识迁移（如 Claude 分支替换）则立刻平滑替换路由，随后以新内容与附件立即发送。
+     */
+    fun editAndResend(
+        key: ConversationKey,
+        userMessageId: String,
+        newText: String,
+        attachments: List<ImageAttachment> = emptyList(),
+        rewindClaudeFiles: Boolean = false,
+        onMigrated: (ConversationKey) -> Unit = {},
+        onFailedBeforeSend: (String) -> Unit = {},
+        onFinished: () -> Unit = {},
+    ) = scope.launch {
+        var reverted = false
+        try {
+            val cleanText = newText.trim()
+            require(cleanText.isNotEmpty() || attachments.isNotEmpty()) { "消息内容不能为空" }
+            val (targetKey, _) = revertBeforeTurnInternal(
+                key = key,
+                userMessageId = userMessageId,
+                rewindClaudeFiles = rewindClaudeFiles,
+                restoreToComposer = false,
+            )
+            reverted = true
+            if (targetKey != key) onMigrated(targetKey)
+            sendRecoverably(targetKey, cleanText, attachments, steer = false)
+        } catch (cancel: CancellationException) {
+            throw cancel
+        } catch (error: Exception) {
+            val reason = error.message ?: error.javaClass.simpleName
+            Log.w("GALIAIS", "编辑重发失败", error)
+            notify("编辑重发失败：$reason")
+            if (!reverted) onFailedBeforeSend(reason)
+        } finally {
+            onFinished()
         }
     }
     fun archive(key: ConversationKey) = launchOperation("归档失败") {

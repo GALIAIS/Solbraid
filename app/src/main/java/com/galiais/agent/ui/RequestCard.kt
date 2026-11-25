@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -24,7 +25,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -96,7 +96,8 @@ fun ApprovalCardContainer(
     val haloMod = if (style == "soft_halo") {
         modifier
             .fillMaxWidth()
-            .border(3.dp, g.warning.copy(alpha = 0.14f), d.shape(d.cardRadius + 2.dp))
+            .border(3.dp, g.warning.copy(alpha = 0.16f), RoundedCornerShape(d.cardRadius + 3.dp))
+            .padding(2.dp)
     } else modifier.fillMaxWidth()
 
     Surface(
@@ -149,30 +150,39 @@ fun ApprovalCardContainer(
 
         Column(Modifier.fillMaxWidth().then(innerDrawMod)) {
             if (style == "hazard_header") {
+                Box(Modifier.fillMaxWidth().height(2.5.dp).background(g.warning))
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(g.warning)
-                        .padding(horizontal = 12.dp, vertical = 5.dp),
+                        .background(g.warningTint)
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
+                    Icon(GaliaisIcons.AlertTriangle, contentDescription = null, tint = g.warning, modifier = Modifier.size(13.5.dp))
                     Text(
-                        "▲ APPROVAL REQUIRED",
-                        fontFamily = Mono,
-                        fontSize = 10.5.sp,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = Color(0xFF141210),
-                        letterSpacing = 0.6.sp,
+                        "需确认执行",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = g.warning,
+                        modifier = Modifier.weight(1f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
                     Text(
                         badgeText,
-                        fontFamily = Mono,
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFF141210),
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = g.ink,
+                        maxLines = 1,
                     )
                 }
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .height(0.75.dp)
+                        .background(g.warning.copy(alpha = 0.25f)),
+                )
             }
             val startPad = if (style == "accent_rail") pad + 9.dp else pad
             Column(
@@ -240,7 +250,12 @@ fun DockedApprovalPanel(
     var activeRequestId by remember { mutableStateOf<Any?>(null) }
     val safeIndex = requests.indexOfFirst { it.requestId == activeRequestId }.takeIf { it >= 0 } ?: 0
     val active = requests[safeIndex]
-    Box(modifier = modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .heightIn(max = 480.dp)
+            .padding(horizontal = 12.dp, vertical = 4.dp),
+    ) {
         RequestCard(
             request = active,
             queuePosition = if (requests.size > 1) "${safeIndex + 1}/${requests.size}" else null,
@@ -788,7 +803,7 @@ fun JsonSchemaForm(
                                 Text(field.description, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
                             }
                         }
-                        Switch(checked = checked, onCheckedChange = { boolValues[field.name] = it })
+                        GaliaisSwitch(checked = checked, onCheckedChange = { boolValues[field.name] = it })
                     }
                 }
                 "multi_enum" -> {
@@ -911,11 +926,9 @@ fun JsonSchemaForm(
                                 val rawLabel = field.enumNames.getOrNull(idx)?.takeIf { it.isNotBlank() } ?: value
                                 val (displayLabel, _) = parseRecommendedLabel(rawLabel)
                                 val picked = selected == value
-                                TagPill(
+                                SelectableChip(
                                     text = displayLabel,
-                                    fg = if (picked) G.onAccent else G.ink,
-                                    bg = if (picked) G.accent else G.surfaceSubtle,
-                                    border = if (picked) null else G.border,
+                                    selected = picked,
                                     onClick = { textValues[field.name] = value },
                                 )
                             }

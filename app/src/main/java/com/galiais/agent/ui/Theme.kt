@@ -18,9 +18,12 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
@@ -80,6 +83,11 @@ data class GaliaisColors(
     val diffRemovedInk: Color,
     val diffHunkBg: Color,
     val diffHunkInk: Color,
+    val onSuccess: Color = Color.White,
+    val onWarning: Color = Color.White,
+    val onCodex: Color = Color.White,
+    val artifact: Color = Color(0xFF4F46E5),
+    val artifactTint: Color = Color(0xFFEEF2FF),
 )
 
 /** 分组列表卡片位置（用于首尾大圆角 + 中间小圆角的拼接效果）。 */
@@ -147,7 +155,7 @@ data class GaliaisDesign(
         }
     val buttonShape: RoundedCornerShape
         get() = when (buttonStyle) {
-            "pill" -> RoundedCornerShape(999.dp)
+            "pill" -> shape(999.dp)
             "chamfer_tactile" -> RoundedCornerShape(5.dp)
             "squircle" -> shape(11.dp)
             "tonal_soft" -> shape(12.dp)
@@ -165,7 +173,10 @@ data class GaliaisDesign(
             else -> if (material) shape(16.dp) else shape(999.dp)
         }
     val sheetShape: RoundedCornerShape
-        get() = radius(if (material) 28.dp else 24.dp).let { RoundedCornerShape(topStart = it, topEnd = it) }
+        get() = when (cardStyle) {
+            "hardware_tactile" -> RoundedCornerShape(topStart = 10.dp, topEnd = 10.dp)
+            else -> radius(if (material) 28.dp else 24.dp).let { RoundedCornerShape(topStart = it, topEnd = it) }
+        }
     val borderWidth: Dp get() = if (cardStyle == "hardware_tactile") 1.25.dp else 1.dp
     val hairline: Dp get() = if (material || cardStyle == "hardware_tactile") 1.dp else 0.75.dp
 }
@@ -173,6 +184,8 @@ data class GaliaisDesign(
 val LocalGaliaisColors = staticCompositionLocalOf { galiaisColors(ThemeConfig(), false) }
 val LocalDesign = staticCompositionLocalOf { designOf(ThemeConfig(), false) }
 val LocalRenderPrefs = staticCompositionLocalOf { com.galiais.agent.engine.SettingsState() }
+/** 当前页面底部固定栏（底栏 / 聊天输入栏）占位高度，供全局插件悬浮层自动避让。 */
+val LocalBottomChromeInset = staticCompositionLocalOf { 0.dp }
 
 val G: GaliaisColors
     @Composable get() = LocalGaliaisColors.current
@@ -296,8 +309,11 @@ private fun neutrals(config: ThemeConfig, dark: Boolean): Neutrals = if (!dark) 
         Color(0xFFF3F4F8), Color(0xFF9298AC), Color(0xFF60667A), Color(0xFF0B0C10))
 }
 
-private fun readableOn(bg: Color): Color =
-    if (ColorEngine.relativeLuminance(bg) > 0.36) Color(0xFF111114) else Color.White
+/** 按感知亮度阈值选择前景墨色：中高饱和度强调色（如暖陶/祖母绿/靛蓝）保持清晰纯白，高亮度浅色/霓虹色切深墨。 */
+internal fun readableOn(bg: Color): Color {
+    val lum = ColorEngine.relativeLuminance(bg)
+    return if (lum > 0.38) Color(0xFF111114) else Color.White
+}
 
 /** GALIAIS 编辑风：中性纸张/深色基调 + 可选强调色（默认墨色）。 */
 fun galiaisColors(config: ThemeConfig, dark: Boolean): GaliaisColors {
@@ -322,10 +338,12 @@ fun galiaisColors(config: ThemeConfig, dark: Boolean): GaliaisColors {
         onAccentContainer = if (dark) ColorEngine.tone(lch.h, lch.c, 88.0) else ColorEngine.tone(lch.h, lch.c, 28.0)
     }
     val accentBubble = config.bubbleStyle == "accent"
+    val filledBg = lerp(n.surface, n.subtle, if (dark) 0.52f else 0.55f)
+    val elevatedBg = if (dark) lerp(n.surface, n.subtle, 0.55f) else n.surface
     return GaliaisColors(
         dark = dark,
         canvas = n.canvas, surface = n.surface, surfaceSubtle = n.subtle,
-        surfaceFilled = n.subtle, surfaceElevated = n.surface,
+        surfaceFilled = filledBg, surfaceElevated = elevatedBg,
         border = n.border, borderStrong = n.borderStrong,
         ink = n.ink, inkMuted = n.inkMuted, inkSubtle = n.inkSubtle, onInk = n.onInk,
         accent = accent, onAccent = readableOn(accent),
@@ -342,6 +360,11 @@ fun galiaisColors(config: ThemeConfig, dark: Boolean): GaliaisColors {
         codeBg = code.bg, codeHeader = code.header, codeBorder = code.border, codeInk = code.ink, codeMuted = code.muted,
         diffAddedBg = f.diffAddedBg, diffAddedInk = f.diffAddedInk, diffRemovedBg = f.diffRemovedBg,
         diffRemovedInk = f.diffRemovedInk, diffHunkBg = f.diffHunkBg, diffHunkInk = f.diffHunkInk,
+        onSuccess = readableOn(f.success),
+        onWarning = readableOn(f.warning),
+        onCodex = readableOn(f.codex),
+        artifact = if (dark) Color(0xFF818CF8) else Color(0xFF4F46E5),
+        artifactTint = if (dark) Color(0xFF1E2242) else Color(0xFFEEF2FF),
     )
 }
 
@@ -356,7 +379,7 @@ fun materialColors(scheme: ColorScheme, config: ThemeConfig, dark: Boolean): Gal
         surface = scheme.surfaceContainerLow,
         surfaceSubtle = scheme.surfaceContainerHighest,
         surfaceFilled = scheme.surfaceContainer,
-        surfaceElevated = scheme.surfaceContainerLow,
+        surfaceElevated = if (dark) scheme.surfaceContainerHigh else scheme.surfaceContainerLow,
         border = scheme.outlineVariant,
         borderStrong = scheme.outline,
         ink = scheme.onSurface,
@@ -378,6 +401,11 @@ fun materialColors(scheme: ColorScheme, config: ThemeConfig, dark: Boolean): Gal
         codeBg = code.bg, codeHeader = code.header, codeBorder = code.border, codeInk = code.ink, codeMuted = code.muted,
         diffAddedBg = f.diffAddedBg, diffAddedInk = f.diffAddedInk, diffRemovedBg = f.diffRemovedBg,
         diffRemovedInk = f.diffRemovedInk, diffHunkBg = f.diffHunkBg, diffHunkInk = f.diffHunkInk,
+        onSuccess = readableOn(f.success),
+        onWarning = readableOn(f.warning),
+        onCodex = readableOn(f.codex),
+        artifact = if (dark) Color(0xFF818CF8) else Color(0xFF4F46E5),
+        artifactTint = if (dark) Color(0xFF1E2242) else Color(0xFFEEF2FF),
     )
 }
 
@@ -457,50 +485,50 @@ fun GaliaisTheme(config: ThemeConfig = ThemeConfig(), dark: Boolean, content: @C
 fun Modifier.galiaisCanvasBackground(): Modifier = composed {
     val g = G
     val texture = D.canvasTexture
-    drawBehind {
-        drawRect(g.canvas)
-        when (texture) {
-            "dot_grid" -> {
-                val step = 16.dp.toPx()
-                val r = 1.dp.toPx()
-                val dotColor = if (g.dark) Color.White.copy(alpha = 0.065f) else Color.Black.copy(alpha = 0.075f)
+    drawWithCache {
+        val dotColor = if (g.dark) Color.White.copy(alpha = 0.065f) else Color.Black.copy(alpha = 0.075f)
+        val dotPath = if (texture == "dot_grid") {
+            val step = 16.dp.toPx()
+            val r = 1.dp.toPx()
+            Path().apply {
                 var y = step * 0.5f
                 while (y < size.height) {
                     var x = step * 0.5f
                     while (x < size.width) {
-                        drawCircle(color = dotColor, radius = r, center = Offset(x, y))
+                        addOval(androidx.compose.ui.geometry.Rect(x - r, y - r, x + r, y + r))
                         x += step
                     }
                     y += step
                 }
             }
-            "mesh_glow" -> {
-                val glowRadius = size.width.coerceAtLeast(1f) * 0.85f
-                drawRect(
-                    brush = Brush.radialGradient(
-                        colors = listOf(
-                            g.accent.copy(alpha = if (g.dark) 0.16f else 0.11f),
-                            g.accent.copy(alpha = if (g.dark) 0.04f else 0.03f),
-                            Color.Transparent,
-                        ),
-                        center = Offset(size.width * 0.5f, -size.height * 0.04f),
-                        radius = glowRadius,
-                    ),
-                )
-            }
-            "paper_grain" -> {
-                drawRect(
-                    brush = Brush.linearGradient(
-                        colors = listOf(
-                            g.accent.copy(alpha = if (g.dark) 0.06f else 0.05f),
-                            Color.Transparent,
-                            g.ink.copy(alpha = if (g.dark) 0.03f else 0.025f),
-                        ),
-                        start = Offset.Zero,
-                        end = Offset(size.width, size.height),
-                    ),
-                )
-            }
+        } else null
+        val meshBrush = if (texture == "mesh_glow") {
+            Brush.radialGradient(
+                colors = listOf(
+                    g.accent.copy(alpha = if (g.dark) 0.16f else 0.11f),
+                    g.accent.copy(alpha = if (g.dark) 0.04f else 0.03f),
+                    Color.Transparent,
+                ),
+                center = Offset(size.width * 0.5f, -size.height * 0.04f),
+                radius = size.width.coerceAtLeast(1f) * 0.85f,
+            )
+        } else null
+        val paperBrush = if (texture == "paper_grain") {
+            Brush.linearGradient(
+                colors = listOf(
+                    g.accent.copy(alpha = if (g.dark) 0.06f else 0.05f),
+                    Color.Transparent,
+                    g.ink.copy(alpha = if (g.dark) 0.03f else 0.025f),
+                ),
+                start = Offset.Zero,
+                end = Offset(size.width, size.height),
+            )
+        } else null
+        onDrawBehind {
+            drawRect(g.canvas)
+            if (dotPath != null) drawPath(dotPath, color = dotColor)
+            else if (meshBrush != null) drawRect(brush = meshBrush)
+            else if (paperBrush != null) drawRect(brush = paperBrush)
         }
     }
 }

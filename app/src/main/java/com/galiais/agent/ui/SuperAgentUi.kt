@@ -7,20 +7,21 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -240,6 +241,8 @@ fun SuperAgentBoardSheet(
     val draftList = remember { mutableStateListOf(DraftTicketSpec()) }
     var diffTicket by remember { mutableStateOf<WorkTicket?>(null) }
     var trustAction by remember { mutableStateOf<ProjectTrustAction?>(null) }
+    var confirmDiscardTicket by remember { mutableStateOf<WorkTicket?>(null) }
+    var confirmMergeTicket by remember { mutableStateOf<WorkTicket?>(null) }
 
     fun executeWithTrust(cwd: String, usesClaude: Boolean, action: () -> Unit) {
         if (usesClaude && cwd !in app.settings.state.value.trustedProjects) {
@@ -253,8 +256,7 @@ fun SuperAgentBoardSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .imePadding()
-                .navigationBarsPadding()
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp)
                 .padding(bottom = 22.dp),
@@ -343,28 +345,30 @@ fun SuperAgentBoardSheet(
                     }
                 }
 
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (draftList.size < 4) {
-                        SecondaryPillButton("+ 再加一个并行工单", onClick = { draftList.add(DraftTicketSpec()) })
-                    }
-                    Spacer(Modifier.weight(1f))
-                    PrimaryPillButton(
-                        text = "派发执行 (${draftList.count { it.task.isNotBlank() }})",
-                        enabled = runtime.ready && targetCwd.isNotBlank() && draftList.any { it.task.isNotBlank() },
-                        onClick = {
-                            val cwd = targetCwd.trim()
-                            val specs = draftList.filter { it.task.isNotBlank() }.map { Triple(it.title, it.task, it.role) }
-                            val isolated = isolateWorktree
-                            val usesClaude = specs.any { settings.roleRoutes[it.third]?.engineId == "claude" }
-                            executeWithTrust(cwd, usesClaude) {
-                                app.superAgent.dispatchBatch(repoCwd = cwd, specs = specs, isolatedWorktree = isolated)
-                                draftList.clear()
-                                draftList.add(DraftTicketSpec())
-                                tab = "board"
-                            }
-                        },
+                if (draftList.size < 4) {
+                    SecondaryPillButton(
+                        text = "+ 再加一个并行工单",
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = { draftList.add(DraftTicketSpec()) },
                     )
                 }
+                PrimaryPillButton(
+                    text = "派发执行 (${draftList.count { it.task.isNotBlank() }})",
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = runtime.ready && targetCwd.isNotBlank() && draftList.any { it.task.isNotBlank() },
+                    onClick = {
+                        val cwd = targetCwd.trim()
+                        val specs = draftList.filter { it.task.isNotBlank() }.map { Triple(it.title, it.task, it.role) }
+                        val isolated = isolateWorktree
+                        val usesClaude = specs.any { settings.roleRoutes[it.third]?.engineId == "claude" }
+                        executeWithTrust(cwd, usesClaude) {
+                            app.superAgent.dispatchBatch(repoCwd = cwd, specs = specs, isolatedWorktree = isolated)
+                            draftList.clear()
+                            draftList.add(DraftTicketSpec())
+                            tab = "board"
+                        }
+                    },
+                )
             } else {
                 if (tickets.isEmpty()) {
                     CrispCard {
@@ -381,10 +385,18 @@ fun SuperAgentBoardSheet(
                                     TagPill("${roleDisplayName(t.role)} · ${EngineKind.of(t.engineId).label}", fg = G.inkMuted, bg = G.surfaceSubtle)
                                     Spacer(Modifier.weight(1f))
                                     if (t.isolated && t.branch != null) {
-                                        Text(t.branch.removePrefix("solbraid/"), fontFamily = Mono, fontSize = 10.sp, color = G.inkSubtle, maxLines = 1)
+                                        Text(
+                                            t.branch.removePrefix("solbraid/"),
+                                            fontFamily = Mono,
+                                            fontSize = 10.sp,
+                                            color = G.inkSubtle,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f, fill = false),
+                                        )
                                     }
                                 }
-                                Text(t.title, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
+                                Text(t.title, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                 if (t.summary.isNotBlank()) {
                                     Text(t.summary, style = MaterialTheme.typography.bodySmall, color = G.inkMuted, maxLines = 3, overflow = TextOverflow.Ellipsis)
                                 }
@@ -419,9 +431,7 @@ fun SuperAgentBoardSheet(
                                             text = if (busy) "处理中…" else "一键合并",
                                             fg = G.success,
                                             bg = G.successTint,
-                                            onClick = if (!busy && runtime.ready) ({
-                                                scope.launch { app.superAgent.mergeTicket(t.id) }
-                                            }) else null,
+                                            onClick = if (!busy && runtime.ready) ({ confirmMergeTicket = t }) else null,
                                         )
                                     }
                                     if (t.stage in setOf(TicketStage.WORKING, TicketStage.QUEUED, TicketStage.AWAITING_ANSWER)) {
@@ -436,7 +446,7 @@ fun SuperAgentBoardSheet(
                                     }
                                     if (t.active) {
                                         TagPill("丢弃", fg = G.danger, bg = G.dangerTint, onClick = if (!busy && runtime.ready) ({
-                                            scope.launch { app.superAgent.discardTicket(t.id) }
+                                            confirmDiscardTicket = t
                                         }) else null)
                                     } else {
                                         TagPill(if (t.cleanupPending) "清理并移除记录" else "清除记录", fg = G.inkMuted, bg = G.surfaceSubtle, onClick = if (!busy && runtime.ready) ({
@@ -461,21 +471,43 @@ fun SuperAgentBoardSheet(
             onDismiss = { diffTicket = null },
         )
     }
-    trustAction?.let { pending ->
-        AlertDialog(
-            onDismissRequest = { trustAction = null },
-            shape = D.dialogShape,
-            containerColor = G.surface,
-            title = { Text("信任此项目？") },
-            text = { Text("Claude 将加载此项目及其工单隔离目录中的配置和钩子。请确认项目来源可信。\n\n${pending.cwd}") },
-            confirmButton = {
-                TextButton(enabled = runtime.ready, onClick = {
-                    app.settings.trust(pending.cwd)
-                    trustAction = null
-                    pending.execute()
-                }) { Text("信任并执行") }
+    confirmMergeTicket?.let { t ->
+        GaliaisConfirmDialog(
+            title = "合并工单改动？",
+            message = "将把工单「${t.title}」的改动合并回主工作区（${t.filesChanged.size} 文件，+${t.addedLines}/-${t.removedLines}）。",
+            confirmText = "确认合并",
+            onConfirm = {
+                confirmMergeTicket = null
+                scope.launch { app.superAgent.mergeTicket(t.id) }
             },
-            dismissButton = { TextButton(onClick = { trustAction = null }) { Text("取消") } },
+            onDismiss = { confirmMergeTicket = null },
+        )
+    }
+    confirmDiscardTicket?.let { t ->
+        GaliaisConfirmDialog(
+            title = "丢弃工单与隔离改动？",
+            message = "将永久删除工单「${t.title}」的隔离分支及所有未合并代码改动，无法撤销。",
+            confirmText = "确认丢弃",
+            danger = true,
+            onConfirm = {
+                confirmDiscardTicket = null
+                scope.launch { app.superAgent.discardTicket(t.id) }
+            },
+            onDismiss = { confirmDiscardTicket = null },
+        )
+    }
+    trustAction?.let { pending ->
+        GaliaisConfirmDialog(
+            title = "信任此项目？",
+            message = "Claude 将加载此项目及其工单隔离目录中的配置和钩子。请确认项目来源可信。\n\n${pending.cwd}",
+            confirmText = "信任并执行",
+            confirmEnabled = runtime.ready,
+            onConfirm = {
+                app.settings.trust(pending.cwd)
+                trustAction = null
+                pending.execute()
+            },
+            onDismiss = { trustAction = null },
         )
     }
 }

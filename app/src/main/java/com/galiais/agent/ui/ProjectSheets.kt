@@ -9,13 +9,16 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -128,6 +131,7 @@ fun ProjectGroupHeader(
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
                     )
                     if (hasRunning) PulsingDot(G.warning, size = 6.dp)
                     else if (hasPending) Box(Modifier.size(6.dp).background(G.warning, CircleShape))
@@ -236,8 +240,7 @@ fun AddProjectSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .imePadding()
-                .navigationBarsPadding()
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 18.dp)
                 .padding(bottom = 22.dp),
@@ -277,28 +280,26 @@ fun AddProjectSheet(
                     textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
                     modifier = Modifier.fillMaxWidth(),
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(
-                        value = cloneTarget,
-                        onValueChange = { cloneTarget = it; cloneTargetEdited = true; error = null },
-                        label = { Text("克隆目录") },
-                        singleLine = true,
-                        shape = D.fieldShape,
-                        colors = galiaisTextFieldColors(),
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
-                        modifier = Modifier.weight(1.4f),
-                    )
-                    OutlinedTextField(
-                        value = cloneBranch,
-                        onValueChange = { cloneBranch = it },
-                        label = { Text("分支（可选）") },
-                        singleLine = true,
-                        shape = D.fieldShape,
-                        colors = galiaisTextFieldColors(),
-                        textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
-                        modifier = Modifier.weight(0.9f),
-                    )
-                }
+                OutlinedTextField(
+                    value = cloneTarget,
+                    onValueChange = { cloneTarget = it; cloneTargetEdited = true; error = null },
+                    label = { Text("克隆目录") },
+                    singleLine = true,
+                    shape = D.fieldShape,
+                    colors = galiaisTextFieldColors(),
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = cloneBranch,
+                    onValueChange = { cloneBranch = it },
+                    label = { Text("分支（可选，留空为默认分支）") },
+                    singleLine = true,
+                    shape = D.fieldShape,
+                    colors = galiaisTextFieldColors(),
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = Mono),
+                    modifier = Modifier.fillMaxWidth(),
+                )
                 if (repoUrl.trim().startsWith("https://")) {
                     OutlinedTextField(
                         value = httpsToken,

@@ -33,7 +33,7 @@ const EXTRA_BINS = [
 ];
 const IDLE_HIBERNATE_MS = 10 * 60 * 1000;
 const MAXIMUM_FRAME = 8 * 1024 * 1024 - 1024;
-const SESSION_MUTATIONS = new Set(["sessions/prompt", "sessions/delete", "sessions/rename", "sessions/setModel", "sessions/setMode", "sessions/setConfigOption", "sessions/setProvider"]);
+const SESSION_MUTATIONS = new Set(["sessions/prompt", "sessions/revertBefore", "sessions/delete", "sessions/rename", "sessions/setModel", "sessions/setMode", "sessions/setConfigOption", "sessions/setProvider"]);
 const NPM_PACKAGE = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*(?:@[a-zA-Z0-9._~^+*-]+)?$/;
 
 if (typeof process.getuid === "function" && process.getuid() === 0) throw new Error("Agent Hub must not run as root");
@@ -2310,7 +2310,10 @@ async function dispatchRequest(method, params = {}) {
       const isAgyStreamJson = drv instanceof AgyStreamJsonDriver;
       if (m.protocol === "acp" && !isAgyStreamJson && drv) await attachAcpSession(drv, record);
       const now = Date.now();
-      record.messages.push({id: `user-${now}`, role: "user", text, imageCount: images.length, ts: now});
+      const userMsgId = (typeof params.clientMessageId === "string" && params.clientMessageId.trim())
+        ? params.clientMessageId.trim().slice(0, 128)
+        : `user-${now}`;
+      record.messages.push({id: userMsgId, role: "user", text, imageCount: images.length, ts: now});
       if (record.title === "新会话" && text.trim()) {
         record.title = text.trim().split(/\r?\n/)[0].slice(0, 60);
       }
@@ -2391,13 +2394,21 @@ async function dispatchRequest(method, params = {}) {
       const turnStartMs = Date.now();
       try {
         let promptTextForDriver = text;
-        if (record.pendingContextBridge && !record.remoteSessionId) {
+        const consumedContextBridge = Boolean(record.pendingContextBridge);
+        if (consumedContextBridge) {
           const prior = (record.messages || [])
-            .filter(msg => (msg.role === "user" || msg.role === "agent") && msg.id !== `user-${now}` && typeof msg.text === "string" && msg.text.trim())
-            .slice(-8);
+            .filter(msg => (msg.role === "user" || msg.role === "agent") && msg.id !== userMsgId && typeof msg.text === "string" && msg.text.trim())
+            .slice(-16);
           if (prior.length > 0) {
-            const summaryLines = prior.map(msg => `${msg.role === "user" ? "用户" : "助手"}：${msg.text.trim().slice(0, 600)}`).join("\n\n");
-            promptTextForDriver = `[以下为切换服务商前的近期对话上下文，请自然承接继续回答]\n${summaryLines}\n\n[当前新消息]\n${text}`;
+            let budget = 20_000;
+            const picked = [];
+            for (let i = prior.length - 1; i >= 0 && budget > 0; i--) {
+              const msg = prior[i];
+              const chunk = msg.text.trim().slice(0, Math.min(2000, budget));
+              picked.unshift(`${msg.role === "user" ? "用户" : "助手"}：${chunk}`);
+              budget -= chunk.length;
+            }
+            promptTextForDriver = `[以下为此会话此前的对话上下文，请自然承接继续回答，勿提及此系统提示]\n${picked.join("\n\n")}\n\n[当前用户消息]\n${text}`;
           }
           record.pendingContextBridge = false;
         }
@@ -2712,6 +2723,10 @@ async function dispatchRequest(method, params = {}) {
         return {stopReason, text: replyText, turnDiff, usage: normalizedUsage, contextUsage: finalContextUsage};
       } catch (error) {
         stopSessionDriver(key);
+        if (consumedContextBridge && !replySaved) {
+          record.remoteSessionId = null;
+          record.pendingContextBridge = true;
+        }
         if (!params.provider?.id) {
           void usageLedger.recordUsageEvent({
             agent: m.id,
@@ -2753,6 +2768,48 @@ async function dispatchRequest(method, params = {}) {
       const drv = drivers.get(key);
       if (drv) await drv.cancel(m?.protocol === "acp" ? (record?.remoteSessionId || params.sessionId) : params.sessionId).catch(() => {});
       return {ok: true};
+    }
+
+    case "sessions/revertBefore": {
+      const agentId = validateAgentId(params.agentId);
+      const record = await loadStoredSession(agentId, params.sessionId);
+      if (!record) throw new Error("会话不存在");
+      const key = `${agentId}:${record.id}`;
+      if (activeTurns.has(key)) throw new Error("当前会话正在运行任务，请先停止后再编辑重发");
+      const targetId = typeof params.messageId === "string" && params.messageId.trim() ? params.messageId.trim() : null;
+      const userTurnIndex = Number.isInteger(params.userTurnIndex) && params.userTurnIndex >= 0 ? params.userTurnIndex : -1;
+      if (!targetId && userTurnIndex < 0) throw new Error("缺少待回退的用户消息标识");
+      const msgs = Array.isArray(record.messages) ? record.messages : [];
+      let idx = targetId ? msgs.findIndex(msg => msg?.role === "user" && msg?.id === targetId) : -1;
+      if (idx < 0 && userTurnIndex >= 0) {
+        let seen = 0;
+        for (let i = 0; i < msgs.length; i++) {
+          if (msgs[i]?.role === "user") {
+            if (seen === userTurnIndex) { idx = i; break; }
+            seen++;
+          }
+        }
+      }
+      if (idx >= 0) {
+        record.messages = msgs.slice(0, idx);
+        stopSessionDriver(key);
+        record.remoteSessionId = null;
+        record.plan = [];
+        record.planExplanation = null;
+        record.lastContextUsed = null;
+        const hasPrior = record.messages.some(msg => (msg?.role === "user" || msg?.role === "agent") && typeof msg.text === "string" && msg.text.trim());
+        record.pendingContextBridge = hasPrior;
+        const lastTextMsg = [...record.messages].reverse().find(msg => (msg?.role === "user" || msg?.role === "agent") && typeof msg.text === "string" && msg.text.trim());
+        record.preview = lastTextMsg ? lastTextMsg.text.trim().slice(0, 120) : "";
+        if (record.messages.length === 0) record.title = "新会话";
+        record.updatedAt = Date.now();
+        await saveSession(record);
+      }
+      return {
+        ok: true,
+        retainedCount: (record.messages || []).length,
+        hasContextBridge: Boolean(record.pendingContextBridge),
+      };
     }
 
     case "sessions/rename": {

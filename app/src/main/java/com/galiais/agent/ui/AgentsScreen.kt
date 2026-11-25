@@ -18,13 +18,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -50,6 +49,7 @@ import kotlinx.coroutines.launch
 fun AgentsScreen(
     app: GaliaisApplication,
     modifier: Modifier,
+    snackbar: SnackbarHostState? = null,
     onOpenAgent: (String) -> Unit,
     onBack: (() -> Unit)? = null,
 ) {
@@ -69,97 +69,97 @@ fun AgentsScreen(
     }
 
     val installedAgents = AgentCatalog.all()
-
-    Column(
-        modifier
-            .fillMaxSize()
-            .galiaisCanvasBackground()
-            .let { if (onBack != null) it.statusBarsPadding().navigationBarsPadding() else it },
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(if (D.material) 64.dp else 56.dp)
-                .padding(start = if (onBack != null) 4.dp else 18.dp, end = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            if (onBack != null) {
-                IconButton(onClick = onBack) {
-                    Icon(GaliaisIcons.ArrowBack, contentDescription = "返回", tint = G.ink, modifier = Modifier.size(20.dp))
+    val headerActions: @Composable androidx.compose.foundation.layout.RowScope.() -> Unit = {
+        CompactActionButton(
+            text = "检查更新",
+            enabled = runtime.ready,
+            onClick = { app.conversations.cliUpdates.check() },
+        )
+        IconButton(
+            enabled = runtime.ready && !refreshing,
+            modifier = Modifier.size(38.dp),
+            onClick = {
+                scope.launch {
+                    refreshing = true
+                    try { app.conversations.hub.refreshStatuses() }
+                    catch (e: Exception) { app.conversations.notify("刷新 Agent 状态失败：${e.message}") }
+                    finally { refreshing = false }
                 }
-            }
-            Column(Modifier.weight(1f)) {
-                Text("Agent 管理", style = MaterialTheme.typography.titleLarge, color = G.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text("内置三大原生编码 Agent", style = MaterialTheme.typography.labelSmall, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-            TagPill("检查更新", fg = G.accent, bg = G.accentContainer, onClick = { app.conversations.cliUpdates.check() })
-            IconButton(
-                enabled = runtime.ready && !refreshing,
-                modifier = Modifier.size(38.dp),
-                onClick = {
-                    scope.launch {
-                        refreshing = true
-                        try { app.conversations.hub.refreshStatuses() }
-                        catch (e: Exception) { app.conversations.notify("刷新 Agent 状态失败：${e.message}") }
-                        finally { refreshing = false }
+            },
+        ) {
+            Icon(GaliaisIcons.Refresh, contentDescription = "刷新 Agent 状态", tint = if (runtime.ready && !refreshing) G.inkMuted else G.inkSubtle, modifier = Modifier.size(19.dp))
+        }
+    }
+
+    val bodyContent: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit = {
+        if (!runtime.ready) {
+            CrispCard(background = G.surfaceSubtle, padding = PaddingValues(12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text("本地运行环境未就绪", style = MaterialTheme.typography.titleSmall, color = G.ink)
+                        Text("启动后可使用 Codex、Claude Code 与 Antigravity。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
                     }
-                },
-            ) {
-                Icon(GaliaisIcons.Refresh, contentDescription = "刷新 Agent 状态", tint = if (runtime.ready && !refreshing) G.inkMuted else G.inkSubtle, modifier = Modifier.size(19.dp))
+                    PrimaryPillButton("启动", onClick = app.runtime::start, enabled = runtime.bound && !runtime.busy)
+                }
             }
         }
-        HeaderProgressSlot(refreshing)
 
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 14.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(D.space(10.dp)),
-        ) {
-            if (!runtime.ready) {
-                CrispCard(background = G.surfaceSubtle, padding = PaddingValues(12.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            Text("本地运行环境未就绪", style = MaterialTheme.typography.titleSmall, color = G.ink)
-                            Text("启动后可使用 Codex、Claude Code 与 Antigravity。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
-                        }
-                        PrimaryPillButton("启动", onClick = app.runtime::start, enabled = runtime.bound && !runtime.busy)
-                    }
-                }
-            }
+        SectionHeader(
+            title = "内置编码 Agent（${installedAgents.size}）",
+            trailing = { TagPill("下载镜像与代理", fg = G.inkMuted, bg = G.surfaceSubtle, border = G.border, onClick = { showAcceleration = true }) },
+        )
+        installedAgents.forEach { agent ->
+            val status = statuses[agent.id]
+            val cliVer = cliStates[agent.id]?.currentVersion?.takeIf { it.isNotBlank() }
+            val provName = settings.provider(settings.defaultProviderIdFor(agent.engineKind))?.name
+            val modelName = settings.defaultModelFor(agent.engineKind)
+            InstalledAgentCard(
+                app = app,
+                manifest = agent,
+                status = status,
+                versionFallback = cliVer,
+                runtimeReady = runtime.ready,
+                providerSummary = buildString {
+                    append(provName ?: when (agent.id) {
+                        "codex" -> "OpenAI 官方"
+                        "claude" -> "Anthropic 官方"
+                        "antigravity" -> "Google 官方"
+                        else -> "Agent 自带配置"
+                    })
+                    if (!modelName.isNullOrBlank()) append(" · $modelName")
+                },
+                onOpenDetail = { onOpenAgent(agent.id) },
+            )
+        }
 
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                SectionLabel("已内置（${installedAgents.size}）")
-                Spacer(Modifier.weight(1f))
-                TagPill("下载镜像与代理", fg = G.inkMuted, bg = G.surfaceSubtle, border = G.border, onClick = { showAcceleration = true })
-            }
-            installedAgents.forEach { agent ->
-                val status = statuses[agent.id]
-                val cliVer = cliStates[agent.id]?.currentVersion?.takeIf { it.isNotBlank() }
-                val provName = settings.provider(settings.defaultProviderIdFor(agent.engineKind))?.name
-                val modelName = settings.defaultModelFor(agent.engineKind)
-                InstalledAgentCard(
-                    app = app,
-                    manifest = agent,
-                    status = status,
-                    versionFallback = cliVer,
-                    runtimeReady = runtime.ready,
-                    providerSummary = buildString {
-                        append(provName ?: when (agent.id) {
-                            "codex" -> "OpenAI 官方"
-                            "claude" -> "Anthropic 官方"
-                            "antigravity" -> "Google 官方"
-                            else -> "Agent 自带配置"
-                        })
-                        if (!modelName.isNullOrBlank()) append(" · $modelName")
-                    },
-                    onOpenDetail = { onOpenAgent(agent.id) },
-                )
-            }
+        Spacer(Modifier.height(16.dp))
+    }
 
-            Spacer(Modifier.height(16.dp))
+    if (onBack != null) {
+        SubPageScaffold(
+            title = "Agent 管理",
+            onBack = onBack,
+            snackbar = snackbar,
+            loading = refreshing,
+            actions = headerActions,
+            content = bodyContent,
+        )
+    } else {
+        Column(modifier.fillMaxSize().galiaisCanvasBackground()) {
+            GaliaisTopBar(
+                title = "Agent 管理",
+                subtitle = "内置三大原生编码 Agent",
+                loading = refreshing,
+                actions = headerActions,
+            )
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(D.space(10.dp)),
+                content = bodyContent,
+            )
         }
     }
 
@@ -180,41 +180,49 @@ private fun InstalledAgentCard(
 ) {
     val accent = agentAccent(manifest.engineKind)
     val tint = agentTint(manifest.engineKind)
+    val stateLabel = when {
+        !runtimeReady -> "待启动"
+        status?.installing == true -> "安装中…"
+        status?.error != null -> "启动失败"
+        manifest.protocol.isNative || manifest.id == "antigravity" -> if (status?.running == true) "运行中" else "已连接"
+        status?.running == true -> "运行中"
+        else -> "就绪"
+    }
+    val versionStr = (status?.version?.takeIf { it.isNotBlank() } ?: versionFallback)?.take(28)
     CrispCard(onClick = onOpenDetail, padding = PaddingValues(D.space(14.dp))) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(11.dp)) {
                 AgentAppIcon(engine = manifest.engineKind, size = 40.dp)
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text(manifest.name, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        TagPill(if (manifest.id == "antigravity") "Antigravity 原生" else manifest.protocol.badge, fg = accent, bg = tint)
-                        if (manifest.preinstalled) TagPill("内置", fg = G.inkMuted, bg = G.surfaceSubtle)
+                        Text(
+                            manifest.name,
+                            style = MaterialTheme.typography.titleSmall,
+                            color = G.ink,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                        TagPill(
+                            stateLabel,
+                            fg = if (status?.error != null) G.danger else if (runtimeReady) G.success else G.inkMuted,
+                            bg = if (status?.error != null) G.dangerTint else if (runtimeReady) G.successTint else G.surfaceSubtle,
+                        )
                     }
                     Text(providerSummary, style = MaterialTheme.typography.bodySmall, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
+                Icon(GaliaisIcons.ChevronRight, contentDescription = null, tint = G.inkSubtle, modifier = Modifier.size(16.dp))
             }
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                val stateLabel = when {
-                    !runtimeReady -> "待启动"
-                    status?.installing == true -> "安装中…"
-                    status?.error != null -> "启动失败"
-                    manifest.protocol.isNative || manifest.id == "antigravity" -> if (status?.running == true) "运行中" else "已连接"
-                    status?.running == true -> "运行中"
-                    else -> "就绪"
-                }
-                TagPill(stateLabel, fg = if (status?.error != null) G.danger else if (runtimeReady) G.success else G.inkMuted,
-                    bg = if (status?.error != null) G.dangerTint else if (runtimeReady) G.successTint else G.surfaceSubtle)
-                (status?.version?.takeIf { it.isNotBlank() } ?: versionFallback)?.let { TagPill(it.take(28), fg = G.inkMuted, bg = G.surfaceSubtle) }
-                if (manifest.capabilities.approval) TagPill("操作审批", fg = G.inkMuted, bg = G.surfaceSubtle)
-                if (manifest.capabilities.steer) TagPill("插话", fg = G.inkMuted, bg = G.surfaceSubtle)
-                if (manifest.capabilities.modes) TagPill("模式切换", fg = G.inkMuted, bg = G.surfaceSubtle)
-                if (manifest.capabilities.customProvider) TagPill("支持自定义服务商", fg = G.inkMuted, bg = G.surfaceSubtle)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                TagPill(if (manifest.id == "antigravity") "Antigravity 原生" else manifest.protocol.badge, fg = accent, bg = tint)
+                versionStr?.let { TagPill(it, fg = G.inkMuted, bg = G.surfaceSubtle) }
             }
             status?.let { AgentInstallProgressView(it) }
             (status?.installError ?: status?.error)?.let {
                 Text(it.lineSequence().first(), style = MaterialTheme.typography.bodySmall, color = G.danger)
             }
-            CliUpdateControls(app, manifest.id, showCheck = false)
+            CliUpdateControls(app, manifest.id, showCheck = false, showVersionLine = false, onlyWhenActionable = true)
         }
     }
 }
