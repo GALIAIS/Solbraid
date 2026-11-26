@@ -366,11 +366,28 @@ async function syncMarkdownInstructions(filePath, items) {
 }
 
 async function syncAllInstructions(registry) {
-  const all = (registry.instructions || []).filter(i => i && i.enabled !== false && String(i.content || "").trim());
-  const forTarget = agentId => all.filter(i => matchesTarget(i.targets, agentId));
-  const c1 = await syncMarkdownInstructions(CLAUDE_MD_FILE, forTarget("claude"));
-  const c2 = await syncMarkdownInstructions(CODEX_MD_FILE, forTarget("codex"));
-  const c3 = await syncMarkdownInstructions(AGY_MD_FILE, forTarget("antigravity"));
+  const all = (registry.instructions || [])
+    .filter(i => i && i.enabled !== false && String(i.content || "").trim())
+    .sort((a, b) => (Number(a.priority) || 0) - (Number(b.priority) || 0));
+  const globalItems = all.filter(i => !i.scope || i.scope === "global");
+  const forTarget = (list, agentId) => list.filter(i => matchesTarget(i.targets, agentId));
+  const c1 = await syncMarkdownInstructions(CLAUDE_MD_FILE, forTarget(globalItems, "claude"));
+  const c2 = await syncMarkdownInstructions(CODEX_MD_FILE, forTarget(globalItems, "codex"));
+  const c3 = await syncMarkdownInstructions(AGY_MD_FILE, forTarget(globalItems, "antigravity"));
+  // 同步项目级作用域指令至 <project>/CLAUDE.md、AGENTS.md、GEMINI.md（无损保留手写内容）
+  const projectDirs = new Set(
+    (registry.instructions || [])
+      .map(i => (typeof i?.scope === "string" && i.scope.startsWith("project:")) ? i.scope.slice("project:".length).trim() : "")
+      .filter(p => path.isAbsolute(p)),
+  );
+  for (const dir of projectDirs) {
+    const okDir = await fs.stat(dir).then(s => s.isDirectory()).catch(() => false);
+    if (!okDir) continue;
+    const pItems = all.filter(i => i.scope === `project:${dir}`);
+    await syncMarkdownInstructions(path.join(dir, "CLAUDE.md"), forTarget(pItems, "claude")).catch(() => {});
+    await syncMarkdownInstructions(path.join(dir, "AGENTS.md"), forTarget(pItems, "codex")).catch(() => {});
+    await syncMarkdownInstructions(path.join(dir, "GEMINI.md"), forTarget(pItems, "antigravity")).catch(() => {});
+  }
   return {claudeInstructions: c1, codexInstructions: c2, antigravityInstructions: c3};
 }
 
@@ -386,6 +403,18 @@ async function syncSubagentDir(dir, items) {
       `description: ${String(ag.description || "").replace(/[\r\n]/g, " ")}`,
     ];
     if (ag.model && String(ag.model).trim()) fmLines.push(`model: ${String(ag.model).trim()}`);
+    if (Array.isArray(ag.tools) && ag.tools.length > 0) {
+      fmLines.push(`tools: ${ag.tools.map(t => String(t).trim()).filter(Boolean).join(", ")}`);
+    }
+    if (Array.isArray(ag.disallowedTools) && ag.disallowedTools.length > 0) {
+      fmLines.push(`disallowedTools: ${ag.disallowedTools.map(t => String(t).trim()).filter(Boolean).join(", ")}`);
+    }
+    if (ag.permissionMode && String(ag.permissionMode).trim()) {
+      fmLines.push(`permissionMode: ${String(ag.permissionMode).trim()}`);
+    }
+    if (Number(ag.maxTurns) > 0) {
+      fmLines.push(`maxTurns: ${Math.min(200, Math.round(Number(ag.maxTurns)))}`);
+    }
     const body = `---\n${fmLines.join("\n")}\n---\n\n${String(ag.prompt || "").trim()}\n`;
     await writeAtomic(path.join(dir, fname), body, 0o644);
   }
@@ -400,10 +429,24 @@ async function syncSubagentDir(dir, items) {
 
 async function syncAllSubagents(registry) {
   const all = (registry.subagents || []).filter(a => a && a.enabled !== false && String(a.name || "").trim());
-  const forTarget = agentId => all.filter(a => matchesTarget(a.targets, agentId));
-  const c1 = await syncSubagentDir(CLAUDE_AGENTS_DIR, forTarget("claude"));
-  const c2 = await syncSubagentDir(CODEX_AGENTS_DIR, forTarget("codex"));
-  const c3 = await syncSubagentDir(SHARED_AGENTS_DIR, forTarget("antigravity"));
+  const globalItems = all.filter(a => !a.scope || a.scope === "global");
+  const forTarget = (list, agentId) => list.filter(a => matchesTarget(a.targets, agentId));
+  const c1 = await syncSubagentDir(CLAUDE_AGENTS_DIR, forTarget(globalItems, "claude"));
+  const c2 = await syncSubagentDir(CODEX_AGENTS_DIR, forTarget(globalItems, "codex"));
+  const c3 = await syncSubagentDir(SHARED_AGENTS_DIR, forTarget(globalItems, "antigravity"));
+  const projectDirs = new Set(
+    (registry.subagents || [])
+      .map(a => (typeof a?.scope === "string" && a.scope.startsWith("project:")) ? a.scope.slice("project:".length).trim() : "")
+      .filter(p => path.isAbsolute(p)),
+  );
+  for (const dir of projectDirs) {
+    const okDir = await fs.stat(dir).then(s => s.isDirectory()).catch(() => false);
+    if (!okDir) continue;
+    const pItems = all.filter(a => a.scope === `project:${dir}`);
+    await syncSubagentDir(path.join(dir, ".claude", "agents"), forTarget(pItems, "claude")).catch(() => {});
+    await syncSubagentDir(path.join(dir, ".codex", "agents"), forTarget(pItems, "codex")).catch(() => {});
+    await syncSubagentDir(path.join(dir, ".agents", "agents"), forTarget(pItems, "antigravity")).catch(() => {});
+  }
   return {claudeSubagents: c1, codexSubagents: c2, antigravitySubagents: c3};
 }
 
@@ -419,10 +462,11 @@ async function syncHooksJsonFile(filePath, items) {
   for (const h of items) {
     const ev = String(h.event || "PreToolUse").trim();
     if (!Array.isArray(hooksObj[ev])) hooksObj[ev] = [];
+    const timeoutSec = Math.max(1, Math.min(300, Number(h.timeoutSec) || 30));
     hooksObj[ev].push({
       _solbraidManaged: true,
       matcher: String(h.matcher || "*"),
-      hooks: [{type: "command", command: String(h.command || "")}],
+      hooks: [{type: "command", command: String(h.command || ""), timeout: timeoutSec}],
     });
   }
   if (Object.keys(hooksObj).length > 0 || existing?.hooks) {
@@ -433,10 +477,105 @@ async function syncHooksJsonFile(filePath, items) {
 
 async function syncAllHooks(registry) {
   const all = (registry.hooks || []).filter(h => h && h.enabled !== false && String(h.command || "").trim());
-  const c1 = await syncHooksJsonFile(CODEX_HOOKS_FILE, all.filter(h => matchesTarget(h.targets, "codex")));
-  const c2 = await syncHooksJsonFile(SHARED_HOOKS_FILE, all.filter(h => matchesTarget(h.targets, "antigravity")));
-  const c3 = await syncHooksJsonFile(CLAUDE_SETTINGS_FILE, all.filter(h => matchesTarget(h.targets, "claude")));
+  const globalItems = all.filter(h => !h.scope || h.scope === "global");
+  const c1 = await syncHooksJsonFile(CODEX_HOOKS_FILE, globalItems.filter(h => matchesTarget(h.targets, "codex")));
+  const c2 = await syncHooksJsonFile(SHARED_HOOKS_FILE, globalItems.filter(h => matchesTarget(h.targets, "antigravity")));
+  const c3 = await syncHooksJsonFile(CLAUDE_SETTINGS_FILE, globalItems.filter(h => matchesTarget(h.targets, "claude")));
+  const projectDirs = new Set(
+    (registry.hooks || [])
+      .map(h => (typeof h?.scope === "string" && h.scope.startsWith("project:")) ? h.scope.slice("project:".length).trim() : "")
+      .filter(p => path.isAbsolute(p)),
+  );
+  for (const dir of projectDirs) {
+    const okDir = await fs.stat(dir).then(s => s.isDirectory()).catch(() => false);
+    if (!okDir) continue;
+    const pItems = all.filter(h => h.scope === `project:${dir}`);
+    await syncHooksJsonFile(path.join(dir, ".codex", "hooks.json"), pItems.filter(h => matchesTarget(h.targets, "codex"))).catch(() => {});
+    await syncHooksJsonFile(path.join(dir, ".agents", "hooks.json"), pItems.filter(h => matchesTarget(h.targets, "antigravity"))).catch(() => {});
+    await syncHooksJsonFile(path.join(dir, ".claude", "settings.json"), pItems.filter(h => matchesTarget(h.targets, "claude"))).catch(() => {});
+  }
   return {codexHooks: c1, antigravityHooks: c2, claudeHooks: c3};
+}
+
+/** 在受控超时与样例 JSON Stdin 下现场试运行单条生命周期钩子（验证退出码 0 放行 / 2 阻断与标准输出）。 */
+export async function testHookCommand({event = "PostToolUse", matcher = "*", command = "", cwd = HOME, timeoutSec = 10, sampleInput = null}) {
+  const cmd = String(command || "").trim();
+  if (!cmd) return {ok: false, exitCode: -1, blocked: false, latencyMs: 0, stdout: "", stderr: "钩子命令为空"};
+  const started = Date.now();
+  const effectiveCwd = (typeof cwd === "string" && path.isAbsolute(cwd)) ? cwd : HOME;
+  const userEnv = await loadEffectiveUserEnv(effectiveCwd).catch(() => ({}));
+  const payload = sampleInput || {
+    hook_event_name: event,
+    matcher,
+    cwd: effectiveCwd,
+    tool_name: matcher === "*" ? "Edit" : matcher.split("|")[0],
+    tool_input: {file_path: path.join(effectiveCwd, "sample.txt")},
+    solbraid_dry_run: true,
+  };
+  const timeoutMs = Math.max(1000, Math.min(30_000, (Number(timeoutSec) || 10) * 1000));
+  return await new Promise(resolve => {
+    let settled = false;
+    let stdout = "";
+    let stderr = "";
+    const shellCmd = process.platform === "win32" ? (process.env.COMSPEC || "cmd.exe") : "/bin/sh";
+    const shellArgs = process.platform === "win32" ? ["/d", "/s", "/c", cmd] : ["-lc", cmd];
+    const child = spawn(shellCmd, shellArgs, {
+      cwd: effectiveCwd,
+      env: {...process.env, ...userEnv, SOLBRAID_HOOK_EVENT: String(event), SOLBRAID_HOOK_DRY_RUN: "1"},
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const finish = (exitCode, extraErr = "") => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const errOut = extraErr ? `${stderr}${stderr ? "\n" : ""}${extraErr}` : stderr;
+      resolve({
+        ok: exitCode === 0,
+        exitCode,
+        blocked: exitCode === 2,
+        latencyMs: Date.now() - started,
+        stdout: stdout.slice(0, 4096),
+        stderr: errOut.slice(0, 4096),
+      });
+    };
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      finish(124, `钩子执行超时 (${Math.round(timeoutMs / 1000)}s)`);
+    }, timeoutMs);
+    child.on("error", err => finish(-1, err.message));
+    child.stdout.on("data", d => { if (stdout.length < 4096) stdout += d.toString("utf8"); });
+    child.stderr.on("data", d => { if (stderr.length < 4096) stderr += d.toString("utf8"); });
+    child.on("close", code => finish(typeof code === "number" ? code : -1));
+    try {
+      child.stdin.write(JSON.stringify(payload) + "\n");
+      child.stdin.end();
+    } catch {}
+  });
+}
+
+/** 列出指定技能目录下的附属文件（SKILL.md / scripts / references / assets，深度 <= 2）。 */
+export async function listSkillCompanionFiles({dirPath}) {
+  const dir = String(dirPath || "").trim();
+  if (!dir || !path.isAbsolute(dir)) return {files: []};
+  const files = [];
+  async function walk(cur, relPrefix, depth) {
+    const entries = await fs.readdir(cur, {withFileTypes: true}).catch(() => []);
+    for (const e of entries) {
+      if (e.name === ".git" || e.name === "node_modules") continue;
+      const abs = path.join(cur, e.name);
+      const rel = relPrefix ? `${relPrefix}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        if (depth < 2) await walk(abs, rel, depth + 1);
+      } else if (e.isFile()) {
+        const st = await fs.stat(abs).catch(() => null);
+        files.push({relPath: rel, absPath: abs, size: st?.size || 0});
+      }
+      if (files.length >= 60) return;
+    }
+  }
+  await walk(dir, "", 0);
+  files.sort((a, b) => (a.relPath === "SKILL.md" ? -1 : b.relPath === "SKILL.md" ? 1 : a.relPath.localeCompare(b.relPath)));
+  return {files};
 }
 
 const BUILTIN_PLUGIN_SDK_SKILL = `---
@@ -621,6 +760,7 @@ export async function probeMcpServer({server, secrets}) {
       const reqHeaders = sessionId ? {...baseHeaders, "Mcp-Session-Id": sessionId} : baseHeaders;
       // 尝试继续执行 notifications/initialized 与 tools/list，获取真实工具清单
       let tools = [];
+      let toolDetails = [];
       try {
         await fetch(server.url, {
           method: "POST",
@@ -637,7 +777,10 @@ export async function probeMcpServer({server, secrets}) {
         if (toolsResp.ok) {
           const parsed = parseJsonRpcPayload(await toolsResp.text());
           if (Array.isArray(parsed?.result?.tools)) {
-            tools = parsed.result.tools.map(t => String(t?.name || "")).filter(Boolean);
+            toolDetails = parsed.result.tools
+              .map(t => ({name: String(t?.name || ""), description: String(t?.description || "").slice(0, 240)}))
+              .filter(t => t.name);
+            tools = toolDetails.map(t => t.name);
           }
         }
       } catch {}
@@ -645,6 +788,7 @@ export async function probeMcpServer({server, secrets}) {
         ok: true,
         latencyMs,
         tools,
+        toolDetails,
         message: tools.length > 0 ? `HTTP ${resp.status} 已连接，发现 ${tools.length} 个工具` : `HTTP ${resp.status} 连通正常`,
       };
     } catch (err) {
@@ -689,8 +833,11 @@ export async function probeMcpServer({server, secrets}) {
           child.stdin.write(JSON.stringify({jsonrpc: "2.0", method: "notifications/initialized"}) + "\n");
           child.stdin.write(JSON.stringify({jsonrpc: "2.0", id: 2, method: "tools/list", params: {}}) + "\n");
         } else if (msg.id === 2 && Array.isArray(msg.result?.tools)) {
-          const tools = msg.result.tools.map(t => String(t?.name || "")).filter(Boolean);
-          finish({ok: true, tools, message: `已连接，发现 ${tools.length} 个工具`});
+          const toolDetails = msg.result.tools
+            .map(t => ({name: String(t?.name || ""), description: String(t?.description || "").slice(0, 240)}))
+            .filter(t => t.name);
+          const tools = toolDetails.map(t => t.name);
+          finish({ok: true, tools, toolDetails, message: `已连接，发现 ${tools.length} 个工具`});
         } else if (msg.id === 1 || msg.id === 2) {
           finish({ok: false, tools: [], error: "MCP 响应格式无效"});
         }

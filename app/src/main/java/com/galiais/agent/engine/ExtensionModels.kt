@@ -163,17 +163,32 @@ data class ManagedPlugin(
     }
 }
 
-/** 资源库托管全局指令块（自动同步至 CLAUDE.md / AGENTS.md / GEMINI.md，保留手写内容）。 */
+/** 资源库托管全局/项目级指令块（自动无损同步至 CLAUDE.md / AGENTS.md / GEMINI.md，保留手写内容）。 */
 data class ManagedInstruction(
     val id: String,
     val title: String,
     val content: String,
     val enabled: Boolean = true,
     val targets: List<String> = listOf("all"),
+    val scope: String = "global", // "global" | "project:/abs/path"
+    val priority: Int = 0,
 ) {
+    /** 粗略估算指令占用的上下文 Token 数（英文 ~4 字符/tok，中文 ~1.5 字符/tok）。 */
+    val estimatedTokens: Int
+        get() {
+            var cjk = 0
+            var other = 0
+            for (ch in content) {
+                if (ch.code > 0x2E7F) cjk++ else other++
+            }
+            return ((cjk / 1.5) + (other / 4.0)).toInt().coerceAtLeast(if (content.isNotBlank()) 1 else 0)
+        }
+
     fun toJson(): JSONObject = JSONObject()
         .put("id", id).put("title", title).put("content", content)
         .put("enabled", enabled).put("targets", JSONArray(targets))
+        .put("scope", scope).put("priority", priority)
+
     companion object {
         fun fromJson(obj: JSONObject) = ManagedInstruction(
             id = obj.getString("id"),
@@ -181,23 +196,47 @@ data class ManagedInstruction(
             content = obj.optString("content"),
             enabled = obj.optBoolean("enabled", true),
             targets = obj.arr("targets").strings().ifEmpty { listOf("all") },
+            scope = obj.optString("scope", "global").ifBlank { "global" },
+            priority = obj.optInt("priority", 0),
         )
     }
 }
 
-/** 资源库托管子代理定义（自动投影到 .claude/agents / .codex/agents / .agents/agents）。 */
+/** 资源库托管子代理定义（自动投影到 .claude/agents / .codex/agents / .agents/agents，支持完整 Frontmatter）。 */
 data class ManagedSubagent(
     val id: String,
     val name: String,
     val description: String = "",
     val model: String = "",
     val prompt: String = "",
+    val tools: List<String> = emptyList(),
+    val disallowedTools: List<String> = emptyList(),
+    val permissionMode: String = "", // "" | "plan" | "acceptEdits" | "default"
+    val maxTurns: Int = 0,
+    val scope: String = "global",
     val enabled: Boolean = true,
     val targets: List<String> = listOf("all"),
 ) {
+    fun toMarkdownPreview(): String = buildString {
+        appendLine("---")
+        appendLine("name: $name")
+        if (description.isNotBlank()) appendLine("description: $description")
+        if (model.isNotBlank()) appendLine("model: $model")
+        if (tools.isNotEmpty()) appendLine("tools: ${tools.joinToString(", ")}")
+        if (disallowedTools.isNotEmpty()) appendLine("disallowedTools: ${disallowedTools.joinToString(", ")}")
+        if (permissionMode.isNotBlank()) appendLine("permissionMode: $permissionMode")
+        if (maxTurns > 0) appendLine("maxTurns: $maxTurns")
+        appendLine("---")
+        appendLine()
+        append(prompt.trim())
+    }
+
     fun toJson(): JSONObject = JSONObject()
         .put("id", id).put("name", name).put("description", description).put("model", model)
-        .put("prompt", prompt).put("enabled", enabled).put("targets", JSONArray(targets))
+        .put("prompt", prompt).put("tools", JSONArray(tools)).put("disallowedTools", JSONArray(disallowedTools))
+        .put("permissionMode", permissionMode).put("maxTurns", maxTurns).put("scope", scope)
+        .put("enabled", enabled).put("targets", JSONArray(targets))
+
     companion object {
         fun fromJson(obj: JSONObject) = ManagedSubagent(
             id = obj.getString("id"),
@@ -205,25 +244,35 @@ data class ManagedSubagent(
             description = obj.optString("description"),
             model = obj.optString("model"),
             prompt = obj.optString("prompt"),
+            tools = obj.arr("tools").strings(),
+            disallowedTools = obj.arr("disallowedTools").strings(),
+            permissionMode = obj.optString("permissionMode"),
+            maxTurns = obj.optInt("maxTurns", 0),
+            scope = obj.optString("scope", "global").ifBlank { "global" },
             enabled = obj.optBoolean("enabled", true),
             targets = obj.arr("targets").strings().ifEmpty { listOf("all") },
         )
     }
 }
 
-/** 资源库托管生命周期钩子（PreToolUse / PostToolUse / Stop / SessionStart）。 */
+/** 资源库托管生命周期钩子（支持全部 8 类官方生命周期事件、超时控制、作用域与现场试运行）。 */
 data class ManagedHook(
     val id: String,
     val name: String,
     val event: String = "PostToolUse",
     val matcher: String = "*",
     val command: String = "",
+    val timeoutSec: Int = 30,
+    val scope: String = "global",
+    val description: String = "",
     val enabled: Boolean = true,
     val targets: List<String> = listOf("all"),
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("id", id).put("name", name).put("event", event).put("matcher", matcher)
-        .put("command", command).put("enabled", enabled).put("targets", JSONArray(targets))
+        .put("command", command).put("timeoutSec", timeoutSec).put("scope", scope)
+        .put("description", description).put("enabled", enabled).put("targets", JSONArray(targets))
+
     companion object {
         fun fromJson(obj: JSONObject) = ManagedHook(
             id = obj.getString("id"),
@@ -231,6 +280,9 @@ data class ManagedHook(
             event = obj.optString("event", "PostToolUse"),
             matcher = obj.optString("matcher", "*"),
             command = obj.optString("command"),
+            timeoutSec = obj.optInt("timeoutSec", 30).coerceIn(1, 300),
+            scope = obj.optString("scope", "global").ifBlank { "global" },
+            description = obj.optString("description"),
             enabled = obj.optBoolean("enabled", true),
             targets = obj.arr("targets").strings().ifEmpty { listOf("all") },
         )
@@ -275,11 +327,32 @@ data class ExtensionRegistry(
     }
 }
 
+data class McpToolInfo(
+    val name: String,
+    val description: String = "",
+)
+
 data class McpProbeResult(
     val ok: Boolean,
     val latencyMs: Int = 0,
     val tools: List<String> = emptyList(),
+    val toolDetails: List<McpToolInfo> = emptyList(),
     val message: String = "",
+)
+
+data class HookTestResult(
+    val ok: Boolean,
+    val exitCode: Int = -1,
+    val blocked: Boolean = false,
+    val latencyMs: Int = 0,
+    val stdout: String = "",
+    val stderr: String = "",
+)
+
+data class SkillCompanionFile(
+    val relPath: String,
+    val absPath: String,
+    val size: Long = 0L,
 )
 
 private fun JSONObject.toStringMap(): Map<String, String> {
@@ -574,9 +647,9 @@ data class HostPluginSnapshot(
     val composerActions: List<HostPluginComposerAction> = emptyList(),
     val plugins: List<HostPluginInfo> = emptyList(),
 ) {
-    val corePlugins: List<HostPluginInfo> get() = plugins.filter { it.isCore }
-    val extensionPlugins: List<HostPluginInfo> get() = plugins.filterNot { it.isCore }
-    val activeCount: Int get() = plugins.count { it.status == "active" }
+    val corePlugins: List<HostPluginInfo> = plugins.filter { it.isCore }
+    val extensionPlugins: List<HostPluginInfo> = plugins.filterNot { it.isCore }
+    val activeCount: Int = plugins.count { it.status == "active" }
 
     companion object {
         fun fromJson(obj: JSONObject): HostPluginSnapshot = HostPluginSnapshot(
@@ -623,171 +696,4 @@ data class HostPluginCommandResult(
     val title: String = "",
     val artifactKind: String = "html",
     val content: String = "",
-)
-
-// ── 统一共享资源仓库与强制 AI 安全审查 DTO（对接 runtime/community-registry.mjs） ──
-
-data class AuditFinding(
-    val ruleId: String,
-    val severity: String,
-    val title: String,
-    val location: String,
-    val detail: String,
-) {
-    companion object {
-        fun fromJson(obj: JSONObject) = AuditFinding(
-            ruleId = obj.optString("ruleId"),
-            severity = obj.optString("severity", "medium"),
-            title = obj.optString("title"),
-            location = obj.optString("location"),
-            detail = obj.optString("detail"),
-        )
-    }
-}
-
-data class ResourceAuditReport(
-    val verdict: String = "pending_review", // "approved" | "rejected" | "pending_review"
-    val riskLevel: String = "medium", // "low" | "medium" | "high" | "critical"
-    val score: Int = 0,
-    val reviewerMode: String = "static-only",
-    val reviewerModel: String = "",
-    val auditedAt: Long = 0L,
-    val sha256: String = "",
-    val summary: String = "",
-    val checks: List<String> = emptyList(),
-    val findings: List<AuditFinding> = emptyList(),
-) {
-    val approved: Boolean get() = verdict == "approved"
-
-    companion object {
-        fun fromJson(obj: JSONObject?) = if (obj == null) ResourceAuditReport() else ResourceAuditReport(
-            verdict = obj.optString("verdict", "pending_review"),
-            riskLevel = obj.optString("riskLevel", "medium"),
-            score = obj.optInt("score", 0),
-            reviewerMode = obj.optString("reviewerMode", "static-only"),
-            reviewerModel = obj.optString("reviewerModel"),
-            auditedAt = obj.optLong("auditedAt", 0L),
-            sha256 = obj.optString("sha256"),
-            summary = obj.optString("summary"),
-            checks = obj.arr("checks").strings(),
-            findings = obj.arr("findings").objects().map(AuditFinding::fromJson),
-        )
-    }
-}
-
-data class CommunityRegistryConfig(
-    val mode: String = "builtin-local", // "builtin-local" | "http" | "github"
-    val serverUrl: String = "",
-    val githubRepo: String = "GALIAIS/Solbraid",
-    val githubBranch: String = "main",
-    val hasGithubToken: Boolean = false,
-    val authorName: String = "Solbraid 用户",
-    val reviewerBaseUrl: String = "",
-    val hasReviewerApiKey: Boolean = false,
-    val reviewerModel: String = "",
-    val reviewerWireApi: String = "openai",
-    val requireLlmReview: Boolean = false,
-    val staticRulesCount: Int = 14,
-) {
-    companion object {
-        fun fromJson(obj: JSONObject?) = if (obj == null) CommunityRegistryConfig() else CommunityRegistryConfig(
-            mode = obj.optString("mode", "builtin-local"),
-            serverUrl = obj.optString("serverUrl"),
-            githubRepo = obj.optString("githubRepo", "GALIAIS/Solbraid"),
-            githubBranch = obj.optString("githubBranch", "main"),
-            hasGithubToken = obj.optBoolean("hasGithubToken", false),
-            authorName = obj.optString("authorName", "Solbraid 用户"),
-            reviewerBaseUrl = obj.optString("reviewerBaseUrl"),
-            hasReviewerApiKey = obj.optBoolean("hasReviewerApiKey", false),
-            reviewerModel = obj.optString("reviewerModel"),
-            reviewerWireApi = obj.optString("reviewerWireApi", "openai"),
-            requireLlmReview = obj.optBoolean("requireLlmReview", false),
-            staticRulesCount = obj.optInt("staticRulesCount", 14),
-        )
-    }
-}
-
-data class CommunityResourceItem(
-    val id: String,
-    val kind: String,
-    val name: String,
-    val version: String,
-    val author: String,
-    val description: String,
-    val tags: List<String>,
-    val sha256: String,
-    val downloads: Int,
-    val publishedAt: Long,
-    val updatedAt: Long,
-    val audit: ResourceAuditReport,
-) {
-    companion object {
-        fun fromJson(obj: JSONObject) = CommunityResourceItem(
-            id = obj.optString("id"),
-            kind = obj.optString("kind"),
-            name = obj.optString("name", obj.optString("id")),
-            version = obj.optString("version", "1.0.0"),
-            author = obj.optString("author", "匿名用户"),
-            description = obj.optString("description"),
-            tags = obj.arr("tags").strings(),
-            sha256 = obj.optString("sha256"),
-            downloads = obj.optInt("downloads", 0),
-            publishedAt = obj.optLong("publishedAt", 0L),
-            updatedAt = obj.optLong("updatedAt", 0L),
-            audit = ResourceAuditReport.fromJson(obj.optJSONObject("audit")),
-        )
-    }
-}
-
-data class CommunitySubmissionRecord(
-    val submissionId: String,
-    val resourceId: String,
-    val kind: String,
-    val name: String,
-    val version: String,
-    val author: String,
-    val status: String,
-    val submittedAt: Long,
-    val audit: ResourceAuditReport,
-) {
-    companion object {
-        fun fromJson(obj: JSONObject) = CommunitySubmissionRecord(
-            submissionId = obj.optString("submissionId"),
-            resourceId = obj.optString("resourceId"),
-            kind = obj.optString("kind"),
-            name = obj.optString("name"),
-            version = obj.optString("version", "1.0.0"),
-            author = obj.optString("author"),
-            status = obj.optString("status"),
-            submittedAt = obj.optLong("submittedAt", 0L),
-            audit = ResourceAuditReport.fromJson(obj.optJSONObject("audit")),
-        )
-    }
-}
-
-data class CommunityRegistrySnapshot(
-    val config: CommunityRegistryConfig = CommunityRegistryConfig(),
-    val sourceLabel: String = "",
-    val items: List<CommunityResourceItem> = emptyList(),
-    val submissions: List<CommunitySubmissionRecord> = emptyList(),
-    val aiReviewerActive: Boolean = true,
-) {
-    companion object {
-        fun fromJson(obj: JSONObject) = CommunityRegistrySnapshot(
-            config = CommunityRegistryConfig.fromJson(obj.optJSONObject("config")),
-            sourceLabel = obj.optString("sourceLabel"),
-            items = obj.arr("items").objects().map(CommunityResourceItem::fromJson),
-            submissions = obj.arr("submissions").objects().map(CommunitySubmissionRecord::fromJson),
-            aiReviewerActive = obj.optBoolean("aiReviewerActive", true),
-        )
-    }
-}
-
-data class CommunitySubmitResult(
-    val status: String, // "approved" | "rejected" | "pending_review" | "pr_bundle_ready" | "pr_submitted"
-    val audit: ResourceAuditReport,
-    val bundlePath: String = "",
-    val prHint: String = "",
-    val prUrl: String = "",
-    val prNumber: Int = 0,
 )

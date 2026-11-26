@@ -13,7 +13,7 @@
 [![Linux](https://img.shields.io/badge/Linux-Ubuntu%2024.04%20(Root%20%2F%20PRoot)-E95420?style=flat-square&logo=ubuntu&logoColor=white)](runtime/components.json)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](LICENSE)
 
-[核心特性](#核心特性) · [架构概览](#架构概览) · [快速构建](#快速构建) · [扩展文档](#扩展文档)
+[核心特性](#核心特性) · [架构概览](#架构概览) · [快速构建](#快速构建) · [开源协议](#开源协议)
 
 </div>
 
@@ -71,11 +71,6 @@ node tools/self-test.mjs
 ```
 
 构建产物输出至 `app/build/outputs/apk/debug/`，并在打包结束时自动校验运行时资产完整性。
-
-## 扩展文档
-
-- 自演进插件微内核设计：[docs/self-evolving-plugins-design.md](docs/self-evolving-plugins-design.md)
-- 社区资源仓库自托管与 PR 门禁部署：[registry/README.md](registry/README.md)
 
 ## 开源协议
 

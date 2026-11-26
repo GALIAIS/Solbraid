@@ -31,7 +31,6 @@ import * as envSsh from "./env-ssh-hub.mjs";
 import * as usageLedger from "./usage-ledger.mjs";
 import {PluginKernel, startPluginControlServer} from "./plugin-kernel.mjs";
 import {registerBuiltinHostPlugins} from "./plugin-builtins.mjs";
-import {CommunityRegistryClient} from "./community-registry.mjs";
 import {normalizeDownloadNetwork, saveDownloadNetwork, downloadEnvironment, githubDownloadUrl, redactNetworkText} from "./download-network.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -1281,7 +1280,6 @@ const devTools = createDevToolsHub({
   preparePtyEnv: async cwd => baseEnv(null, null, networkConfig, await envSsh.loadEffectiveUserEnv(cwd, process.env.PATH || "")),
 });
 
-const communityRegistry = new CommunityRegistryClient({home: HOME});
 const pluginKernel = new PluginKernel({home: HOME, onNotify: notify});
 let pluginControlServer = null;
 registerBuiltinHostPlugins(pluginKernel, {
@@ -1289,12 +1287,16 @@ registerBuiltinHostPlugins(pluginKernel, {
     listManifests: () => [...manifests.keys()],
     activeSessionCount: () => sessions.size,
   },
+  selfEvolution: {
+    getControlInfo: () => pluginControlServer ? {socketPath: pluginControlServer.socketPath} : null,
+    listSnapshots: id => pluginKernel.listPluginSnapshots(id),
+    getSelfBuildConfig: () => pluginKernel.getSelfBuildConfig(),
+  },
   usageLedger,
   extSync,
   devTools,
   envSsh,
   worktreeMgr,
-  communityRegistry,
 });
 
 const DELEGATE_MCP_SCRIPT = "/opt/galiais-codex/android/delegate-mcp.mjs";
@@ -3543,6 +3545,10 @@ async function dispatchRequest(method, params = {}) {
         env: baseEnv(null, null),
         githubMirrorPrefix: networkConfig.githubMirrorPrefix,
       });
+    case "extensions/testHook":
+      return await extSync.testHookCommand(params);
+    case "extensions/listSkillFiles":
+      return await extSync.listSkillCompanionFiles(params);
     case "extensions/installBuiltinPlugin":
       return await extSync.installBuiltinPluginFiles(params);
     case "extensions/uninstallPlugin":
@@ -3773,23 +3779,6 @@ async function dispatchRequest(method, params = {}) {
         }
       }
     }
-
-    case "registry/getConfig":
-      return communityRegistry.sanitizeConfig(await communityRegistry.loadConfig());
-    case "registry/saveConfig":
-      return await communityRegistry.saveConfig(params || {});
-    case "registry/list":
-      return await communityRegistry.list(params || {});
-    case "registry/previewAudit":
-      return await communityRegistry.previewAudit(params?.bundle || params, {reviewerOverride: params?.reviewerOverride || null});
-    case "registry/testReviewer":
-      return await communityRegistry.testReviewer();
-    case "registry/submit":
-      return await communityRegistry.submit(params?.bundle || params, {reviewerOverride: params?.reviewerOverride || null});
-    case "registry/remove":
-      return await communityRegistry.remove(params || {});
-    case "registry/download":
-      return await communityRegistry.downloadVerified(params || {});
 
     default: {
       if (method.startsWith("plugin.")) {

@@ -1349,13 +1349,144 @@ export class PluginKernel {
     return {handled: true, result};
   }
 
-  async createLocalPlugin({id, name, description = ""}) {
+  async createLocalPlugin({id, name, description = "", executionTier = "worker-isolated", template = "basic"}) {
     const cleanId = String(id || "").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
     if (!PLUGIN_ID_RE.test(cleanId)) throw new Error("插件 ID 仅支持小写字母、数字、点、短横线或下划线（2~64位）");
     if (this.records.has(cleanId)) throw new Error(`插件 ID 已存在：${cleanId}`);
     const cleanName = String(name || cleanId).trim().slice(0, 60);
+    const tier = executionTier === "trusted-in-process" ? "trusted-in-process" : "worker-isolated";
+    const tpl = ["basic", "sdui", "hook", "translator"].includes(template) ? template : "basic";
     const dir = path.join(this.pluginsRoot, cleanId);
     await fs.mkdir(dir, {recursive: true});
+
+    const cmdName = cleanId.split(".").pop().replace(/[^a-z0-9_-]/g, "").slice(0, 24) || "hello";
+    let capabilities = {
+      required: ["commands", "settings.schema", "ui.panel", "storage.local"],
+      optional: ["events.observe"],
+    };
+    let settingsSchema = {
+      type: "object",
+      properties: {
+        greeting: {type: "string", title: "问候语", description: "执行命令与面板展示时使用的提示文本", default: `你好，来自 ${cleanName}`},
+        showTimestamp: {type: "boolean", title: "显示时间戳", default: true},
+      },
+      required: ["greeting"],
+    };
+    let entryCode = "";
+
+    if (tpl === "sdui") {
+      capabilities = {required: ["ui.sdui", "ui.slot", "rpc", "storage.local"], optional: ["settings.schema"]};
+      settingsSchema = {
+        type: "object",
+        properties: {
+          headline: {type: "string", title: "卡片标题", default: cleanName},
+          showOnHome: {type: "boolean", title: "挂载到首页横幅", default: false},
+        },
+      };
+      entryCode = [
+        `export async function activate(ctx) {`,
+        `  ctx.log.info("${cleanName} SDUI 插件已激活");`,
+        `  ctx.rpc.register("ping", async () => ({ok: true, ts: Date.now()}));`,
+        `  ctx.ui.registerSurface({`,
+        `    id: "main",`,
+        `    title: "${cleanName}",`,
+        `    description: "原生 Compose SDUI 交互界面",`,
+        `    async render({cwd}) {`,
+        `      const cfg = ctx.settings.get();`,
+        `      const hits = (Number(await ctx.storage.get("views")) || 0) + 1;`,
+        `      await ctx.storage.set("views", hits);`,
+        `      return {`,
+        `        title: cfg.headline || "${cleanName}",`,
+        `        subtitle: cwd,`,
+        `        nodes: [`,
+        `          {type: "row", children: [{type: "metric", label: "访问次数", value: String(hits), tone: "accent"}, {type: "metric", label: "代际", value: ctx.host.generationId, tone: "ink"}]},`,
+        `          {type: "card", title: "状态", children: [{type: "text", text: "原生 Jetpack Compose SDUI 已就绪。"}, {type: "button", label: "刷新", style: "primary", action: {type: "refresh"}}]},`,
+        `        ],`,
+        `      };`,
+        `    },`,
+        `  });`,
+        `  ctx.ui.registerSlot({`,
+        `    id: "home-card", slot: "home.banner", label: "${cleanName}", surfaceId: "main",`,
+        `    async render() {`,
+        `      if (!ctx.settings.get().showOnHome) return null;`,
+        `      return {title: "${cleanName}", nodes: [{type: "button", label: "打开面板", style: "primary", action: {type: "surface", surfaceId: "main"}}]};`,
+        `    },`,
+        `  });`,
+        `}`,
+        ``,
+      ].join("\n");
+    } else if (tpl === "hook") {
+      capabilities = {required: ["hooks.prompt", "settings.schema"], optional: ["commands"]};
+      settingsSchema = {
+        type: "object",
+        properties: {
+          prefix: {type: "string", title: "自动附加提示词前缀", default: ""},
+          enabledNotice: {type: "boolean", title: "触发时显示轻提示", default: true},
+        },
+      };
+      entryCode = [
+        `export async function activate(ctx) {`,
+        `  ctx.log.info("${cleanName} Prompt Hook 已激活");`,
+        `  ctx.hooks.onBeforePrompt(({text}) => {`,
+        `    const cfg = ctx.settings.get();`,
+        `    const p = String(cfg.prefix || "").trim();`,
+        `    if (!p) return null;`,
+        `    return {text: p + "\\n\\n" + text, notice: cfg.enabledNotice ? "${cleanName} 已附加前缀" : ""};`,
+        `  });`,
+        `}`,
+        ``,
+      ].join("\n");
+    } else if (tpl === "translator") {
+      capabilities = {required: ["provider.translator"], optional: ["settings.schema"]};
+      settingsSchema = {type: "object", properties: {customHeader: {type: "string", title: "附加请求头 X-Custom", default: ""}}};
+      entryCode = [
+        `export async function activate(ctx) {`,
+        `  ctx.log.info("${cleanName} 协议转换器已激活");`,
+        `  ctx.providers.registerTranslator({`,
+        `    id: "${cmdName}-adapter",`,
+        `    name: "${cleanName}",`,
+        `    baseProtocol: "openai_chat",`,
+        `    description: "自定义 OpenAI 兼容协议适配层",`,
+        `    toUpstream(req) {`,
+        `      const h = ctx.settings.get().customHeader;`,
+        `      return h ? {headers: {"X-Custom": String(h)}} : {};`,
+        `    },`,
+        `  });`,
+        `}`,
+        ``,
+      ].join("\n");
+    } else {
+      entryCode = [
+        `export async function activate(ctx) {`,
+        `  ctx.log.info("${cleanName} 已启动");`,
+        `  ctx.commands.register("${cmdName}", {`,
+        `    description: "运行 ${cleanName} 命令",`,
+        `    async handler({cwd}) {`,
+        `      const cfg = ctx.settings.get();`,
+        `      const count = (Number(await ctx.storage.get("runs")) || 0) + 1;`,
+        `      await ctx.storage.set("runs", count);`,
+        `      const ts = cfg.showTimestamp ? \` (\${new Date().toLocaleTimeString()})\` : "";`,
+        `      return {kind: "notice", message: \`\${cfg.greeting}\${ts} · 第 \${count} 次调用 · \${cwd}\`};`,
+        `    },`,
+        `  });`,
+        `  ctx.panels.register({`,
+        `    id: "main",`,
+        `    title: "${cleanName} 面板",`,
+        `    description: "插件自带隔离 WebView 交互面板",`,
+        `    async render({cwd}) {`,
+        `      const cfg = ctx.settings.get();`,
+        `      const runs = Number(await ctx.storage.get("runs")) || 0;`,
+        `      const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));`,
+        `      return \`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>html{min-height:100%;background:#0f172a}body{margin:0;min-height:100vh;font-family:system-ui,sans-serif;padding:18px;background:#0f172a;color:#e2e8f0;box-sizing:border-box}h1{font-size:18px;margin:0 0 8px}.card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:14px;margin-top:12px}code{color:#38bdf8}</style></head><body><h1>\${esc("${cleanName}")}</h1><p>\${esc(cfg.greeting)}</p><div class="card"><div>工作区：<code>\${esc(cwd)}</code></div><div>命令累计调用：<strong>\${runs}</strong></div><div>Generation：<code>\${esc(ctx.host.generationId)}</code></div></div></body></html>\`;`,
+        `    },`,
+        `  });`,
+        `  ctx.events?.observe("session.completed", ev => {`,
+        `    ctx.log.info(\`观测到会话完成：\${ev.agentId}:\${ev.sessionId}\`);`,
+        `  });`,
+        `}`,
+        ``,
+      ].join("\n");
+    }
 
     const manifest = {
       manifestVersion: "1.0.0",
@@ -1365,52 +1496,11 @@ export class PluginKernel {
       version: "0.1.0",
       description: String(description || "本地 Solbraid 扩展插件").trim(),
       kind: "local",
+      executionTier: tier,
       entrypoint: "index.mjs",
-      capabilities: {
-        required: ["commands", "settings.schema", "ui.panel", "storage.local"],
-        optional: ["events.observe"],
-      },
-      settingsSchema: {
-        type: "object",
-        properties: {
-          greeting: {type: "string", title: "问候语", description: "执行命令与面板展示时使用的提示文本", default: `你好，来自 ${cleanName}`},
-          showTimestamp: {type: "boolean", title: "显示时间戳", default: true},
-        },
-        required: ["greeting"],
-      },
+      capabilities,
+      settingsSchema,
     };
-
-    const cmdName = cleanId.split(".").pop().replace(/[^a-z0-9_-]/g, "").slice(0, 24) || "hello";
-    const entryCode = [
-      `export async function activate(ctx) {`,
-      `  ctx.log.info("${cleanName} 已启动");`,
-      `  ctx.commands.register("${cmdName}", {`,
-      `    description: "运行 ${cleanName} 示例命令",`,
-      `    async handler({cwd}) {`,
-      `      const cfg = ctx.settings.get();`,
-      `      const count = (Number(await ctx.storage.get("runs")) || 0) + 1;`,
-      `      await ctx.storage.set("runs", count);`,
-      `      const ts = cfg.showTimestamp ? \` (\${new Date().toLocaleTimeString()})\` : "";`,
-      `      return {kind: "notice", message: \`\${cfg.greeting}\${ts} · 第 \${count} 次调用 · \${cwd}\`};`,
-      `    },`,
-      `  });`,
-      `  ctx.panels.register({`,
-      `    id: "main",`,
-      `    title: "${cleanName} 面板",`,
-      `    description: "插件自带隔离 WebView 交互面板",`,
-      `    async render({cwd}) {`,
-      `      const cfg = ctx.settings.get();`,
-      `      const runs = Number(await ctx.storage.get("runs")) || 0;`,
-      `      const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));`,
-      `      return \`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>html{min-height:100%;background:#0f172a}body{margin:0;min-height:100vh;font-family:system-ui,sans-serif;padding:18px;background:#0f172a;color:#e2e8f0;box-sizing:border-box}h1{font-size:18px;margin:0 0 8px}.card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:14px;margin-top:12px}code{color:#38bdf8}</style></head><body><h1>\${esc("${cleanName}")}</h1><p>\${esc(cfg.greeting)}</p><div class="card"><div>工作区：<code>\${esc(cwd)}</code></div><div>命令累计调用：<strong>\${runs}</strong></div><div>Generation：<code>\${esc(ctx.host.generationId)}</code></div></div></body></html>\`;`,
-      `    },`,
-      `  });`,
-      `  ctx.events?.observe("session.completed", ev => {`,
-      `    ctx.log.info(\`观测到会话完成：\${ev.agentId}:\${ev.sessionId}\`);`,
-      `  });`,
-      `}`,
-      ``,
-    ].join("\n");
 
     await writeJsonAtomic(path.join(dir, MANIFEST_FILENAME), manifest, 0o644);
     await fs.writeFile(path.join(dir, "index.mjs"), entryCode, {encoding: "utf8", mode: 0o644});
@@ -1446,18 +1536,23 @@ export class PluginKernel {
     return snap;
   }
 
-  /** 安装来自共享仓库的社区 Host 插件包（静态清单校验 + 防路径穿越写入 + 热激活）。 */
+  /** 导入本地/JSON Host 插件包（静态清单 + 恶意代码安全门禁 + 防路径穿越写入 + 热激活）。 */
   async installPluginBundle({manifest: rawManifest, files = {}}) {
-    const checked = validatePluginManifest({...rawManifest, kind: "community"}, {allowCore: false});
+    const checked = validatePluginManifest({...rawManifest, kind: "local"}, {allowCore: false});
     if (!checked.ok) throw new Error(`插件清单校验失败：${checked.errors.join("; ")}`);
     const m = checked.manifest;
     if (this.records.get(m.id)?.manifest?.kind === "core" || this.records.get(m.id)?.manifest?.kind === "builtin") {
       throw new Error(`禁止覆盖核心或内置插件：${m.id}`);
     }
+    const sec = scanStaticSecurity({id: m.id, kind: "host_plugin", name: m.name, version: m.version, payload: {manifest: m, files}});
+    const blockers = (sec.findings || []).filter(f => f.severity === "critical" || f.severity === "high");
+    if (blockers.length > 0) {
+      throw new Error(`静态安全门禁拦截：${blockers.map(b => `${b.ruleId}: ${b.title}`).join("; ")}`);
+    }
     const dir = path.join(this.pluginsRoot, m.id);
     await fs.rm(dir, {recursive: true, force: true});
     await fs.mkdir(dir, {recursive: true});
-    await writeJsonAtomic(path.join(dir, MANIFEST_FILENAME), {...rawManifest, id: m.id, kind: "community"}, 0o644);
+    await writeJsonAtomic(path.join(dir, MANIFEST_FILENAME), {...rawManifest, id: m.id, kind: "local"}, 0o644);
     for (const [relRaw, content] of Object.entries(files || {})) {
       const rel = String(relRaw || "").replace(/\\/g, "/").replace(/^\/+/, "");
       if (!rel || rel.split("/").includes("..") || rel === MANIFEST_FILENAME) continue;

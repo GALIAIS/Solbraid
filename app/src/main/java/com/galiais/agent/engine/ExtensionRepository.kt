@@ -45,8 +45,8 @@ class ExtensionRepository(
     private val hostPluginsFlow = MutableStateFlow(HostPluginSnapshot())
     val hostPlugins: StateFlow<HostPluginSnapshot> = hostPluginsFlow.asStateFlow()
 
-    private val communityRegistryFlow = MutableStateFlow(CommunityRegistrySnapshot())
-    val communityRegistry: StateFlow<CommunityRegistrySnapshot> = communityRegistryFlow.asStateFlow()
+    private val hookTestsFlow = MutableStateFlow<Map<String, HookTestResult>>(emptyMap())
+    val hookTests: StateFlow<Map<String, HookTestResult>> = hookTestsFlow.asStateFlow()
 
     private fun commit(transform: (ExtensionRegistry) -> ExtensionRegistry) {
         val next = transform(registryFlow.value)
@@ -89,13 +89,92 @@ class ExtensionRepository(
 
     // ── MCP 管理 ─────────────────────────────────────────────────────────────
 
-    fun upsertMcp(server: ManagedMcpServer, secretValues: Map<String, String> = emptyMap()) {
+    fun upsertMcp(
+        server: ManagedMcpServer,
+        secretValues: Map<String, String> = emptyMap(),
+        removedSecretKeys: Set<String> = emptySet(),
+    ) {
+        removedSecretKeys.forEach { k -> settings.setExtensionSecret(server.id, k, null) }
         secretValues.forEach { (k, v) -> settings.setExtensionSecret(server.id, k, v) }
         commit { reg ->
             val list = reg.mcpServers.filterNot { it.id == server.id } + server
             reg.copy(mcpServers = list)
         }
         onNotify("已保存 MCP：${server.name}")
+    }
+
+    fun duplicateMcp(id: String) {
+        val src = registryFlow.value.mcpServers.firstOrNull { it.id == id } ?: return
+        val newId = "${src.id}-copy-${System.currentTimeMillis().toString(36).takeLast(4)}"
+        val copy = src.copy(id = newId, name = "${src.name} 副本", pluginId = null, enabled = false)
+        commit { reg -> reg.copy(mcpServers = reg.mcpServers + copy) }
+        onNotify("已创建副本：${copy.name}（默认关闭，可按需配置密钥）")
+    }
+
+    /** 解析标准 Claude / Cursor / Codex `mcpServers` JSON 或单条 MCP JSON 并批量导入。 */
+    fun importMcpServersFromJson(rawJson: String): Int {
+        val root = JSONObject(rawJson.trim())
+        val mapObj = root.optJSONObject("mcpServers") ?: if (root.has("command") || root.has("url") || root.has("serverUrl")) {
+            JSONObject().put(root.optString("name", root.optString("id", "imported-mcp")), root)
+        } else {
+            root
+        }
+        val added = mutableListOf<ManagedMcpServer>()
+        val keys = mapObj.keys()
+        while (keys.hasNext()) {
+            val rawKey = keys.next().trim()
+            val item = mapObj.optJSONObject(rawKey) ?: continue
+            val url = item.str("url") ?: item.str("serverUrl")
+            val command = item.str("command")
+            if (url.isNullOrBlank() && command.isNullOrBlank()) continue
+            val transport = if (!url.isNullOrBlank() && command.isNullOrBlank()) "http" else item.optString("transport", if (!url.isNullOrBlank()) "http" else "stdio")
+            val slug = rawKey.lowercase().replace(Regex("[^a-z0-9_-]+"), "-").trim('-').ifBlank { "mcp-${System.currentTimeMillis().toString(36)}" }
+            val args = item.arr("args").strings()
+            val envObj = item.optJSONObject("env")
+            val envMap = linkedMapOf<String, String>()
+            envObj?.keys()?.forEach { k -> envMap[k] = envObj.optString(k) }
+            val hdrObj = item.optJSONObject("headers") ?: item.optJSONObject("http_headers")
+            val hdrMap = linkedMapOf<String, String>()
+            hdrObj?.keys()?.forEach { k -> hdrMap[k] = hdrObj.optString(k) }
+            added += ManagedMcpServer(
+                id = slug,
+                name = item.optString("name", rawKey),
+                transport = if (transport == "http") "http" else "stdio",
+                command = if (transport == "http") null else command,
+                args = if (transport == "http") emptyList() else args,
+                url = if (transport == "http") url else null,
+                env = if (transport == "http") emptyMap() else envMap,
+                headers = if (transport == "http") hdrMap else emptyMap(),
+                enabled = true,
+                scope = "global",
+                targets = listOf("all"),
+            )
+        }
+        require(added.isNotEmpty()) { "未在 JSON 中找到有效的 MCP 服务（需包含 command 或 url/serverUrl）" }
+        commit { reg ->
+            val incomingIds = added.map { it.id }.toSet()
+            reg.copy(mcpServers = reg.mcpServers.filterNot { it.id in incomingIds } + added)
+        }
+        onNotify("已导入 ${added.size} 个 MCP 服务器")
+        return added.size
+    }
+
+    /** 导出标准 `mcpServers` JSON（不含 Keystore 加密密钥明文）。 */
+    fun exportMcpServersJson(): String {
+        val servers = JSONObject()
+        registryFlow.value.mcpServers.forEach { srv ->
+            val obj = JSONObject()
+            if (srv.transport == "http") {
+                obj.put("url", srv.url.orEmpty())
+                if (srv.headers.isNotEmpty()) obj.put("headers", JSONObject(srv.headers))
+            } else {
+                obj.put("command", srv.command.orEmpty())
+                obj.put("args", JSONArray(srv.args))
+                if (srv.env.isNotEmpty()) obj.put("env", JSONObject(srv.env))
+            }
+            servers.put(srv.id, obj)
+        }
+        return JSONObject().put("mcpServers", servers).toString(2)
     }
 
     fun toggleMcp(id: String, enabled: Boolean) {
@@ -127,10 +206,14 @@ class ExtensionRepository(
         return try {
             val raw = runtime.hubRequest("extensions/probeMcp", jsonOf("server" to server.toJson(), "secrets" to secrets), timeoutMs = 15_000)
             val tools = raw.arr("tools").strings()
+            val details = raw.arr("toolDetails").objects().map { o ->
+                McpToolInfo(name = o.optString("name"), description = o.optString("description"))
+            }.filter { it.name.isNotBlank() }.ifEmpty { tools.map { McpToolInfo(it) } }
             val res = McpProbeResult(
                 ok = raw.optBoolean("ok"),
                 latencyMs = raw.optInt("latencyMs"),
                 tools = tools,
+                toolDetails = details,
                 message = raw.str("message") ?: raw.str("error") ?: if (raw.optBoolean("ok")) "连通正常" else "连接失败",
             )
             probesFlow.value = probesFlow.value + (server.id to res)
@@ -168,7 +251,14 @@ class ExtensionRepository(
         }
     }
 
-    suspend fun saveLocalSkill(id: String?, name: String, description: String, body: String, targets: List<String> = listOf("all")) = skillMutex.withLock {
+    suspend fun saveLocalSkill(
+        id: String?,
+        name: String,
+        description: String,
+        body: String,
+        targets: List<String> = listOf("all"),
+        scope: String = "global",
+    ) = skillMutex.withLock {
         check(runtime.hubAvailable) { "请先启动本地运行环境" }
         val res = runtime.hubRequest("extensions/saveSkill", jsonOf("id" to id, "name" to name, "description" to description, "body" to body), timeoutMs = 15_000)
         val savedId = res.getString("id")
@@ -183,12 +273,47 @@ class ExtensionRepository(
             source = existing?.source ?: "local",
             sourceUrl = existing?.sourceUrl,
             enabled = existing?.enabled ?: true,
-            scope = existing?.scope ?: "global",
+            scope = scope.ifBlank { existing?.scope ?: "global" },
             targets = targets.ifEmpty { existing?.targets ?: listOf("all") },
             pluginId = existing?.pluginId,
         )
         commit { reg -> reg.copy(skills = reg.skills.filterNot { it.id == savedId } + skill) }
         onNotify("已保存技能：${skill.name}")
+    }
+
+    /** 解析完整 SKILL.md（含 YAML Frontmatter）并保存为托管技能。 */
+    suspend fun importSkillFromMarkdown(rawMarkdown: String, fallbackName: String = "custom-skill") {
+        val text = rawMarkdown.replace("\r\n", "\n").trim()
+        require(text.isNotBlank()) { "SKILL.md 内容为空" }
+        val fmMatch = Regex("^---\\n([\\s\\S]*?)\\n---\\n?([\\s\\S]*)$").find(text)
+        var name = fallbackName
+        var desc = ""
+        var body = text
+        if (fmMatch != null) {
+            body = fmMatch.groupValues[2].trim()
+            fmMatch.groupValues[1].lineSequence().forEach { line ->
+                val i = line.indexOf(':')
+                if (i > 0) {
+                    val k = line.substring(0, i).trim().lowercase()
+                    val v = line.substring(i + 1).trim().trim('"', '\'')
+                    if (k == "name" && v.isNotBlank()) name = v
+                    if (k == "description" && v.isNotBlank()) desc = v
+                }
+            }
+        }
+        saveLocalSkill(id = null, name = name, description = desc, body = body.ifBlank { text })
+    }
+
+    suspend fun listSkillFiles(dirPath: String): List<SkillCompanionFile> {
+        if (!runtime.hubAvailable || dirPath.isBlank()) return emptyList()
+        val res = runtime.hubRequest("extensions/listSkillFiles", jsonOf("dirPath" to dirPath), timeoutMs = 10_000)
+        return res.arr("files").objects().map { o ->
+            SkillCompanionFile(
+                relPath = o.optString("relPath"),
+                absPath = o.optString("absPath"),
+                size = o.optLong("size", 0L),
+            )
+        }.filter { it.relPath.isNotBlank() }
     }
 
     suspend fun importSkillFromGitHub(url: String) = skillMutex.withLock {
@@ -257,6 +382,13 @@ class ExtensionRepository(
             )
         }
         onNotify("已安装插件包：${plugin.name}（${mcps.size} MCP · ${skills.size} 技能）")
+    }
+
+    fun saveLocalPluginPack(plugin: ManagedPlugin) {
+        commit { reg ->
+            reg.copy(plugins = reg.plugins.filterNot { it.id == plugin.id } + plugin)
+        }
+        onNotify("已保存插件包：${plugin.name}")
     }
 
     fun togglePlugin(pluginId: String, enabled: Boolean) {
@@ -384,164 +516,49 @@ class ExtensionRepository(
         return runtime.hubRequest("plugins/exportBundle", jsonOf("pluginId" to pluginId), timeoutMs = 15_000)
     }
 
-    // ── 统一共享资源仓库（上传 AI 安全审查 + 验真下载安装） ──────────────────
-
-    suspend fun refreshCommunityRegistry(kind: String = "all", query: String = ""): CommunityRegistrySnapshot {
-        if (!runtime.hubAvailable) return communityRegistryFlow.value
-        val res = runtime.hubRequest("registry/list", jsonOf("kind" to kind, "query" to query), timeoutMs = 20_000)
-        val snap = CommunityRegistrySnapshot.fromJson(res)
-        communityRegistryFlow.value = snap
+    /** 导入本地/JSON 导出的 Host 插件包（经清单与静态安全门禁校验后热激活）。 */
+    suspend fun importLocalHostPluginBundle(rawJson: String): HostPluginSnapshot {
+        check(runtime.hubAvailable) { "运行环境未就绪" }
+        val root = JSONObject(rawJson.trim())
+        val payload = root.optJSONObject("payload") ?: root
+        require(payload.optJSONObject("manifest") != null) { "JSON 中缺少 manifest 字段" }
+        val snapJson = runtime.hubRequest("plugins/installBundle", payload, timeoutMs = 20_000)
+        val snap = HostPluginSnapshot.fromJson(snapJson)
+        hostPluginsFlow.value = snap
+        onNotify("已通过安全检查并导入 Host 插件")
         return snap
     }
 
-    suspend fun saveCommunityRegistryConfig(patch: JSONObject): CommunityRegistrySnapshot {
-        check(runtime.hubAvailable) { "运行环境未就绪" }
-        runtime.hubRequest("registry/saveConfig", patch, timeoutMs = 12_000)
-        val snap = refreshCommunityRegistry()
-        onNotify("已保存共享仓库与 AI 审查配置")
-        return snap
-    }
+    /** 导出全部托管资源库配置（指令/MCP/子代理/钩子/插件包元信息，不含加密密钥明文）。 */
+    fun exportAllExtensionsJson(): String = JSONObject()
+        .put("format", "solbraid-extensions-v1")
+        .put("exportedAt", System.currentTimeMillis())
+        .put("registry", registryFlow.value.toJson())
+        .toString(2)
 
-    suspend fun previewCommunityAudit(bundle: JSONObject): CommunitySubmitResult {
-        check(runtime.hubAvailable) { "运行环境未就绪" }
-        val res = runtime.hubRequest("registry/previewAudit", jsonOf("bundle" to bundle), timeoutMs = 45_000)
-        return CommunitySubmitResult(
-            status = res.optString("status", "rejected"),
-            audit = ResourceAuditReport.fromJson(res.optJSONObject("audit")),
-        )
-    }
-
-    suspend fun testCommunityReviewer(): JSONObject {
-        check(runtime.hubAvailable) { "运行环境未就绪" }
-        return runtime.hubRequest("registry/testReviewer", JSONObject(), timeoutMs = 40_000)
-    }
-
-    suspend fun submitToCommunityRegistry(bundle: JSONObject): CommunitySubmitResult {
-        check(runtime.hubAvailable) { "运行环境未就绪" }
-        val res = runtime.hubRequest("registry/submit", jsonOf("bundle" to bundle), timeoutMs = 60_000)
-        val result = CommunitySubmitResult(
-            status = res.optString("status", "rejected"),
-            audit = ResourceAuditReport.fromJson(res.optJSONObject("audit")),
-            bundlePath = res.optString("bundlePath"),
-            prHint = res.optString("prHint"),
-            prUrl = res.optString("prUrl"),
-            prNumber = res.optInt("prNumber", 0),
-        )
-        runCatching { refreshCommunityRegistry() }
-        return result
-    }
-
-    suspend fun removeCommunityResource(id: String, kind: String) {
-        check(runtime.hubAvailable) { "运行环境未就绪" }
-        runtime.hubRequest("registry/remove", jsonOf("id" to id, "kind" to kind), timeoutMs = 15_000)
-        runCatching { refreshCommunityRegistry() }
-        onNotify("已从共享仓库下架")
-    }
-
-    suspend fun downloadAndInstallCommunityResource(item: CommunityResourceItem) {
-        check(runtime.hubAvailable) { "运行环境未就绪" }
-        val res = runtime.hubRequest("registry/download", jsonOf("id" to item.id, "kind" to item.kind), timeoutMs = 30_000)
-        val bundle = res.optJSONObject("bundle") ?: error("下载的资源包为空")
-        val payload = bundle.optJSONObject("payload") ?: JSONObject()
-        val kind = bundle.optString("kind", item.kind)
-        val resId = bundle.optString("id", item.id)
-        val resName = bundle.optString("name", item.name)
-        when (kind) {
-            "instruction" -> upsertInstruction(
-                ManagedInstruction(
-                    id = resId,
-                    title = payload.optString("title", resName),
-                    content = payload.optString("content"),
-                    enabled = true,
-                    targets = payload.arr("targets").strings().ifEmpty { listOf("all") },
-                ),
-            )
-            "mcp" -> upsertMcp(
-                ManagedMcpServer(
-                    id = resId,
-                    name = payload.optString("name", resName),
-                    transport = payload.optString("transport", "stdio"),
-                    command = payload.str("command"),
-                    args = payload.arr("args").strings(),
-                    url = payload.str("url"),
-                    env = payload.optJSONObject("env")?.let { e -> buildMap { e.keys().forEach { k -> put(k, e.optString(k)) } } } ?: emptyMap(),
-                    secretEnvKeys = payload.arr("secretEnvKeys").strings(),
-                    headers = payload.optJSONObject("headers")?.let { h -> buildMap { h.keys().forEach { k -> put(k, h.optString(k)) } } } ?: emptyMap(),
-                    secretHeaderKeys = payload.arr("secretHeaderKeys").strings(),
-                    enabled = true,
-                    targets = payload.arr("targets").strings().ifEmpty { listOf("all") },
-                ),
-            )
-            "skill" -> saveLocalSkill(
-                id = resId,
-                name = payload.optString("name", resName),
-                description = payload.optString("description", item.description),
-                body = payload.optString("body"),
-                targets = payload.arr("targets").strings().ifEmpty { listOf("all") },
-            )
-            "subagent" -> upsertSubagent(
-                ManagedSubagent(
-                    id = resId,
-                    name = payload.optString("name", resName),
-                    description = payload.optString("description", item.description),
-                    model = payload.optString("model"),
-                    prompt = payload.optString("prompt"),
-                    enabled = true,
-                    targets = payload.arr("targets").strings().ifEmpty { listOf("all") },
-                ),
-            )
-            "hook" -> upsertHook(
-                ManagedHook(
-                    id = resId,
-                    name = payload.optString("name", resName),
-                    event = payload.optString("event", "PostToolUse"),
-                    matcher = payload.optString("matcher", "*"),
-                    command = payload.optString("command"),
-                    enabled = true,
-                    targets = payload.arr("targets").strings().ifEmpty { listOf("all") },
-                ),
-            )
-            "host_plugin" -> {
-                val snapJson = runtime.hubRequest("plugins/installBundle", payload, timeoutMs = 20_000)
-                hostPluginsFlow.value = HostPluginSnapshot.fromJson(snapJson)
-                onNotify("已验真并激活 Host 插件：$resName")
+    /** 合并导入资源库备份 JSON（同名覆盖、异名保留，绝不覆盖加密密钥）。 */
+    fun importAllExtensionsJson(rawJson: String): String {
+        val root = JSONObject(rawJson.trim())
+        val regObj = root.optJSONObject("registry") ?: root
+        val incoming = ExtensionRegistry.fromJson(regObj.toString())
+        val importedCnt = incoming.instructions.size + incoming.mcpServers.size + incoming.subagents.size + incoming.hooks.size + incoming.plugins.size
+        require(importedCnt > 0) { "未在备份 JSON 中找到可导入的资源项" }
+        commit { cur ->
+            fun <T> mergeById(old: List<T>, add: List<T>, idOf: (T) -> String): List<T> {
+                val addIds = add.map(idOf).toSet()
+                return old.filterNot { idOf(it) in addIds } + add
             }
-            "plugin_pack" -> {
-                val rawSkills = payload.arr("skills").objects().map { ManagedSkill.fromJson(it).copy(source = "plugin", pluginId = resId) }
-                val rawMcps = payload.arr("mcpServers").objects().map { ManagedMcpServer.fromJson(it).copy(pluginId = resId) }
-                val rawCmds = payload.arr("commands").objects().map(PluginCommand::fromJson)
-                val rawSecrets = payload.arr("requiredSecrets").objects().map(PluginSecretSpec::fromJson)
-                val installedSkills = if (rawSkills.isNotEmpty()) {
-                    val skillsJson = JSONArray().apply { rawSkills.forEach { put(it.toJson()) } }
-                    val installRes = runtime.hubRequest("extensions/installBuiltinPlugin", jsonOf("pluginId" to resId, "skills" to skillsJson), timeoutMs = 20_000)
-                    installRes.arr("skills").objects().map { obj ->
-                        val s = ManagedSkill.fromJson(obj)
-                        val orig = rawSkills.firstOrNull { it.name == s.name }
-                        s.copy(body = orig?.body ?: s.body, source = "plugin", pluginId = resId)
-                    }
-                } else emptyList()
-                val plugin = ManagedPlugin(
-                    id = resId,
-                    name = resName,
-                    version = item.version,
-                    description = item.description,
-                    source = "community",
-                    enabled = true,
-                    requiredSecrets = rawSecrets,
-                    commands = rawCmds,
-                )
-                commit { reg ->
-                    reg.copy(
-                        plugins = reg.plugins.filterNot { it.id == resId } + plugin,
-                        mcpServers = reg.mcpServers.filterNot { it.pluginId == resId } + rawMcps,
-                        skills = reg.skills.filterNot { it.pluginId == resId } + installedSkills,
-                    )
-                }
-                onNotify("已验真并安装插件包：$resName")
-            }
-            else -> error("未知资源类型：$kind")
+            cur.copy(
+                instructions = mergeById(cur.instructions, incoming.instructions) { it.id },
+                mcpServers = mergeById(cur.mcpServers, incoming.mcpServers) { it.id },
+                subagents = mergeById(cur.subagents, incoming.subagents) { it.id },
+                hooks = mergeById(cur.hooks, incoming.hooks) { it.id },
+                plugins = mergeById(cur.plugins, incoming.plugins) { it.id },
+            )
         }
-        runCatching { refreshCommunityRegistry() }
+        val summary = "指令 ${incoming.instructions.size} · MCP ${incoming.mcpServers.size} · 子代理 ${incoming.subagents.size} · 钩子 ${incoming.hooks.size}"
+        onNotify("已导入资源库：$summary")
+        return summary
     }
 
     suspend fun setHostPluginSafeMode(enabled: Boolean): HostPluginSnapshot {
@@ -610,11 +627,23 @@ class ExtensionRepository(
         return snap
     }
 
-    suspend fun createLocalHostPlugin(id: String, name: String, description: String): HostPluginSnapshot {
+    suspend fun createLocalHostPlugin(
+        id: String,
+        name: String,
+        description: String,
+        executionTier: String = "worker-isolated",
+        template: String = "basic",
+    ): HostPluginSnapshot {
         check(runtime.hubAvailable) { "运行环境未就绪" }
         val res = runtime.hubRequest(
             "plugins/createLocal",
-            jsonOf("id" to id.trim(), "name" to name.trim(), "description" to description.trim()),
+            jsonOf(
+                "id" to id.trim(),
+                "name" to name.trim(),
+                "description" to description.trim(),
+                "executionTier" to executionTier,
+                "template" to template,
+            ),
             timeoutMs = 15_000,
         )
         val snap = HostPluginSnapshot.fromJson(res)
@@ -731,11 +760,39 @@ class ExtensionRepository(
             ?.commands?.firstOrNull { it.name == cmdName }?.promptTemplate
     }
 
-    // ── 全局指令集（CLAUDE.md / AGENTS.md / GEMINI.md） ─────────────────────
+    // ── 全局/项目级指令集（CLAUDE.md / AGENTS.md / GEMINI.md） ──────────────
 
     fun upsertInstruction(item: ManagedInstruction) {
-        commit { reg -> reg.copy(instructions = reg.instructions.filterNot { it.id == item.id } + item) }
+        commit { reg ->
+            val exists = reg.instructions.any { it.id == item.id }
+            val nextItem = if (exists || item.priority != 0) item else item.copy(priority = reg.instructions.size)
+            val updated = if (exists) reg.instructions.map { if (it.id == item.id) nextItem else it } else reg.instructions + nextItem
+            reg.copy(instructions = updated.sortedBy { it.priority })
+        }
         onNotify("已保存指令：${item.title}")
+    }
+
+    fun reorderInstruction(id: String, moveUp: Boolean) {
+        commit { reg ->
+            val list = reg.instructions.sortedBy { it.priority }.toMutableList()
+            val idx = list.indexOfFirst { it.id == id }
+            if (idx < 0) return@commit reg
+            val targetIdx = if (moveUp) idx - 1 else idx + 1
+            if (targetIdx !in list.indices) return@commit reg
+            val item = list.removeAt(idx)
+            list.add(targetIdx, item)
+            reg.copy(instructions = list.mapIndexed { i, v -> v.copy(priority = i) })
+        }
+    }
+
+    fun duplicateInstruction(id: String) {
+        val src = registryFlow.value.instructions.firstOrNull { it.id == id } ?: return
+        val copy = src.copy(
+            id = "inst-${System.currentTimeMillis().toString(36)}",
+            title = "${src.title} 副本",
+            priority = registryFlow.value.instructions.size,
+        )
+        upsertInstruction(copy)
     }
 
     fun toggleInstruction(id: String, enabled: Boolean) {
@@ -754,6 +811,60 @@ class ExtensionRepository(
         onNotify("已保存子代理：${item.name}")
     }
 
+    fun duplicateSubagent(id: String) {
+        val src = registryFlow.value.subagents.firstOrNull { it.id == id } ?: return
+        val suffix = System.currentTimeMillis().toString(36).takeLast(4)
+        upsertSubagent(src.copy(id = "${src.id}-$suffix", name = "${src.name}-copy"))
+    }
+
+    /** 从带 YAML Frontmatter 的 Markdown 文本导入子代理定义。 */
+    fun importSubagentFromMarkdown(rawMd: String) {
+        val text = rawMd.replace("\r\n", "\n").trim()
+        require(text.isNotBlank()) { "Markdown 内容为空" }
+        val fm = Regex("^---\\n([\\s\\S]*?)\\n---\\n?([\\s\\S]*)$").find(text)
+        var name = "custom-agent"
+        var desc = ""
+        var model = ""
+        var tools = emptyList<String>()
+        var disallowed = emptyList<String>()
+        var permMode = ""
+        var maxTurns = 0
+        var prompt = text
+        if (fm != null) {
+            prompt = fm.groupValues[2].trim()
+            fm.groupValues[1].lineSequence().forEach { line ->
+                val i = line.indexOf(':')
+                if (i > 0) {
+                    val k = line.substring(0, i).trim().lowercase()
+                    val v = line.substring(i + 1).trim().trim('"', '\'')
+                    when (k) {
+                        "name" -> if (v.isNotBlank()) name = v
+                        "description" -> desc = v
+                        "model" -> model = v
+                        "tools" -> tools = v.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+                        "disallowedtools", "disallowed_tools" -> disallowed = v.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+                        "permissionmode", "permission_mode" -> permMode = v
+                        "maxturns", "max_turns" -> maxTurns = v.toIntOrNull() ?: 0
+                    }
+                }
+            }
+        }
+        val slug = name.lowercase().replace(Regex("[^a-z0-9_-]+"), "-").trim('-').ifBlank { "sub-${System.currentTimeMillis().toString(36)}" }
+        upsertSubagent(
+            ManagedSubagent(
+                id = slug,
+                name = name,
+                description = desc,
+                model = model,
+                prompt = prompt.ifBlank { text },
+                tools = tools,
+                disallowedTools = disallowed,
+                permissionMode = permMode,
+                maxTurns = maxTurns,
+            ),
+        )
+    }
+
     fun toggleSubagent(id: String, enabled: Boolean) {
         commit { reg -> reg.copy(subagents = reg.subagents.map { if (it.id == id) it.copy(enabled = enabled) else it }) }
     }
@@ -770,12 +881,54 @@ class ExtensionRepository(
         onNotify("已保存钩子：${item.name}")
     }
 
+    fun duplicateHook(id: String) {
+        val src = registryFlow.value.hooks.firstOrNull { it.id == id } ?: return
+        upsertHook(src.copy(id = "hook-${System.currentTimeMillis().toString(36)}", name = "${src.name} 副本", enabled = false))
+    }
+
     fun toggleHook(id: String, enabled: Boolean) {
         commit { reg -> reg.copy(hooks = reg.hooks.map { if (it.id == id) it.copy(enabled = enabled) else it }) }
     }
 
     fun deleteHook(id: String) {
+        hookTestsFlow.value = hookTestsFlow.value - id
         commit { reg -> reg.copy(hooks = reg.hooks.filterNot { it.id == id }) }
         onNotify("已删除钩子")
+    }
+
+    suspend fun testHook(hook: ManagedHook, cwd: String? = null): HookTestResult {
+        if (!runtime.hubAvailable) {
+            val res = HookTestResult(ok = false, stderr = "请先启动本地运行环境")
+            hookTestsFlow.value = hookTestsFlow.value + (hook.id to res)
+            return res
+        }
+        val effectiveCwd = if (hook.scope.startsWith("project:")) hook.scope.removePrefix("project:") else (cwd ?: settings.state.value.defaultCwd)
+        return try {
+            val raw = runtime.hubRequest(
+                "extensions/testHook",
+                jsonOf(
+                    "event" to hook.event,
+                    "matcher" to hook.matcher,
+                    "command" to hook.command,
+                    "cwd" to effectiveCwd,
+                    "timeoutSec" to hook.timeoutSec.coerceAtMost(15),
+                ),
+                timeoutMs = 20_000,
+            )
+            val res = HookTestResult(
+                ok = raw.optBoolean("ok"),
+                exitCode = raw.optInt("exitCode", -1),
+                blocked = raw.optBoolean("blocked"),
+                latencyMs = raw.optInt("latencyMs"),
+                stdout = raw.optString("stdout"),
+                stderr = raw.optString("stderr"),
+            )
+            hookTestsFlow.value = hookTestsFlow.value + (hook.id to res)
+            res
+        } catch (e: Exception) {
+            val res = HookTestResult(ok = false, stderr = e.message ?: "试运行失败")
+            hookTestsFlow.value = hookTestsFlow.value + (hook.id to res)
+            res
+        }
     }
 }

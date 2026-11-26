@@ -31,7 +31,7 @@ const TOOLS = [
     description: "读取指定本地/社区/覆写插件的 solbraid-plugin.json 清单与全部源码文件；核心内核插件禁止覆写。",
     inputSchema: {
       type: "object",
-      properties: {pluginId: {type: "string", description: "目标插件 ID，例如 local.hello.kit 或 solbraid.builtin.workspace-inspector"}},
+      properties: {pluginId: {type: "string", description: "目标插件 ID，例如 local.hello.kit"}},
       required: ["pluginId"],
       additionalProperties: false,
     },

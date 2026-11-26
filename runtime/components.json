@@ -68,7 +68,6 @@
     "plugin-mcp.mjs",
     "plugin-worker-host.mjs",
     "ai-reviewer.mjs",
-    "community-registry.mjs",
     "download-network.mjs",
     "env-ssh-hub.mjs",
     "worktree-manager.mjs",
