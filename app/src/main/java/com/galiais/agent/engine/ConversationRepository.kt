@@ -69,9 +69,48 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val conversationsFlow = MutableStateFlow<Map<ConversationKey, ConversationState>>(emptyMap())
     val conversations: StateFlow<Map<ConversationKey, ConversationState>> = conversationsFlow.asStateFlow()
-    val summaries: StateFlow<List<ConversationSummary>> = conversationsFlow
-        .map { all -> all.values.map { it.summary.copy(running = it.running) }.sortedByDescending { it.updatedAt } }
-        .stateIn(scope, SharingStarted.Eagerly, emptyList())
+    private val summariesFlow = MutableStateFlow<List<ConversationSummary>>(emptyList())
+    val summaries: StateFlow<List<ConversationSummary>> = summariesFlow.asStateFlow()
+    private val loadingJobs = mutableMapOf<ConversationKey, Job>()
+    private val loadedOrder = LinkedHashSet<ConversationKey>()
+    @Volatile private var activeConversationKey: ConversationKey? = null
+
+    private fun publishConversations(next: Map<ConversationKey, ConversationState>, syncSummaryList: Boolean = true) {
+        conversationsFlow.value = next
+        if (syncSummaryList) {
+            val sorted = next.values.map { it.summary.copy(running = it.running) }.sortedByDescending { it.updatedAt }
+            if (sorted != summariesFlow.value) summariesFlow.value = sorted
+        }
+    }
+
+    fun setActiveConversation(key: ConversationKey?) {
+        activeConversationKey = key
+        if (key != null) {
+            loadedOrder.remove(key)
+            loadedOrder.add(key)
+        }
+    }
+
+    private fun recordLoadedAndEvictIfNeeded(key: ConversationKey) {
+        loadedOrder.remove(key)
+        loadedOrder.add(key)
+        val maxInRam = 6
+        if (loadedOrder.size <= maxInRam) return
+        val current = conversationsFlow.value
+        val toEvict = loadedOrder.filter { k ->
+            k != key && k != activeConversationKey && current[k]?.loaded == true && current[k]?.running != true
+        }.take((loadedOrder.size - maxInRam).coerceAtLeast(0))
+        if (toEvict.isEmpty()) return
+        val next = current.toMutableMap()
+        var evictedAny = false
+        for (k in toEvict) {
+            val st = next[k] ?: continue
+            next[k] = st.copy(items = emptyList(), loaded = false)
+            loadedOrder.remove(k)
+            evictedAny = true
+        }
+        if (evictedAny) publishConversations(next, syncSummaryList = false)
+    }
     private val requestsFlow = MutableStateFlow<List<PendingRequest>>(emptyList())
     val requests: StateFlow<List<PendingRequest>> = requestsFlow.asStateFlow()
     private val messageFlow = MutableSharedFlow<String>(
@@ -119,7 +158,8 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
                 if (snapshot.ready && !wasReady) {
                     wasReady = true
                     if (lastReadyMode != null && lastReadyMode != snapshot.mode) {
-                        conversationsFlow.value = emptyMap()
+                        loadingJobs.values.forEach { it.cancel() }; loadingJobs.clear(); loadedOrder.clear()
+                        publishConversations(emptyMap())
                         arenaGroupsFlow.value = emptyMap()
                         requestsFlow.value = emptyList()
                     }
@@ -182,10 +222,12 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
                     requestsFlow.value = emptyList()
                     val modeChanged = lastReadyMode != null && settings.state.value.effectiveRuntimeMode != lastReadyMode
                     if (modeChanged) {
-                        conversationsFlow.value = emptyMap()
+                        loadingJobs.values.forEach { it.cancel() }; loadingJobs.clear(); loadedOrder.clear()
+                        publishConversations(emptyMap())
                         arenaGroupsFlow.value = emptyMap()
                     } else {
-                        conversationsFlow.value = conversationsFlow.value.mapValues { it.value.copy(running = false, activeTurnId = null, loaded = false) }
+                        loadingJobs.values.forEach { it.cancel() }; loadingJobs.clear(); loadedOrder.clear()
+                        publishConversations(conversationsFlow.value.mapValues { it.value.copy(running = false, activeTurnId = null, loaded = false) })
                     }
                 }
             }
@@ -194,10 +236,13 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
             requestsFlow.collect { list -> syncApprovalNotification(list) }
         }
         scope.launch {
-            conversationsFlow
-                .map { all -> all.values.any { it.running } }
+            kotlinx.coroutines.flow.combine(
+                conversationsFlow.map { all -> all.values.any { it.running } }.distinctUntilChanged(),
+                envSsh.nativeTerminals.hasActiveSession,
+                envSsh.activeTunnels.map { list -> list.any { it.status == "running" } }.distinctUntilChanged(),
+            ) { anyTurn, anyTerm, anyTunnel -> anyTurn || anyTerm || anyTunnel }
                 .distinctUntilChanged()
-                .collect { anyRunning -> runtime.setActiveTurnRunning(anyRunning) }
+                .collect { keepAlive -> runtime.setActiveTurnRunning(keepAlive) }
         }
     }
 
@@ -295,7 +340,7 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
                         merged[summary.key] = existing?.copy(summary = summary.copy(parent = summary.parent ?: existing.summary.parent))
                             ?: initialState(summary).copy(running = summary.running)
                     }
-                    conversationsFlow.value = merged
+                    publishConversations(merged)
                 }
                 if (runtime.snapshot.value.ready && runtime.isServiceReady && runtime.hubAvailable) {
                     val hubListed = try { hub.listAllSessions() }
@@ -312,7 +357,7 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
                             merged[summary.key] = existing?.copy(summary = summary.copy(parent = summary.parent ?: existing.summary.parent))
                                 ?: initialState(summary).copy(running = summary.running)
                         }
-                        conversationsFlow.value = merged
+                        publishConversations(merged)
                     }
                 }
             } finally {
@@ -419,8 +464,8 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
             changed = true
         }
         if (changed) {
-            // 流式增量不改写 summary.updatedAt，避免触发后台会话列表高频重排
-            conversationsFlow.value = current + (key to existing.copy(items = items))
+            // 流式增量绝不触碰 summariesFlow，杜绝 20fps 后台会话列表重排与重组
+            publishConversations(current + (key to existing.copy(items = items)), syncSummaryList = false)
         }
     }
 
@@ -439,12 +484,16 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
         val existing = current[key] ?: initialState(ConversationSummary(key, "新会话", "", null, System.currentTimeMillis()))
         val next = block(existing)
         if (next === existing) return
-        conversationsFlow.value = current + (key to next)
+        val summaryChanged = existing.summary != next.summary || existing.running != next.running || !current.containsKey(key)
+        publishConversations(current + (key to next), syncSummaryList = summaryChanged)
+        if (next.loaded && !existing.loaded) recordLoadedAndEvictIfNeeded(key)
     }
 
     fun remove(key: ConversationKey) {
         pendingDeltas.remove(key)
-        conversationsFlow.value = conversationsFlow.value - key
+        loadingJobs.remove(key)?.cancel()
+        loadedOrder.remove(key)
+        publishConversations(conversationsFlow.value - key)
         requestsFlow.value = requestsFlow.value.filter { it.conversation != key }
         arenaGroupsFlow.value = arenaGroupsFlow.value.mapValues { it.value - key }.filterValues { it.size > 1 }
     }
@@ -628,8 +677,19 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
 
     fun open(key: ConversationKey) {
         val state = state(key)
-        if (state?.loaded == true) return
-        launchOperation("打开会话失败") { adapter(key.engine).load(key) }
+        if (state?.loaded == true) {
+            recordLoadedAndEvictIfNeeded(key)
+            return
+        }
+        if (loadingJobs[key]?.isActive == true) return
+        val job = launchOperation("打开会话失败") {
+            try {
+                adapter(key.engine).load(key)
+            } finally {
+                loadingJobs.remove(key)
+            }
+        }
+        loadingJobs[key] = job
     }
 
     private val initialDrafts = mutableMapOf<ConversationKey, String>()

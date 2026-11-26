@@ -24,6 +24,8 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.PlatformTextStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -91,9 +93,12 @@ fun AgentAppIcon(
             Text(
                 text = initial,
                 color = Color.White,
-                fontWeight = FontWeight.Bold,
-                fontSize = (size.value * 0.46f).sp,
-                lineHeight = (size.value * 0.46f).sp,
+                style = TextStyle(
+                    fontWeight = FontWeight.Bold,
+                    fontSize = (size.value * 0.46f).sp,
+                    lineHeight = (size.value * 0.46f).sp,
+                    platformStyle = PlatformTextStyle(includeFontPadding = false),
+                ),
             )
         }
     }

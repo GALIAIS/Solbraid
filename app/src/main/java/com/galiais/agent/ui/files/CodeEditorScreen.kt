@@ -37,6 +37,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -100,6 +101,7 @@ import com.galiais.agent.ui.Mono
 import com.galiais.agent.ui.PrimaryPillButton
 import com.galiais.agent.ui.RPrefs
 import com.galiais.agent.ui.SecondaryPillButton
+import com.galiais.agent.ui.SyncFullscreenDialogWindow
 import com.galiais.agent.ui.SyntaxHighlight
 import com.galiais.agent.ui.TagPill
 import com.galiais.agent.ui.galiaisTextFieldColors
@@ -615,6 +617,7 @@ fun CodeEditorDialog(
             decorFitsSystemWindows = false,
         ),
     ) {
+        SyncFullscreenDialogWindow()
         Surface(color = G.canvas, modifier = Modifier.fillMaxSize()) {
             Column(
                 Modifier
@@ -694,13 +697,13 @@ fun CodeEditorDialog(
                     }
                     Box {
                         IconButton(onClick = { showEditorMenu = true }, modifier = Modifier.size(36.dp)) {
-                            Icon(GaliaisIcons.MoreHoriz, contentDescription = "编辑器工具", tint = G.inkMuted, modifier = Modifier.size(20.dp))
+                            Icon(GaliaisIcons.MoreHoriz, contentDescription = "编辑器工具", tint = G.inkMuted, modifier = Modifier.size(18.dp))
                         }
                         GaliaisDropdownMenu(expanded = showEditorMenu, onDismissRequest = { showEditorMenu = false }) {
                             Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                 if (!largeFileMode) {
                                     if (redoStack.isNotEmpty()) {
-                                        GaliaisMenuRow("重做编辑", icon = GaliaisIcons.Refresh, onClick = {
+                                        GaliaisMenuRow("重做编辑", icon = GaliaisIcons.Redo, onClick = {
                                             showEditorMenu = false
                                             val next = redoStack.removeAt(redoStack.lastIndex)
                                             undoStack.add(field)
@@ -711,12 +714,12 @@ fun CodeEditorDialog(
                                     GaliaisMenuRow("跳转至指定行", icon = GaliaisIcons.Search, onClick = { showEditorMenu = false; showGoToLine = true })
                                     GaliaisMenuRow(
                                         title = if (prefs.fileEditorWordWrap) "关闭自动换行（显示行号）" else "开启自动换行",
-                                        icon = GaliaisIcons.FileLines,
+                                        icon = GaliaisIcons.WrapText,
                                         onClick = { showEditorMenu = false; app.settings.setFileEditorWordWrap(!prefs.fileEditorWordWrap) },
                                     )
                                     GaliaisMenuRow(
                                         title = "切换字号（当前 ${(fontScale * 100).toInt()}%）",
-                                        icon = GaliaisIcons.Edit,
+                                        icon = GaliaisIcons.FontSize,
                                         onClick = {
                                             showEditorMenu = false
                                             fontScale = when {
@@ -833,21 +836,33 @@ fun CodeEditorDialog(
                                     textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = Mono),
                                     modifier = Modifier.weight(1f),
                                 )
-                                TagPill("↑", fg = G.ink, bg = G.surfaceSubtle, border = G.border, onClick = if (matches.isNotEmpty()) ({
-                                    activeMatchIdx = if (activeMatchIdx <= 0) matches.lastIndex else activeMatchIdx - 1
-                                    val r = matches[activeMatchIdx]
-                                    val targetLine = field.text.substring(0, r.first).count { it == '\n' } + 1
-                                    field = field.copy(selection = TextRange(r.first, r.last + 1))
-                                    scope.launch { vScroll.animateScrollTo(((targetLine - 3).coerceAtLeast(0) * editorLineHeightPx).toInt()) }
-                                }) else null)
-                                TagPill("↓", fg = G.ink, bg = G.surfaceSubtle, border = G.border, onClick = if (matches.isNotEmpty()) ({
-                                    activeMatchIdx = if (activeMatchIdx >= matches.lastIndex) 0 else activeMatchIdx + 1
-                                    val r = matches[activeMatchIdx]
-                                    val targetLine = field.text.substring(0, r.first).count { it == '\n' } + 1
-                                    field = field.copy(selection = TextRange(r.first, r.last + 1))
-                                    scope.launch { vScroll.animateScrollTo(((targetLine - 3).coerceAtLeast(0) * editorLineHeightPx).toInt()) }
-                                }) else null)
-                                IconButton(onClick = { showFindBar = false }, modifier = Modifier.size(30.dp)) {
+                                IconButton(
+                                    enabled = matches.isNotEmpty(),
+                                    onClick = {
+                                        activeMatchIdx = if (activeMatchIdx <= 0) matches.lastIndex else activeMatchIdx - 1
+                                        val r = matches[activeMatchIdx]
+                                        val targetLine = field.text.substring(0, r.first).count { it == '\n' } + 1
+                                        field = field.copy(selection = TextRange(r.first, r.last + 1))
+                                        scope.launch { vScroll.animateScrollTo(((targetLine - 3).coerceAtLeast(0) * editorLineHeightPx).toInt()) }
+                                    },
+                                    modifier = Modifier.size(32.dp),
+                                ) {
+                                    Icon(GaliaisIcons.ArrowUp, contentDescription = "上一个匹配", tint = if (matches.isNotEmpty()) G.ink else G.inkSubtle, modifier = Modifier.size(16.dp))
+                                }
+                                IconButton(
+                                    enabled = matches.isNotEmpty(),
+                                    onClick = {
+                                        activeMatchIdx = if (activeMatchIdx >= matches.lastIndex) 0 else activeMatchIdx + 1
+                                        val r = matches[activeMatchIdx]
+                                        val targetLine = field.text.substring(0, r.first).count { it == '\n' } + 1
+                                        field = field.copy(selection = TextRange(r.first, r.last + 1))
+                                        scope.launch { vScroll.animateScrollTo(((targetLine - 3).coerceAtLeast(0) * editorLineHeightPx).toInt()) }
+                                    },
+                                    modifier = Modifier.size(32.dp),
+                                ) {
+                                    Icon(GaliaisIcons.ArrowDown, contentDescription = "下一个匹配", tint = if (matches.isNotEmpty()) G.ink else G.inkSubtle, modifier = Modifier.size(16.dp))
+                                }
+                                IconButton(onClick = { showFindBar = false }, modifier = Modifier.size(32.dp)) {
                                     Icon(GaliaisIcons.Close, contentDescription = "关闭查找", tint = G.inkMuted, modifier = Modifier.size(16.dp))
                                 }
                             }
@@ -930,7 +945,17 @@ fun CodeEditorDialog(
                 }
 
                 // 主体编辑区（普通编辑态带行号、Gutter Diff 色条与窗口化高亮 / 超大文件对齐分页、流式搜索与局部窗口编辑）
-                if (largeFileMode) {
+                val initialLoading = loading && savedText.isEmpty() && largePage == null && error == null
+                if (initialLoading) {
+                    Surface(
+                        modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
+                        shape = D.codeShape,
+                        color = G.codeBg,
+                        border = BorderStroke(0.75.dp, G.codeBorder),
+                    ) {
+                        Box(Modifier.fillMaxSize())
+                    }
+                } else if (largeFileMode) {
                     val page = largePage
                     Column(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Surface(Modifier.fillMaxWidth(), shape = D.shape(10.dp), color = if (editingLargePage) G.accentContainer else G.warningTint) {
@@ -1073,8 +1098,10 @@ fun CodeEditorDialog(
                     val palette = D.code
                     val matchBg = G.warning.copy(alpha = 0.28f)
                     val activeMatchBg = G.accent.copy(alpha = 0.45f)
-                    // 依据垂直滚动位置估算可视区字符窗口（每 40 行量化步进，避免滚动每像素重复触发高亮）
-                    val scrollBucketLine = ((vScroll.value / editorLineHeightPx.coerceAtLeast(1f)).toInt() / 40) * 40
+                    // 依据垂直滚动位置估算可视区字符窗口（每 40 行量化步进，经 derivedStateOf 隔离避免滚动逐像素全屏重组）
+                    val scrollBucketLine by remember(editorLineHeightPx) {
+                        derivedStateOf { ((vScroll.value / editorLineHeightPx.coerceAtLeast(1f)).toInt() / 40) * 40 }
+                    }
                     val visibleCharWindow = remember(field.text.length, scrollBucketLine) {
                         if (field.text.length <= 40_000) 0 to field.text.length
                         else {

@@ -14,9 +14,8 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -62,6 +61,7 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
@@ -85,8 +85,10 @@ import com.galiais.agent.engine.LatexEngineStatus
 import com.galiais.agent.engine.VisualArtifactTemplate
 import com.galiais.agent.engine.WorkspaceFiles
 import com.galiais.agent.engine.visualArtifactTemplates
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+import java.net.URLEncoder
 
 private const val ARTIFACT_HOST = "artifact.solbraid.local"
 
@@ -177,6 +179,8 @@ fun ArtifactStudioSheet(
     savePath: String? = null,
     editableScratchpad: Boolean = false,
     pluginId: String? = null,
+    externalLoading: Boolean = false,
+    externalError: String? = null,
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -214,8 +218,9 @@ fun ArtifactStudioSheet(
     var consoleLogs by remember(current.id) { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
     var showConsole by remember(current.id) { mutableStateOf(false) }
     var renderNonce by remember { mutableIntStateOf(0) }
-    var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    val webViewHolder = remember { object { var view: WebView? = null; var seq = 0; var lastViewport = "auto" } }
     var pageLoaded by remember { mutableStateOf(false) }
+    var contentRendered by remember { mutableStateOf(false) }
     var latexStatus by remember { mutableStateOf<LatexEngineStatus?>(null) }
     var compilingNative by remember { mutableStateOf(false) }
     var compileLog by remember { mutableStateOf<String?>(null) }
@@ -254,6 +259,7 @@ fun ArtifactStudioSheet(
     val latestDark by rememberUpdatedState(dark)
     val latestViewport by rememberUpdatedState(viewport)
     val latestPalette by rememberUpdatedState(themePaletteJson)
+    val latestExternalLoading by rememberUpdatedState(externalLoading)
     val canvasArgb = G.canvas.toArgb()
 
     fun pushToWebView(
@@ -264,8 +270,8 @@ fun ArtifactStudioSheet(
         vp: String = latestViewport,
         force: Boolean = false,
     ) {
-        if (wv == null || !pageLoaded) return
-        val payload = JSONObject()
+        if (wv == null || !pageLoaded || latestExternalLoading) return
+        val basePayload = JSONObject()
             .put("id", art.id)
             .put("kind", art.kind.wire)
             .put("title", art.title)
@@ -274,33 +280,45 @@ fun ArtifactStudioSheet(
             .put("viewport", vp)
             .put("palette", latestPalette)
             .apply { if (!latestPluginId.isNullOrBlank()) put("pluginId", latestPluginId) }
-            .toString()
-        val tagKey = "$renderNonce:$payload"
+        val tagKey = "$renderNonce:${basePayload}"
         if (!force && wv.tag == tagKey) return
         wv.tag = tagKey
-        wv.evaluateJavascript("window.SolbraidStudio && window.SolbraidStudio.render($payload);", null)
+        val nextSeq = ++webViewHolder.seq
+        webViewHolder.lastViewport = vp
+        basePayload.put("renderSeq", nextSeq)
+        wv.evaluateJavascript("window.SolbraidStudio && window.SolbraidStudio.render($basePayload);", null)
     }
 
-    LaunchedEffect(pageLoaded, current.id, current.kind, current.title, editableContent, dark, renderNonce) {
-        if (pageLoaded) pushToWebView(webViewRef, current, editableContent, dark, viewport, force = false)
+    LaunchedEffect(pageLoaded, externalLoading, current.id, current.kind, current.title, editableContent, dark, renderNonce) {
+        if (pageLoaded && !externalLoading) pushToWebView(webViewHolder.view, current, editableContent, dark, viewport, force = false)
+    }
+
+    // 兜底：若极少数设备未触发 JS onRendered，确保 1.4s 后可见而非永久隐藏
+    LaunchedEffect(pageLoaded, externalLoading) {
+        if (pageLoaded && !externalLoading && !contentRendered) {
+            delay(1400)
+            contentRendered = true
+        }
     }
 
     // 视口切换直接走原地 CSS 切换，避免重载整个页面/iframe 引起闪烁
     LaunchedEffect(pageLoaded, viewport) {
-        val wv = webViewRef ?: return@LaunchedEffect
-        if (!pageLoaded) return@LaunchedEffect
+        val wv = webViewHolder.view ?: return@LaunchedEffect
+        if (!pageLoaded || webViewHolder.lastViewport == viewport) return@LaunchedEffect
+        webViewHolder.lastViewport = viewport
         wv.evaluateJavascript("window.SolbraidStudio && window.SolbraidStudio.setViewport(${JSONObject.quote(viewport)});", null)
     }
 
     // 单实例 WebView 仅在工作台关闭时销毁：切换产物 Tab 或「预览 ↔ 源码」彻底零重建、零闪屏
     DisposableEffect(Unit) {
         onDispose {
-            webViewRef?.let { wv ->
+            webViewHolder.view?.let { wv ->
                 wv.stopLoading()
                 wv.destroy()
             }
-            webViewRef = null
+            webViewHolder.view = null
             pageLoaded = false
+            contentRendered = false
         }
     }
 
@@ -312,15 +330,18 @@ fun ArtifactStudioSheet(
             decorFitsSystemWindows = false,
         ),
     ) {
+        SyncFullscreenDialogWindow(cCanvas)
         var moreActionsMenu by remember { mutableStateOf(false) }
         Surface(
-            modifier = Modifier
-                .fillMaxSize()
-                .statusBarsPadding()
-                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
+            modifier = Modifier.fillMaxSize(),
             color = G.canvas,
         ) {
-            Column(Modifier.fillMaxSize()) {
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .statusBarsPadding()
+                    .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
+            ) {
                 // 顶栏
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
@@ -400,9 +421,14 @@ fun ArtifactStudioSheet(
                             }
                             Hairline()
                         }
-                        Box(Modifier.weight(1f).fillMaxWidth()) {
+                        val webAlpha by animateFloatAsState(
+                            targetValue = if (contentRendered && !externalLoading && externalError == null) 1f else 0f,
+                            animationSpec = tween(90),
+                            label = "studioWebAlpha",
+                        )
+                        Box(Modifier.weight(1f).fillMaxWidth().background(cCanvas)) {
                             AndroidView(
-                                modifier = Modifier.fillMaxSize(),
+                                modifier = Modifier.fillMaxSize().alpha(webAlpha),
                                 factory = { ctx ->
                                     WebView(ctx).apply {
                                         setBackgroundColor(canvasArgb)
@@ -417,6 +443,15 @@ fun ArtifactStudioSheet(
                                         settings.loadWithOverviewMode = true
                                         addJavascriptInterface(
                                             object {
+                                                @JavascriptInterface
+                                                fun onRendered(seq: Int) {
+                                                    post {
+                                                        if (seq <= 0 || seq >= webViewHolder.seq) {
+                                                            contentRendered = true
+                                                        }
+                                                    }
+                                                }
+
                                                 @JavascriptInterface
                                                 fun onConsole(level: String, message: String) {
                                                     post {
@@ -491,23 +526,22 @@ fun ArtifactStudioSheet(
                                                 pushToWebView(view, force = true)
                                             }
                                         }
-                                        webViewRef = this
-                                        loadUrl("https://$ARTIFACT_HOST/artifact-viewer.html")
+                                        webViewHolder.view = this
+                                        val initBg = URLEncoder.encode(cCanvas.toCssHex(), "UTF-8")
+                                        loadUrl("https://$ARTIFACT_HOST/artifact-viewer.html?dark=${if (dark) 1 else 0}&bg=$initBg")
                                     }
                                 },
                                 update = { wv ->
-                                    webViewRef = wv
+                                    webViewHolder.view = wv
                                     wv.setBackgroundColor(canvasArgb)
                                     if (wv.visibility != View.VISIBLE) wv.visibility = View.VISIBLE
                                     wv.isEnabled = (tab == 0)
                                 },
                             )
-                            androidx.compose.animation.AnimatedVisibility(
-                                visible = !pageLoaded,
-                                exit = fadeOut(tween(110)),
-                                modifier = Modifier.fillMaxSize(),
-                            ) {
-                                Box(Modifier.fillMaxSize().background(cCanvas))
+                            if (externalError != null) {
+                                Box(Modifier.fillMaxSize().background(cCanvas).padding(20.dp), contentAlignment = Alignment.Center) {
+                                    CrispCard { Text(externalError, color = G.danger, style = MaterialTheme.typography.bodyMedium) }
+                                }
                             }
                         }
                     }
@@ -617,7 +651,7 @@ fun ArtifactStudioSheet(
                             text = "导出 PDF",
                             icon = GaliaisIcons.FileLines,
                             onClick = {
-                                val wv = webViewRef
+                                val wv = webViewHolder.view
                                 if (wv == null) {
                                     app.conversations.notify("预览视图尚未加载完成")
                                 } else {

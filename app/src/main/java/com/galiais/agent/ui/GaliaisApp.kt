@@ -18,15 +18,20 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
@@ -90,6 +95,7 @@ data class PendingCreate(val cwd: String, val referenceFile: String? = null, val
 private data class TerminalLaunchRequest(
     val cwd: String,
     val sshHost: SshHostConfig? = null,
+    val initialSessionId: String? = null,
     val onClosed: (() -> Unit)? = null,
 )
 
@@ -147,8 +153,8 @@ fun GaliaisApp(app: GaliaisApplication) {
     var pendingAddProject by remember { mutableStateOf(false) }
     var pendingBrowseDir by remember { mutableStateOf<String?>(null) }
     var terminalRequest by remember { mutableStateOf<TerminalLaunchRequest?>(null) }
-    val openTerminal: (cwd: String, sshHost: SshHostConfig?, onClosed: (() -> Unit)?) -> Unit = { cwd, sshHost, onClosed ->
-        terminalRequest = TerminalLaunchRequest(cwd, sshHost, onClosed)
+    val openTerminal: (cwd: String, sshHost: SshHostConfig?, initialSessionId: String?, onClosed: (() -> Unit)?) -> Unit = { cwd, sshHost, sessionId, onClosed ->
+        terminalRequest = TerminalLaunchRequest(cwd, sshHost, sessionId, onClosed)
         safeNavigate("terminal")
     }
 
@@ -199,88 +205,191 @@ fun GaliaisApp(app: GaliaisApplication) {
         ) {
             composable("home") {
                 BackHandler(enabled = tab != 0) { tab = 0 }
-                Scaffold(
-                    containerColor = Color.Transparent,
-                    modifier = Modifier.fillMaxSize().background(G.canvas).galiaisCanvasBackground(),
-                    snackbarHost = { GaliaisSnackbarHost(snackbar) },
-                    bottomBar = {
-                        GaliaisBottomBar(
-                            selectedIndex = tab,
-                            onSelect = { tab = it },
-                            onQuickCreate = {
-                                pendingAddProject = true
-                                tab = 0
-                            },
-                            extraTabLabels = extraNavLabels,
-                        )
-                    },
-                ) { padding ->
-                    val modifier = Modifier.padding(padding)
-                    Crossfade(targetState = tab, animationSpec = tween(140), label = "homeTabs") { currentTab ->
-                        tabStateHolder.SaveableStateProvider(currentTab) {
-                            when (currentTab) {
-                                0 -> PluginPageTakeoverHost(app = app, replaceSlotName = "home.replace", cwd = settings.defaultCwd, modifier = modifier) {
-                                    ConversationListScreen(
-                                        app = app,
-                                        modifier = modifier,
-                                        open = openConversation,
-                                        pendingCreate = pendingCreate,
-                                        onConsumePendingCreate = { pendingCreate = null },
-                                        pendingAddProject = pendingAddProject,
-                                        onConsumePendingAddProject = { pendingAddProject = false },
-                                        onOpenDirectory = { dir -> pendingBrowseDir = dir; tab = 2 },
-                                    )
+                val isFloatingNav = D.navBarStyle !in setOf("m3_expressive", "editorial_bar")
+                val density = LocalDensity.current
+                var floatingBarHeightDp by remember { mutableStateOf(82.dp) }
+                if (isFloatingNav) {
+                    // 悬浮式底栏：去除外围不透明裁切，让主内容区铺满整屏并穿透滚动至半透明悬浮底栏下方
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(G.canvas)
+                            .galiaisCanvasBackground(),
+                    ) {
+                        CompositionLocalProvider(LocalFloatingNavBottomInset provides floatingBarHeightDp) {
+                            val modifier = Modifier.fillMaxSize().statusBarsPadding()
+                            Crossfade(targetState = tab, animationSpec = tween(140), label = "homeTabs") { currentTab ->
+                                tabStateHolder.SaveableStateProvider(currentTab) {
+                                    when (currentTab) {
+                                        0 -> PluginPageTakeoverHost(app = app, replaceSlotName = "home.replace", cwd = settings.defaultCwd, modifier = modifier) {
+                                            ConversationListScreen(
+                                                app = app,
+                                                modifier = modifier,
+                                                open = openConversation,
+                                                pendingCreate = pendingCreate,
+                                                onConsumePendingCreate = { pendingCreate = null },
+                                                pendingAddProject = pendingAddProject,
+                                                onConsumePendingAddProject = { pendingAddProject = false },
+                                                onOpenDirectory = { dir -> pendingBrowseDir = dir; tab = 2 },
+                                            )
+                                        }
+                                        1 -> PluginPageTakeoverHost(app = app, replaceSlotName = "ssh.replace", cwd = settings.defaultCwd, modifier = modifier) {
+                                            SshScreen(
+                                                app = app,
+                                                modifier = modifier,
+                                                onOpenEnvironmentHub = { safeNavigate("settings/env") },
+                                                onOpenTerminal = { dir, host -> openTerminal(dir, host, null, null) },
+                                                onOpenTerminalSession = { sid -> openTerminal(settings.defaultCwd, null, sid, null) },
+                                            )
+                                        }
+                                        2 -> PluginPageTakeoverHost(app = app, replaceSlotName = "files.replace", cwd = settings.defaultCwd, modifier = modifier) {
+                                            FilesScreen(
+                                                app = app,
+                                                modifier = modifier,
+                                                requestedPath = pendingBrowseDir,
+                                                onConsumeRequestedPath = { pendingBrowseDir = null },
+                                                onOpenSsh = { tab = 1 },
+                                                onOpenTerminal = { dir, onClosed -> openTerminal(dir, null, null, onClosed) },
+                                                onUseDirectory = { cwd ->
+                                                    app.settings.addProject(cwd)
+                                                    app.settings.setDefaultCwd(cwd)
+                                                    app.conversations.notify("已添加到项目并设为默认目录：$cwd")
+                                                    tab = 0
+                                                },
+                                                onReferenceFile = { cwd, file ->
+                                                    app.settings.addProject(cwd)
+                                                    app.settings.setDefaultCwd(cwd)
+                                                    pendingCreate = PendingCreate(cwd, file)
+                                                    tab = 0
+                                                },
+                                            )
+                                        }
+                                        3 -> PluginPageTakeoverHost(app = app, replaceSlotName = "settings.replace", cwd = settings.defaultCwd, modifier = modifier) {
+                                            SettingsScreen(
+                                                app = app,
+                                                modifier = modifier,
+                                                onNavigate = { route ->
+                                                    if (route == "tab/ssh") tab = 1
+                                                    else safeNavigate(route)
+                                                },
+                                            )
+                                        }
+                                        else -> {
+                                            val dynSlot = navTabSlots.getOrNull(currentTab - 4)
+                                            if (dynSlot != null) {
+                                                PluginFullTabScreen(
+                                                    app = app,
+                                                    slot = dynSlot,
+                                                    cwd = settings.defaultCwd,
+                                                    modifier = modifier,
+                                                )
+                                            } else {
+                                                SettingsScreen(
+                                                    app = app,
+                                                    modifier = modifier,
+                                                    onNavigate = { route ->
+                                                        if (route == "tab/ssh") tab = 1
+                                                        else safeNavigate(route)
+                                                    },
+                                                )
+                                            }
+                                        }
+                                    }
                                 }
-                                1 -> PluginPageTakeoverHost(app = app, replaceSlotName = "ssh.replace", cwd = settings.defaultCwd, modifier = modifier) {
-                                    SshScreen(
-                                        app = app,
-                                        modifier = modifier,
-                                        onOpenEnvironmentHub = { safeNavigate("settings/env") },
-                                        onOpenTerminal = { dir, host -> openTerminal(dir, host, null) },
-                                    )
-                                }
-                                2 -> PluginPageTakeoverHost(app = app, replaceSlotName = "files.replace", cwd = settings.defaultCwd, modifier = modifier) {
-                                    FilesScreen(
-                                        app = app,
-                                        modifier = modifier,
-                                        requestedPath = pendingBrowseDir,
-                                        onConsumeRequestedPath = { pendingBrowseDir = null },
-                                        onOpenSsh = { tab = 1 },
-                                        onOpenTerminal = { dir, onClosed -> openTerminal(dir, null, onClosed) },
-                                        onUseDirectory = { cwd ->
-                                            app.settings.addProject(cwd)
-                                            app.settings.setDefaultCwd(cwd)
-                                            app.conversations.notify("已添加到项目并设为默认目录：$cwd")
-                                            tab = 0
-                                        },
-                                        onReferenceFile = { cwd, file ->
-                                            app.settings.addProject(cwd)
-                                            app.settings.setDefaultCwd(cwd)
-                                            pendingCreate = PendingCreate(cwd, file)
-                                            tab = 0
-                                        },
-                                    )
-                                }
-                                3 -> PluginPageTakeoverHost(app = app, replaceSlotName = "settings.replace", cwd = settings.defaultCwd, modifier = modifier) {
-                                    SettingsScreen(
-                                        app = app,
-                                        modifier = modifier,
-                                        onNavigate = { route ->
-                                            if (route == "tab/ssh") tab = 1
-                                            else safeNavigate(route)
-                                        },
-                                    )
-                                }
-                                else -> {
-                                    val dynSlot = navTabSlots.getOrNull(currentTab - 4)
-                                    if (dynSlot != null) {
-                                        PluginFullTabScreen(
+                            }
+                        }
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(bottom = floatingBarHeightDp + 6.dp),
+                        ) {
+                            GaliaisSnackbarHost(snackbar)
+                        }
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .fillMaxWidth()
+                                .onSizeChanged { size ->
+                                    val measured = with(density) { size.height.toDp() }
+                                    if (measured > 0.dp && measured != floatingBarHeightDp) floatingBarHeightDp = measured
+                                },
+                        ) {
+                            GaliaisBottomBar(
+                                selectedIndex = tab,
+                                onSelect = { tab = it },
+                                onQuickCreate = {
+                                    pendingAddProject = true
+                                    tab = 0
+                                },
+                                extraTabLabels = extraNavLabels,
+                            )
+                        }
+                    }
+                } else {
+                    Scaffold(
+                        containerColor = Color.Transparent,
+                        modifier = Modifier.fillMaxSize().background(G.canvas).galiaisCanvasBackground(),
+                        snackbarHost = { GaliaisSnackbarHost(snackbar) },
+                        bottomBar = {
+                            GaliaisBottomBar(
+                                selectedIndex = tab,
+                                onSelect = { tab = it },
+                                onQuickCreate = {
+                                    pendingAddProject = true
+                                    tab = 0
+                                },
+                                extraTabLabels = extraNavLabels,
+                            )
+                        },
+                    ) { padding ->
+                        val modifier = Modifier.padding(padding)
+                        Crossfade(targetState = tab, animationSpec = tween(140), label = "homeTabs") { currentTab ->
+                            tabStateHolder.SaveableStateProvider(currentTab) {
+                                when (currentTab) {
+                                    0 -> PluginPageTakeoverHost(app = app, replaceSlotName = "home.replace", cwd = settings.defaultCwd, modifier = modifier) {
+                                        ConversationListScreen(
                                             app = app,
-                                            slot = dynSlot,
-                                            cwd = settings.defaultCwd,
                                             modifier = modifier,
+                                            open = openConversation,
+                                            pendingCreate = pendingCreate,
+                                            onConsumePendingCreate = { pendingCreate = null },
+                                            pendingAddProject = pendingAddProject,
+                                            onConsumePendingAddProject = { pendingAddProject = false },
+                                            onOpenDirectory = { dir -> pendingBrowseDir = dir; tab = 2 },
                                         )
-                                    } else {
+                                    }
+                                    1 -> PluginPageTakeoverHost(app = app, replaceSlotName = "ssh.replace", cwd = settings.defaultCwd, modifier = modifier) {
+                                        SshScreen(
+                                            app = app,
+                                            modifier = modifier,
+                                            onOpenEnvironmentHub = { safeNavigate("settings/env") },
+                                            onOpenTerminal = { dir, host -> openTerminal(dir, host, null, null) },
+                                            onOpenTerminalSession = { sid -> openTerminal(settings.defaultCwd, null, sid, null) },
+                                        )
+                                    }
+                                    2 -> PluginPageTakeoverHost(app = app, replaceSlotName = "files.replace", cwd = settings.defaultCwd, modifier = modifier) {
+                                        FilesScreen(
+                                            app = app,
+                                            modifier = modifier,
+                                            requestedPath = pendingBrowseDir,
+                                            onConsumeRequestedPath = { pendingBrowseDir = null },
+                                            onOpenSsh = { tab = 1 },
+                                            onOpenTerminal = { dir, onClosed -> openTerminal(dir, null, null, onClosed) },
+                                            onUseDirectory = { cwd ->
+                                                app.settings.addProject(cwd)
+                                                app.settings.setDefaultCwd(cwd)
+                                                app.conversations.notify("已添加到项目并设为默认目录：$cwd")
+                                                tab = 0
+                                            },
+                                            onReferenceFile = { cwd, file ->
+                                                app.settings.addProject(cwd)
+                                                app.settings.setDefaultCwd(cwd)
+                                                pendingCreate = PendingCreate(cwd, file)
+                                                tab = 0
+                                            },
+                                        )
+                                    }
+                                    3 -> PluginPageTakeoverHost(app = app, replaceSlotName = "settings.replace", cwd = settings.defaultCwd, modifier = modifier) {
                                         SettingsScreen(
                                             app = app,
                                             modifier = modifier,
@@ -289,6 +398,26 @@ fun GaliaisApp(app: GaliaisApplication) {
                                                 else safeNavigate(route)
                                             },
                                         )
+                                    }
+                                    else -> {
+                                        val dynSlot = navTabSlots.getOrNull(currentTab - 4)
+                                        if (dynSlot != null) {
+                                            PluginFullTabScreen(
+                                                app = app,
+                                                slot = dynSlot,
+                                                cwd = settings.defaultCwd,
+                                                modifier = modifier,
+                                            )
+                                        } else {
+                                            SettingsScreen(
+                                                app = app,
+                                                modifier = modifier,
+                                                onNavigate = { route ->
+                                                    if (route == "tab/ssh") tab = 1
+                                                    else safeNavigate(route)
+                                                },
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -343,15 +472,21 @@ fun GaliaisApp(app: GaliaisApplication) {
 
             composable("terminal") {
                 val req = terminalRequest
-                TerminalSheet(
-                    app = app,
-                    cwd = req?.cwd ?: settings.defaultCwd,
-                    sshHost = req?.sshHost,
-                    onDismiss = {
-                        req?.onClosed?.invoke()
-                        safePopBack()
-                    },
-                )
+                Box(Modifier.fillMaxSize()) {
+                    TerminalSheet(
+                        app = app,
+                        cwd = req?.cwd ?: settings.defaultCwd,
+                        sshHost = req?.sshHost,
+                        initialSessionId = req?.initialSessionId,
+                        onDismiss = {
+                            req?.onClosed?.invoke()
+                            safePopBack()
+                        },
+                    )
+                    Box(Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 48.dp)) {
+                        GaliaisSnackbarHost(snackbar)
+                    }
+                }
             }
 
             composable(
@@ -443,6 +578,8 @@ fun GaliaisApp(app: GaliaisApplication) {
                 Text(if (request.returnToApp) "确认后请在 30 秒内返回目标应用。授权仅限本次操作。" else "授权仅限本次操作。", color = G.inkMuted)
             }
         }
+        // 全局 SSH 交互式主机指纹确认（TOFU/MITM）与 2FA/OTP/密码质询弹窗
+        SshPromptDialogHost(app.envSsh.nativeSsh)
     }
     }
 }
@@ -567,11 +704,11 @@ fun GaliaisBottomBar(
                                         .fillMaxHeight()
                                         .semantics { selected = active }
                                         .clickable(interactionSource = interaction, indication = null, role = Role.Tab) { onSelect(index) }
-                                        .padding(top = 12.dp, bottom = 6.dp, start = 2.dp, end = 2.dp),
+                                        .padding(top = 9.dp, bottom = 4.dp, start = 2.dp, end = 2.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally,
-                                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                                    verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically),
                                 ) {
-                                    Icon(item.icon, contentDescription = null, tint = if (active) g.ink else g.inkMuted, modifier = Modifier.size(17.dp))
+                                    Icon(item.icon, contentDescription = null, tint = if (active) g.ink else g.inkMuted, modifier = Modifier.size(18.dp))
                                     Text(
                                         item.label,
                                         fontFamily = Mono,
@@ -606,14 +743,14 @@ fun GaliaisBottomBar(
                 )
                 Surface(
                     onClick = { onQuickCreate?.invoke() ?: onSelect(0) },
-                    modifier = Modifier.size(50.dp).semantics { contentDescription = "创建项目" },
+                    modifier = Modifier.size(58.dp).semantics { contentDescription = "创建项目" },
                     shape = CircleShape,
                     color = g.accent,
                     contentColor = g.onAccent,
                     shadowElevation = if (g.dark) 4.dp else 8.dp,
                 ) {
                     Box(contentAlignment = Alignment.Center) {
-                        Icon(GaliaisIcons.Add, contentDescription = null, modifier = Modifier.size(21.dp))
+                        Icon(GaliaisIcons.Add, contentDescription = null, modifier = Modifier.size(22.dp))
                     }
                 }
             }
@@ -623,7 +760,7 @@ fun GaliaisBottomBar(
                 Column(Modifier.fillMaxWidth().then(navPadMod)) {
                     Hairline()
                     BoxWithConstraints(
-                        modifier = Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 10.dp, vertical = 8.dp),
+                        modifier = Modifier.fillMaxWidth().height(if (allTabs.size >= 5) 60.dp else 56.dp).padding(horizontal = 10.dp, vertical = 6.dp),
                     ) {
                         val slotW = maxWidth / allTabs.size
                         val slotX by animateDpAsState(slotW * safeIndex, slideSpec, label = "edPill")
@@ -649,8 +786,8 @@ fun GaliaisBottomBar(
                                     contentAlignment = Alignment.Center,
                                 ) {
                                     if (allTabs.size >= 5) {
-                                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                            Icon(item.icon, contentDescription = null, tint = if (active) g.accent else g.inkSubtle, modifier = Modifier.size(16.dp))
+                                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically)) {
+                                            Icon(item.icon, contentDescription = null, tint = if (active) g.accent else g.inkSubtle, modifier = Modifier.size(17.dp))
                                             Text(
                                                 item.label,
                                                 style = MaterialTheme.typography.labelSmall,
@@ -662,8 +799,8 @@ fun GaliaisBottomBar(
                                             )
                                         }
                                     } else {
-                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                            Icon(item.icon, contentDescription = null, tint = if (active) g.accent else g.inkSubtle, modifier = Modifier.size(17.dp))
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                            Icon(item.icon, contentDescription = null, tint = if (active) g.accent else g.inkSubtle, modifier = Modifier.size(18.dp))
                                             Text(
                                                 item.label,
                                                 style = MaterialTheme.typography.labelMedium,
@@ -712,8 +849,8 @@ private fun FloatingDockTrack(
     Surface(
         modifier = modifier,
         shape = CircleShape,
-        color = g.surface.copy(alpha = if (g.dark) 0.94f else 0.96f),
-        border = BorderStroke(1.dp, g.border),
+        color = g.surface.copy(alpha = if (g.dark) 0.78f else 0.84f),
+        border = BorderStroke(1.dp, g.borderStrong.copy(alpha = if (g.dark) 0.72f else 0.85f)),
         shadowElevation = if (g.dark) 6.dp else 8.dp,
     ) {
         BoxWithConstraints(modifier = Modifier.fillMaxWidth().padding(4.dp).height(50.dp)) {
@@ -747,13 +884,13 @@ private fun FloatingDockTrack(
                             .clickable(interactionSource = interaction, indication = null, role = Role.Tab) { onSelect(index) }
                             .padding(horizontal = 3.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center,
+                        verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically),
                     ) {
                         Icon(
                             item.icon,
                             contentDescription = null,
                             tint = if (active) g.onAccentContainer else g.inkMuted,
-                            modifier = Modifier.size(18.dp),
+                            modifier = Modifier.size(19.dp),
                         )
                         Text(
                             item.label,

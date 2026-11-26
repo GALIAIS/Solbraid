@@ -184,8 +184,10 @@ data class GaliaisDesign(
 val LocalGaliaisColors = staticCompositionLocalOf { galiaisColors(ThemeConfig(), false) }
 val LocalDesign = staticCompositionLocalOf { designOf(ThemeConfig(), false) }
 val LocalRenderPrefs = staticCompositionLocalOf { com.galiais.agent.engine.SettingsState() }
-/** 当前页面底部固定栏（底栏 / 聊天输入栏）占位高度，供全局插件悬浮层自动避让。 */
-val LocalBottomChromeInset = staticCompositionLocalOf { 0.dp }
+/** 当前页面底部固定栏（底栏 / 聊天输入栏）占位高度，供全局插件悬浮层自动避让；使用 dynamic CompositionLocal 避免切页整树重组。 */
+val LocalBottomChromeInset = androidx.compose.runtime.compositionLocalOf { 0.dp }
+/** 悬浮式底栏遮挡高度（列表底边距与 FAB 按需叠加，使内容无缝穿透滚动至透明悬浮底栏下方）。 */
+val LocalFloatingNavBottomInset = androidx.compose.runtime.compositionLocalOf { 0.dp }
 
 val G: GaliaisColors
     @Composable get() = LocalGaliaisColors.current

@@ -275,9 +275,10 @@ fun ConversationListScreen(
             }
             HeaderProgressSlot(loading || (runtime.ready && !initialSyncDone))
 
+            val floatingNavBottom = LocalFloatingNavBottomInset.current
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 12.dp, bottom = 96.dp),
+                contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 12.dp, bottom = 96.dp + floatingNavBottom),
                 verticalArrangement = Arrangement.spacedBy(D.space(10.dp)),
             ) {
                 val linkedRequests = requests.filter { it.conversation != null }
@@ -378,11 +379,11 @@ fun ConversationListScreen(
                     }
                 }
 
-                items(projectGroups, key = { "project-${it.first}" }) { (dir, sessions) ->
+                // 将项目分组头与各会话行彻底拍平为兄弟 LazyColumn 项，避免单项目 50-200 条会话全部非懒加载引起切页掉帧
+                projectGroups.forEach { (dir, sessions) ->
                     val expanded = query.isNotBlank() || dir !in settings.collapsedProjects
                     val canRemove = dir != UNASSIGNED_PROJECT && (settings.projects.size > 1 || dir != settings.defaultCwd) && sessions.isEmpty()
-                    // 不叠加 animateItem() 弹簧位移动画且把 8dp 间距放进折叠体内部，彻底消除折叠/展开时下方分组回弹与 8dp 瞬间跳变。
-                    Column(modifier = Modifier.fillMaxWidth()) {
+                    item(key = "project-hdr-$dir", contentType = "project_header") {
                         ProjectGroupHeader(
                             path = dir,
                             sessionCount = sessions.size,
@@ -408,83 +409,87 @@ fun ConversationListScreen(
                                 app.conversations.notify("已从项目列表移除「${projectDisplayName(dir)}」")
                             }) else null,
                         )
-                        AnimatedExpandable(expanded = expanded) {
-                            Spacer(Modifier.height(D.space(8.dp)))
-                            val layoutMode = D.listLayout
-                            val guideColor = G.borderStrong.copy(alpha = 0.7f)
-                            val guideMod = if (layoutMode == "tree_guide" && sessions.isNotEmpty()) {
-                                Modifier
-                                    .fillMaxWidth()
-                                    .padding(start = 10.dp)
-                                    .drawBehind {
-                                        val x = 3.dp.toPx()
-                                        drawLine(
-                                            color = guideColor,
-                                            start = Offset(x, 4.dp.toPx()),
-                                            end = Offset(x, (size.height - 4.dp.toPx()).coerceAtLeast(4.dp.toPx())),
-                                            strokeWidth = 1.5.dp.toPx(),
-                                        )
-                                    }
-                                    .padding(start = 12.dp)
-                            } else {
-                                Modifier.fillMaxWidth().padding(start = if (layoutMode == "grouped") 4.dp else 10.dp)
-                            }
-                            Column(
-                                modifier = guideMod,
-                                verticalArrangement = Arrangement.spacedBy(if (layoutMode == "grouped") 3.dp else D.space(8.dp)),
-                            ) {
-                                if (sessions.isEmpty()) {
-                                    val canTapStart = !runtime.ready && runtime.bound && !runtime.busy
-                                    Surface(
-                                        modifier = Modifier.fillMaxWidth().clickable(
-                                            enabled = (runtime.ready && dir != UNASSIGNED_PROJECT) || canTapStart,
-                                        ) {
+                    }
+                    if (expanded) {
+                        if (sessions.isEmpty()) {
+                            item(key = "project-empty-$dir", contentType = "project_empty") {
+                                val canTapStart = !runtime.ready && runtime.bound && !runtime.busy
+                                Surface(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(start = 10.dp)
+                                        .clickable(enabled = (runtime.ready && dir != UNASSIGNED_PROJECT) || canTapStart) {
                                             if (runtime.ready) creating = PendingCreate(dir)
                                             else app.runtime.start()
                                         },
-                                        shape = D.shape(10.dp),
-                                        color = G.surfaceSubtle,
-                                        border = BorderStroke(0.75.dp, G.border),
+                                    shape = D.shape(10.dp),
+                                    color = G.surfaceSubtle,
+                                    border = BorderStroke(0.75.dp, G.border),
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                                     ) {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                        ) {
-                                            Text(
-                                                when {
-                                                    !runtime.ready && runtime.busy -> "正在准备运行环境，就绪后可在此项目新建会话…"
-                                                    !runtime.ready -> "启动运行环境后可在此项目新建会话"
-                                                    !initialSyncDone || loading -> "正在加载会话列表…"
-                                                    else -> "此项目暂无会话"
-                                                },
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = G.inkMuted,
-                                                modifier = Modifier.weight(1f),
-                                            )
-                                            if (canTapStart) {
-                                                TagPill("启动环境", fg = G.onAccent, bg = G.accent, onClick = app.runtime::start)
-                                            }
+                                        Text(
+                                            when {
+                                                !runtime.ready && runtime.busy -> "正在准备运行环境，就绪后可在此项目新建会话…"
+                                                !runtime.ready -> "启动运行环境后可在此项目新建会话"
+                                                !initialSyncDone || loading -> "正在加载会话列表…"
+                                                else -> "此项目暂无会话"
+                                            },
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = G.inkMuted,
+                                            modifier = Modifier.weight(1f),
+                                        )
+                                        if (canTapStart) {
+                                            TagPill("启动环境", fg = G.onAccent, bg = G.accent, onClick = app.runtime::start)
                                         }
                                     }
+                                }
+                            }
+                        } else {
+                            items(
+                                count = sessions.size,
+                                key = { idx -> "conv-${dir}-${sessions[idx].key.route}" },
+                                contentType = { "conversation_row" },
+                            ) { idx ->
+                                val summary = sessions[idx]
+                                val layoutMode = D.listLayout
+                                val guideColor = G.borderStrong.copy(alpha = 0.7f)
+                                val rowPadMod = if (layoutMode == "tree_guide") {
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .padding(start = 10.dp)
+                                        .drawBehind {
+                                            val x = 3.dp.toPx()
+                                            drawLine(
+                                                color = guideColor,
+                                                start = Offset(x, 0f),
+                                                end = Offset(x, size.height),
+                                                strokeWidth = 1.5.dp.toPx(),
+                                            )
+                                        }
+                                        .padding(start = 12.dp)
                                 } else {
-                                    sessions.forEachIndexed { idx, summary ->
-                                        val groupPos = if (layoutMode == "grouped" && sessions.size > 1) {
-                                            when (idx) {
-                                                0 -> CardGroupPos.FIRST
-                                                sessions.lastIndex -> CardGroupPos.LAST
-                                                else -> CardGroupPos.MIDDLE
-                                            }
-                                        } else CardGroupPos.SINGLE
-                                        ConversationRow(
-                                            app = app,
-                                            summary = summary,
-                                            hasPendingRequest = summary.key in pendingKeys,
-                                            open = open,
-                                            showCwd = false,
-                                            groupPosition = groupPos,
-                                        )
+                                    Modifier.fillMaxWidth().padding(start = if (layoutMode == "grouped") 4.dp else 10.dp)
+                                }
+                                val groupPos = if (layoutMode == "grouped" && sessions.size > 1) {
+                                    when (idx) {
+                                        0 -> CardGroupPos.FIRST
+                                        sessions.lastIndex -> CardGroupPos.LAST
+                                        else -> CardGroupPos.MIDDLE
                                     }
+                                } else CardGroupPos.SINGLE
+                                Box(rowPadMod) {
+                                    ConversationRow(
+                                        app = app,
+                                        summary = summary,
+                                        hasPendingRequest = summary.key in pendingKeys,
+                                        open = open,
+                                        showCwd = false,
+                                        groupPosition = groupPos,
+                                    )
                                 }
                             }
                         }
@@ -508,11 +513,12 @@ fun ConversationListScreen(
         }
 
         if (D.navBarStyle != "split_fab") {
+            val floatingNavBottom = LocalFloatingNavBottomInset.current
             PrimaryFab(
                 text = "创建项目",
                 icon = GaliaisIcons.Add,
                 onClick = { addingProject = true },
-                modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
+                modifier = Modifier.align(Alignment.BottomEnd).padding(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 16.dp + floatingNavBottom),
             )
         }
     }
@@ -633,7 +639,7 @@ private fun QuickEngineCard(engine: EngineKind, title: String, subtitle: String,
                 Text(title, style = MaterialTheme.typography.titleSmall, color = G.ink, fontWeight = FontWeight.SemiBold)
                 Text(subtitle, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
             }
-            Text("→", style = MaterialTheme.typography.titleMedium, color = G.inkSubtle)
+            Icon(GaliaisIcons.ChevronRight, contentDescription = null, tint = G.inkSubtle, modifier = Modifier.size(18.dp))
         }
     }
 }
@@ -893,7 +899,7 @@ private fun ConversationRow(
                     )
                 }
                 Hairline(Modifier.padding(vertical = 2.dp))
-                GaliaisMenuRow(title = "删除", icon = GaliaisIcons.Close, danger = true, onClick = { menu = false; deleting = true })
+                GaliaisMenuRow(title = "删除", icon = GaliaisIcons.Trash, danger = true, onClick = { menu = false; deleting = true })
             }
         }
     }

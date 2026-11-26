@@ -575,17 +575,15 @@ async function syncSshHostsNow({hosts = [], passwords = {}, keyPassphrases = {}}
       lines.push(`  ServerAliveInterval ${h.keepAliveSec}`);
       lines.push(`  ServerAliveCountMax 3`);
     }
+    lines.push(`  ControlMaster auto`);
+    lines.push(`  ControlPersist 120`);
+    lines.push(`  ControlPath ~/.ssh/cm-%r@%h:%p`);
     return lines.join("\n");
   });
   await upsertManagedBlock(SSH_CONFIG_FILE, SSH_BLOCK_START, SSH_BLOCK_END, blocks.join("\n\n"), 0o600);
-  await atomicWrite(SSH_PASSWORDS_FILE, JSON.stringify(passwords && typeof passwords === "object" ? passwords : {}, null, 2), 0o600);
-  const phrases = {};
-  for (const [name, value] of Object.entries(keyPassphrases)) {
-    validateKeyName(name);
-    if (typeof value !== "string" || /[\r\n\0]/.test(value) || Buffer.byteLength(value) > 4096) throw new Error("密钥口令无效");
-    if (value) phrases[name] = value;
-  }
-  await atomicWrite(SSH_KEY_PASSPHRASES_FILE, JSON.stringify(phrases), 0o600);
+  // 密码与密钥口令统一留存在 Android Keystore 中由原生 SSH 引擎按需内存读取，不再向容器磁盘写入明文密码文件
+  await fs.rm(SSH_PASSWORDS_FILE, {force: true}).catch(() => {});
+  await fs.rm(SSH_KEY_PASSPHRASES_FILE, {force: true}).catch(() => {});
   await atomicWrite(SSH_HOSTS_FILE, JSON.stringify(normalized, null, 2), 0o600);
   return {ok: true, count: normalized.length};
 }

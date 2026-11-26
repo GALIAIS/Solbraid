@@ -2,6 +2,10 @@ package com.galiais.agent.engine
 
 import com.galiais.agent.newId
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -163,32 +167,40 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
     }
 
     override suspend fun load(key: ConversationKey) {
-        attach(key)
-        val thread = call("thread/read", jsonOf("threadId" to key.id, "includeTurns" to true)).getJSONObject("thread")
-        val items = mutableListOf<TimelineItem>()
-        val durations = mutableMapOf<String, Long>()
-        var activeTurn: String? = null
-        for (turn in thread.arr("turns").objects()) {
-            val tid = turn.str("id")
-            val durMs = if (turn.has("durationMs") && !turn.isNull("durationMs")) turn.optLong("durationMs", -1L).takeIf { it >= 0L } else null
-            if (tid != null && durMs != null) durations[tid] = durMs
-            var attachedDur = false
-            val turnItems = turn.arr("items").objects()
-            turnItems.forEachIndexed { index, raw ->
-                val liveReasoning = turn.optString("status") == "inProgress" && index == turnItems.lastIndex &&
-                    raw.optString("type") == "reasoning" && raw.isNull("completedAtMs")
-                val mapped = mapItem(raw, live = liveReasoning) ?: return@forEachIndexed
-                if (mapped is TimelineItem.UserMessage && tid != null) {
-                    val withDur = if (!attachedDur && durMs != null) {
-                        attachedDur = true
-                        durations[mapped.id] = durMs
-                        mapped.copy(turnId = tid, durationMs = durMs)
-                    } else mapped.copy(turnId = tid)
-                    items += withDur
-                } else items += mapped
+        // 并行执行 thread/read 与 attach，并将历史 JSON 映射下沉到 Dispatchers.Default，降低冷进会话延迟与主线程掉帧
+        val thread = coroutineScope {
+            val attachTask = async { attach(key) }
+            val readThread = call("thread/read", jsonOf("threadId" to key.id, "includeTurns" to true)).getJSONObject("thread")
+            attachTask.await()
+            readThread
+        }
+        val (items, durations, activeTurn) = withContext(Dispatchers.Default) {
+            val list = ArrayList<TimelineItem>()
+            val durs = LinkedHashMap<String, Long>()
+            var runningTurn: String? = null
+            for (turn in thread.arr("turns").objects()) {
+                val tid = turn.str("id")
+                val durMs = if (turn.has("durationMs") && !turn.isNull("durationMs")) turn.optLong("durationMs", -1L).takeIf { it >= 0L } else null
+                if (tid != null && durMs != null) durs[tid] = durMs
+                var attachedDur = false
+                val turnItems = turn.arr("items").objects()
+                turnItems.forEachIndexed { index, raw ->
+                    val liveReasoning = turn.optString("status") == "inProgress" && index == turnItems.lastIndex &&
+                        raw.optString("type") == "reasoning" && raw.isNull("completedAtMs")
+                    val mapped = mapItem(raw, live = liveReasoning) ?: return@forEachIndexed
+                    if (mapped is TimelineItem.UserMessage && tid != null) {
+                        val withDur = if (!attachedDur && durMs != null) {
+                            attachedDur = true
+                            durs[mapped.id] = durMs
+                            mapped.copy(turnId = tid, durationMs = durMs)
+                        } else mapped.copy(turnId = tid)
+                        list += withDur
+                    } else list += mapped
+                }
+                turn.obj("error")?.let { list += TimelineItem.Notice("error-${turn.optString("id")}", it.optString("message"), error = true) }
+                if (turn.optString("status") == "inProgress") runningTurn = tid
             }
-            turn.obj("error")?.let { items += TimelineItem.Notice("error-${turn.optString("id")}", it.optString("message"), error = true) }
-            if (turn.optString("status") == "inProgress") activeTurn = tid
+            Triple(list, durs, runningTurn)
         }
         val providerId = CustomProvider.fromCodexProviderId(thread.str("modelProvider"))
         if (providerId != null) threadProviderIds[key.id] = providerId else threadProviderIds.remove(key.id)

@@ -89,7 +89,7 @@ class RuntimeClient(val app: Application) {
     val snapshot: StateFlow<RuntimeSnapshot> = snapshotFlow.asStateFlow()
     private val eventFlow = MutableSharedFlow<EngineEvent>(extraBufferCapacity = 4096, onBufferOverflow = BufferOverflow.SUSPEND)
     val events: SharedFlow<EngineEvent> = eventFlow.asSharedFlow()
-    private val hubEventFlow = MutableSharedFlow<JSONObject>(extraBufferCapacity = 1024, onBufferOverflow = BufferOverflow.SUSPEND)
+    private val hubEventFlow = MutableSharedFlow<JSONObject>(extraBufferCapacity = 4096, onBufferOverflow = BufferOverflow.SUSPEND)
     val hubEvents: SharedFlow<JSONObject> = hubEventFlow.asSharedFlow()
     private val environmentFlow = MutableStateFlow(EnvironmentStatus())
     val environment: StateFlow<EnvironmentStatus> = environmentFlow.asStateFlow()
@@ -139,28 +139,26 @@ class RuntimeClient(val app: Application) {
             snapshotFlow.value = RuntimeSnapshot("error", "无法连接本地运行服务")
     }
 
-    private fun receive(text: String) {
-        val packet = try { JSONObject(text) } catch (error: Exception) { Log.e("GALIAIS", "运行服务消息无效", error); return }
-        when (packet.optString("kind")) {
-            "runtime-state" -> {
-                val p = if (packet.isNull("progress")) null else packet.optDouble("progress", Double.NaN).takeIf { !it.isNaN() }?.toFloat()
+    private fun receive(packet: VmRuntimeService.RuntimePacket) {
+        when (packet) {
+            is VmRuntimeService.RuntimePacket.State -> {
                 snapshotFlow.value = RuntimeSnapshot(
-                    state = packet.getString("state"),
-                    message = packet.getString("message"),
-                    engineInfo = packet.optJSONObject("engineInfo"),
+                    state = packet.state,
+                    message = packet.message,
+                    engineInfo = packet.engineInfo,
                     bound = true,
-                    reattached = packet.optBoolean("reattached"),
-                    mode = packet.optString("mode", settingsState.effectiveRuntimeMode),
-                    progress = p,
-                    stepIndex = packet.optInt("stepIndex", 0),
-                    stepTotal = packet.optInt("stepTotal", 0),
-                    stepLabel = packet.optString("stepLabel", ""),
-                    firstTimeSetup = packet.optBoolean("firstTimeSetup", false),
+                    reattached = packet.reattached,
+                    mode = packet.mode.ifBlank { settingsState.effectiveRuntimeMode },
+                    progress = packet.progress,
+                    stepIndex = packet.stepIndex,
+                    stepTotal = packet.stepTotal,
+                    stepLabel = packet.stepLabel,
+                    firstTimeSetup = packet.firstTimeSetup,
                 )
             }
-            "engine-event" -> {
-                val engId = packet.getString("engine")
-                val data = packet.getJSONObject("data")
+            is VmRuntimeService.RuntimePacket.Engine -> {
+                val engId = packet.engineName
+                val data = packet.data
                 if (engId == "agent-hub") {
                     if (!hubEventFlow.tryEmit(data)) {
                         Log.e("GALIAIS", "Agent Hub 事件队列已满，停止运行环境以免丢失审批或传输数据")

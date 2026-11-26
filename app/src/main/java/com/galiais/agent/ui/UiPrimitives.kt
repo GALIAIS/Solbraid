@@ -1,5 +1,6 @@
 package com.galiais.agent.ui
 
+import android.graphics.drawable.ColorDrawable
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -33,16 +34,34 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogWindowProvider
+
+/** 同步全屏 Dialog 独立窗口底色并去除默认暗色遮罩与切窗动画，消除打开/关闭全屏预览器与编辑器时的闪白/闪黑。 */
+@Composable
+fun SyncFullscreenDialogWindow(canvasColor: Color = G.canvas) {
+    val view = LocalView.current
+    val argb = canvasColor.toArgb()
+    SideEffect {
+        (view.parent as? DialogWindowProvider)?.window?.let { w ->
+            w.setBackgroundDrawable(ColorDrawable(argb))
+            w.setDimAmount(0f)
+            w.setWindowAnimations(0)
+        }
+    }
+}
 
 /**
  * 全站统一顶栏原语（对齐 56dp 编辑风 / 64dp Material 3，消除 4 个一级 Tab 切换上下跳动）。

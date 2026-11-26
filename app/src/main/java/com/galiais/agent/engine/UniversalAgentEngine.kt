@@ -1658,127 +1658,129 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
     override suspend fun load(key: ConversationKey) {
         val res = runtime.hubRequest("sessions/load", jsonOf("agentId" to kind.id, "sessionId" to key.id))
         val session = res.optJSONObject("session") ?: return
-        val items = buildList {
-            session.arr("messages").objects().forEach { m ->
-                val id = m.str("id") ?: newId()
-                val text = m.optString("text")
-                when (m.optString("role")) {
-                    "user" -> add(TimelineItem.UserMessage(id, text, m.optInt("imageCount", 0)))
-                    "thought" -> add(TimelineItem.Reasoning(
-                        id = id,
-                        text = text,
-                        streaming = false,
-                        startedAtMs = m.optLong("startedAtMs", 0L).takeIf { it > 0L },
-                        completedAtMs = m.optLong("completedAtMs", 0L).takeIf { it > 0L },
-                    ))
-                    "tool" -> {
-                        val toolName = m.optString("name", "工具调用")
-                        if (isAcpMetaToolTitle(toolName)) return@forEach
-                        val st = when (m.optString("status").lowercase()) {
-                            "failed" -> ItemStatus.FAILED
-                            "declined" -> ItemStatus.DECLINED
-                            else -> ItemStatus.COMPLETED
-                        }
-                        val kindStr = m.optString("kind").lowercase()
-                        val diffs = m.arr("diffs").objects().mapNotNull { d ->
-                            val p = d.str("path") ?: return@mapNotNull null
-                            val dk = d.optString("kind", "update")
-                            val diffText = d.str("diff") ?: unifiedDiff(p, d.optString("oldText"), d.optString("newText"))
-                            FileDiff(p, dk, diffText)
-                        }
-                        val cmd = m.str("command")
-                        when {
-                            diffs.isNotEmpty() -> add(TimelineItem.FileEdit(id, diffs, st))
-                            !cmd.isNullOrBlank() || kindStr == "execute" -> add(TimelineItem.CommandRun(
-                                id = id,
-                                command = cmd ?: toolName.ifBlank { "执行命令" },
-                                cwd = m.str("cwd"),
-                                output = m.optString("result"),
-                                exitCode = if (m.has("exitCode")) m.optInt("exitCode") else if (st == ItemStatus.COMPLETED) 0 else null,
-                                status = st,
-                                durationMs = m.optLong("durationMs", 0L).takeIf { it > 0L },
-                            ))
-                            else -> add(TimelineItem.ToolCall(
-                                id = id,
-                                name = toolName,
-                                input = m.optString("input"),
-                                result = m.str("result"),
-                                status = st,
-                                kind = kindStr.takeIf { it.isNotBlank() },
-                            ))
-                        }
-                    }
-                    "plan" -> {
-                        if (text.isNotBlank()) {
-                            val reqFb = m.optBoolean("requestFeedback", false)
+        val (items, restoredSteps) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            val builtItems = buildList {
+                session.arr("messages").objects().forEach { m ->
+                    val id = m.str("id") ?: newId()
+                    val text = m.optString("text")
+                    when (m.optString("role")) {
+                        "user" -> add(TimelineItem.UserMessage(id, text, m.optInt("imageCount", 0)))
+                        "thought" -> add(TimelineItem.Reasoning(
+                            id = id,
+                            text = text,
+                            streaming = false,
+                            startedAtMs = m.optLong("startedAtMs", 0L).takeIf { it > 0L },
+                            completedAtMs = m.optLong("completedAtMs", 0L).takeIf { it > 0L },
+                        ))
+                        "tool" -> {
+                            val toolName = m.optString("name", "工具调用")
+                            if (isAcpMetaToolTitle(toolName)) return@forEach
                             val st = when (m.optString("status").lowercase()) {
-                                "running" -> ItemStatus.RUNNING
                                 "failed" -> ItemStatus.FAILED
                                 "declined" -> ItemStatus.DECLINED
-                                else -> if (reqFb) ItemStatus.RUNNING else ItemStatus.COMPLETED
+                                else -> ItemStatus.COMPLETED
                             }
-                            add(TimelineItem.Plan(
+                            val kindStr = m.optString("kind").lowercase()
+                            val diffs = m.arr("diffs").objects().mapNotNull { d ->
+                                val p = d.str("path") ?: return@mapNotNull null
+                                val dk = d.optString("kind", "update")
+                                val diffText = d.str("diff") ?: unifiedDiff(p, d.optString("oldText"), d.optString("newText"))
+                                FileDiff(p, dk, diffText)
+                            }
+                            val cmd = m.str("command")
+                            when {
+                                diffs.isNotEmpty() -> add(TimelineItem.FileEdit(id, diffs, st))
+                                !cmd.isNullOrBlank() || kindStr == "execute" -> add(TimelineItem.CommandRun(
+                                    id = id,
+                                    command = cmd ?: toolName.ifBlank { "执行命令" },
+                                    cwd = m.str("cwd"),
+                                    output = m.optString("result"),
+                                    exitCode = if (m.has("exitCode")) m.optInt("exitCode") else if (st == ItemStatus.COMPLETED) 0 else null,
+                                    status = st,
+                                    durationMs = m.optLong("durationMs", 0L).takeIf { it > 0L },
+                                ))
+                                else -> add(TimelineItem.ToolCall(
+                                    id = id,
+                                    name = toolName,
+                                    input = m.optString("input"),
+                                    result = m.str("result"),
+                                    status = st,
+                                    kind = kindStr.takeIf { it.isNotBlank() },
+                                ))
+                            }
+                        }
+                        "plan" -> {
+                            if (text.isNotBlank()) {
+                                val reqFb = m.optBoolean("requestFeedback", false)
+                                val st = when (m.optString("status").lowercase()) {
+                                    "running" -> ItemStatus.RUNNING
+                                    "failed" -> ItemStatus.FAILED
+                                    "declined" -> ItemStatus.DECLINED
+                                    else -> if (reqFb) ItemStatus.RUNNING else ItemStatus.COMPLETED
+                                }
+                                add(TimelineItem.Plan(
+                                    id = id,
+                                    text = text,
+                                    title = m.str("title") ?: extractPlanTitle(text, m.str("filePath")),
+                                    streaming = false,
+                                    filePath = m.str("filePath"),
+                                    status = st,
+                                    requestFeedback = reqFb,
+                                    summary = m.str("summary"),
+                                    artifactType = m.str("artifactType") ?: "plan",
+                                ))
+                            }
+                        }
+                        "receipt" -> {
+                            val entries = m.arr("entries").objects().mapNotNull { e ->
+                                val lbl = e.optString("label")
+                                val v = e.optString("value")
+                                if (lbl.isBlank() && v.isBlank()) null else lbl to v
+                            }
+                            val st = if (m.optString("status").equals("declined", true)) ItemStatus.DECLINED else ItemStatus.COMPLETED
+                            add(TimelineItem.InteractionReceipt(
                                 id = id,
-                                text = text,
-                                title = m.str("title") ?: extractPlanTitle(text, m.str("filePath")),
-                                streaming = false,
-                                filePath = m.str("filePath"),
+                                kind = m.optString("kind", "question"),
+                                title = m.optString("title", "交互记录"),
+                                entries = entries,
                                 status = st,
-                                requestFeedback = reqFb,
-                                summary = m.str("summary"),
-                                artifactType = m.str("artifactType") ?: "plan",
                             ))
                         }
+                        "agent" -> add(TimelineItem.AgentMessage(id, text, streaming = false))
+                        "notice" -> add(TimelineItem.Notice(id, text, m.optBoolean("error")))
                     }
-                    "receipt" -> {
-                        val entries = m.arr("entries").objects().mapNotNull { e ->
-                            val lbl = e.optString("label")
-                            val v = e.optString("value")
-                            if (lbl.isBlank() && v.isBlank()) null else lbl to v
-                        }
-                        val st = if (m.optString("status").equals("declined", true)) ItemStatus.DECLINED else ItemStatus.COMPLETED
-                        add(TimelineItem.InteractionReceipt(
-                            id = id,
-                            kind = m.optString("kind", "question"),
-                            title = m.optString("title", "交互记录"),
-                            entries = entries,
-                            status = st,
-                        ))
-                    }
-                    "agent" -> add(TimelineItem.AgentMessage(id, text, streaming = false))
-                    "notice" -> add(TimelineItem.Notice(id, text, m.optBoolean("error")))
+                }
+                val existingPlanPaths = filterIsInstance<TimelineItem.Plan>().mapNotNull { it.filePath }.toSet()
+                session.arr("brainPlans").objects().forEach { bp ->
+                    val p = bp.str("path")
+                    val md = bp.optString("markdown")
+                    if (md.isBlank() || (p != null && p in existingPlanPaths)) return@forEach
+                    val reqFb = bp.optBoolean("requestFeedback", false)
+                    add(TimelineItem.Plan(
+                        id = bp.str("id") ?: "brain-${p?.substringAfterLast('/') ?: newId()}",
+                        text = md,
+                        title = bp.str("title") ?: extractPlanTitle(md, p),
+                        streaming = false,
+                        filePath = p,
+                        status = ItemStatus.COMPLETED,
+                        requestFeedback = reqFb,
+                        summary = bp.str("summary"),
+                        artifactType = bp.str("artifactType") ?: "plan",
+                    ))
                 }
             }
-            // 为早期历史 Antigravity 会话回填磁盘上的 Brain 计划/总结产物，使重开后同样展现完整 Plan Artifact 卡
-            val existingPlanPaths = filterIsInstance<TimelineItem.Plan>().mapNotNull { it.filePath }.toSet()
-            session.arr("brainPlans").objects().forEach { bp ->
-                val p = bp.str("path")
-                val md = bp.optString("markdown")
-                if (md.isBlank() || (p != null && p in existingPlanPaths)) return@forEach
-                val reqFb = bp.optBoolean("requestFeedback", false)
-                add(TimelineItem.Plan(
-                    id = bp.str("id") ?: "brain-${p?.substringAfterLast('/') ?: newId()}",
-                    text = md,
-                    title = bp.str("title") ?: extractPlanTitle(md, p),
-                    streaming = false,
-                    filePath = p,
-                    status = ItemStatus.COMPLETED,
-                    requestFeedback = reqFb,
-                    summary = bp.str("summary"),
-                    artifactType = bp.str("artifactType") ?: "plan",
-                ))
+            val steps = session.arr("plan").objects().mapNotNull { s ->
+                val label = s.optString("step").ifBlank { s.optString("title").ifBlank { s.optString("content") } }
+                if (label.isBlank()) null
+                else PlanStep(
+                    step = label,
+                    status = normalizePlanStepStatus(s.optString("status", "pending")),
+                    id = s.str("id"),
+                    activeForm = s.str("activeForm"),
+                    priority = s.str("priority"),
+                )
             }
-        }
-        val restoredSteps = session.arr("plan").objects().mapNotNull { s ->
-            val label = s.optString("step").ifBlank { s.optString("title").ifBlank { s.optString("content") } }
-            if (label.isBlank()) null
-            else PlanStep(
-                step = label,
-                status = normalizePlanStepStatus(s.optString("status", "pending")),
-                id = s.str("id"),
-                activeForm = s.str("activeForm"),
-                priority = s.str("priority"),
-            )
+            builtItems to steps
         }
         val restoredPlanExpl = session.str("planExplanation")
         val rawModel = session.str("model") ?: settings.state.value.agentModels[kind.id]

@@ -25,3 +25,7 @@
 -keep class com.galiais.agent.engine.mobile.ISolbraidShizukuService** { *; }
 -keep class com.galiais.agent.engine.mobile.MobileUseStopReceiver { *; }
 -keep class rikka.shizuku.** { *; }
+-keep class com.jcraft.jsch.** { *; }
+-keep class org.bouncycastle.crypto.** { *; }
+-dontwarn org.bouncycastle.**
+-dontwarn com.jcraft.jsch.**

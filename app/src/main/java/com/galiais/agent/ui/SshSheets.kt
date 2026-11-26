@@ -410,7 +410,8 @@ fun SshTunnelEditorSheet(
                     val hostCfg = selectedHost ?: return@PrimaryPillButton
                     val lp = localPort.toIntOrNull() ?: 0
                     val rp = if (mode == "dynamic") 0 else (remotePort.toIntOrNull() ?: 0)
-                    if (lp !in 1024..65535) { error = "本地端口请使用 1024..65535"; return@PrimaryPillButton }
+                    val minLocal = if (mode == "remote") 1 else 1024
+                    if (lp !in minLocal..65535) { error = "本地端口须在 $minLocal..65535"; return@PrimaryPillButton }
                     if (mode != "dynamic" && rp !in 1..65535) { error = "远端端口须在 1..65535"; return@PrimaryPillButton }
                     val title = name.trim().ifBlank {
                         when (mode) {
@@ -454,10 +455,7 @@ fun GenerateSshKeyDialog(
         onDismissRequest = onDismiss,
         title = "生成 SSH 密钥对",
         text = {
-            Column(
-                modifier = Modifier.verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 SegmentedPillBar(
                     options = listOf("ed25519" to "Ed25519（推荐）", "rsa" to "RSA 4096"),
                     selected = keyType,
@@ -537,10 +535,7 @@ fun ImportSshKeyDialog(
         onDismissRequest = onDismiss,
         title = "导入 SSH 私钥",
         text = {
-            Column(
-                modifier = Modifier.verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedTextField(
                     value = keyName,
                     onValueChange = { keyName = it.trim() },
@@ -612,7 +607,8 @@ fun SftpBrowserSheet(
     onDismiss: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
-    var remotePath by remember { mutableStateOf(host.defaultPath.ifBlank { "." }) }
+    var requestPath by remember(host.id) { mutableStateOf(host.defaultPath.ifBlank { "." }) }
+    var displayPath by remember(host.id) { mutableStateOf(host.defaultPath.ifBlank { "." }) }
     var entries by remember { mutableStateOf<List<SshRemoteEntry>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var busyLabel by remember { mutableStateOf<String?>(null) }
@@ -625,14 +621,13 @@ fun SftpBrowserSheet(
     var editingFile by remember { mutableStateOf<SshRemoteEntry?>(null) }
     var jumpPath by remember { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(host.id, remotePath, reloadNonce) {
+    LaunchedEffect(host.id, requestPath, reloadNonce) {
         loading = true
         error = null
-        entries = emptyList()
         try {
-            val (resolved, list) = app.envSsh.sftpList(host, remotePath)
-            if (resolved.isNotBlank() && resolved != remotePath) {
-                remotePath = resolved
+            val (resolved, list) = app.envSsh.sftpList(host, requestPath)
+            if (resolved.isNotBlank()) {
+                displayPath = resolved
             }
             entries = list
         } catch (cancel: kotlinx.coroutines.CancellationException) {
@@ -657,23 +652,23 @@ fun SftpBrowserSheet(
                 Icon(GaliaisIcons.Server, contentDescription = null, tint = G.accent, modifier = Modifier.size(18.dp))
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text("SFTP · ${host.name}", style = MaterialTheme.typography.titleMedium, color = G.ink)
-                    Text(remotePath, fontFamily = Mono, fontSize = 11.5.sp, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(displayPath, fontFamily = Mono, fontSize = 11.5.sp, color = G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 TagPill("刷新", fg = G.inkMuted, bg = G.surfaceSubtle, onClick = { reloadNonce++ })
             }
 
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                if (remotePath != "/" && remotePath != ".") {
+                if (displayPath != "/" && displayPath != ".") {
                     TagPill("↑ 上级", fg = G.ink, bg = G.surfaceSubtle, border = G.border, onClick = {
-                        val trimmed = remotePath.trimEnd('/')
+                        val trimmed = displayPath.trimEnd('/')
                         val idx = trimmed.lastIndexOf('/')
-                        remotePath = if (idx <= 0) "/" else trimmed.substring(0, idx)
+                        requestPath = if (idx <= 0) "/" else trimmed.substring(0, idx)
                     })
                 }
                 TagPill("+ 目录", fg = G.ink, bg = G.surfaceSubtle, border = G.border, onClick = { showMkdir = true })
                 TagPill("上传", fg = G.accent, bg = G.accentContainer, onClick = { showUploadPicker = true })
-                TagPill("转到路径", fg = G.ink, bg = G.surfaceSubtle, onClick = { jumpPath = remotePath })
-                TagPill("在此开终端", fg = G.accent, bg = G.accentContainer, onClick = { onOpenTerminalAt(remotePath) })
+                TagPill("转到路径", fg = G.ink, bg = G.surfaceSubtle, onClick = { jumpPath = displayPath })
+                TagPill("在此开终端", fg = G.accent, bg = G.accentContainer, onClick = { onOpenTerminalAt(displayPath) })
             }
 
             HeaderProgressSlot(loading)
@@ -703,8 +698,8 @@ fun SftpBrowserSheet(
                         CrispCard(
                             padding = PaddingValues(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
                             onClick = {
-                                if (entry.directory) remotePath = entry.path
-                                else if (entry.permissions.startsWith("-")) editingFile = entry
+                                if (entry.directory) requestPath = entry.path
+                                else editingFile = entry
                             },
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -735,7 +730,7 @@ fun SftpBrowserSheet(
                                     }
                                     GaliaisDropdownMenu(expanded = rowMenu, onDismissRequest = { rowMenu = false }) {
                                         Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                            if (entry.permissions.startsWith("-")) {
+                                            if (!entry.directory) {
                                                 GaliaisMenuRow("在线编辑", icon = GaliaisIcons.Edit, onClick = { rowMenu = false; editingFile = entry })
                                             }
                                             GaliaisMenuRow("下载到本地", icon = GaliaisIcons.Download, onClick = {
@@ -787,7 +782,7 @@ fun SftpBrowserSheet(
                     modifier = Modifier.fillMaxWidth(),
                 )
             },
-            confirmButton = { TextButton(enabled = value.isNotBlank(), onClick = { remotePath = value; jumpPath = null }) { Text("打开", color = G.accent, fontWeight = FontWeight.SemiBold) } },
+            confirmButton = { TextButton(enabled = value.isNotBlank(), onClick = { requestPath = value; jumpPath = null }) { Text("打开", color = G.accent, fontWeight = FontWeight.SemiBold) } },
             dismissButton = { TextButton(onClick = { jumpPath = null }) { Text("取消", color = G.inkMuted) } },
         )
     }
@@ -813,7 +808,7 @@ fun SftpBrowserSheet(
                     val clean = dirName.trim().trim('/')
                     if (clean.isNotEmpty() && !clean.contains('/')) {
                         showMkdir = false
-                        val target = remotePath.trimEnd('/') + "/" + clean
+                        val target = displayPath.trimEnd('/') + "/" + clean
                         busyLabel = "正在创建目录 $clean…"
                         scope.launch {
                             try {
@@ -841,10 +836,10 @@ fun SftpBrowserSheet(
             onDismiss = { showUploadPicker = false },
             onPickFile = { localPath ->
                 showUploadPicker = false
-                busyLabel = "正在上传 ${localPath.substringAfterLast('/')} → $remotePath …"
+                busyLabel = "正在上传 ${localPath.substringAfterLast('/')} → $displayPath …"
                 scope.launch {
                     try {
-                        app.envSsh.startTransfer(host, "upload", localPath, remotePath)
+                        app.envSsh.startTransfer(host, "upload", localPath, displayPath)
                         reloadNonce++
                     } catch (e: Exception) {
                         error = "上传失败：${e.message}"

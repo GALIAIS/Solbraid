@@ -33,6 +33,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableLongStateOf
@@ -93,6 +94,156 @@ private val VISUAL_TOOL_NAMES = setOf("show_widget", "visualize", "render_artifa
 private fun isVisualToolCallWithArtifact(item: TimelineItem): Boolean =
     item is TimelineItem.ToolCall && item.name in VISUAL_TOOL_NAMES && extractArtifactsFromItems(listOf(item)).isNotEmpty()
 
+/** 供 LazyColumn 使用的稳定回调聚合体，避免在非 Composable 的 LazyListScope 中反复分配闭包触发整屏重组。 */
+@Stable
+class ChatTimelineActions(
+    val onOpenConversation: (ConversationKey) -> Unit,
+    val onCancelDelegation: () -> Unit,
+    val onQuote: ((String) -> Unit)?,
+    val onEditResend: ((TimelineItem.UserMessage) -> Unit)? = null,
+    val onRegenerate: ((TimelineItem.UserMessage) -> Unit)? = null,
+    val onUndoTurn: ((TimelineItem.UserMessage) -> Unit)? = null,
+    val onRewindFiles: ((TimelineItem.UserMessage) -> Unit)? = null,
+    val onFork: (() -> Unit)? = null,
+    val onInspectDiffs: (List<FileDiff>) -> Unit,
+    val onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
+    val onApprovePlan: ((TimelineItem.Plan) -> Unit)? = null,
+    val onRevisePlan: ((TimelineItem.Plan, String) -> Unit)? = null,
+)
+
+/**
+ * 轮次增量分组缓存：已完成的历史轮次按 (user, body, durationMs) 复用不可变 [TurnBlock]，
+ * 流式输出期间仅重算最后一轮，彻底消除每 48ms 扫描全历史 Diff 与工具调用的主线程开销。
+ */
+class TurnBlockIncrementalCache {
+    private data class CachedTurn(
+        val user: TimelineItem.UserMessage?,
+        val body: List<TimelineItem>,
+        val durationMs: Long?,
+        val inProgress: Boolean,
+        val block: TurnBlock,
+    )
+
+    private var previous: List<CachedTurn> = emptyList()
+
+    fun group(
+        items: List<TimelineItem>,
+        turnDurations: Map<String, Long>,
+        running: Boolean,
+    ): List<TurnBlock> {
+        if (items.isEmpty()) {
+            previous = emptyList()
+            return emptyList()
+        }
+        val rawGroups = ArrayList<Pair<TimelineItem.UserMessage?, ArrayList<TimelineItem>>>()
+        for (item in items) {
+            if (item is TimelineItem.UserMessage) {
+                rawGroups += item to ArrayList()
+            } else {
+                if (rawGroups.isEmpty()) rawGroups += null to ArrayList()
+                rawGroups.last().second += item
+            }
+        }
+        val nextCache = ArrayList<CachedTurn>(rawGroups.size)
+        val out = ArrayList<TurnBlock>(rawGroups.size)
+        rawGroups.forEachIndexed { idx, (user, body) ->
+            val isLast = idx == rawGroups.lastIndex
+            val inProgress = running && isLast
+            val durMs = user?.durationMs
+                ?: user?.turnId?.let { turnDurations[it] }
+                ?: user?.id?.let { turnDurations[it] }
+            val prev = previous.getOrNull(idx)
+            val reused = prev != null &&
+                !inProgress &&
+                !prev.inProgress &&
+                prev.user == user &&
+                prev.durationMs == durMs &&
+                prev.body == body
+            val block = if (reused) prev.block else buildSingleTurnBlock(idx, user, body, durMs, inProgress)
+            nextCache += CachedTurn(user, body, durMs, inProgress, block)
+            out += block
+        }
+        previous = nextCache
+        return out
+    }
+}
+
+private fun buildSingleTurnBlock(
+    idx: Int,
+    user: TimelineItem.UserMessage?,
+    body: List<TimelineItem>,
+    durMs: Long?,
+    inProgress: Boolean,
+): TurnBlock {
+    // 清理空推理摘要块（GPT/Claude 省略摘要时常产生空占位，不应展示空白折叠行）
+    val cleaned = body.filterNot { it is TimelineItem.Reasoning && it.summaryText.isBlank() && !it.streaming }
+
+    val finalCandidate: TimelineItem.AgentMessage? = run {
+        val msgs = cleaned.filterIsInstance<TimelineItem.AgentMessage>()
+        val explicitFinal = msgs.lastOrNull { it.phase == "final_answer" && (it.text.isNotBlank() || it.streaming) }
+        if (explicitFinal != null) explicitFinal
+        else {
+            val lastMsg = msgs.lastOrNull { it.text.isNotBlank() || it.streaming }
+            if (lastMsg == null) null
+            else {
+                val lastMsgIdx = cleaned.indexOfLast { it.id == lastMsg.id }
+                val hasWorkAfter = cleaned.drop(lastMsgIdx + 1).any {
+                    it is TimelineItem.CommandRun || it is TimelineItem.FileEdit || it is TimelineItem.ToolCall || it is TimelineItem.Delegation
+                }
+                if (!hasWorkAfter && lastMsg.phase != "commentary") lastMsg
+                else if (!inProgress) lastMsg
+                else null
+            }
+        }
+    }
+
+    val trailingNotices = cleaned.filterIsInstance<TimelineItem.Notice>().filter { it.error }
+    val planItems = cleaned.filterIsInstance<TimelineItem.Plan>().filter { it.text.isNotBlank() || it.streaming }
+    val receipts = cleaned.filterIsInstance<TimelineItem.InteractionReceipt>()
+    val visualTools = cleaned.filter(::isVisualToolCallWithArtifact).filterIsInstance<TimelineItem.ToolCall>()
+    val excludedIds = buildSet {
+        finalCandidate?.id?.let(::add)
+        trailingNotices.forEach { add(it.id) }
+        planItems.forEach { add(it.id) }
+        receipts.forEach { add(it.id) }
+        visualTools.forEach { add(it.id) }
+    }
+    val traceItems = cleaned.filterNot { it.id in excludedIds }
+
+    val byPath = linkedMapOf<String, MutableList<FileDiff>>()
+    for (it in cleaned) {
+        if (it is TimelineItem.FileEdit) {
+            for (c in it.changes) {
+                byPath.getOrPut(c.path) { mutableListOf() } += c
+            }
+        }
+    }
+    val editedFiles = byPath.map { (path, diffs) ->
+        var add = 0
+        var rem = 0
+        for (d in diffs) {
+            val (a, r) = diffStats(d.diff)
+            add += a
+            rem += r
+        }
+        FileChangeSummary(path = path, added = add, removed = rem, diffs = diffs)
+    }
+
+    return TurnBlock(
+        id = user?.id ?: "turn-head-$idx",
+        userMessage = user,
+        traceItems = traceItems,
+        planItems = planItems,
+        receipts = receipts,
+        visualToolCalls = visualTools,
+        finalMessage = finalCandidate,
+        trailingNotices = trailingNotices,
+        editedFiles = editedFiles,
+        durationMs = durMs,
+        inProgress = inProgress,
+    )
+}
+
 /** 将平铺的时间线条目归组为 Codex 风格轮次块，自动区分过程旁白（commentary）与最终答复（final_answer）。 */
 fun groupIntoTurnBlocks(
     items: List<TimelineItem>,
@@ -100,91 +251,7 @@ fun groupIntoTurnBlocks(
     running: Boolean,
 ): List<TurnBlock> {
     if (items.isEmpty()) return emptyList()
-    val rawGroups = mutableListOf<Pair<TimelineItem.UserMessage?, MutableList<TimelineItem>>>()
-    for (item in items) {
-        if (item is TimelineItem.UserMessage) {
-            rawGroups += item to mutableListOf()
-        } else {
-            if (rawGroups.isEmpty()) rawGroups += null to mutableListOf()
-            rawGroups.last().second += item
-        }
-    }
-
-    return rawGroups.mapIndexed { idx, (user, body) ->
-        val isLast = idx == rawGroups.lastIndex
-        val inProgress = running && isLast
-        // 清理空推理摘要块（GPT/Claude 省略摘要时常产生空占位，不应展示空白折叠行）
-        val cleaned = body.filterNot { it is TimelineItem.Reasoning && it.summaryText.isBlank() && !it.streaming }
-
-        val finalCandidate: TimelineItem.AgentMessage? = run {
-            val msgs = cleaned.filterIsInstance<TimelineItem.AgentMessage>()
-            val explicitFinal = msgs.lastOrNull { it.phase == "final_answer" && (it.text.isNotBlank() || it.streaming) }
-            if (explicitFinal != null) explicitFinal
-            else {
-                val lastMsg = msgs.lastOrNull { it.text.isNotBlank() || it.streaming }
-                if (lastMsg == null) null
-                else {
-                    val lastMsgIdx = cleaned.indexOfLast { it.id == lastMsg.id }
-                    val hasWorkAfter = cleaned.drop(lastMsgIdx + 1).any {
-                        it is TimelineItem.CommandRun || it is TimelineItem.FileEdit || it is TimelineItem.ToolCall || it is TimelineItem.Delegation
-                    }
-                    if (!hasWorkAfter && lastMsg.phase != "commentary") lastMsg
-                    else if (!inProgress) lastMsg
-                    else null
-                }
-            }
-        }
-
-        val trailingNotices = cleaned.filterIsInstance<TimelineItem.Notice>().filter { it.error }
-        val planItems = cleaned.filterIsInstance<TimelineItem.Plan>().filter { it.text.isNotBlank() || it.streaming }
-        val receipts = cleaned.filterIsInstance<TimelineItem.InteractionReceipt>()
-        val visualTools = cleaned.filter(::isVisualToolCallWithArtifact).filterIsInstance<TimelineItem.ToolCall>()
-        val excludedIds = buildSet {
-            finalCandidate?.id?.let(::add)
-            trailingNotices.forEach { add(it.id) }
-            planItems.forEach { add(it.id) }
-            receipts.forEach { add(it.id) }
-            visualTools.forEach { add(it.id) }
-        }
-        val traceItems = cleaned.filterNot { it.id in excludedIds }
-
-        val byPath = linkedMapOf<String, MutableList<FileDiff>>()
-        for (it in cleaned) {
-            if (it is TimelineItem.FileEdit) {
-                for (c in it.changes) {
-                    byPath.getOrPut(c.path) { mutableListOf() } += c
-                }
-            }
-        }
-        val editedFiles = byPath.map { (path, diffs) ->
-            var add = 0
-            var rem = 0
-            for (d in diffs) {
-                val (a, r) = diffStats(d.diff)
-                add += a
-                rem += r
-            }
-            FileChangeSummary(path = path, added = add, removed = rem, diffs = diffs)
-        }
-
-        val durMs = user?.durationMs
-            ?: user?.turnId?.let { turnDurations[it] }
-            ?: user?.id?.let { turnDurations[it] }
-
-        TurnBlock(
-            id = user?.id ?: "turn-head-$idx",
-            userMessage = user,
-            traceItems = traceItems,
-            planItems = planItems,
-            receipts = receipts,
-            visualToolCalls = visualTools,
-            finalMessage = finalCandidate,
-            trailingNotices = trailingNotices,
-            editedFiles = editedFiles,
-            durationMs = durMs,
-            inProgress = inProgress,
-        )
-    }
+    return TurnBlockIncrementalCache().group(items, turnDurations, running)
 }
 
 fun formatTurnDuration(ms: Long): String {
@@ -199,9 +266,62 @@ fun formatTurnDuration(ms: Long): String {
 }
 
 /**
+ * 将长篇已定稿 Markdown 文本按安全块边界（不截断围栏代码块、数学块、表格与 `<antArtifact>`）切分为 ~1.2KB 虚拟化块，
+ * 供 `LazyColumn` 按屏懒加载与回收，彻底消除长回复单 item 全量排版卡顿。
+ */
+internal fun splitMarkdownVirtualChunks(text: String, targetChunkChars: Int = 1200): List<String> {
+    if (text.length <= targetChunkChars + 600) return listOf(text)
+    val chunks = ArrayList<String>()
+    var chunkStart = 0
+    var pos = 0
+    var inFence = false
+    var inMath = false
+    var inArtifact = false
+    val len = text.length
+    while (pos < len) {
+        val nl = text.indexOf('\n', pos)
+        val end = if (nl < 0) len else nl
+        val line = text.substring(pos, end)
+        val trimmed = line.trim()
+        if (trimmed.startsWith("```") || trimmed.startsWith("~~~")) {
+            inFence = !inFence
+        } else if (!inFence) {
+            if (trimmed == "$$" || (trimmed.startsWith("$$") && !trimmed.drop(2).contains("$$"))) {
+                inMath = !inMath
+            } else if (trimmed.startsWith("\\[") && !trimmed.contains("\\]")) {
+                inMath = true
+            } else if (inMath && trimmed.contains("\\]")) {
+                inMath = false
+            }
+            if (line.contains("<antArtifact", ignoreCase = true) && !line.contains("</antArtifact>", ignoreCase = true)) {
+                inArtifact = true
+            } else if (inArtifact && line.contains("</antArtifact>", ignoreCase = true)) {
+                inArtifact = false
+            }
+        }
+        val nextPos = if (nl < 0) len else nl + 1
+        if (trimmed.isEmpty() && !inFence && !inMath && !inArtifact && (nextPos - chunkStart) >= targetChunkChars && nextPos < len) {
+            val peekEnd = text.indexOf('\n', nextPos).let { if (it < 0) len else it }
+            val nextTrim = text.substring(nextPos, peekEnd).trim()
+            if (nextTrim.isNotEmpty() && !nextTrim.startsWith("|")) {
+                val slice = text.substring(chunkStart, nextPos).trimEnd()
+                if (slice.isNotEmpty()) chunks += slice
+                chunkStart = nextPos
+            }
+        }
+        pos = nextPos
+    }
+    if (chunkStart < len) {
+        val tail = text.substring(chunkStart).trimEnd()
+        if (tail.isNotEmpty()) chunks += tail
+    }
+    return if (chunks.isEmpty()) listOf(text) else chunks
+}
+
+/**
  * 细粒度铺平单轮 LazyColumn 项：
- * 将用户气泡、执行轨迹、内联组件、最终回复、变更汇总拆分为独立 key 的 LazyColumn 子项，
- * 流式输出最终回复时仅重组单条 `m-${block.id}`，彻底避免整轮重测与长对话滚帧抖动。
+ * 将用户气泡、执行轨迹、内联组件、长回复虚拟化切片、变更汇总拆分为独立 key 的 LazyColumn 子项，
+ * 并通过 [ChatTimelineActions] 将每项闭包收敛到 @Composable 内部，杜绝非 Composable 作用域闭包抖动。
  */
 fun LazyListScope.turnBlockItems(
     block: TurnBlock,
@@ -210,28 +330,24 @@ fun LazyListScope.turnBlockItems(
     cwd: String? = null,
     focusText: String? = null,
     editingUserMessageId: String? = null,
-    onOpenConversation: (ConversationKey) -> Unit,
-    onCancelDelegation: () -> Unit,
-    onQuote: ((String) -> Unit)?,
-    onEditResend: ((TimelineItem.UserMessage) -> Unit)? = null,
-    onRegenerate: ((TimelineItem.UserMessage) -> Unit)? = null,
-    onUndoTurn: ((TimelineItem.UserMessage) -> Unit)?,
-    onRewindFiles: ((TimelineItem.UserMessage) -> Unit)? = null,
-    onFork: (() -> Unit)? = null,
-    onInspectDiffs: (List<FileDiff>) -> Unit,
-    onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
-    onApprovePlan: ((TimelineItem.Plan) -> Unit)? = null,
-    onRevisePlan: ((TimelineItem.Plan, String) -> Unit)? = null,
+    enablePlanActions: Boolean = false,
+    actions: ChatTimelineActions,
 ) {
     val editableUser = block.userMessage?.takeIf { !it.id.startsWith("steer-") }
     block.userMessage?.let { user ->
         val canEdit = editableUser != null
         item(key = "u-${block.id}-${user.id}", contentType = "user_msg") {
+            val editCb = remember(canEdit, user, actions.onEditResend) {
+                if (canEdit && actions.onEditResend != null) ({ actions.onEditResend.invoke(user) }) else null
+            }
+            val revertCb: ((String) -> Unit)? = remember(canEdit, user, actions.onUndoTurn) {
+                if (canEdit && actions.onUndoTurn != null) ({ _: String -> actions.onUndoTurn.invoke(user) }) else null
+            }
             UserMessageBubble(
                 item = user,
-                onQuote = onQuote,
-                onEditResend = if (canEdit && onEditResend != null) ({ onEditResend(user) }) else null,
-                onRevert = if (canEdit && onUndoTurn != null) ({ onUndoTurn(user) }) else null,
+                onQuote = actions.onQuote,
+                onEditResend = editCb,
+                onRevert = revertCb,
                 isEditing = editingUserMessageId == user.id,
             )
         }
@@ -245,9 +361,9 @@ fun LazyListScope.turnBlockItems(
                 expandByDefault = expandByDefault,
                 cwd = cwd,
                 focusText = if (block.inProgress) focusText else null,
-                onOpenConversation = onOpenConversation,
-                onCancelDelegation = onCancelDelegation,
-                onOpenArtifact = onOpenArtifact,
+                onOpenConversation = actions.onOpenConversation,
+                onCancelDelegation = actions.onCancelDelegation,
+                onOpenArtifact = actions.onOpenArtifact,
             )
         }
     }
@@ -260,13 +376,19 @@ fun LazyListScope.turnBlockItems(
 
     block.planItems.forEachIndexed { idx, plan ->
         val isLatestPlan = idx == block.planItems.lastIndex
-        val actionable = !block.inProgress && (isLatestPlan || plan.requestFeedback || plan.status == ItemStatus.RUNNING)
+        val actionable = enablePlanActions && !block.inProgress && (isLatestPlan || plan.requestFeedback || plan.status == ItemStatus.RUNNING)
         item(key = "p-${plan.id}", contentType = "plan_artifact") {
+            val approveCb = remember(actionable, plan, actions.onApprovePlan) {
+                if (actionable && actions.onApprovePlan != null) ({ actions.onApprovePlan.invoke(plan) }) else null
+            }
+            val reviseCb = remember(actionable, plan, actions.onRevisePlan) {
+                if (actionable && actions.onRevisePlan != null) ({ fb: String -> actions.onRevisePlan.invoke(plan, fb) }) else null
+            }
             PlanArtifactCard(
                 item = plan,
-                onOpenArtifact = onOpenArtifact,
-                onApprovePlan = if (actionable && onApprovePlan != null) ({ onApprovePlan(plan) }) else null,
-                onRevisePlan = if (actionable && onRevisePlan != null) ({ fb -> onRevisePlan(plan, fb) }) else null,
+                onOpenArtifact = actions.onOpenArtifact,
+                onApprovePlan = approveCb,
+                onRevisePlan = reviseCb,
             )
         }
     }
@@ -275,14 +397,50 @@ fun LazyListScope.turnBlockItems(
         item(key = "v-${tc.id}", contentType = "visual_widget") {
             val widget = remember(tc.id, tc.input) { extractArtifactsFromItems(listOf(tc)).firstOrNull() }
             if (widget != null) {
-                InlineVisualArtifactCard(artifact = widget, onOpenStudio = onOpenArtifact)
+                InlineVisualArtifactCard(artifact = widget, onOpenStudio = actions.onOpenArtifact)
             }
         }
     }
 
     block.finalMessage?.let { msg ->
-        item(key = "m-${block.id}-${msg.id}", contentType = "agent_msg") {
-            AgentMessageView(item = msg, onQuote = onQuote, showFooterActions = false, onOpenArtifact = onOpenArtifact)
+        if (!msg.streaming && msg.text.length > 1800) {
+            val chunks = splitMarkdownVirtualChunks(msg.text)
+            chunks.forEachIndexed { cIdx, chunk ->
+                val isLastChunk = cIdx == chunks.lastIndex
+                item(key = "m-${block.id}-${msg.id}-c$cIdx", contentType = "agent_msg_chunk") {
+                    Column(Modifier.fillMaxWidth().padding(vertical = 1.dp)) {
+                        Markdown(
+                            text = chunk,
+                            sourceItemId = "${msg.id}:c$cIdx",
+                            streaming = false,
+                            onOpenArtifact = actions.onOpenArtifact,
+                        )
+                        if (isLastChunk) {
+                            val pluginFooter = LocalPluginMessageFooter.current
+                            if (pluginFooter != null && pluginFooter.first.isNotEmpty() && msg.text.isNotBlank()) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    pluginFooter.first.forEach { slot ->
+                                        TagPill(
+                                            text = slot.badge.ifBlank { slot.label.ifBlank { slot.id } },
+                                            fg = G.accent,
+                                            bg = G.accentContainer,
+                                            onClick = { pluginFooter.second(slot, msg) },
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            item(key = "m-${block.id}-${msg.id}", contentType = "agent_msg") {
+                AgentMessageView(item = msg, onQuote = actions.onQuote, showFooterActions = false, onOpenArtifact = actions.onOpenArtifact)
+            }
         }
     }
 
@@ -290,23 +448,29 @@ fun LazyListScope.turnBlockItems(
         item(key = "n-${notice.id}", contentType = "notice") {
             TimelineItemView(
                 item = notice,
-                onOpenConversation = onOpenConversation,
-                onCancelDelegation = onCancelDelegation,
+                onOpenConversation = actions.onOpenConversation,
+                onCancelDelegation = actions.onCancelDelegation,
             )
         }
     }
 
     if (block.editedFiles.isNotEmpty() && !block.inProgress) {
-        val undoFilesAction = editableUser?.let { u ->
-            (onRewindFiles ?: onUndoTurn)?.let { cb -> ({ cb(u) }) }
-        }
         item(key = "f-${block.id}", contentType = "edited_files") {
+            val undoFilesAction = remember(editableUser, actions.onRewindFiles, actions.onUndoTurn) {
+                editableUser?.let { u -> (actions.onRewindFiles ?: actions.onUndoTurn)?.let { cb -> ({ cb(u) }) } }
+            }
+            val viewAllCb = remember(block.editedFiles, actions.onInspectDiffs) {
+                { actions.onInspectDiffs(block.editedFiles.flatMap { it.diffs }) }
+            }
+            val viewFileCb = remember(actions.onInspectDiffs) {
+                { file: FileChangeSummary -> actions.onInspectDiffs(file.diffs) }
+            }
             EditedFilesSummaryCard(
                 files = block.editedFiles,
                 cwd = cwd,
                 onUndo = undoFilesAction,
-                onViewAll = { onInspectDiffs(block.editedFiles.flatMap { it.diffs }) },
-                onViewFile = { file -> onInspectDiffs(file.diffs) },
+                onViewAll = viewAllCb,
+                onViewFile = viewFileCb,
             )
         }
     }
@@ -315,18 +479,36 @@ fun LazyListScope.turnBlockItems(
     val hasFooterTrigger = answerText != null || block.editedFiles.isNotEmpty() || block.trailingNotices.isNotEmpty()
     if (!block.inProgress && hasFooterTrigger) {
         item(key = "a-${block.id}", contentType = "turn_footer") {
+            val quoteCb = remember(answerText, actions.onQuote) {
+                if (answerText != null && actions.onQuote != null) ({
+                    val snippet = answerText.lineSequence().firstOrNull { it.isNotBlank() }?.take(120) ?: answerText.take(120)
+                    actions.onQuote.invoke("> $snippet\n\n")
+                }) else null
+            }
+            val editCb = remember(editableUser, actions.onEditResend) {
+                editableUser?.let { u -> actions.onEditResend?.let { cb -> ({ cb(u) }) } }
+            }
+            val regenCb = remember(editableUser, actions.onRegenerate) {
+                editableUser?.takeIf { it.text.isNotBlank() }?.let { u -> actions.onRegenerate?.let { cb -> ({ cb(u) }) } }
+            }
+            val viewDiffsCb = remember(block.editedFiles, actions.onInspectDiffs) {
+                if (block.editedFiles.isNotEmpty()) ({ actions.onInspectDiffs(block.editedFiles.flatMap { it.diffs }) }) else null
+            }
+            val undoCb = remember(editableUser, actions.onUndoTurn) {
+                editableUser?.let { u -> actions.onUndoTurn?.let { cb -> ({ cb(u) }) } }
+            }
+            val rewindCb = remember(block.editedFiles, editableUser, actions.onRewindFiles) {
+                if (block.editedFiles.isNotEmpty()) editableUser?.let { u -> actions.onRewindFiles?.let { cb -> ({ cb(u) }) } } else null
+            }
             TurnFooterActionBar(
                 copyText = answerText,
-                onQuote = if (answerText != null && onQuote != null) ({
-                    val snippet = answerText.lineSequence().firstOrNull { it.isNotBlank() }?.take(120) ?: answerText.take(120)
-                    onQuote("> $snippet\n\n")
-                }) else null,
-                onEditResend = editableUser?.let { u -> onEditResend?.let { cb -> ({ cb(u) }) } },
-                onRegenerate = editableUser?.takeIf { it.text.isNotBlank() }?.let { u -> onRegenerate?.let { cb -> ({ cb(u) }) } },
-                onViewDiffs = if (block.editedFiles.isNotEmpty()) ({ onInspectDiffs(block.editedFiles.flatMap { it.diffs }) }) else null,
-                onUndo = editableUser?.let { u -> onUndoTurn?.let { cb -> ({ cb(u) }) } },
-                onRewindFiles = if (block.editedFiles.isNotEmpty()) editableUser?.let { u -> onRewindFiles?.let { cb -> ({ cb(u) }) } } else null,
-                onFork = onFork,
+                onQuote = quoteCb,
+                onEditResend = editCb,
+                onRegenerate = regenCb,
+                onViewDiffs = viewDiffsCb,
+                onUndo = undoCb,
+                onRewindFiles = rewindCb,
+                onFork = actions.onFork,
             )
         }
     }
@@ -1264,7 +1446,7 @@ private fun TurnFooterActionBar(
                     .clickable(role = Role.Button, onClick = onEditResend),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(GaliaisIcons.Edit, contentDescription = null, tint = G.inkSubtle, modifier = Modifier.size(14.5.dp))
+                Icon(GaliaisIcons.Edit, contentDescription = null, tint = G.inkSubtle, modifier = Modifier.size(15.dp))
             }
         }
 
@@ -1277,7 +1459,7 @@ private fun TurnFooterActionBar(
                     .clickable(role = Role.Button, onClick = onRegenerate),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(GaliaisIcons.Refresh, contentDescription = null, tint = G.inkSubtle, modifier = Modifier.size(14.5.dp))
+                Icon(GaliaisIcons.Refresh, contentDescription = null, tint = G.inkSubtle, modifier = Modifier.size(15.dp))
             }
         }
 
@@ -1292,7 +1474,7 @@ private fun TurnFooterActionBar(
                         .clickable(role = Role.Button) { moreOpen = true },
                     contentAlignment = Alignment.Center,
                 ) {
-                    Icon(GaliaisIcons.MoreHoriz, contentDescription = null, tint = G.inkSubtle, modifier = Modifier.size(16.dp))
+                    Icon(GaliaisIcons.MoreHoriz, contentDescription = null, tint = G.inkSubtle, modifier = Modifier.size(15.dp))
                 }
                 GaliaisAnchoredPopover(
                     expanded = moreOpen,

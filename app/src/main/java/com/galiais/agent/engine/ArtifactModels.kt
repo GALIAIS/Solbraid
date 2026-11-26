@@ -85,7 +85,7 @@ private fun splitRawSvgSegments(sourceItemId: String, markdown: String, startIdx
         }
         val svg = m.value.trim()
         val idx = startIdx + offset
-        val title = Regex("""<title>([^<]{1,60})</title>""", RegexOption.IGNORE_CASE).find(svg)?.groupValues?.get(1)?.trim()
+        val title = HTML_TITLE_RE.find(svg)?.groupValues?.get(1)?.trim()
             ?: "SVG 图形 #${idx + 1}"
         out += MessageSegment.Artifact(
             ChatArtifact(
@@ -153,27 +153,37 @@ fun splitMessageSegments(sourceItemId: String, text: String, streaming: Boolean 
     return segments
 }
 
-/** 从整条会话时间线汇总全部可渲染产物（`<antArtifact>` + Claude `show_widget`/`visualize` + 可视化代码块），自动追踪版本号。 */
-fun extractArtifactsFromItems(items: List<TimelineItem>): List<ChatArtifact> {
-    val result = mutableListOf<ChatArtifact>()
-    val versionByIdent = mutableMapOf<String, Int>()
+private val LATEX_TITLE_RE = Regex("""\\title\{([^{}]{1,60})\}""")
+private val HTML_TITLE_RE = Regex("""<title>([^<]{1,60})</title>""", RegexOption.IGNORE_CASE)
+private val VISUAL_ARTIFACT_TOOLS = setOf("show_widget", "visualize", "render_artifact", "create_artifact")
+private val itemArtifactCache = object : LinkedHashMap<String, List<ChatArtifact>>(256, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<ChatArtifact>>?): Boolean = size > 512
+}
 
-    fun addWithVersion(raw: ChatArtifact) {
-        if (raw.content.isBlank() && !raw.streaming) return
-        val ver = (versionByIdent[raw.identifier] ?: 0) + 1
-        versionByIdent[raw.identifier] = ver
-        result += raw.copy(version = ver)
+private fun extractRawArtifactsForItem(item: TimelineItem): List<ChatArtifact> {
+    val cacheKey = when (item) {
+        is TimelineItem.AgentMessage -> if (item.streaming) null else "a:${item.id}:${item.text.length}:${item.text.hashCode()}"
+        is TimelineItem.ToolCall -> if (item.name in VISUAL_ARTIFACT_TOOLS) "t:${item.id}:${item.input.length}:${item.input.hashCode()}" else return emptyList()
+        is TimelineItem.Plan -> if (item.streaming) null else "p:${item.id}:${item.text.length}:${item.text.hashCode()}"
+        else -> return emptyList()
     }
-
-    for (item in items) {
-        when (item) {
-            is TimelineItem.AgentMessage -> {
-                val segments = splitMessageSegments(item.id, item.text, item.streaming)
+    if (cacheKey != null) {
+        synchronized(itemArtifactCache) {
+            itemArtifactCache[cacheKey]?.let { return it }
+        }
+    }
+    val out = mutableListOf<ChatArtifact>()
+    when (item) {
+        is TimelineItem.AgentMessage -> {
+            // 快路径：无围栏、无 SVG、无 antArtifact 时零正则直接返回
+            val t = item.text
+            if (t.contains("```") || t.contains("<svg", ignoreCase = true) || t.contains("<antArtifact", ignoreCase = true)) {
+                val segments = splitMessageSegments(item.id, t, item.streaming)
                 var fenceIdx = 0
                 for (seg in segments) {
                     when (seg) {
-                        is MessageSegment.Artifact -> addWithVersion(seg.artifact)
-                        is MessageSegment.Text -> {
+                        is MessageSegment.Artifact -> if (seg.artifact.content.isNotBlank() || seg.artifact.streaming) out += seg.artifact
+                        is MessageSegment.Text -> if (seg.markdown.contains("```")) {
                             VISUAL_FENCE_RE.findAll(seg.markdown).forEach { m ->
                                 val lang = m.groupValues[1].lowercase()
                                 val code = m.groupValues[2].trim()
@@ -189,12 +199,12 @@ fun extractArtifactsFromItems(items: List<TimelineItem>): List<ChatArtifact> {
                                     else -> null
                                 } ?: return@forEach
                                 val title = when (kind) {
-                                    ArtifactKind.LATEX -> Regex("""\\title\{([^{}]{1,60})\}""").find(code)?.groupValues?.get(1) ?: "LaTeX 排版 #${fenceIdx + 1}"
-                                    ArtifactKind.HTML -> Regex("""<title>([^<]{1,60})</title>""", RegexOption.IGNORE_CASE).find(code)?.groupValues?.get(1) ?: "交互网页 #${fenceIdx + 1}"
+                                    ArtifactKind.LATEX -> LATEX_TITLE_RE.find(code)?.groupValues?.get(1) ?: "LaTeX 排版 #${fenceIdx + 1}"
+                                    ArtifactKind.HTML -> HTML_TITLE_RE.find(code)?.groupValues?.get(1) ?: "交互网页 #${fenceIdx + 1}"
                                     else -> "${kind.label} #${fenceIdx + 1}"
                                 }
-                                addWithVersion(
-                                    ChatArtifact(
+                                if (code.isNotBlank() || item.streaming) {
+                                    out += ChatArtifact(
                                         id = "${item.id}:fence:$fenceIdx",
                                         identifier = "fence-${kind.wire}-${item.id}-$fenceIdx",
                                         title = title,
@@ -203,59 +213,83 @@ fun extractArtifactsFromItems(items: List<TimelineItem>): List<ChatArtifact> {
                                         content = code,
                                         sourceItemId = item.id,
                                         streaming = item.streaming,
-                                    ),
-                                )
+                                    )
+                                }
                                 fenceIdx++
                             }
                         }
                     }
                 }
             }
-            is TimelineItem.ToolCall -> {
-                if (item.name in setOf("show_widget", "visualize", "render_artifact", "create_artifact")) {
-                    val obj = runCatching { JSONObject(item.input) }.getOrNull()
-                    val code = obj?.optString("widget_code")?.ifBlank { null }
-                        ?: obj?.optString("html")?.ifBlank { null }
-                        ?: obj?.optString("content")?.ifBlank { null }
-                        ?: obj?.optString("code")?.ifBlank { null }
-                    if (obj != null && !code.isNullOrBlank()) {
-                        val title = obj.optString("title").ifBlank { "交互组件 ${item.name}" }
-                        val kind = ArtifactKind.fromMimeOrLang(obj.optString("type"), if (code.trimStart().startsWith("<svg")) "svg" else "html")
-                        addWithVersion(
-                            ChatArtifact(
-                                id = "${item.id}:widget",
-                                identifier = obj.optString("identifier").ifBlank { "widget-${item.id}" },
-                                title = title,
-                                kind = kind,
-                                language = kind.extension,
-                                content = code,
-                                sourceItemId = item.id,
-                            ),
-                        )
-                    }
-                }
+        }
+        is TimelineItem.ToolCall -> {
+            val obj = runCatching { JSONObject(item.input) }.getOrNull()
+            val code = obj?.optString("widget_code")?.ifBlank { null }
+                ?: obj?.optString("html")?.ifBlank { null }
+                ?: obj?.optString("content")?.ifBlank { null }
+                ?: obj?.optString("code")?.ifBlank { null }
+            if (obj != null && !code.isNullOrBlank()) {
+                val title = obj.optString("title").ifBlank { "交互组件 ${item.name}" }
+                val kind = ArtifactKind.fromMimeOrLang(obj.optString("type"), if (code.trimStart().startsWith("<svg")) "svg" else "html")
+                out += ChatArtifact(
+                    id = "${item.id}:widget",
+                    identifier = obj.optString("identifier").ifBlank { "widget-${item.id}" },
+                    title = title,
+                    kind = kind,
+                    language = kind.extension,
+                    content = code,
+                    sourceItemId = item.id,
+                )
             }
-            is TimelineItem.Plan -> {
-                if (item.text.isNotBlank() || item.streaming) {
-                    val baseIdent = item.filePath?.takeIf { it.isNotBlank() }
-                        ?.substringAfterLast('/')
-                        ?.let { "plan-$it" }
-                        ?: "plan-${item.id}"
-                    addWithVersion(
-                        ChatArtifact(
-                            id = "${item.id}:plan",
-                            identifier = baseIdent,
-                            title = item.title.ifBlank { "执行计划" },
-                            kind = ArtifactKind.MARKDOWN,
-                            language = "markdown",
-                            content = item.text.trim(),
-                            sourceItemId = item.id,
-                            streaming = item.streaming,
-                        ),
-                    )
-                }
+        }
+        is TimelineItem.Plan -> {
+            if (item.text.isNotBlank() || item.streaming) {
+                val baseIdent = item.filePath?.takeIf { it.isNotBlank() }
+                    ?.substringAfterLast('/')
+                    ?.let { "plan-$it" }
+                    ?: "plan-${item.id}"
+                out += ChatArtifact(
+                    id = "${item.id}:plan",
+                    identifier = baseIdent,
+                    title = item.title.ifBlank { "执行计划" },
+                    kind = ArtifactKind.MARKDOWN,
+                    language = "markdown",
+                    content = item.text.trim(),
+                    sourceItemId = item.id,
+                    streaming = item.streaming,
+                )
             }
-            else -> Unit
+        }
+        is TimelineItem.UserMessage,
+        is TimelineItem.Reasoning,
+        is TimelineItem.CommandRun,
+        is TimelineItem.FileEdit,
+        is TimelineItem.Delegation,
+        is TimelineItem.InteractionReceipt,
+        is TimelineItem.Notice,
+        -> Unit
+    }
+    if (cacheKey != null) {
+        synchronized(itemArtifactCache) {
+            itemArtifactCache[cacheKey] = out
+        }
+    }
+    return out
+}
+
+/** 从整条会话时间线汇总全部可渲染产物（`<antArtifact>` + Claude `show_widget`/`visualize` + 可视化代码块），按条目 LRU 缓存并自动追踪版本号。 */
+fun extractArtifactsFromItems(items: List<TimelineItem>): List<ChatArtifact> {
+    if (items.isEmpty()) return emptyList()
+    val result = mutableListOf<ChatArtifact>()
+    val versionByIdent = HashMap<String, Int>()
+    for (item in items) {
+        val rawList = extractRawArtifactsForItem(item)
+        if (rawList.isEmpty()) continue
+        for (raw in rawList) {
+            if (raw.content.isBlank() && !raw.streaming) continue
+            val ver = (versionByIdent[raw.identifier] ?: 0) + 1
+            versionByIdent[raw.identifier] = ver
+            result += if (ver == raw.version) raw else raw.copy(version = ver)
         }
     }
     return result

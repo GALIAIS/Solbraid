@@ -12,10 +12,10 @@
     <path
         android:fillColor="#FFFFFF"
         android:pathData="M77,54 L77,58 C77,69.6 67.6,77 55,77 L31,77 L31,66 L40,66 L40,69.5 L55,69.5 C63.2,69.5 69,65 69,58 L69,54 Z" />
-    <!-- Terminal prompt chevron > -->
+    <!-- Terminal prompt chevron > (optically centered inside S cavity) -->
     <path
         android:fillColor="@android:color/transparent"
-        android:pathData="M46.5,47.5 L54,54 L46.5,60.5"
+        android:pathData="M45.5,47.5 L53,54 L45.5,60.5"
         android:strokeColor="#FFFFFF"
         android:strokeLineCap="round"
         android:strokeLineJoin="round"
@@ -23,7 +23,7 @@
     <!-- Terminal prompt underscore _ -->
     <path
         android:fillColor="@android:color/transparent"
-        android:pathData="M55.5,60.5 L63.5,60.5"
+        android:pathData="M54.5,60.5 L62.5,60.5"
         android:strokeColor="#FFFFFF"
         android:strokeLineCap="round"
         android:strokeWidth="3.6" />

@@ -40,6 +40,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -93,12 +94,17 @@ internal fun JsonTreeViewer(app: GaliaisApplication, file: File) {
     val scope = rememberCoroutineScope()
     var query by remember { mutableStateOf("") }
     val collapsed = remember { mutableStateMapOf<String, Boolean>() }
-    val parsed = remember(file) {
-        runCatching {
-            val raw = file.readText(Charsets.UTF_8).take(1_500_000)
-            JSONTokener(raw).nextValue()
-        }.getOrNull()
+    val parsedState by produceState<Pair<Boolean, Any?>>(initialValue = false to null, key1 = file) {
+        val result = withContext(Dispatchers.IO) {
+            runCatching {
+                val raw = file.readText(Charsets.UTF_8).take(1_500_000)
+                JSONTokener(raw).nextValue()
+            }.getOrNull()
+        }
+        value = true to result
     }
+    if (!parsedState.first) return
+    val parsed = parsedState.second
     if (parsed == null) {
         Box(Modifier.fillMaxSize().padding(20.dp), contentAlignment = Alignment.Center) {
             CrispCard { Text("JSON 解析失败，请点击上方「以代码编辑器打开」查看源码。", color = G.danger) }
@@ -178,12 +184,17 @@ internal fun JsonTreeViewer(app: GaliaisApplication, file: File) {
 @Composable
 internal fun CsvTableViewer(file: File, isTsv: Boolean) {
     var query by remember { mutableStateOf("") }
-    val table = remember(file, isTsv) {
-        val delim = if (isTsv) '\t' else ','
-        file.bufferedReader(Charsets.UTF_8).useLines { seq ->
-            seq.take(1000).map { line -> parseCsvRow(line, delim) }.toList()
+    val tableState by produceState<List<List<String>>?>(initialValue = null, key1 = file, key2 = isTsv) {
+        value = withContext(Dispatchers.IO) {
+            val delim = if (isTsv) '\t' else ','
+            runCatching {
+                file.bufferedReader(Charsets.UTF_8).useLines { seq ->
+                    seq.take(1000).map { line -> parseCsvRow(line, delim) }.toList()
+                }
+            }.getOrDefault(emptyList())
         }
     }
+    val table = tableState ?: return
     val headers = table.firstOrNull().orEmpty()
     val body = remember(table, query) {
         val q = query.trim().lowercase()
@@ -478,7 +489,14 @@ internal fun ApkInspectorViewer(app: GaliaisApplication, file: File) {
 @Composable
 internal fun FontSpecimenViewer(file: File) {
     var sample by remember { mutableStateOf("Solbraid 文件管理器 · The quick brown fox jumps over 0123456789") }
-    val fontFamily = remember(file) { runCatching { FontFamily(Typeface.createFromFile(file)) }.getOrNull() }
+    val fontState by produceState<Pair<Boolean, FontFamily?>>(initialValue = false to null, key1 = file) {
+        val ff = withContext(Dispatchers.IO) {
+            runCatching { FontFamily(Typeface.createFromFile(file)) }.getOrNull()
+        }
+        value = true to ff
+    }
+    if (!fontState.first) return
+    val fontFamily = fontState.second
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         OutlinedTextField(value = sample, onValueChange = { sample = it }, label = { Text("自定义预览文本") }, shape = D.fieldShape, colors = galiaisTextFieldColors(), modifier = Modifier.fillMaxWidth())
         if (fontFamily == null) {

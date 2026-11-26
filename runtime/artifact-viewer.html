@@ -5,13 +5,24 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=4,user-scalable=yes" />
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; frame-src blob: data:;" />
 <title>Solbraid Artifact Studio</title>
+<script>
+(function(){
+  try {
+    var q = new URLSearchParams(location.search || "");
+    var d = q.get("dark") === "1";
+    var bg = q.get("bg");
+    if (d) document.documentElement.classList.add("dark");
+    if (bg && /^#[0-9a-fA-F]{6}$/.test(bg)) document.documentElement.style.setProperty("--bg", bg);
+  } catch (e) {}
+})();
+</script>
 <style>
 :root {
-  --bg: #ffffff; --surface: #f7f8fa; --ink: #14171f; --muted: #5d6472;
+  --bg: transparent; --surface: #f7f8fa; --ink: #14171f; --muted: #5d6472;
   --border: #dfe3eb; --accent: #2563eb; --accent-soft: #eff6ff; --code-bg: #f1f4f9;
   --paper: #ffffff; --shadow: 0 2px 12px rgba(15, 23, 42, 0.08);
 }
-body.dark {
+html.dark, body.dark {
   --bg: #0f1117; --surface: #171a23; --ink: #eceff4; --muted: #98a2b3;
   --border: #2a3040; --accent: #60a5fa; --accent-soft: #172554; --code-bg: #1c202c;
   --paper: #141821; --shadow: 0 2px 16px rgba(0, 0, 0, 0.35);

@@ -24,6 +24,7 @@
   }
 
   function setTheme(dark, inlineMode, viewportMode, palette) {
+    document.documentElement.classList.toggle("dark", Boolean(dark));
     document.body.classList.toggle("dark", Boolean(dark));
     document.body.classList.toggle("inline", Boolean(inlineMode));
     stage.classList.remove("vp-mobile", "vp-desktop");
@@ -984,6 +985,29 @@
     reportHeight();
   }
 
+  function notifyRendered(seq) {
+    if (!global.SolbraidStudioBridge || typeof global.SolbraidStudioBridge.onRendered !== "function") return;
+    let sent = false;
+    const fire = () => {
+      if (sent) return;
+      sent = true;
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        try { global.SolbraidStudioBridge.onRendered(Number(seq || 0)); } catch {}
+      }));
+    };
+    const iframe = stage.querySelector("iframe.sandbox-frame");
+    if (iframe) {
+      const prevOnload = iframe.onload;
+      iframe.onload = () => {
+        if (typeof prevOnload === "function") prevOnload();
+        fire();
+      };
+      setTimeout(fire, 900);
+    } else {
+      fire();
+    }
+  }
+
   function render(payload) {
     if (!payload) return;
     const prevId = lastPayload && lastPayload.id;
@@ -1008,6 +1032,7 @@
       window.scrollTo(0, 0);
     }
     reportHeight();
+    notifyRendered(payload.renderSeq || 0);
   }
 
   if (typeof ResizeObserver !== "undefined" && stage) {

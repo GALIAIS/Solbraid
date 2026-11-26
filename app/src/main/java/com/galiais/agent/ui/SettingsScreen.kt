@@ -24,6 +24,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.galiais.agent.BuildConfig
@@ -81,12 +82,12 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
 
     Column(modifier.fillMaxSize().galiaisCanvasBackground()) {
         Row(
-            modifier = Modifier.fillMaxWidth().height(if (D.material) 64.dp else 56.dp).padding(horizontal = 18.dp),
+            modifier = Modifier.fillMaxWidth().height(if (D.material) 64.dp else 56.dp).padding(horizontal = 16.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("设置", style = MaterialTheme.typography.titleLarge, color = G.ink)
+            Text("设置", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, color = G.ink)
         }
-        HeaderDivider()
+        HeaderProgressSlot(runtime.busy)
 
         Column(
             modifier = Modifier
@@ -134,7 +135,7 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                             enabled = runtime.bound,
                         )
                     }
-                    Icon(GaliaisIcons.ChevronRight, contentDescription = "查看运行环境详情", tint = G.inkSubtle, modifier = Modifier.size(16.dp))
+                    Icon(GaliaisIcons.ChevronRight, contentDescription = "查看运行环境详情", tint = G.inkSubtle, modifier = Modifier.size(18.dp))
                 }
                 if (runtime.busy) {
                     Spacer(Modifier.height(10.dp))
@@ -322,7 +323,7 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                 )
             }
 
-            Spacer(Modifier.height(20.dp))
+            Spacer(Modifier.height(20.dp + LocalFloatingNavBottomInset.current))
         }
     }
     PluginSlotOverlayHost(

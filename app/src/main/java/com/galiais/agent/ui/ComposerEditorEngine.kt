@@ -88,11 +88,24 @@ internal class ComposerRichVisualTransformation(
     private val renderMath: Boolean,
     private val fallbackThreshold: Int,
 ) : VisualTransformation {
+    private var cachedRaw: String? = null
+    private var cachedResult: TransformedText? = null
+
+    private fun mayContainMarkup(raw: String): Boolean {
+        for (i in raw.indices) {
+            when (raw[i]) {
+                '`', '#', '*', '_', '~', '[', '>', '-', '+', '@', '/', '$', '\\', ':' -> return true
+            }
+        }
+        return false
+    }
+
     override fun filter(text: AnnotatedString): TransformedText {
         val raw = text.text
-        if (raw.isEmpty() || (fallbackThreshold > 0 && raw.length > fallbackThreshold)) {
+        if (raw.isEmpty() || (fallbackThreshold > 0 && raw.length > fallbackThreshold) || !mayContainMarkup(raw)) {
             return TransformedText(text, OffsetMapping.Identity)
         }
+        if (cachedRaw == raw) cachedResult?.let { return it }
         val dimColor = colors.inkSubtle.copy(alpha = 0.55f)
         val codeBg = if (colors.dark) colors.surfaceElevated else colors.surfaceSubtle
         val mathBg = colors.claudeTint.copy(alpha = if (colors.dark) 0.30f else 0.55f)
@@ -200,7 +213,10 @@ internal class ComposerRichVisualTransformation(
                 if (!overlaps(m.range)) safeStyle(SpanStyle(color = colors.codex, textDecoration = TextDecoration.Underline), m.range.first, m.range.last + 1)
             }
         }
-        return TransformedText(styled, OffsetMapping.Identity)
+        val result = TransformedText(styled, OffsetMapping.Identity)
+        cachedRaw = raw
+        cachedResult = result
+        return result
     }
 }
 
@@ -208,8 +224,15 @@ internal class ComposerRichVisualTransformation(
 internal fun hasRichRenderableContent(text: String, renderMath: Boolean = true): Boolean {
     val s = text.trim()
     if (s.length < 3) return false
+    var hasMeta = false
+    for (i in s.indices) {
+        when (s[i]) {
+            '`', '<', '$', '\\', '#', '|', '>', '-', '*', '+', '~', '[' -> { hasMeta = true; break }
+        }
+    }
+    if (!hasMeta) return false
     if (s.contains("```") || s.contains("<svg", ignoreCase = true) || s.contains("<antArtifact", ignoreCase = true)) return true
-    if (renderMath && (ComposerPatterns.displayMath.containsMatchIn(s) || ComposerPatterns.inlineMath.containsMatchIn(s))) return true
+    if (renderMath && (s.contains('$') || s.contains("\\[") || s.contains("\\(")) && (ComposerPatterns.displayMath.containsMatchIn(s) || ComposerPatterns.inlineMath.containsMatchIn(s))) return true
     return ComposerPatterns.heading.containsMatchIn(s) ||
         ComposerPatterns.mdTable.containsMatchIn(s) ||
         ComposerPatterns.blockquote.containsMatchIn(s) ||

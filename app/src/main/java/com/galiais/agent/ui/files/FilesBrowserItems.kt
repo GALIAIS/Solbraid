@@ -91,7 +91,7 @@ internal fun iconAndColorForNode(node: FileNode): Triple<ImageVector, Color, Col
         ext in setOf("png", "jpg", "jpeg", "webp", "gif", "bmp", "heic", "avif", "svg", "ico") ->
             Triple(GaliaisIcons.Image, G.success, G.successTint)
         ext in setOf("mp4", "mkv", "webm", "mov", "3gp", "mp3", "aac", "m4a", "flac", "ogg", "opus", "wav") ->
-            Triple(GaliaisIcons.Activity, G.artifact, G.artifactTint)
+            Triple(GaliaisIcons.Play, G.artifact, G.artifactTint)
         ext in setOf("zip", "tar", "gz", "tgz", "xz", "7z", "apk", "jar", "aar") ->
             Triple(GaliaisIcons.Archive, G.warning, G.warningTint)
         ext in setOf("kt", "kts", "java", "js", "mjs", "ts", "tsx", "py", "rs", "go", "c", "cpp", "h", "sh", "json", "yaml", "yml", "toml", "xml", "html", "css", "sql", "md") ->
@@ -107,7 +107,7 @@ private val ROW_TIME_FMT = ThreadLocal.withInitial { SimpleDateFormat("MM-dd HH:
 internal fun TabCounterButton(count: Int, onClick: () -> Unit) {
     Box(
         modifier = Modifier
-            .size(36.dp)
+            .size(38.dp)
             .clip(CircleShape)
             .semantics { contentDescription = "标签页 ($count)" }
             .clickable(onClick = onClick),
@@ -115,17 +115,20 @@ internal fun TabCounterButton(count: Int, onClick: () -> Unit) {
     ) {
         Box(
             modifier = Modifier
-                .size(20.dp)
-                .clip(RoundedCornerShape(5.dp))
-                .border(1.5.dp, if (count > 1) G.accent else G.inkMuted, RoundedCornerShape(5.dp)),
+                .size(18.dp)
+                .clip(RoundedCornerShape(4.5.dp))
+                .border(1.5.dp, if (count > 1) G.accent else G.inkMuted, RoundedCornerShape(4.5.dp)),
             contentAlignment = Alignment.Center,
         ) {
             Text(
                 text = count.coerceAtMost(9).toString(),
-                fontFamily = Mono,
-                fontSize = 10.5.sp,
-                fontWeight = FontWeight.Bold,
                 color = if (count > 1) G.accent else G.inkMuted,
+                style = androidx.compose.ui.text.TextStyle(
+                    fontFamily = Mono,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    platformStyle = androidx.compose.ui.text.PlatformTextStyle(includeFontPadding = false),
+                ),
             )
         }
     }
@@ -185,18 +188,24 @@ internal fun ScopeSegmentedHeader(
                             horizontalArrangement = Arrangement.spacedBy(5.dp),
                         ) {
                             Text(label, fontFamily = Mono, fontSize = 11.sp, fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal, color = if (active) G.ink else G.inkMuted, maxLines = 1)
-                            Text("×", fontSize = 12.sp, color = G.inkSubtle, modifier = Modifier.clickable { onCloseTab(tab.id) }.padding(horizontal = 2.dp))
+                            Box(
+                                modifier = Modifier.size(16.dp).clip(CircleShape).clickable { onCloseTab(tab.id) },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(GaliaisIcons.Close, contentDescription = "关闭标签", tint = G.inkSubtle, modifier = Modifier.size(10.dp))
+                            }
                         }
                     }
                 }
                 Box(
                     modifier = Modifier
+                        .size(24.dp)
                         .clip(D.shape(8.dp))
                         .background(G.accentContainer)
-                        .clickable(onClick = onOpenNewTab)
-                        .padding(horizontal = 8.dp, vertical = 3.dp),
+                        .clickable(onClick = onOpenNewTab),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Text("+", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = G.accent)
+                    Icon(GaliaisIcons.Add, contentDescription = "新建标签", tint = G.accent, modifier = Modifier.size(13.dp))
                 }
             }
         }
@@ -281,13 +290,13 @@ internal fun PathAndUtilityBar(
                 .clickable(onClick = onToggleFilterTray),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(GaliaisIcons.ListCheck, contentDescription = null, tint = if (filterActive || filterExpanded) G.accent else G.inkMuted, modifier = Modifier.size(16.dp))
+            Icon(GaliaisIcons.Filter, contentDescription = null, tint = if (filterActive || filterExpanded) G.accent else G.inkMuted, modifier = Modifier.size(16.dp))
         }
         // 视图循环切换（详细 / 紧凑 / 缩略图网格）
         val viewIcon = when (viewMode) {
-            ViewMode.DETAILED -> GaliaisIcons.FileLines
+            ViewMode.DETAILED -> GaliaisIcons.ListView
             ViewMode.COMPACT -> GaliaisIcons.Layers
-            ViewMode.GRID -> GaliaisIcons.Image
+            ViewMode.GRID -> GaliaisIcons.LayoutGrid
         }
         val viewDesc = when (viewMode) {
             ViewMode.DETAILED -> "当前：详细列表，点击切换紧凑"

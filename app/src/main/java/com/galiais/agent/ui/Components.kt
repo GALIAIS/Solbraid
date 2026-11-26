@@ -760,7 +760,7 @@ fun PrimaryFab(text: String, icon: ImageVector, onClick: () -> Unit, modifier: M
             shape = D.fabShape,
             containerColor = MaterialTheme.colorScheme.primaryContainer,
             contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-            icon = { Icon(icon, contentDescription = null) },
+            icon = { Icon(icon, contentDescription = null, modifier = Modifier.size(19.dp)) },
             text = { Text(text, style = MaterialTheme.typography.labelLarge) },
         )
     } else {
@@ -777,7 +777,7 @@ fun PrimaryFab(text: String, icon: ImageVector, onClick: () -> Unit, modifier: M
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(7.dp),
             ) {
-                Icon(icon, contentDescription = null, modifier = Modifier.size(18.dp))
+                Icon(icon, contentDescription = null, modifier = Modifier.size(19.dp))
                 Text(text, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
             }
         }
@@ -848,28 +848,70 @@ fun CodeContent(
     val d = D
     val fontSize = d.codeSize(baseSize)
     val lineHeight = d.codeSize(baseSize * 1.52f)
-    Row(modifier.fillMaxWidth()) {
-        if (d.codeLineNumbers && !softWrap) {
-            val count = text.text.count { it == '\n' } + 1
-            Text(
-                (1..count).joinToString("\n"),
-                fontFamily = Mono,
-                fontSize = fontSize,
-                lineHeight = lineHeight,
-                color = G.codeMuted.copy(alpha = 0.7f),
-                textAlign = TextAlign.End,
-                modifier = Modifier.padding(start = contentPadding, top = contentPadding, bottom = contentPadding, end = 4.dp),
-            )
+    val totalLines = remember(text.text) { text.text.count { it == '\n' } + 1 }
+    val expandedLongState = remember(text.text) { androidx.compose.runtime.mutableStateOf(false) }
+    val expandedLong = expandedLongState.value
+    val collapseLimit = 80
+    val shouldCollapse = totalLines > collapseLimit && !expandedLong
+    val displayText = remember(text, shouldCollapse) {
+        if (!shouldCollapse) text
+        else {
+            var cut = 0
+            var seen = 0
+            val raw = text.text
+            while (cut < raw.length && seen < collapseLimit) {
+                val nl = raw.indexOf('\n', cut)
+                if (nl < 0) { cut = raw.length; break }
+                cut = nl + 1
+                seen++
+            }
+            text.subSequence(0, cut.coerceAtMost(text.length))
         }
-        Box(Modifier.weight(1f).let { m -> if (softWrap) m else m.horizontalScroll(rememberScrollState()) }) {
-            Text(
-                text,
-                fontFamily = Mono,
-                fontSize = fontSize,
-                lineHeight = lineHeight,
-                softWrap = softWrap,
-                modifier = Modifier.padding(contentPadding),
-            )
+    }
+    val shownLines = if (shouldCollapse) collapseLimit else totalLines
+    val gutterText = remember(shownLines) { (1..shownLines).joinToString("\n") }
+    Column(modifier.fillMaxWidth()) {
+        Row(Modifier.fillMaxWidth()) {
+            if (d.codeLineNumbers && !softWrap) {
+                Text(
+                    gutterText,
+                    fontFamily = Mono,
+                    fontSize = fontSize,
+                    lineHeight = lineHeight,
+                    color = G.codeMuted.copy(alpha = 0.7f),
+                    textAlign = TextAlign.End,
+                    modifier = Modifier.padding(start = contentPadding, top = contentPadding, bottom = contentPadding, end = 4.dp),
+                )
+            }
+            Box(Modifier.weight(1f).let { m -> if (softWrap) m else m.horizontalScroll(rememberScrollState()) }) {
+                Text(
+                    displayText,
+                    fontFamily = Mono,
+                    fontSize = fontSize,
+                    lineHeight = lineHeight,
+                    softWrap = softWrap,
+                    modifier = Modifier.padding(contentPadding),
+                )
+            }
+        }
+        if (totalLines > collapseLimit) {
+            Hairline()
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(G.codeHeader.copy(alpha = 0.55f))
+                    .clickable { expandedLongState.value = !expandedLongState.value }
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    if (expandedLong) "收起长代码（仅显示前 $collapseLimit 行）" else "展开全部 $totalLines 行代码（剩余 ${totalLines - collapseLimit} 行）",
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = G.accent,
+                )
+            }
         }
     }
 }
@@ -898,7 +940,7 @@ fun SubPageScaffold(
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(if (D.material) 64.dp else 56.dp)
-                            .padding(start = 4.dp, end = 8.dp),
+                            .padding(start = 4.dp, end = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(2.dp),
                     ) {
@@ -908,6 +950,7 @@ fun SubPageScaffold(
                         Text(
                             title,
                             style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
                             color = G.ink,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
@@ -958,12 +1001,12 @@ fun SettingsNavRow(
     ) {
         Box(
             modifier = Modifier
-                .size(38.dp)
+                .size(36.dp)
                 .clip(D.shape(if (D.material) 12.dp else 10.dp))
                 .background(iconBg),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(icon, contentDescription = null, tint = iconTint, modifier = Modifier.size(19.dp))
+            Icon(icon, contentDescription = null, tint = iconTint, modifier = Modifier.size(18.dp))
         }
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(
@@ -1010,10 +1053,10 @@ fun SettingsToggleRow(
     ) {
         if (icon != null) {
             Box(
-                modifier = Modifier.size(34.dp).clip(D.shape(9.dp)).background(G.surfaceSubtle),
+                modifier = Modifier.size(36.dp).clip(D.shape(if (D.material) 12.dp else 10.dp)).background(G.surfaceSubtle),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(icon, contentDescription = null, tint = G.inkMuted, modifier = Modifier.size(17.dp))
+                Icon(icon, contentDescription = null, tint = G.inkMuted, modifier = Modifier.size(18.dp))
             }
         }
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -1042,12 +1085,12 @@ fun SearchBar(
         border = if (D.material) null else BorderStroke(1.dp, G.border),
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp),
+            modifier = Modifier.fillMaxWidth().height(42.dp).padding(start = 12.dp, end = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Icon(GaliaisIcons.Search, contentDescription = null, tint = G.inkMuted, modifier = Modifier.size(18.dp))
-            Box(Modifier.weight(1f)) {
+            Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
                 if (value.isEmpty()) {
                     Text(placeholder, style = MaterialTheme.typography.bodyMedium, color = G.inkSubtle, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
@@ -1063,7 +1106,7 @@ fun SearchBar(
             if (value.isNotEmpty()) {
                 Box(
                     modifier = Modifier
-                        .size(34.dp)
+                        .size(30.dp)
                         .clip(CircleShape)
                         .semantics { contentDescription = "清除搜索" }
                         .clickable { onValueChange("") },
@@ -1073,7 +1116,7 @@ fun SearchBar(
                         modifier = Modifier.size(22.dp).clip(CircleShape).background(G.surfaceSubtle),
                         contentAlignment = Alignment.Center,
                     ) {
-                        Icon(GaliaisIcons.Close, contentDescription = null, tint = G.inkMuted, modifier = Modifier.size(13.dp))
+                        Icon(GaliaisIcons.Close, contentDescription = null, tint = G.inkMuted, modifier = Modifier.size(12.dp))
                     }
                 }
             }
@@ -1086,7 +1129,10 @@ fun SearchBar(
 fun ScrollToBottomFab(onClick: () -> Unit, modifier: Modifier = Modifier, running: Boolean = false) {
     Surface(
         onClick = onClick,
-        modifier = modifier.height(34.dp).semantics { contentDescription = "回到底部" },
+        modifier = modifier
+            .height(34.dp)
+            .widthIn(min = 34.dp)
+            .semantics { contentDescription = "回到底部" },
         shape = CircleShape,
         color = if (D.material) MaterialTheme.colorScheme.secondaryContainer else G.surface,
         contentColor = if (D.material) MaterialTheme.colorScheme.onSecondaryContainer else G.ink,
@@ -1094,9 +1140,9 @@ fun ScrollToBottomFab(onClick: () -> Unit, modifier: Modifier = Modifier, runnin
         shadowElevation = if (G.dark) 3.dp else 5.dp,
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = if (running) 11.dp else 8.dp),
+            modifier = Modifier.padding(horizontal = if (running) 11.dp else 0.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(5.dp),
+            horizontalArrangement = Arrangement.spacedBy(5.dp, Alignment.CenterHorizontally),
         ) {
             if (running) PulsingDot(G.accent, size = 6.dp)
             Icon(GaliaisIcons.ArrowDown, contentDescription = null, modifier = Modifier.size(17.dp))

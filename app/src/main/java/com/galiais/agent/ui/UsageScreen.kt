@@ -513,7 +513,7 @@ fun UsageScreen(
         actions = {
             if (runtime.ready) {
                 IconButton(enabled = !loading, onClick = { tick++ }) {
-                    Icon(GaliaisIcons.Refresh, contentDescription = "刷新用量", tint = if (!loading) G.inkMuted else G.inkSubtle, modifier = Modifier.size(19.dp))
+                    Icon(GaliaisIcons.Refresh, contentDescription = "刷新用量", tint = if (!loading) G.inkMuted else G.inkSubtle, modifier = Modifier.size(20.dp))
                 }
                 if (totals.requests > 0) {
                     Box {
@@ -522,7 +522,7 @@ fun UsageScreen(
                         }
                         GaliaisDropdownMenu(expanded = topMenuOpen, onDismissRequest = { topMenuOpen = false }) {
                             Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                GaliaisMenuRow(title = "导出 CSV 报表", onClick = {
+                                GaliaisMenuRow(title = "导出 CSV 报表", icon = GaliaisIcons.Download, onClick = {
                                     topMenuOpen = false
                                     scope.launch {
                                         runCatching {

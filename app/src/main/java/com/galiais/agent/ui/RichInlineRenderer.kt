@@ -344,91 +344,101 @@ fun InlineVisualArtifactCard(
                         .put("inline", true)
                         .toString()
                 }
-                var webViewRef by remember(artifact.id, showSource) { mutableStateOf<WebView?>(null) }
+                // 防快速滑屏风暴：停留 180ms 后再实例化内联 WebView，避免高速滚动大会话时反复创建/销毁 Chromium 造成掉帧
+                var mountWebView by remember(artifact.id, showSource) { mutableStateOf(false) }
+                LaunchedEffect(artifact.id, showSource) {
+                    delay(180L)
+                    mountWebView = true
+                }
+                val webViewHolder = remember(artifact.id, showSource) { object { var view: WebView? = null } }
                 val interactiveKind = artifact.kind in setOf(ArtifactKind.HTML, ArtifactKind.REACT, ArtifactKind.CHART)
                 DisposableEffect(artifact.id, showSource) {
                     onDispose {
-                        webViewRef?.let { wv ->
+                        webViewHolder.view?.let { wv ->
                             wv.stopLoading()
                             wv.destroy()
                         }
-                        webViewRef = null
+                        webViewHolder.view = null
                         pageLoaded = false
                     }
                 }
-                Box(Modifier.fillMaxWidth().height(contentHeightDp.coerceIn(minH, maxH).dp)) {
-                    androidx.compose.runtime.key(artifact.id, showSource) {
-                        AndroidView(
-                            modifier = Modifier.fillMaxWidth().height(contentHeightDp.coerceIn(minH, maxH).dp),
-                            factory = { ctx ->
-                                pageLoaded = false
-                                object : WebView(ctx) {
-                                    override fun onTouchEvent(event: MotionEvent?): Boolean {
-                                        when (event?.actionMasked) {
-                                            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
-                                                if (interactiveKind || canScrollHorizontally(-1) || canScrollHorizontally(1)) {
-                                                    parent?.requestDisallowInterceptTouchEvent(true)
+                Box(Modifier.fillMaxWidth().height(contentHeightDp.coerceIn(minH, maxH).dp), contentAlignment = Alignment.Center) {
+                    if (!mountWebView) {
+                        Text("正在准备${artifact.kind.label}预览…", style = MaterialTheme.typography.labelSmall, color = G.inkSubtle)
+                    } else {
+                        androidx.compose.runtime.key(artifact.id, showSource) {
+                            AndroidView(
+                                modifier = Modifier.fillMaxWidth().height(contentHeightDp.coerceIn(minH, maxH).dp),
+                                factory = { ctx ->
+                                    pageLoaded = false
+                                    object : WebView(ctx) {
+                                        override fun onTouchEvent(event: MotionEvent?): Boolean {
+                                            when (event?.actionMasked) {
+                                                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
+                                                    if (interactiveKind || canScrollHorizontally(-1) || canScrollHorizontally(1)) {
+                                                        parent?.requestDisallowInterceptTouchEvent(true)
+                                                    }
+                                                }
+                                                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                                    parent?.requestDisallowInterceptTouchEvent(false)
                                                 }
                                             }
-                                            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                                                parent?.requestDisallowInterceptTouchEvent(false)
-                                            }
+                                            return super.onTouchEvent(event)
                                         }
-                                        return super.onTouchEvent(event)
-                                    }
-                                }.apply {
-                                    setBackgroundColor(android.graphics.Color.TRANSPARENT)
-                                    isVerticalScrollBarEnabled = false
-                                    isHorizontalScrollBarEnabled = true
-                                    settings.javaScriptEnabled = true
-                                    settings.domStorageEnabled = false
-                                    settings.allowFileAccess = false
-                                    settings.allowContentAccess = false
-                                    settings.cacheMode = WebSettings.LOAD_NO_CACHE
-                                    addJavascriptInterface(
-                                        object {
-                                            @JavascriptInterface
-                                            fun onHeight(px: Int) {
-                                                post {
-                                                    val target = px.coerceIn(minH, maxH)
-                                                    if (kotlin.math.abs(target - contentHeightDp) > 8) contentHeightDp = target
+                                    }.apply {
+                                        setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                                        isVerticalScrollBarEnabled = false
+                                        isHorizontalScrollBarEnabled = true
+                                        settings.javaScriptEnabled = true
+                                        settings.domStorageEnabled = false
+                                        settings.allowFileAccess = false
+                                        settings.allowContentAccess = false
+                                        settings.cacheMode = WebSettings.LOAD_NO_CACHE
+                                        addJavascriptInterface(
+                                            object {
+                                                @JavascriptInterface
+                                                fun onHeight(px: Int) {
+                                                    post {
+                                                        val target = px.coerceIn(minH, maxH)
+                                                        if (kotlin.math.abs(target - contentHeightDp) > 8) contentHeightDp = target
+                                                    }
                                                 }
+                                            },
+                                            "SolbraidInlineBridge",
+                                        )
+                                        webViewClient = object : WebViewClient() {
+                                            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                                                val uri = request?.url ?: return null
+                                                if (uri.host != INLINE_ARTIFACT_HOST) return WebResourceResponse("text/plain", "utf-8", 403, "Blocked", emptyMap(), "".byteInputStream())
+                                                val name = uri.lastPathSegment?.takeIf { it in setOf("artifact-viewer.html", "artifact-latex.js", "artifact-mermaid.js", "artifact-renderer.js") }
+                                                    ?: return WebResourceResponse("text/plain", "utf-8", 404, "Not Found", emptyMap(), "".byteInputStream())
+                                                val mime = if (name.endsWith(".html")) "text/html" else "application/javascript"
+                                                return runCatching { WebResourceResponse(mime, "utf-8", ctx.assets.open("galiais/runtime/$name")) }
+                                                    .getOrElse { WebResourceResponse("text/plain", "utf-8", 404, "Missing Asset", emptyMap(), "".byteInputStream()) }
                                             }
-                                        },
-                                        "SolbraidInlineBridge",
-                                    )
-                                    webViewClient = object : WebViewClient() {
-                                        override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
-                                            val uri = request?.url ?: return null
-                                            if (uri.host != INLINE_ARTIFACT_HOST) return WebResourceResponse("text/plain", "utf-8", 403, "Blocked", emptyMap(), "".byteInputStream())
-                                            val name = uri.lastPathSegment?.takeIf { it in setOf("artifact-viewer.html", "artifact-latex.js", "artifact-mermaid.js", "artifact-renderer.js") }
-                                                ?: return WebResourceResponse("text/plain", "utf-8", 404, "Not Found", emptyMap(), "".byteInputStream())
-                                            val mime = if (name.endsWith(".html")) "text/html" else "application/javascript"
-                                            return runCatching { WebResourceResponse(mime, "utf-8", ctx.assets.open("galiais/runtime/$name")) }
-                                                .getOrElse { WebResourceResponse("text/plain", "utf-8", 404, "Missing Asset", emptyMap(), "".byteInputStream()) }
-                                        }
 
-                                        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = true
+                                            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = true
 
-                                        override fun onPageFinished(view: WebView?, url: String?) {
-                                            pageLoaded = true
-                                            view?.tag = payloadJson
-                                            view?.evaluateJavascript("window.SolbraidStudio && window.SolbraidStudio.render($payloadJson);", null)
+                                            override fun onPageFinished(view: WebView?, url: String?) {
+                                                pageLoaded = true
+                                                view?.tag = payloadJson
+                                                view?.evaluateJavascript("window.SolbraidStudio && window.SolbraidStudio.render($payloadJson);", null)
+                                            }
                                         }
+                                        webViewHolder.view = this
+                                        loadUrl("https://$INLINE_ARTIFACT_HOST/artifact-viewer.html?dark=${if (dark) 1 else 0}")
                                     }
-                                    webViewRef = this
-                                    loadUrl("https://$INLINE_ARTIFACT_HOST/artifact-viewer.html")
-                                }
-                            },
-                            update = { wv ->
-                                webViewRef = wv
-                                // 去重：仅当内容/主题变化时重渲染 WebView，彻底杜绝父重组触发的重复渲染与高度抖动风暴
-                                if (pageLoaded && wv.tag != payloadJson) {
-                                    wv.tag = payloadJson
-                                    wv.evaluateJavascript("window.SolbraidStudio && window.SolbraidStudio.render($payloadJson);", null)
-                                }
-                            },
-                        )
+                                },
+                                update = { wv ->
+                                    webViewHolder.view = wv
+                                    // 去重：仅当内容/主题变化时重渲染 WebView，彻底杜绝父重组触发的重复渲染与高度抖动风暴
+                                    if (pageLoaded && wv.tag != payloadJson) {
+                                        wv.tag = payloadJson
+                                        wv.evaluateJavascript("window.SolbraidStudio && window.SolbraidStudio.render($payloadJson);", null)
+                                    }
+                                },
+                            )
+                        }
                     }
                 }
             }
@@ -563,7 +573,11 @@ fun InlineCsvTableCard(
     }
 }
 
-/** Markdown 内联图片卡片：原生解码渲染 Base64 Data URI 图片，并对远程图片链接提供一键打开。 */
+private val inlineBitmapCache = object : LinkedHashMap<String, androidx.compose.ui.graphics.ImageBitmap>(16, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, androidx.compose.ui.graphics.ImageBitmap>?): Boolean = size > 24
+}
+
+/** Markdown 内联图片卡片：后台线程异步解码 + LRU 缓存渲染 Base64 Data URI 图片，并对远程图片链接提供一键打开。 */
 @Composable
 fun InlineImageCard(
     destination: String,
@@ -571,23 +585,39 @@ fun InlineImageCard(
     modifier: Modifier = Modifier,
 ) {
     val uriHandler = LocalUriHandler.current
-    val decoded = remember(destination) {
-        if (!destination.startsWith("data:image/", ignoreCase = true)) null
-        else runCatching {
-            val b64 = destination.substringAfter("base64,", "")
-            if (b64.isBlank() || b64.length > 6_000_000) null
-            else {
-                val bytes = Base64.decode(b64, Base64.DEFAULT)
-                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-                var sample = 1
-                while (bounds.outWidth / sample > 1600 || bounds.outHeight / sample > 1600) sample *= 2
-                val opts = BitmapFactory.Options().apply { inSampleSize = sample }
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)?.asImageBitmap()
-            }
-        }.getOrNull()
+    val decoded by androidx.compose.runtime.produceState<androidx.compose.ui.graphics.ImageBitmap?>(initialValue = null, key1 = destination) {
+        if (!destination.startsWith("data:image/", ignoreCase = true)) {
+            value = null
+            return@produceState
+        }
+        val cacheKey = "${destination.length}:${destination.hashCode()}"
+        val cached = synchronized(inlineBitmapCache) { inlineBitmapCache[cacheKey] }
+        if (cached != null) {
+            value = cached
+            return@produceState
+        }
+        val img = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching {
+                val b64 = destination.substringAfter("base64,", "")
+                if (b64.isBlank() || b64.length > 6_000_000) null
+                else {
+                    val bytes = Base64.decode(b64, Base64.DEFAULT)
+                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                    var sample = 1
+                    while (bounds.outWidth / sample > 1600 || bounds.outHeight / sample > 1600) sample *= 2
+                    val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)?.asImageBitmap()
+                }
+            }.getOrNull()
+        }
+        if (img != null) {
+            synchronized(inlineBitmapCache) { inlineBitmapCache[cacheKey] = img }
+        }
+        value = img
     }
-    if (decoded != null) {
+    val img = decoded
+    if (img != null) {
         Surface(
             modifier = modifier.fillMaxWidth(),
             shape = D.shape(12.dp),
@@ -596,7 +626,7 @@ fun InlineImageCard(
         ) {
             Column {
                 Image(
-                    bitmap = decoded,
+                    bitmap = img,
                     contentDescription = alt.ifBlank { "图片" },
                     contentScale = ContentScale.Fit,
                     modifier = Modifier.fillMaxWidth().heightIn(min = 80.dp, max = 300.dp).background(G.surfaceSubtle),

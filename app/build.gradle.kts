@@ -135,6 +135,9 @@ android {
             useLegacyPackaging = true
             keepDebugSymbols += setOf("**/libbin_*.so", "**/libpayload_*.so", "**/libproot*.so", "**/libtalloc.so", "**/libandroid-shmem.so")
         }
+        resources {
+            excludes += setOf("META-INF/versions/9/OSGI-INF/MANIFEST.MF")
+        }
     }
     buildTypes {
         release {
@@ -199,6 +202,8 @@ dependencies {
     implementation("org.commonmark:commonmark-ext-gfm-strikethrough:0.33.0")
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
+    implementation("com.github.mwiede:jsch:2.28.8")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.87")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
 }

@@ -1,9 +1,14 @@
 package com.galiais.agent.engine
 
 import android.util.Log
+import com.galiais.agent.LinuxRuntime
+import com.galiais.agent.engine.ssh.NativeSftpClient
+import com.galiais.agent.engine.ssh.NativeSshEngine
+import com.galiais.agent.engine.ssh.NativeTerminalManager
 import com.galiais.agent.newId
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
@@ -15,6 +20,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Solbraid 统一环境中心与完整 SSH 套件仓库：
@@ -46,6 +53,19 @@ class EnvSshRepository(
 
     private val activeTunnelsFlow = MutableStateFlow<List<SshActiveTunnel>>(emptyList())
     val activeTunnels: StateFlow<List<SshActiveTunnel>> = activeTunnelsFlow.asStateFlow()
+    private val containerTunnelsFlow = MutableStateFlow<List<SshActiveTunnel>>(emptyList())
+    private val transferJobs = ConcurrentHashMap<String, Job>()
+
+    val nativeSsh = NativeSshEngine(runtime.app, settings)
+    val nativeSftp = NativeSftpClient(nativeSsh)
+    val nativeTerminals = NativeTerminalManager(
+        app = runtime.app,
+        runtime = runtime,
+        sshEngine = nativeSsh,
+        allHostsProvider = { sshHostsFlow.value },
+        prepareLocalRuntime = { syncBeforeLaunch() },
+        onNotify = onNotify,
+    )
 
     private val hostTestsFlow = MutableStateFlow<Map<String, SshHostTestResult>>(emptyMap())
     val hostTests: StateFlow<Map<String, SshHostTestResult>> = hostTestsFlow.asStateFlow()
@@ -57,7 +77,20 @@ class EnvSshRepository(
     private val envSyncErrorFlow = MutableStateFlow<String?>(null)
     val envSyncError = envSyncErrorFlow.asStateFlow()
 
+    private fun mergeActiveTunnels() {
+        val nativeList = nativeSsh.activeNativeTunnels.value
+        val nativeIds = nativeList.mapTo(HashSet()) { it.id }
+        val containerOnly = containerTunnelsFlow.value.filterNot { it.id in nativeIds }
+        activeTunnelsFlow.value = nativeList + containerOnly
+    }
+
     init {
+        scope.launch {
+            nativeSsh.activeNativeTunnels.collect { mergeActiveTunnels() }
+        }
+        scope.launch {
+            runCatching { refreshSshKeys() }
+        }
         scope.launch {
             runtime.hubEvents.collect { packet ->
                 if (packet.optString("method") == "ssh/transferChanged") {
@@ -66,9 +99,10 @@ class EnvSshRepository(
                 }
                 if (packet.optString("method") == "ssh/tunnelChanged") {
                     val params = packet.optJSONObject("params") ?: return@collect
-                    activeTunnelsFlow.value = params.arr("tunnels").objects().mapNotNull {
+                    containerTunnelsFlow.value = params.arr("tunnels").objects().mapNotNull {
                         runCatching { SshActiveTunnel.fromJson(it) }.getOrNull()
                     }
+                    mergeActiveTunnels()
                     params.str("error")?.takeIf { it.isNotBlank() }?.let { err ->
                         onNotify("SSH 隧道已断开：${err.lineSequence().first().take(80)}")
                     }
@@ -113,9 +147,13 @@ class EnvSshRepository(
     }
 
     fun resetRuntimeState() {
-        activeTunnelsFlow.value = emptyList()
+        containerTunnelsFlow.value = emptyList()
+        mergeActiveTunnels()
         syncedEnvironmentPayload = null
-        transfersFlow.value = transfersFlow.value.map { if (it.active) it.copy(phase = "failed", error = "运行环境已断开，请检查文件后重试") else it }
+        nativeTerminals.onLocalRuntimeDisconnected()
+        transfersFlow.value = transfersFlow.value.map {
+            if (it.active && !transferJobs.containsKey(it.id)) it.copy(phase = "failed", error = "运行环境已断开，请检查文件后重试") else it
+        }
     }
 
     // ── 完整环境中心 ─────────────────────────────────────────────────────────
@@ -282,10 +320,11 @@ class EnvSshRepository(
     suspend fun syncSshNow(): JSONObject = sshSyncMutex.withLock {
         check(runtime.hubAvailable) { "请先启动本地运行环境" }
         val hostsArr = JSONArray().apply { sshHostsFlow.value.forEach { put(it.toJson()) } }
+        // 安全加固：绝不再向 Linux 容器磁盘落盘明文密码或私钥口令；原生 SSH/SFTP 直接从 Android Keystore 内存读取。
         val payload = jsonOf(
             "hosts" to hostsArr,
-            "passwords" to settings.exportBucketSecretsJson(SSH_SECRET_BUCKET),
-            "keyPassphrases" to settings.exportBucketSecretsJson(SSH_KEY_SECRET_BUCKET),
+            "passwords" to JSONObject(),
+            "keyPassphrases" to JSONObject(),
         )
         runtime.hubRequest("ssh/sync", payload, timeoutMs = 15_000)
     }
@@ -297,12 +336,22 @@ class EnvSshRepository(
         } else if (host.authType != "password") {
             settings.setExtensionSecret(SSH_SECRET_BUCKET, host.id, null)
         }
+        nativeSftp.closeHost(host.id)
+        // 若主机别名发生修改，同步更新关联隧道预设的 alias，防止隧道失效
+        val updatedTunnels = savedTunnelsFlow.value.map { t ->
+            if (t.hostId == host.id && t.alias != host.alias) t.copy(alias = host.alias) else t
+        }
+        if (updatedTunnels != savedTunnelsFlow.value) {
+            savedTunnelsFlow.value = updatedTunnels
+            settings.setSshTunnelsJson(JSONArray().apply { updatedTunnels.forEach { put(it.toJson()) } }.toString())
+        }
         persistHosts(sshHostsFlow.value.filterNot { it.id == host.id } + host)
         onNotify("已保存 SSH 主机：${host.name}（ssh ${host.alias}）")
     }
 
     fun deleteSshHost(id: String) {
         settings.setExtensionSecret(SSH_SECRET_BUCKET, id, null)
+        nativeSftp.closeHost(id)
         hostTestsFlow.value = hostTestsFlow.value - id
         val orphanTunnels = savedTunnelsFlow.value.filter { it.hostId == id }
         val activeOrphans = activeTunnelsFlow.value.filter { it.hostId == id }
@@ -311,7 +360,7 @@ class EnvSshRepository(
             savedTunnelsFlow.value = remaining
             settings.setSshTunnelsJson(JSONArray().apply { remaining.forEach { put(it.toJson()) } }.toString())
         }
-        if (activeOrphans.isNotEmpty() && runtime.hubAvailable) {
+        if (activeOrphans.isNotEmpty()) {
             scope.launch {
                 activeOrphans.forEach { t -> runCatching { stopTunnel(t.id) } }
             }
@@ -323,71 +372,47 @@ class EnvSshRepository(
     fun hasSshPassword(hostId: String): Boolean = settings.hasExtensionSecret(SSH_SECRET_BUCKET, hostId)
 
     suspend fun testSshHost(host: SshHostConfig): SshHostTestResult {
-        check(runtime.hubAvailable) { "请先启动本地运行环境" }
-        syncSshNow()
-        val res = runtime.hubRequest("ssh/test", jsonOf("hostId" to host.id, "alias" to host.alias), timeoutMs = 25_000)
-        val parsed = SshHostTestResult(
-            ok = res.optBoolean("ok"),
-            latencyMs = res.optInt("latencyMs"),
-            remoteInfo = res.optString("remoteInfo", ""),
-            error = res.optString("error", ""),
-        )
+        val parsed = nativeSsh.testHost(host, sshHostsFlow.value)
         hostTestsFlow.value = hostTestsFlow.value + (host.id to parsed)
         return parsed
     }
 
     suspend fun deployKeyToHost(host: SshHostConfig, keyName: String = "id_ed25519") {
-        check(runtime.hubAvailable) { "请先启动本地运行环境" }
-        syncSshNow()
-        runtime.hubRequest("ssh/deployKey", jsonOf("hostId" to host.id, "alias" to host.alias, "keyName" to keyName), timeoutMs = 28_000)
+        nativeSsh.deployPublicKey(host, sshHostsFlow.value, keyName)
         onNotify("已部署公钥 $keyName 到 ${host.alias}，现在可切换密钥免密登录")
     }
 
-    suspend fun execSshCommand(host: SshHostConfig, command: String, remoteCwd: String = ""): SshExecResult {
-        check(runtime.hubAvailable) { "请先启动本地运行环境" }
-        syncSshNow()
-        val res = runtime.hubRequest("ssh/exec", jsonOf("hostId" to host.id, "alias" to host.alias, "command" to command, "remoteCwd" to remoteCwd), timeoutMs = 70_000)
-        return SshExecResult(
-            exitCode = res.optInt("exitCode", 1),
-            stdout = res.optString("stdout", ""),
-            stderr = res.optString("stderr", ""),
-            durationMs = res.optInt("durationMs", 0),
-        )
-    }
+    suspend fun execSshCommand(host: SshHostConfig, command: String, remoteCwd: String = ""): SshExecResult =
+        nativeSsh.execCommand(host, sshHostsFlow.value, command, remoteCwd, interactive = true, timeoutMs = 45_000)
 
     suspend fun refreshSshKeys(): List<SshKeyInfo> {
-        if (!runtime.hubAvailable) return emptyList()
-        val res = runtime.hubRequest("ssh/listKeys", JSONObject(), timeoutMs = 15_000)
-        val list = res.arr("keys").objects().mapNotNull { runCatching { SshKeyInfo.fromJson(it) }.getOrNull() }
+        val list = nativeSsh.listKeys()
         sshKeysFlow.value = list
         return list
     }
 
     suspend fun generateSshKey(name: String, type: String = "ed25519", comment: String = "solbraid-mobile", passphrase: String = ""): SshKeyInfo? {
-        check(runtime.hubAvailable) { "请先启动本地运行环境" }
-        val res = runtime.hubRequest("ssh/generateKey", jsonOf("name" to name, "type" to type, "comment" to comment, "passphrase" to passphrase), timeoutMs = 30_000)
+        val key = nativeSsh.generateKey(name, type, comment, passphrase)
         settings.setExtensionSecret(SSH_KEY_SECRET_BUCKET, name, passphrase)
-        syncSshNow()
         refreshSshKeys()
         onNotify("已生成密钥：$name")
-        return res.optJSONObject("key")?.let(SshKeyInfo::fromJson)
+        return key
     }
 
     suspend fun importSshKey(name: String, privateKey: String, publicKey: String = "", passphrase: String = ""): SshKeyInfo? {
-        check(runtime.hubAvailable) { "请先启动本地运行环境" }
-        val res = runtime.hubRequest("ssh/importKey", jsonOf("name" to name, "privateKey" to privateKey, "publicKey" to publicKey, "passphrase" to passphrase), timeoutMs = 15_000)
+        val key = nativeSsh.importKey(name, privateKey, publicKey, passphrase)
         settings.setExtensionSecret(SSH_KEY_SECRET_BUCKET, name, passphrase)
-        syncSshNow()
         refreshSshKeys()
         onNotify("已导入密钥：$name")
-        return res.optJSONObject("key")?.let(SshKeyInfo::fromJson)
+        return key
     }
 
     suspend fun deleteSshKey(name: String) {
-        check(runtime.hubAvailable) { "请先启动本地运行环境" }
-        runtime.hubRequest("ssh/deleteKey", jsonOf("name" to name), timeoutMs = 10_000)
+        nativeSsh.deleteKey(name)
+        if (runtime.hubAvailable) {
+            runCatching { runtime.hubRequest("ssh/deleteKey", jsonOf("name" to name), timeoutMs = 8_000) }
+        }
         settings.setExtensionSecret(SSH_KEY_SECRET_BUCKET, name, null)
-        syncSshNow()
         refreshSshKeys()
         onNotify("已删除密钥：$name")
     }
@@ -395,20 +420,18 @@ class EnvSshRepository(
     fun hasSshKeyPassphrase(name: String) = settings.hasExtensionSecret(SSH_KEY_SECRET_BUCKET, name)
 
     suspend fun saveSshKeyPassphrase(name: String, passphrase: String) {
-        check(runtime.hubAvailable) { "请先启动运行环境" }
-        if (passphrase.isNotEmpty()) runtime.hubRequest("ssh/verifyKeyPassphrase", jsonOf("name" to name, "passphrase" to passphrase), timeoutMs = 15_000)
+        if (passphrase.isNotEmpty()) nativeSsh.verifyKeyPassphrase(name, passphrase)
         settings.setExtensionSecret(SSH_KEY_SECRET_BUCKET, name, passphrase)
-        syncSshNow()
+        onNotify(if (passphrase.isEmpty()) "已清除密钥口令" else "已验证并加密保存密钥口令")
     }
 
-    suspend fun knownHosts(): List<SshKnownHost> =
-        runtime.hubRequest("ssh/knownHosts", JSONObject(), timeoutMs = 10_000).arr("entries").objects().map {
-            SshKnownHost(it.getString("id"), it.getString("hosts"), it.getString("keyType"), it.getString("fingerprint"), it.optString("marker"))
-        }
+    suspend fun knownHosts(): List<SshKnownHost> = nativeSsh.listKnownHosts()
 
-    suspend fun removeKnownHost(id: String) { runtime.hubRequest("ssh/removeKnownHost", jsonOf("id" to id), timeoutMs = 10_000) }
+    suspend fun removeKnownHost(id: String) {
+        nativeSsh.removeKnownHost(id)
+    }
 
-    // ── SSH 隧道 ─────────────────────────────────────────────────────────────
+    // ── SSH 隧道（-L / -R 原生 JSch 无需本地 Linux，-D SOCKS5 使用容器 OpenSSH） ─────
 
     fun saveTunnelPreset(preset: SshTunnelPreset) {
         val next = savedTunnelsFlow.value.filterNot { it.id == preset.id } + preset
@@ -429,13 +452,22 @@ class EnvSshRepository(
     }
 
     suspend fun refreshActiveTunnels() {
-        if (!runtime.hubAvailable) return
-        val res = runtime.hubRequest("ssh/listTunnels", JSONObject(), timeoutMs = 10_000)
-        activeTunnelsFlow.value = res.arr("tunnels").objects().mapNotNull { runCatching { SshActiveTunnel.fromJson(it) }.getOrNull() }
+        if (runtime.hubAvailable) {
+            val res = runtime.hubRequest("ssh/listTunnels", JSONObject(), timeoutMs = 10_000)
+            containerTunnelsFlow.value = res.arr("tunnels").objects().mapNotNull { runCatching { SshActiveTunnel.fromJson(it) }.getOrNull() }
+        }
+        mergeActiveTunnels()
     }
 
     suspend fun startTunnel(preset: SshTunnelPreset) {
-        check(runtime.hubAvailable) { "请先启动本地运行环境" }
+        val host = sshHostsFlow.value.firstOrNull { it.id == preset.hostId } ?: error("未找到关联的 SSH 主机配置")
+        if (preset.mode == "local" || preset.mode == "remote") {
+            nativeSsh.startNativeTunnel(preset, host, sshHostsFlow.value)
+            mergeActiveTunnels()
+            onNotify("原生隧道已启动：${preset.name}")
+            return
+        }
+        check(runtime.hubAvailable) { "SOCKS5 动态代理 (-D) 需先启动本地运行环境；-L / -R 端口转发可直接原生运行" }
         syncSshNow()
         runtime.hubRequest(
             "ssh/startTunnel",
@@ -455,70 +487,138 @@ class EnvSshRepository(
     }
 
     suspend fun stopTunnel(id: String) {
-        if (!runtime.hubAvailable) {
-            check(activeTunnelsFlow.value.none { it.id == id }) { "运行环境未连接，无法确认隧道已停止" }
-            return
+        nativeSsh.stopNativeTunnel(id)
+        if (containerTunnelsFlow.value.any { it.id == id } && runtime.hubAvailable) {
+            runtime.hubRequest("ssh/stopTunnel", jsonOf("id" to id), timeoutMs = 10_000)
+            refreshActiveTunnels()
+        } else {
+            mergeActiveTunnels()
         }
-        runtime.hubRequest("ssh/stopTunnel", jsonOf("id" to id), timeoutMs = 10_000)
-        refreshActiveTunnels()
     }
 
-    // ── SFTP 远端文件浏览器 ──────────────────────────────────────────────────
+    // ── SFTP 远端文件浏览器（基于原生连接复用池，不依赖本地 Linux 运行时） ──────────
 
-    suspend fun sftpList(host: SshHostConfig, remotePath: String = "."): Pair<String, List<SshRemoteEntry>> {
-        check(runtime.hubAvailable) { "请先启动本地运行环境" }
-        syncSshNow()
-        val res = runtime.hubRequest("ssh/sftpList", jsonOf("hostId" to host.id, "alias" to host.alias, "remotePath" to remotePath), timeoutMs = 30_000)
-        val resolved = res.optString("path", remotePath)
-        val list = res.arr("entries").objects().mapNotNull { runCatching { SshRemoteEntry.fromJson(it) }.getOrNull() }
-        return resolved to list
+    private fun resolveLocalTransferFile(path: String): File {
+        val clean = path.trim()
+        if (clean.startsWith("/storage/") || clean.startsWith("/sdcard/") || clean.startsWith(runtime.app.filesDir.absolutePath)) {
+            return File(clean)
+        }
+        val direct = File(clean)
+        if (direct.exists()) return direct
+        val mode = settings.state.value.effectiveRuntimeMode.ifBlank { RUNTIME_MODE_ROOT }
+        return File(LinuxRuntime(runtime.app, mode).root, clean.trimStart('/'))
     }
+
+    suspend fun sftpList(host: SshHostConfig, remotePath: String = "."): Pair<String, List<SshRemoteEntry>> =
+        nativeSftp.list(host, sshHostsFlow.value, remotePath)
 
     private fun acceptTransfer(transfer: SftpTransfer) {
         transfersFlow.value = (transfersFlow.value.filterNot { it.id == transfer.id } + transfer).takeLast(20)
     }
 
     suspend fun refreshTransfers() {
+        if (!runtime.hubAvailable) return
         val result = runtime.hubRequest("ssh/transfers", JSONObject(), timeoutMs = 10_000)
-        transfersFlow.value = result.arr("transfers").objects().map(SftpTransfer::fromJson)
+        val remoteTransfers = result.arr("transfers").objects().map(SftpTransfer::fromJson)
+        val nativeOnly = transfersFlow.value.filter { it.id.startsWith("nat-") }
+        transfersFlow.value = (remoteTransfers + nativeOnly).takeLast(20)
     }
 
     suspend fun startTransfer(host: SshHostConfig, direction: String, localPath: String, remotePath: String) {
-        check(runtime.hubAvailable) { "请先启动运行环境" }
-        syncSshNow()
-        val result = runtime.hubRequest("ssh/startTransfer", jsonOf("hostId" to host.id, "direction" to direction,
-            "localPath" to localPath, "remotePath" to remotePath), timeoutMs = 20_000)
-        acceptTransfer(SftpTransfer.fromJson(result.getJSONObject("transfer")))
+        val transferId = "nat-${newId().take(8)}"
+        val name = if (direction == "upload") localPath.trimEnd('/').substringAfterLast('/') else remotePath.trimEnd('/').substringAfterLast('/')
+        val initial = SftpTransfer(
+            id = transferId,
+            hostId = host.id,
+            direction = direction,
+            localPath = localPath,
+            remotePath = remotePath,
+            phase = "running",
+            progressPercent = 0,
+            progressLabel = name,
+            error = null,
+            resultPath = null,
+        )
+        acceptTransfer(initial)
+        val job = scope.launch(Dispatchers.IO) {
+            try {
+                if (direction == "upload") {
+                    val srcFile = resolveLocalTransferFile(localPath)
+                    require(srcFile.exists()) { "本地文件不存在：$localPath" }
+                    if (srcFile.isDirectory) {
+                        val children = srcFile.walkTopDown().filter { it.isFile }.toList()
+                        val total = children.size.coerceAtLeast(1)
+                        val baseRemote = "${remotePath.trimEnd('/')}/${srcFile.name}"
+                        runCatching { nativeSftp.mkdir(host, sshHostsFlow.value, baseRemote) }
+                        children.forEachIndexed { idx, file ->
+                            val relDir = file.parentFile?.relativeTo(srcFile)?.path?.replace('\\', '/').orEmpty()
+                            val targetDir = if (relDir.isEmpty()) baseRemote else "$baseRemote/$relDir"
+                            if (relDir.isNotEmpty()) runCatching { nativeSftp.mkdir(host, sshHostsFlow.value, targetDir) }
+                            nativeSftp.uploadFile(host, sshHostsFlow.value, file, targetDir) { pct ->
+                                val overall = ((idx * 100 + pct) / total).coerceIn(0, 100)
+                                acceptTransfer(initial.copy(progressPercent = overall, progressLabel = "${file.name} (${idx + 1}/$total)"))
+                            }
+                        }
+                        acceptTransfer(initial.copy(phase = "completed", progressPercent = 100, resultPath = baseRemote))
+                    } else {
+                        val dest = nativeSftp.uploadFile(host, sshHostsFlow.value, srcFile, remotePath) { pct ->
+                            acceptTransfer(initial.copy(progressPercent = pct, progressLabel = srcFile.name))
+                        }
+                        acceptTransfer(initial.copy(phase = "completed", progressPercent = 100, resultPath = dest))
+                    }
+                    onNotify("上传完成：$name")
+                } else {
+                    val destDir = resolveLocalTransferFile(localPath).apply { mkdirs() }
+                    val destFile = File(destDir, name.ifBlank { "download.bin" })
+                    nativeSftp.downloadFile(host, sshHostsFlow.value, remotePath, destFile) { pct ->
+                        acceptTransfer(initial.copy(progressPercent = pct, progressLabel = name))
+                    }
+                    acceptTransfer(initial.copy(phase = "completed", progressPercent = 100, resultPath = destFile.absolutePath))
+                    onNotify("已下载：$name")
+                }
+            } catch (_: CancellationException) {
+                acceptTransfer(initial.copy(phase = "cancelled", error = "用户已取消"))
+            } catch (e: Exception) {
+                acceptTransfer(initial.copy(phase = "failed", error = e.message ?: "传输失败"))
+            } finally {
+                transferJobs.remove(transferId)
+            }
+        }
+        transferJobs[transferId] = job
     }
 
-    suspend fun cancelTransfer(id: String) { runtime.hubRequest("ssh/cancelTransfer", jsonOf("id" to id), timeoutMs = 10_000) }
+    suspend fun cancelTransfer(id: String) {
+        val job = transferJobs.remove(id)
+        if (job != null) {
+            job.cancel()
+            return
+        }
+        if (runtime.hubAvailable) {
+            runtime.hubRequest("ssh/cancelTransfer", jsonOf("id" to id), timeoutMs = 10_000)
+        }
+    }
 
     suspend fun sftpRename(host: SshHostConfig, path: String, newName: String) {
-        runtime.hubRequest("ssh/sftpRename", jsonOf("hostId" to host.id, "remotePath" to path, "newName" to newName), timeoutMs = 60_000)
-    }
-    suspend fun sftpChmod(host: SshHostConfig, path: String, mode: String) {
-        runtime.hubRequest("ssh/sftpChmod", jsonOf("hostId" to host.id, "remotePath" to path, "mode" to mode), timeoutMs = 40_000)
-    }
-    suspend fun sftpReadText(host: SshHostConfig, path: String): SftpTextDocument {
-        val response = runtime.hubRequest("ssh/sftpReadText", jsonOf("hostId" to host.id, "remotePath" to path), timeoutMs = 65_000)
-        return SftpTextDocument(response.getString("content"), response.getString("revision"))
-    }
-    suspend fun sftpWriteText(host: SshHostConfig, path: String, content: String, revision: String): String {
-        return runtime.hubRequest("ssh/sftpWriteText", jsonOf("hostId" to host.id, "remotePath" to path,
-            "content" to content, "expectedRevision" to revision), timeoutMs = 180_000).getString("revision")
+        nativeSftp.rename(host, sshHostsFlow.value, path, newName)
     }
 
+    suspend fun sftpChmod(host: SshHostConfig, path: String, mode: String) {
+        nativeSftp.chmod(host, sshHostsFlow.value, path, mode)
+    }
+
+    suspend fun sftpReadText(host: SshHostConfig, path: String): SftpTextDocument =
+        nativeSftp.readText(host, sshHostsFlow.value, path)
+
+    suspend fun sftpWriteText(host: SshHostConfig, path: String, content: String, revision: String): String =
+        nativeSftp.writeText(host, sshHostsFlow.value, path, content, revision)
+
     suspend fun sftpMkdir(host: SshHostConfig, remotePath: String) {
-        check(runtime.hubAvailable) { "请先启动本地运行环境" }
-        syncSshNow()
-        runtime.hubRequest("ssh/sftpMkdir", jsonOf("hostId" to host.id, "alias" to host.alias, "remotePath" to remotePath), timeoutMs = 25_000)
+        nativeSftp.mkdir(host, sshHostsFlow.value, remotePath)
         onNotify("已创建远端文件夹")
     }
 
     suspend fun sftpDelete(host: SshHostConfig, remotePath: String, directory: Boolean) {
-        check(runtime.hubAvailable) { "请先启动本地运行环境" }
-        syncSshNow()
-        runtime.hubRequest("ssh/sftpDelete", jsonOf("hostId" to host.id, "alias" to host.alias, "remotePath" to remotePath, "directory" to directory), timeoutMs = 25_000)
+        nativeSftp.deleteRecursive(host, sshHostsFlow.value, remotePath, directory)
         onNotify("已删除远端项目")
     }
 

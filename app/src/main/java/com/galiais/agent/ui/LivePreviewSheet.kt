@@ -154,14 +154,17 @@ fun LivePreviewSheet(
             decorFitsSystemWindows = false,
         ),
     ) {
+        SyncFullscreenDialogWindow()
         Surface(
-            modifier = Modifier
-                .fillMaxSize()
-                .statusBarsPadding()
-                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
+            modifier = Modifier.fillMaxSize(),
             color = G.canvas,
         ) {
-            Column(Modifier.fillMaxSize()) {
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .statusBarsPadding()
+                    .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
+            ) {
                 // 1. 紧凑浏览器顶栏（52dp）
                 Surface(color = G.surface) {
                     Column {
@@ -265,7 +268,6 @@ fun LivePreviewSheet(
                             }
                         }
                         HeaderProgressSlot(loading)
-                        Hairline()
                     }
                 }
 
@@ -403,10 +405,10 @@ fun LivePreviewSheet(
                                 Icon(GaliaisIcons.ArrowBack, contentDescription = "后退", tint = if (canGoBack) G.ink else G.inkSubtle, modifier = Modifier.size(18.dp))
                             }
                             IconButton(enabled = canGoForward, onClick = { webViewRef?.goForward() }, modifier = Modifier.size(34.dp)) {
-                                Icon(GaliaisIcons.ChevronRight, contentDescription = "前进", tint = if (canGoForward) G.ink else G.inkSubtle, modifier = Modifier.size(18.dp))
+                                Icon(GaliaisIcons.ArrowForward, contentDescription = "前进", tint = if (canGoForward) G.ink else G.inkSubtle, modifier = Modifier.size(18.dp))
                             }
                             IconButton(onClick = { pageError = null; webViewRef?.reload() }, modifier = Modifier.size(34.dp)) {
-                                Icon(GaliaisIcons.Refresh, contentDescription = "刷新", tint = G.ink, modifier = Modifier.size(17.dp))
+                                Icon(GaliaisIcons.Refresh, contentDescription = "刷新", tint = G.ink, modifier = Modifier.size(18.dp))
                             }
                             TagPill(
                                 text = if (desktopMode) "桌面模式" else "移动模式",

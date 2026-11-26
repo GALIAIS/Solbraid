@@ -57,6 +57,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -101,6 +102,7 @@ import com.galiais.agent.ui.HeaderProgressSlot
 import com.galiais.agent.ui.Mono
 import com.galiais.agent.ui.PrimaryPillButton
 import com.galiais.agent.ui.SecondaryPillButton
+import com.galiais.agent.ui.SyncFullscreenDialogWindow
 import com.galiais.agent.ui.TagPill
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -127,22 +129,30 @@ fun UniversalFileViewerDialog(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
+    val initialCategory = remember(fileRef) { TextCodec.classifyFile(fileRef.name, ByteArray(0)) }
     var loading by remember(fileRef) { mutableStateOf(true) }
     var error by remember(fileRef) { mutableStateOf<String?>(null) }
     var stagedFile by remember(fileRef) { mutableStateOf<File?>(null) }
-    var category by remember(fileRef) { mutableStateOf(ViewerCategory.BINARY_HEX) }
+    var category by remember(fileRef) { mutableStateOf(initialCategory) }
+    var studioText by remember(fileRef) { mutableStateOf<String?>(null) }
     var forceHex by remember(fileRef) { mutableStateOf(false) }
     var activeRef by remember(fileRef) { mutableStateOf(fileRef) }
 
     LaunchedEffect(fileRef) {
-        loading = true; error = null; forceHex = false; activeRef = fileRef
+        loading = true; error = null; forceHex = false; activeRef = fileRef; studioText = null
         try {
             val f = fm.stageReadableFile(fileRef)
-            val head = withContext(Dispatchers.IO) {
-                f.inputStream().use { inp -> ByteArray(512).let { b -> b.copyOf(inp.read(b).coerceAtLeast(0)) } }
+            val (resolvedCat, loadedText) = withContext(Dispatchers.IO) {
+                val head = f.inputStream().use { inp -> ByteArray(512).let { b -> b.copyOf(inp.read(b).coerceAtLeast(0)) } }
+                val cat = TextCodec.classifyFile(fileRef.name, head)
+                val txt = if (cat in setOf(ViewerCategory.SVG, ViewerCategory.MARKDOWN, ViewerCategory.HTML)) {
+                    runCatching { f.readText(Charsets.UTF_8) }.getOrDefault("")
+                } else null
+                cat to txt
             }
             stagedFile = f
-            category = TextCodec.classifyFile(fileRef.name, head)
+            category = resolvedCat
+            studioText = loadedText
         } catch (e: Exception) {
             error = "加载文件失败：${e.message}"
         } finally {
@@ -150,20 +160,22 @@ fun UniversalFileViewerDialog(
         }
     }
 
-    // SVG / Markdown / HTML 直接支持可视化渲染预览
-    if (!loading && error == null && stagedFile != null && !forceHex && category in setOf(ViewerCategory.SVG, ViewerCategory.MARKDOWN, ViewerCategory.HTML)) {
-        val text = remember(stagedFile) { runCatching { stagedFile!!.readText(Charsets.UTF_8) }.getOrDefault("") }
+    // SVG / Markdown / HTML 首帧直接承接为单次 ArtifactStudioSheet，彻底消除先弹空 Dialog 再销毁重建的闪烁，并与文件 IO 并行预热 WebView
+    if (!forceHex && category in setOf(ViewerCategory.SVG, ViewerCategory.MARKDOWN, ViewerCategory.HTML)) {
         val kind = when (category) {
             ViewerCategory.SVG -> ArtifactKind.SVG
             ViewerCategory.HTML -> ArtifactKind.HTML
             else -> ArtifactKind.MARKDOWN
         }
+        val text = studioText ?: ""
         ArtifactStudioSheet(
             app = app,
             artifacts = listOf(ChatArtifact("view:${fileRef.path}", fileRef.name, fileRef.name, kind, fileRef.name.substringAfterLast('.', ""), text)),
             initialArtifactId = "view:${fileRef.path}",
             cwd = fileRef.parentPath,
             savePath = if (fileRef.scope.id.startsWith("linux")) fileRef.path else null,
+            externalLoading = loading || (error == null && studioText == null),
+            externalError = error,
             onDismiss = onDismiss,
         )
         return
@@ -178,6 +190,7 @@ fun UniversalFileViewerDialog(
             decorFitsSystemWindows = false,
         ),
     ) {
+        SyncFullscreenDialogWindow()
         var viewerMenu by remember { mutableStateOf(false) }
         Surface(color = G.canvas, modifier = Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
@@ -231,7 +244,7 @@ fun UniversalFileViewerDialog(
                                         runCatching { ExternalStorageBridge.shareFile(context, stagedFile!!, activeRef.name) }
                                             .onFailure { app.conversations.notify("分享失败：${it.message}") }
                                     })
-                                    GaliaisMenuRow("用其他应用打开", icon = GaliaisIcons.Globe, onClick = {
+                                    GaliaisMenuRow("用其他应用打开", icon = GaliaisIcons.Link, onClick = {
                                         viewerMenu = false
                                         runCatching { ExternalStorageBridge.openWithExternalApp(context, stagedFile!!, activeRef.name) }
                                             .onFailure { app.conversations.notify("无法调起外部应用：${it.message}") }
@@ -250,7 +263,6 @@ fun UniversalFileViewerDialog(
                     }
                 }
                 HeaderProgressSlot(loading)
-                Hairline()
 
                 Box(Modifier.weight(1f).fillMaxWidth()) {
                     when {
@@ -262,6 +274,7 @@ fun UniversalFileViewerDialog(
                         category == ViewerCategory.IMAGE || category == ViewerCategory.ANIMATED_IMAGE -> ImageGalleryViewer(
                             app = app,
                             initialRef = fileRef,
+                            initialFile = stagedFile,
                             siblings = siblingImages.ifEmpty { listOf(fileRef) },
                             onActiveChanged = { ref, file -> activeRef = ref; if (file != null) stagedFile = file },
                         )
@@ -287,6 +300,7 @@ fun UniversalFileViewerDialog(
 private fun ImageGalleryViewer(
     app: GaliaisApplication,
     initialRef: FileRef,
+    initialFile: File?,
     siblings: List<FileRef>,
     onActiveChanged: (FileRef, File?) -> Unit,
 ) {
@@ -295,11 +309,12 @@ private fun ImageGalleryViewer(
     var rotation by remember(pager.currentPage) { mutableFloatStateOf(0f) }
     var checkerboard by remember { mutableStateOf(false) }
     var showExif by remember { mutableStateOf(false) }
-    var currentFile by remember { mutableStateOf<File?>(null) }
+    var currentFile by remember(initialRef) { mutableStateOf<File?>(initialFile) }
 
     LaunchedEffect(pager.currentPage) {
         val ref = siblings[pager.currentPage]
-        val f = runCatching { app.fileManager.stageReadableFile(ref) }.getOrNull()
+        val f = if (ref == initialRef && initialFile != null) initialFile
+        else runCatching { app.fileManager.stageReadableFile(ref) }.getOrNull()
         currentFile = f
         onActiveChanged(ref, f)
     }
@@ -307,10 +322,14 @@ private fun ImageGalleryViewer(
     Column(Modifier.fillMaxSize()) {
         HorizontalPager(state = pager, modifier = Modifier.weight(1f).fillMaxWidth()) { page ->
             val ref = siblings[page]
-            var localFile by remember(ref) { mutableStateOf<File?>(null) }
+            var localFile by remember(ref) { mutableStateOf<File?>(if (ref == initialRef) initialFile else null) }
             var scale by remember(ref) { mutableFloatStateOf(1f) }
             var offset by remember(ref) { mutableStateOf(Offset.Zero) }
-            LaunchedEffect(ref) { localFile = runCatching { app.fileManager.stageReadableFile(ref) }.getOrNull() }
+            LaunchedEffect(ref) {
+                if (localFile == null) {
+                    localFile = runCatching { app.fileManager.stageReadableFile(ref) }.getOrNull()
+                }
+            }
 
             Box(
                 modifier = Modifier
@@ -368,12 +387,15 @@ private fun ImageGalleryViewer(
                                 ImageView(ctx).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
                             },
                             update = { iv ->
-                                runCatching {
-                                    val drawable = ImageDecoder.decodeDrawable(ImageDecoder.createSource(file))
-                                    iv.setImageDrawable(drawable)
-                                    if (drawable is AnimatedImageDrawable) drawable.start()
-                                }.onFailure {
-                                    BitmapFactory.decodeFile(file.absolutePath)?.let { iv.setImageBitmap(it) }
+                                if (iv.tag != file.absolutePath) {
+                                    iv.tag = file.absolutePath
+                                    runCatching {
+                                        val drawable = ImageDecoder.decodeDrawable(ImageDecoder.createSource(file))
+                                        iv.setImageDrawable(drawable)
+                                        if (drawable is AnimatedImageDrawable) drawable.start()
+                                    }.onFailure {
+                                        BitmapFactory.decodeFile(file.absolutePath)?.let { iv.setImageBitmap(it) }
+                                    }
                                 }
                             },
                             modifier = Modifier
@@ -385,15 +407,19 @@ private fun ImageGalleryViewer(
                                 },
                         )
                     } else {
-                        val bmp = remember(file) {
-                            runCatching {
-                                val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                                BitmapFactory.decodeFile(file.absolutePath, opts)
-                                var sample = 1
-                                while (opts.outWidth / sample > 2560 || opts.outHeight / sample > 2560) sample *= 2
-                                BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
-                            }.getOrNull()
+                        val decoded by produceState<Pair<Boolean, Bitmap?>>(initialValue = false to null, key1 = file) {
+                            val bm = withContext(Dispatchers.IO) {
+                                runCatching {
+                                    val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                                    BitmapFactory.decodeFile(file.absolutePath, opts)
+                                    var sample = 1
+                                    while (opts.outWidth / sample > 2560 || opts.outHeight / sample > 2560) sample *= 2
+                                    BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
+                                }.getOrNull()
+                            }
+                            value = true to bm
                         }
+                        val (ready, bmp) = decoded
                         if (bmp != null) {
                             Image(
                                 bitmap = bmp.asImageBitmap(),
@@ -407,7 +433,7 @@ private fun ImageGalleryViewer(
                                         rotationZ = rotation
                                     },
                             )
-                        } else {
+                        } else if (ready) {
                             Text("图片解码失败", color = Color.White)
                         }
                     }
@@ -453,19 +479,29 @@ private fun NativePdfViewer(file: File) {
     var invertDark by remember { mutableStateOf(false) }
     var scale by remember { mutableFloatStateOf(1f) }
     var error by remember(file) { mutableStateOf<String?>(null) }
+    var rendererHolder by remember(file) { mutableStateOf<Pair<ParcelFileDescriptor, PdfRenderer>?>(null) }
 
-    val rendererHolder = remember(file) {
-        runCatching {
-            val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-            val renderer = PdfRenderer(pfd)
-            pageCount = renderer.pageCount
-            pfd to renderer
-        }.onFailure { error = "PDF 打开失败（可能加密或损坏）：${it.message}" }.getOrNull()
+    LaunchedEffect(file) {
+        error = null
+        val opened = withContext(Dispatchers.IO) {
+            runCatching {
+                val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+                val r = PdfRenderer(pfd)
+                pfd to r
+            }
+        }
+        opened.onSuccess { pair ->
+            rendererHolder = pair
+            pageCount = pair.second.pageCount
+        }.onFailure {
+            error = "PDF 打开失败（可能加密或损坏）：${it.message}"
+        }
     }
     DisposableEffect(rendererHolder) {
+        val current = rendererHolder
         onDispose {
-            runCatching { rendererHolder?.second?.close() }
-            runCatching { rendererHolder?.first?.close() }
+            runCatching { current?.second?.close() }
+            runCatching { current?.first?.close() }
         }
     }
 
@@ -506,9 +542,9 @@ private fun NativePdfViewer(file: File) {
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 items(pageCount) { idx ->
-                    var bmp by remember(file, idx, scale) { mutableStateOf<Bitmap?>(null) }
+                    var bmp by remember(file, idx) { mutableStateOf<Bitmap?>(null) }
                     LaunchedEffect(file, idx, scale) {
-                        bmp = withContext(Dispatchers.IO) {
+                        val rendered = withContext(Dispatchers.IO) {
                             synchronized(renderer) {
                                 runCatching {
                                     renderer.openPage(idx).use { page ->
@@ -522,6 +558,7 @@ private fun NativePdfViewer(file: File) {
                                 }.getOrNull()
                             }
                         }
+                        if (rendered != null) bmp = rendered
                     }
                     Surface(shape = D.shape(8.dp), color = Color.White, border = BorderStroke(0.5.dp, G.border), modifier = Modifier.fillMaxWidth()) {
                         Column {

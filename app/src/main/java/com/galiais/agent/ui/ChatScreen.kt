@@ -73,8 +73,10 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -167,6 +169,8 @@ private data class PendingEditResend(
     val hasFileEdits: Boolean,
     val isRegenerate: Boolean,
 )
+
+private var lastKnownChatDockHeightPx: Int = 0
 
 @Composable
 fun ChatScreen(
@@ -304,13 +308,22 @@ fun ChatScreen(
     }
 
     val activeProvider = settings.provider(state?.providerId)
-    val fileEditChangeCount = state?.items?.sumOf { if (it is TimelineItem.FileEdit) it.changes.size else 0 } ?: 0
-    val fileEdits = remember(state?.items?.size, fileEditChangeCount, state?.running) {
+    val fileEdits = remember(state?.items) {
         state?.items?.filterIsInstance<TimelineItem.FileEdit>()?.flatMap { it.changes } ?: emptyList()
     }
-    // 流式输出时不在每个 Token 扫全历史正则，仅在条目数/末项变更、流式结束或主动打开产物抽屉时提取。
-    val conversationArtifacts = remember(state?.items?.size, state?.items?.lastOrNull()?.id, state?.running, showArtifactsDrawer) {
-        extractArtifactsFromItems(state?.items.orEmpty())
+    // 异步在后台线程增量提取会话产物，避免温进会话首帧同步扫全历史正则导致掉帧。
+    val conversationArtifacts by produceState<List<ChatArtifact>>(
+        initialValue = emptyList(),
+        key1 = state?.items?.size,
+        key2 = state?.items?.lastOrNull()?.id,
+        key3 = Pair(state?.running == true, showArtifactsDrawer),
+    ) {
+        val snapshotItems = state?.items.orEmpty()
+        if (snapshotItems.isEmpty()) {
+            value = emptyList()
+        } else {
+            value = withContext(Dispatchers.Default) { extractArtifactsFromItems(snapshotItems) }
+        }
     }
     val hasDiffs = !state?.turnDiff.isNullOrBlank() || fileEdits.isNotEmpty()
     val cwd = state?.summary?.cwd
@@ -345,9 +358,14 @@ fun ChatScreen(
         composerFocus.requestFocus()
         keyboard?.show()
     }
+    androidx.compose.runtime.DisposableEffect(key) {
+        app.conversations.setActiveConversation(key)
+        onDispose { app.conversations.setActiveConversation(null) }
+    }
     LaunchedEffect(key, runtime.ready) { if (runtime.ready) app.conversations.open(key) }
-    LaunchedEffect(key, runtime.ready, state?.providerId, state?.model, state?.loaded, settings.providers, showModelPopover, showModelSheet) {
+    LaunchedEffect(key.engine, runtime.ready, state?.providerId, settings.providers, showModelPopover, showModelSheet) {
         if (!runtime.ready) { models = emptyList(); return@LaunchedEffect }
+        if (models.isEmpty() && !showModelPopover && !showModelSheet) kotlinx.coroutines.delay(240L)
         models = try { app.conversations.adapter(key.engine).models(key) }
         catch (cancel: CancellationException) { throw cancel }
         catch (error: Exception) {
@@ -357,6 +375,7 @@ fun ChatScreen(
     }
     LaunchedEffect(key, runtime.ready, state?.loaded) {
         if (!runtime.ready || state?.loaded != true) return@LaunchedEffect
+        kotlinx.coroutines.delay(280L)
         dynamicCommands = try { app.conversations.adapter(key.engine).commands(key) } catch (_: Exception) { emptyList() }
         if (hostPlugins.generationId.isEmpty()) {
             runCatching { app.extensions.refreshHostPlugins() }
@@ -376,9 +395,11 @@ fun ChatScreen(
     }
     val currentModelOption = effectiveModels.selectedModel(state?.model)
 
-    val turnBlocks = remember(state?.items, state?.turnDurations, state?.running) {
-        groupIntoTurnBlocks(state?.items.orEmpty(), state?.turnDurations.orEmpty(), state?.running == true)
+    val turnBlockCache = remember(key) { TurnBlockIncrementalCache() }
+    val turnBlocks = remember(key, state?.items, state?.turnDurations, state?.running) {
+        turnBlockCache.group(state?.items.orEmpty(), state?.turnDurations.orEmpty(), state?.running == true)
     }
+    var visibleTurnLimit by remember(key) { mutableIntStateOf(25) }
     // 只有用户主动脱离底部且下方确实还有内容时才显示回底按钮，流式增长期间不闪烁。
     val showScrollDown by remember(list) { derivedStateOf { !followLatest && list.canScrollForward } }
     // 毫秒级识别用户上滑意图：手指一向上回看立刻解除自动跟随，彻底杜绝流式回跳。
@@ -525,6 +546,7 @@ fun ChatScreen(
     val fileQueryCache = remember(cwd) { LinkedHashMap<String, List<FuzzyMatch>>() }
     LaunchedEffect(cwd, runtime.ready) {
         if (cwd == null || !runtime.ready) return@LaunchedEffect
+        kotlinx.coroutines.delay(360L)
         val loaded = runCatching {
             withContext(Dispatchers.IO) {
                 files.list(cwd).take(40).map { FuzzyMatch(it.name + if (it.directory) "/" else "", it.name) }
@@ -892,7 +914,7 @@ fun ChatScreen(
                             )
                         }
                         IconButton(onClick = { showInfo = true }) {
-                            Icon(GaliaisIcons.MoreHoriz, contentDescription = "更多操作", tint = G.inkMuted, modifier = Modifier.size(21.dp))
+                            Icon(GaliaisIcons.MoreHoriz, contentDescription = "更多操作", tint = G.inkMuted, modifier = Modifier.size(20.dp))
                         }
                     }
                     HeaderProgressSlot(runtime.ready && (state?.loaded != true || state.reverting || editSubmitting))
@@ -1047,7 +1069,7 @@ fun ChatScreen(
             }
 
             val density = LocalDensity.current
-            var dockHeightPx by remember { mutableIntStateOf(0) }
+            var dockHeightPx by remember { mutableIntStateOf(lastKnownChatDockHeightPx) }
             val composerBottomPadDp = with(density) { dockHeightPx.toDp() }
             val listRevealAlpha by animateFloatAsState(
                 targetValue = if (initialPositioned) 1f else 0f,
@@ -1086,129 +1108,125 @@ fun ChatScreen(
                     },
                 )
             }
-            // 单容器浮层架构：消息列表延伸至底部透明输入框后方，/ 与 @ 悬浮窗叠加于列表之上不挤压 LazyColumn 重排。
+            val latestDraft by rememberUpdatedState(draft)
+            val latestKey by rememberUpdatedState(key)
+            val stableQuoteAction: (String) -> Unit = remember {
+                { quote ->
+                    val cur = latestDraft
+                    replaceDraft(if (cur.isBlank()) quote else "$cur\n$quote")
+                }
+            }
+            val allowUndo = state?.running != true && state?.reverting != true && !editSubmitting
+            val allowFork = AgentCatalog.capabilitiesOf(key.engine).fork && state?.running != true && !editSubmitting
+            val inPlanMode = when (key.engine) {
+                EngineKind.CODEX -> (state?.collaborationMode ?: settings.codexCollaborationMode) == "plan"
+                else -> state?.permissionMode == "plan"
+            }
+            val canReviewPlan = state?.running != true && requests.isEmpty()
+            val approvePlanAction: ((TimelineItem.Plan) -> Unit)? = remember(key, canReviewPlan, inPlanMode, settings.claudePermissionMode) {
+                if (canReviewPlan) ({ plan: TimelineItem.Plan ->
+                    app.conversations.update(key) { st ->
+                        st.copy(
+                            items = st.items.map { item ->
+                                if (item is TimelineItem.Plan && item.id == plan.id) {
+                                    item.copy(requestFeedback = false, status = com.galiais.agent.engine.ItemStatus.COMPLETED, streaming = false)
+                                } else item
+                            },
+                        )
+                    }
+                    if (inPlanMode) {
+                        when (key.engine) {
+                            EngineKind.CODEX -> app.conversations.setCollaborationMode(key, "default")
+                            EngineKind.CLAUDE -> app.conversations.setPermissionMode(
+                                key,
+                                settings.claudePermissionMode.takeUnless { it == "plan" } ?: "acceptEdits",
+                            )
+                            else -> app.conversations.setPermissionMode(key, "default")
+                        }
+                    }
+                    app.conversations.send(key, "批准以上执行计划《${plan.title.ifBlank { "执行计划" }}》，请开始按方案实施。")
+                    Unit
+                }) else null
+            }
+            val revisePlanAction: ((TimelineItem.Plan, String) -> Unit)? = remember(key, canReviewPlan) {
+                if (canReviewPlan) ({ plan: TimelineItem.Plan, feedback: String ->
+                    app.conversations.update(key) { st ->
+                        st.copy(
+                            items = st.items.map { item ->
+                                if (item is TimelineItem.Plan && item.id == plan.id) {
+                                    item.copy(requestFeedback = false, status = com.galiais.agent.engine.ItemStatus.DECLINED, streaming = false)
+                                } else item
+                            },
+                        )
+                    }
+                    app.conversations.send(key, "针对执行计划《${plan.title.ifBlank { "执行计划" }}》的修改建议：\n$feedback")
+                    Unit
+                }) else null
+            }
+            val timelineActions = remember(key, allowUndo, allowFork, approvePlanAction, revisePlanAction, onOpenConversation) {
+                ChatTimelineActions(
+                    onOpenConversation = onOpenConversation,
+                    onCancelDelegation = { app.conversations.cancelDelegation(latestKey) },
+                    onQuote = stableQuoteAction,
+                    onEditResend = if (allowUndo) ({ user -> beginEditMessage(user) }) else null,
+                    onRegenerate = if (allowUndo) ({ user -> triggerRegenerate(user) }) else null,
+                    onUndoTurn = if (allowUndo) ({ user -> revertTarget = user }) else null,
+                    onRewindFiles = if (allowUndo && key.engine == EngineKind.CLAUDE) ({ user ->
+                        scope.launch {
+                            try {
+                                val preview = app.conversations.rewindClaudeFiles(key, user.id, dryRun = true)
+                                if (!preview.canRewind) {
+                                    app.conversations.notify(preview.error ?: "此轮暂无可回滚的文件检查点")
+                                } else {
+                                    claudeRewindTarget = user.id to preview
+                                }
+                            } catch (e: Exception) {
+                                app.conversations.notify("读取检查点失败：${e.message}")
+                            }
+                        }
+                    }) else null,
+                    onFork = if (allowFork) ({ forkConversation() }) else null,
+                    onInspectDiffs = { diffs -> inspectedDiffs = diffs },
+                    onOpenArtifact = { art -> studioArtifact = art },
+                    onApprovePlan = approvePlanAction,
+                    onRevisePlan = revisePlanAction,
+                )
+            }
+            val rememberedPluginFooter = remember(pluginMessageFooterSlots) {
+                pluginMessageFooterSlots to { slot: com.galiais.agent.engine.HostPluginUiSlot, msg: TimelineItem.AgentMessage ->
+                    triggerPluginUiSlot(slot, msg.text)
+                }
+            }
+            val stablePickStarter: (String) -> Unit = remember { { hint -> replaceDraft(hint) } }
+            val stableLoadEarlier: () -> Unit = remember(key) { { visibleTurnLimit += 25 } }
+            // 单容器浮层架构：消息列表延伸至底部透明输入框后方，并通过 ChatTimelineViewport 隔离 draftValue，打字零重组消息列表。
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 CompositionLocalProvider(
                     LocalFileLinkHandler provides openFileLink,
                     LocalDiffActions provides diffActions,
-                    LocalPluginMessageFooter provides (pluginMessageFooterSlots to { slot, msg -> triggerPluginUiSlot(slot, msg.text) }),
+                    LocalPluginMessageFooter provides rememberedPluginFooter,
                 ) {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize().graphicsLayer { alpha = listRevealAlpha }.nestedScroll(userScrollDetector),
-                    state = list,
-                    contentPadding = PaddingValues(
-                        start = 14.dp,
-                        end = 14.dp,
-                        top = D.space(12.dp),
-                        bottom = (composerBottomPadDp + D.space(8.dp)).coerceAtLeast(88.dp),
-                    ),
-                    verticalArrangement = Arrangement.spacedBy(D.space(10.dp)),
-                ) {
-                    if (state?.loaded == true && state.items.isEmpty() && requests.isEmpty()) {
-                        item(key = "empty-welcome") {
-                            Column(
-                                modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 16.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(10.dp),
-                            ) {
-                                AgentAppIcon(engine = key.engine, size = 48.dp)
-                                EngineLabel(key.engine)
-                                Text("向 ${key.engine.label} 描述你的任务", style = MaterialTheme.typography.titleMedium, color = G.ink)
-                                cwd?.let {
-                                    Text(it, fontFamily = Mono, fontSize = 12.sp, color = G.inkSubtle, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                }
-                                Spacer(Modifier.height(6.dp))
-                                FlowRow(
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
-                                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                                    modifier = Modifier.fillMaxWidth(),
-                                ) {
-                                    starterPrompts.forEach { hint ->
-                                        TagPill(hint, fg = G.ink, bg = G.surface, border = G.border, onClick = { replaceDraft(hint) })
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    val allowUndo = state?.running != true && state?.reverting != true && !editSubmitting
-                    val allowFork = AgentCatalog.capabilitiesOf(key.engine).fork && state?.running != true && !editSubmitting
-                    val inPlanMode = when (key.engine) {
-                        EngineKind.CODEX -> (state?.collaborationMode ?: settings.codexCollaborationMode) == "plan"
-                        else -> state?.permissionMode == "plan"
-                    }
-                    val canReviewPlan = state?.running != true && requests.isEmpty()
-                    val approvePlanAction: ((TimelineItem.Plan) -> Unit)? = if (canReviewPlan) ({ plan ->
-                        app.conversations.update(key) { st ->
-                            st.copy(
-                                items = st.items.map { item ->
-                                    if (item is TimelineItem.Plan && item.id == plan.id) {
-                                        item.copy(requestFeedback = false, status = com.galiais.agent.engine.ItemStatus.COMPLETED, streaming = false)
-                                    } else item
-                                },
-                            )
-                        }
-                        if (inPlanMode) {
-                            when (key.engine) {
-                                EngineKind.CODEX -> app.conversations.setCollaborationMode(key, "default")
-                                EngineKind.CLAUDE -> app.conversations.setPermissionMode(
-                                    key,
-                                    settings.claudePermissionMode.takeUnless { it == "plan" } ?: "acceptEdits",
-                                )
-                                else -> app.conversations.setPermissionMode(key, "default")
-                            }
-                        }
-                        app.conversations.send(key, "批准以上执行计划《${plan.title.ifBlank { "执行计划" }}》，请开始按方案实施。")
-                    }) else null
-                    val revisePlanAction: ((TimelineItem.Plan, String) -> Unit)? = if (canReviewPlan) ({ plan, feedback ->
-                        app.conversations.update(key) { st ->
-                            st.copy(
-                                items = st.items.map { item ->
-                                    if (item is TimelineItem.Plan && item.id == plan.id) {
-                                        item.copy(requestFeedback = false, status = com.galiais.agent.engine.ItemStatus.DECLINED, streaming = false)
-                                    } else item
-                                },
-                            )
-                        }
-                        app.conversations.send(key, "针对执行计划《${plan.title.ifBlank { "执行计划" }}》的修改建议：\n$feedback")
-                    }) else null
-                    turnBlocks.forEachIndexed { blockIdx, block ->
-                        val hasPendingPlan = block.planItems.any { it.requestFeedback || it.status == com.galiais.agent.engine.ItemStatus.RUNNING }
-                        val enablePlanActions = (blockIdx == turnBlocks.lastIndex && (inPlanMode || hasPendingPlan)) || hasPendingPlan
-                        turnBlockItems(
-                            block = block,
-                            activeTurnStartedAt = state?.turnStartedAt,
-                            expandByDefault = settings.expandThinking,
-                            cwd = cwd,
-                            focusText = state?.focusText,
-                            editingUserMessageId = editingTarget?.id,
-                            onOpenConversation = onOpenConversation,
-                            onCancelDelegation = { app.conversations.cancelDelegation(key) },
-                            onQuote = { quote -> replaceDraft(if (draft.isBlank()) quote else "$draft\n$quote") },
-                            onEditResend = if (allowUndo) ({ user -> beginEditMessage(user) }) else null,
-                            onRegenerate = if (allowUndo) ({ user -> triggerRegenerate(user) }) else null,
-                            onUndoTurn = if (allowUndo) ({ user -> revertTarget = user }) else null,
-                            onRewindFiles = if (allowUndo && key.engine == EngineKind.CLAUDE) ({ user ->
-                                scope.launch {
-                                    try {
-                                        val preview = app.conversations.rewindClaudeFiles(key, user.id, dryRun = true)
-                                        if (!preview.canRewind) {
-                                            app.conversations.notify(preview.error ?: "此轮暂无可回滚的文件检查点")
-                                        } else {
-                                            claudeRewindTarget = user.id to preview
-                                        }
-                                    } catch (e: Exception) {
-                                        app.conversations.notify("读取检查点失败：${e.message}")
-                                    }
-                                }
-                            }) else null,
-                            onFork = if (allowFork) ({ forkConversation() }) else null,
-                            onInspectDiffs = { diffs -> inspectedDiffs = diffs },
-                            onOpenArtifact = { art -> studioArtifact = art },
-                            onApprovePlan = if (enablePlanActions) approvePlanAction else null,
-                            onRevisePlan = if (enablePlanActions) revisePlanAction else null,
-                        )
-                    }
-                    item(key = "conversation-end", contentType = "sentinel") { Spacer(Modifier.height(2.dp)) }
+                if (!runtime.ready || state == null || state.loaded) {
+                    ChatTimelineViewport(
+                        list = list,
+                        listRevealAlpha = listRevealAlpha,
+                        userScrollDetector = userScrollDetector,
+                        composerBottomPadDp = composerBottomPadDp,
+                        isEmptyConversation = state?.loaded == true && state.items.isEmpty() && requests.isEmpty(),
+                        engine = key.engine,
+                        cwd = cwd,
+                        starterPrompts = starterPrompts,
+                        onPickStarter = stablePickStarter,
+                        turnBlocks = turnBlocks,
+                        visibleTurnLimit = visibleTurnLimit,
+                        onLoadEarlierTurns = stableLoadEarlier,
+                        activeTurnStartedAt = state?.turnStartedAt,
+                        expandByDefault = settings.expandThinking,
+                        focusText = state?.focusText,
+                        editingUserMessageId = editingTarget?.id,
+                        inPlanMode = inPlanMode,
+                        actions = timelineActions,
+                    )
                 }
 
                 androidx.compose.animation.AnimatedVisibility(
@@ -1349,7 +1367,10 @@ fun ChatScreen(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .onSizeChanged { dockHeightPx = it.height },
+                            .onSizeChanged {
+                                dockHeightPx = it.height
+                                if (it.height > 0 && requests.isEmpty()) lastKnownChatDockHeightPx = it.height
+                            },
                     ) {
                         AnimatedVisibility(
                             visible = requests.isNotEmpty(),
@@ -1571,12 +1592,17 @@ fun ChatScreen(
                                         ) {
                                             Icon(GaliaisIcons.Image, contentDescription = null, tint = G.accent, modifier = Modifier.size(14.dp))
                                             Text("${att.name} (${att.bytes / 1024}K)", fontSize = 11.sp, color = G.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                            Icon(
-                                                GaliaisIcons.Close,
-                                                contentDescription = "移除图片",
-                                                tint = G.inkMuted,
-                                                modifier = Modifier.size(14.dp).clickable { attachments.remove(att) },
-                                            )
+                                            Box(
+                                                modifier = Modifier.size(22.dp).clip(CircleShape).clickable { attachments.remove(att) },
+                                                contentAlignment = Alignment.Center,
+                                            ) {
+                                                Icon(
+                                                    GaliaisIcons.Close,
+                                                    contentDescription = "移除图片",
+                                                    tint = G.inkMuted,
+                                                    modifier = Modifier.size(12.dp),
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -3095,4 +3121,99 @@ private fun formatCompactTokens(n: Long): String = when {
     n >= 1_000_000 -> "%.2fM".format(n / 1_000_000.0)
     n >= 1_000 -> "%.1fk".format(n / 1_000.0)
     else -> n.toString()
+}
+
+/** 独立隔离的聊天消息列表视口：不依赖 draftValue，打字时零重组消息气泡与代码块；支持大会话尾部 25 轮分窗加载。 */
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+private fun ChatTimelineViewport(
+    list: androidx.compose.foundation.lazy.LazyListState,
+    listRevealAlpha: Float,
+    userScrollDetector: NestedScrollConnection,
+    composerBottomPadDp: androidx.compose.ui.unit.Dp,
+    isEmptyConversation: Boolean,
+    engine: EngineKind,
+    cwd: String?,
+    starterPrompts: List<String>,
+    onPickStarter: (String) -> Unit,
+    turnBlocks: List<TurnBlock>,
+    visibleTurnLimit: Int,
+    onLoadEarlierTurns: () -> Unit,
+    activeTurnStartedAt: Long?,
+    expandByDefault: Boolean,
+    focusText: String?,
+    editingUserMessageId: String?,
+    inPlanMode: Boolean,
+    actions: ChatTimelineActions,
+) {
+    val hiddenTurns = (turnBlocks.size - visibleTurnLimit).coerceAtLeast(0)
+    val displayedTurns = remember(turnBlocks, hiddenTurns) {
+        if (hiddenTurns > 0) turnBlocks.subList(hiddenTurns, turnBlocks.size) else turnBlocks
+    }
+    LazyColumn(
+        modifier = Modifier.fillMaxSize().graphicsLayer { alpha = listRevealAlpha }.nestedScroll(userScrollDetector),
+        state = list,
+        contentPadding = PaddingValues(
+            start = 14.dp,
+            end = 14.dp,
+            top = D.space(12.dp),
+            bottom = (composerBottomPadDp + D.space(8.dp)).coerceAtLeast(88.dp),
+        ),
+        verticalArrangement = Arrangement.spacedBy(D.space(10.dp)),
+    ) {
+        if (hiddenTurns > 0) {
+            item(key = "load-earlier-turns", contentType = "load_earlier") {
+                Box(Modifier.fillMaxWidth().padding(vertical = 4.dp), contentAlignment = Alignment.Center) {
+                    TagPill(
+                        text = "加载更早的 $hiddenTurns 轮历史对话（+25 轮）",
+                        fg = G.accent,
+                        bg = G.accentContainer,
+                        onClick = onLoadEarlierTurns,
+                    )
+                }
+            }
+        }
+        if (isEmptyConversation) {
+            item(key = "empty-welcome", contentType = "welcome") {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    AgentAppIcon(engine = engine, size = 48.dp)
+                    EngineLabel(engine)
+                    Text("向 ${engine.label} 描述你的任务", style = MaterialTheme.typography.titleMedium, color = G.ink)
+                    cwd?.let {
+                        Text(it, fontFamily = Mono, fontSize = 12.sp, color = G.inkSubtle, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        starterPrompts.forEach { hint ->
+                            TagPill(hint, fg = G.ink, bg = G.surface, border = G.border, onClick = { onPickStarter(hint) })
+                        }
+                    }
+                }
+            }
+        }
+        displayedTurns.forEachIndexed { localIdx, block ->
+            val isLastTurn = localIdx == displayedTurns.lastIndex
+            val hasPendingPlan = block.planItems.any { it.requestFeedback || it.status == com.galiais.agent.engine.ItemStatus.RUNNING }
+            val enablePlanActions = (isLastTurn && (inPlanMode || hasPendingPlan)) || hasPendingPlan
+            turnBlockItems(
+                block = block,
+                activeTurnStartedAt = activeTurnStartedAt,
+                expandByDefault = expandByDefault,
+                cwd = cwd,
+                focusText = focusText,
+                editingUserMessageId = editingUserMessageId,
+                enablePlanActions = enablePlanActions,
+                actions = actions,
+            )
+        }
+        item(key = "conversation-end", contentType = "sentinel") { Spacer(Modifier.height(2.dp)) }
+    }
 }

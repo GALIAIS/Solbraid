@@ -127,6 +127,22 @@ private fun Node.children(): List<Node> = generateSequence(firstChild) { it.next
 
 private val displayMathBlockRe = Regex("""\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]""")
 private val calloutHeaderRe = Regex("""^\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)]\s*(.*)""", RegexOption.IGNORE_CASE)
+private val parsedMarkdownDocCache = object : LinkedHashMap<String, Node>(128, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Node>?): Boolean = size > 256
+}
+
+private fun parseMarkdownCached(markdown: String, streaming: Boolean): Node {
+    if (streaming || markdown.length > 64_000) return parser.parse(markdown)
+    val key = "${markdown.length}:${markdown.hashCode()}:${markdown.take(24)}:${markdown.takeLast(16)}"
+    synchronized(parsedMarkdownDocCache) {
+        parsedMarkdownDocCache[key]?.let { return it }
+    }
+    val doc = parser.parse(markdown)
+    synchronized(parsedMarkdownDocCache) {
+        parsedMarkdownDocCache[key] = doc
+    }
+    return doc
+}
 
 /**
  * 流式长回复增量切分：把已完整闭合的前置段落与正在逐字增长的尾部段落分离，
@@ -253,7 +269,7 @@ private fun MarkdownBody(
                     }
                 }
                 is MessageSegment.Text -> {
-                    val document = remember(seg.markdown) { parser.parse(seg.markdown) }
+                    val document = remember(seg.markdown, streaming) { parseMarkdownCached(seg.markdown, streaming) }
                     Column(verticalArrangement = Arrangement.spacedBy(if (compact) 5.dp else 9.dp)) {
                         document.children().forEach { Block(it, compact, sourceItemId, streaming, overrideTextColor, onOpenArtifact) }
                     }
@@ -325,34 +341,47 @@ private fun Block(
                             }
                         }
                         val tex = (m.groupValues[1].ifBlank { m.groupValues[2] }).trim()
-                        if (compact || !prefs.inlineVisualArtifacts || overrideTextColor != null) {
-                            Surface(
-                                shape = D.shape(8.dp),
-                                color = overrideTextColor?.copy(alpha = 0.14f) ?: G.surfaceSubtle,
-                                border = BorderStroke(0.5.dp, overrideTextColor?.copy(alpha = 0.28f) ?: G.border),
-                                modifier = Modifier.fillMaxWidth(),
+                        val prettyMath = remember(tex) { InlineMathFormatter.toPrettyUnicode(tex) }
+                        val mathArt = remember(tex, sourceItemId, idx, streaming) {
+                            ChatArtifact(
+                                id = "$sourceItemId:math:$idx:${tex.hashCode()}",
+                                identifier = "math-${tex.hashCode()}",
+                                title = "数学公式",
+                                kind = ArtifactKind.MATH,
+                                language = "latex",
+                                content = tex,
+                                sourceItemId = sourceItemId,
+                                streaming = streaming,
+                            )
+                        }
+                        // 块级数学公式默认原生零 WebView 渲染（避免大会话内每条公式都创建 Chromium 实例导致掉帧），点「排版预览」可全屏渲染
+                        Surface(
+                            shape = D.shape(9.dp),
+                            color = overrideTextColor?.copy(alpha = 0.14f) ?: G.surfaceSubtle,
+                            border = BorderStroke(0.5.dp, overrideTextColor?.copy(alpha = 0.28f) ?: G.border),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
-                                Text(
-                                    InlineMathFormatter.toPrettyUnicode(tex),
-                                    style = bodyStyle,
-                                    color = textColor,
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                )
+                                SelectionContainer(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        prettyMath,
+                                        style = bodyStyle,
+                                        color = textColor,
+                                    )
+                                }
+                                if (!compact && overrideTextColor == null && onOpenArtifact != null && !streaming) {
+                                    TagPill(
+                                        text = "公式预览",
+                                        fg = G.claude,
+                                        bg = G.claudeTint,
+                                        onClick = { onOpenArtifact(mathArt) },
+                                    )
+                                }
                             }
-                        } else {
-                            val mathArt = remember(tex, sourceItemId, idx, streaming) {
-                                ChatArtifact(
-                                    id = "$sourceItemId:math:$idx:${tex.hashCode()}",
-                                    identifier = "math-${tex.hashCode()}",
-                                    title = "数学公式",
-                                    kind = ArtifactKind.MATH,
-                                    language = "latex",
-                                    content = tex,
-                                    sourceItemId = sourceItemId,
-                                    streaming = streaming,
-                                )
-                            }
-                            InlineVisualArtifactCard(artifact = mathArt, onOpenStudio = onOpenArtifact)
                         }
                         cursor = m.range.last + 1
                     }
@@ -642,22 +671,44 @@ internal data class ReasoningPreview(val title: String?, val body: String)
 
 private val reasoningBoldTitle = Regex("^\\*\\*([^\\n]*?)\\*\\*")
 private val reasoningHeading = Regex("^#{1,6}[ \\t]+[^\\r\\n]+(?:\\r?\\n|$)")
+private val reasoningStandaloneBoldLine = Regex("^\\*\\*([^\\r\\n]+?)\\*\\*$")
 
+/** 轻量微秒级推理摘要标题提取：逆向扫描 Markdown 标题/加粗行，避免流式期间每 48ms 做整段 CommonMark AST 解析。 */
 internal fun reasoningPreview(text: String, streaming: Boolean): ReasoningPreview {
     val trimmed = text.trimStart()
     val bold = reasoningBoldTitle.find(trimmed)
     // 标题尚未传完时不显示半个 Markdown 标记。
     if (streaming && trimmed.startsWith("**") && bold == null) return ReasoningPreview(null, "")
     val leading = bold ?: reasoningHeading.find(trimmed)
-    fun plain(node: Node): String = when (node) {
-        is org.commonmark.node.Text -> node.literal
-        is Code -> node.literal
-        is SoftLineBreak, is HardLineBreak -> " "
-        else -> node.children().joinToString("") { plain(it) }
+    var title: String? = null
+    var end = trimmed.length
+    var scannedLines = 0
+    while (end > 0 && scannedLines < 200) {
+        val nl = trimmed.lastIndexOf('\n', end - 1)
+        val line = trimmed.substring(nl + 1, end).trim()
+        end = nl
+        if (line.isEmpty()) continue
+        scannedLines++
+        val candidate = when {
+            line.startsWith('#') -> {
+                var hashes = 0
+                while (hashes < line.length && hashes < 6 && line[hashes] == '#') hashes++
+                if (hashes in 1..6 && hashes < line.length && (line[hashes] == ' ' || line[hashes] == '\t')) {
+                    line.substring(hashes).trim().trimEnd('#').trim()
+                } else null
+            }
+            line.startsWith("**") && line.endsWith("**") && line.length > 4 ->
+                reasoningStandaloneBoldLine.matchEntire(line)?.groupValues?.getOrNull(1)?.trim()
+            else -> null
+        }
+        if (!candidate.isNullOrBlank()) {
+            title = candidate.replace("`", "").replace("**", "").trim().takeIf { it.isNotEmpty() }
+            if (title != null) break
+        }
     }
-    val title = parser.parse(trimmed).children().lastOrNull { node ->
-        node is Heading || (node is Paragraph && node.firstChild is StrongEmphasis && node.firstChild.next == null)
-    }?.let(::plain)?.trim()?.takeIf { it.isNotEmpty() } ?: bold?.groupValues?.get(1)?.trim()?.takeIf { it.isNotEmpty() }
+    if (title == null) {
+        title = bold?.groupValues?.get(1)?.replace("`", "")?.trim()?.takeIf { it.isNotEmpty() }
+    }
     return ReasoningPreview(title, if (leading == null) trimmed else trimmed.substring(leading.range.last + 1).trimStart())
 }
 

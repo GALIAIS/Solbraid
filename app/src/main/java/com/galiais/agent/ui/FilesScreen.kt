@@ -383,9 +383,9 @@ fun FilesScreen(
                     if (activeTab.backStack.isNotEmpty() || canGoParent) {
                         IconButton(
                             onClick = { if (activeTab.backStack.isNotEmpty()) fm.goBack() else if (canGoParent) fm.navigate(activeScope, parentPath) },
-                            modifier = Modifier.size(36.dp),
+                            modifier = Modifier.size(38.dp),
                         ) {
-                            Icon(GaliaisIcons.ArrowBack, contentDescription = "返回上级", tint = G.ink, modifier = Modifier.size(18.dp))
+                            Icon(GaliaisIcons.ArrowBack, contentDescription = "返回上级", tint = G.ink, modifier = Modifier.size(19.dp))
                         }
                     }
                     Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -395,22 +395,22 @@ fun FilesScreen(
                         }
                     }
                     Spacer(Modifier.weight(1f))
-                    IconButton(onClick = { searching = !searching; if (!searching) searchQuery = "" }, modifier = Modifier.size(36.dp)) {
-                        Icon(if (searching) GaliaisIcons.Close else GaliaisIcons.Search, contentDescription = "搜索", tint = if (searching) G.accent else G.inkMuted, modifier = Modifier.size(18.dp))
+                    IconButton(onClick = { searching = !searching; if (!searching) searchQuery = "" }, modifier = Modifier.size(38.dp)) {
+                        Icon(if (searching) GaliaisIcons.Close else GaliaisIcons.Search, contentDescription = "搜索", tint = if (searching) G.accent else G.inkMuted, modifier = Modifier.size(19.dp))
                     }
                     TabCounterButton(count = tabs.size, onClick = { showTabSheet = true })
-                    IconButton(onClick = { showBookmarksSheet = true }, modifier = Modifier.size(36.dp)) {
-                        Icon(GaliaisIcons.BookOpen, contentDescription = "书签与回收站", tint = G.inkMuted, modifier = Modifier.size(18.dp))
+                    IconButton(onClick = { showBookmarksSheet = true }, modifier = Modifier.size(38.dp)) {
+                        Icon(GaliaisIcons.BookOpen, contentDescription = "书签与回收站", tint = G.inkMuted, modifier = Modifier.size(19.dp))
                     }
                     Box {
-                        IconButton(onClick = { showHeaderMore = true }, modifier = Modifier.size(36.dp)) {
-                            Icon(GaliaisIcons.MoreHoriz, contentDescription = "更多工具", tint = G.inkMuted, modifier = Modifier.size(18.dp))
+                        IconButton(onClick = { showHeaderMore = true }, modifier = Modifier.size(38.dp)) {
+                            Icon(GaliaisIcons.MoreHoriz, contentDescription = "更多工具", tint = G.inkMuted, modifier = Modifier.size(19.dp))
                         }
                         GaliaisDropdownMenu(expanded = showHeaderMore, onDismissRequest = { showHeaderMore = false }) {
                             Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                 GaliaisMenuRow("刷新当前目录", icon = GaliaisIcons.Refresh, onClick = { showHeaderMore = false; reload++ })
-                                GaliaisMenuRow(if (showHidden) "隐藏 .点文件" else "显示 .点文件", icon = GaliaisIcons.Info, onClick = { showHeaderMore = false; fm.setShowHidden(!showHidden) })
-                                GaliaisMenuRow("磁盘空间占用分析", icon = GaliaisIcons.Activity, onClick = { showHeaderMore = false; showDiskUsage = true })
+                                GaliaisMenuRow(if (showHidden) "隐藏 .点文件" else "显示 .点文件", icon = if (showHidden) GaliaisIcons.EyeOff else GaliaisIcons.Eye, onClick = { showHeaderMore = false; fm.setShowHidden(!showHidden) })
+                                GaliaisMenuRow("磁盘空间占用分析", icon = GaliaisIcons.BarChart, onClick = { showHeaderMore = false; showDiskUsage = true })
                                 GaliaisMenuRow("挂载外部手机目录 (SAF)", icon = GaliaisIcons.FolderSearch, onClick = { showHeaderMore = false; mountSafLauncher.launch(null) })
                                 if (runtime.ready && activeScope in setOf(FileScope.LINUX_WORKSPACE, FileScope.LINUX_ROOT)) {
                                     GaliaisMenuRow("在此打开终端", icon = GaliaisIcons.Terminal, onClick = { showHeaderMore = false; onOpenTerminal(path) { reload++ } })
@@ -484,9 +484,10 @@ fun FilesScreen(
                         SelectableChip("正则 .*", selected = searchRegex, onClick = { searchRegex = !searchRegex })
                     }
                 }
+                val floatingNavBottom = LocalFloatingNavBottomInset.current
                 LazyColumn(
                     modifier = Modifier.weight(1f).fillMaxWidth(),
-                    contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 4.dp, bottom = 24.dp),
+                    contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 4.dp, bottom = 24.dp + floatingNavBottom),
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     if (searchResults.isEmpty() && searchQuery.isNotBlank() && !searchBusy) {
@@ -636,11 +637,12 @@ fun FilesScreen(
                 }
 
                 // ── 主文件区域（占屏幕 78%+ 黄金空间，懒加载 120fps 分组卡片） ───
+                val floatingNavBottom = LocalFloatingNavBottomInset.current
                 if (viewMode == ViewMode.GRID) {
                     LazyVerticalGrid(
                         columns = GridCells.Fixed(3),
                         modifier = Modifier.weight(1f).fillMaxWidth(),
-                        contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 96.dp),
+                        contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 96.dp + floatingNavBottom),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
@@ -667,7 +669,7 @@ fun FilesScreen(
                     LazyColumn(
                         state = listState,
                         modifier = Modifier.weight(1f).fillMaxWidth(),
-                        contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 6.dp, bottom = 96.dp),
+                        contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 6.dp, bottom = 96.dp + floatingNavBottom),
                     ) {
                         if (visibleEntries.isEmpty() && !loading && error == null) {
                             item(key = "empty") {
@@ -753,11 +755,11 @@ fun FilesScreen(
                     exportZipLauncher.launch("solbraid_selection.zip")
                 },
                 onDelete = { deleteTargets = chosenRefs; selectedPaths = emptySet() },
-                modifier = Modifier.align(Alignment.BottomCenter),
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = LocalFloatingNavBottomInset.current),
             )
         } else if (!searching) {
             Row(
-                modifier = Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 14.dp),
+                modifier = Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 14.dp + LocalFloatingNavBottomInset.current),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
@@ -877,7 +879,7 @@ fun FilesScreen(
                 exportZipLauncher.launch("$dirName.zip")
             },
             onUseAsProject = if (activeScope in setOf(FileScope.LINUX_WORKSPACE, FileScope.LINUX_ROOT)) ({ onUseDirectory(path) }) else null,
-            onOpenTerminal = null,
+            onOpenTerminal = if (activeScope in setOf(FileScope.LINUX_WORKSPACE, FileScope.LINUX_ROOT)) ({ onOpenTerminal(path) {} }) else null,
             onOpenGit = null,
             onOpenDiskUsage = null,
             onDismiss = { showCreateSheet = false },

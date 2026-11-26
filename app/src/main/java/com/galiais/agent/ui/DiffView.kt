@@ -53,66 +53,85 @@ val LocalDiffActions = compositionLocalOf<DiffActionCallbacks?> { null }
 
 private data class DiffLine(val kind: Char, val text: String, val oldNumber: Int?, val newNumber: Int?)
 
-private val hunkHeader = Regex("^@@ -(\\d+)(?:,\\d+)? \\+(\\d+)(?:,\\d+)? @@.*")
+private data class ParsedDiffBundle(
+    val lines: List<DiffLine>,
+    val added: Int,
+    val removed: Int,
+    val firstChangedLine: Int,
+)
 
-/** 提取 Diff 中首个新增/变更行的新文件行号，供「编辑」按钮直接精准定位。 */
-internal fun firstChangedNewLine(diff: String): Int {
-    val parsed = parseDiff(diff)
-    parsed.firstOrNull { it.kind == '+' && (it.newNumber ?: 0) > 0 }?.newNumber?.let { return it }
-    for (raw in diff.lineSequence()) {
-        val m = hunkHeader.matchEntire(raw) ?: continue
-        val n = m.groupValues[2].toIntOrNull()
-        if (n != null && n > 0) return n
-    }
-    return 1
+private val hunkHeader = Regex("^@@ -(\\d+)(?:,\\d+)? \\+(\\d+)(?:,\\d+)? @@.*")
+private val parsedDiffCache = object : LinkedHashMap<String, ParsedDiffBundle>(64, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ParsedDiffBundle>?): Boolean = size > 128
 }
 
-/** 识别 Agent 大范围覆写（非纯新增文件且删除 >= 200 行且总变更 >= 350 行），提醒用户注意核验或一键回滚。 */
-internal fun isLargeOverwriteDiff(added: Int, removed: Int, kind: String): Boolean =
-    kind != "add" && removed >= 200 && (added + removed) >= 350
-
-private fun parseDiff(diff: String): List<DiffLine> {
+private fun parseDiffCached(diff: String): ParsedDiffBundle {
+    val key = "${diff.length}:${diff.hashCode()}:${diff.take(24)}"
+    synchronized(parsedDiffCache) {
+        parsedDiffCache[key]?.let { return it }
+    }
     val lines = ArrayList<DiffLine>()
-    var old = 0; var new = 0
+    var old = 0
+    var new = 0
+    var added = 0
+    var removed = 0
+    var inHunk = false
+    var firstPlus = 0
+    var firstHunkNew = 0
     for (raw in diff.lineSequence()) {
-        if (raw.startsWith("--- ") || raw.startsWith("+++ ") || raw.startsWith("diff ") || raw.startsWith("index ")) continue
+        if (raw.startsWith("diff --git ") || raw.startsWith("--- ") || raw.startsWith("+++ ") || raw.startsWith("diff ") || raw.startsWith("index ")) {
+            inHunk = false
+            continue
+        }
         val header = hunkHeader.matchEntire(raw)
         when {
-            header != null -> { old = header.groupValues[1].toInt(); new = header.groupValues[2].toInt(); lines += DiffLine('@', raw, null, null) }
-            raw.startsWith("+") -> lines += DiffLine('+', raw.substring(1), null, new++)
-            raw.startsWith("-") -> lines += DiffLine('-', raw.substring(1), old++, null)
+            header != null -> {
+                old = header.groupValues[1].toInt()
+                new = header.groupValues[2].toInt()
+                inHunk = true
+                if (firstHunkNew == 0 && new > 0) firstHunkNew = new
+                lines += DiffLine('@', raw, null, null)
+            }
+            raw.startsWith("+") -> {
+                val n = new++
+                if (firstPlus == 0 && n > 0) firstPlus = n
+                if (inHunk) added++
+                lines += DiffLine('+', raw.substring(1), null, n)
+            }
+            raw.startsWith("-") -> {
+                if (inHunk) removed++
+                lines += DiffLine('-', raw.substring(1), old++, null)
+            }
             raw.startsWith("\\") -> lines += DiffLine('\\', raw, null, null)
             raw.isEmpty() && lines.isEmpty() -> {}
             else -> lines += DiffLine(' ', raw.removePrefix(" "), old++, new++)
         }
     }
-    return lines
+    if (added == 0 && removed == 0 && !diff.contains("@@ ")) {
+        for (l in lines) {
+            if (l.kind == '+') added++ else if (l.kind == '-') removed++
+        }
+    }
+    val firstLine = when {
+        firstPlus > 0 -> firstPlus
+        firstHunkNew > 0 -> firstHunkNew
+        else -> 1
+    }
+    val bundle = ParsedDiffBundle(lines, added, removed, firstLine)
+    synchronized(parsedDiffCache) { parsedDiffCache[key] = bundle }
+    return bundle
 }
 
+/** 提取 Diff 中首个新增/变更行的新文件行号，供「编辑」按钮直接精准定位。 */
+internal fun firstChangedNewLine(diff: String): Int = parseDiffCached(diff).firstChangedLine
+
+/** 识别 Agent 大范围覆写（非纯新增文件且删除 >= 200 行且总变更 >= 350 行），提醒用户注意核验或一键回滚。 */
+internal fun isLargeOverwriteDiff(added: Int, removed: Int, kind: String): Boolean =
+    kind != "add" && removed >= 200 && (added + removed) >= 350
+
 fun diffStats(diff: String): Pair<Int, Int> {
-    var added = 0; var removed = 0
-    var inHunk = false
-    for (line in diff.lineSequence()) {
-        if (line.startsWith("diff --git ") || line.startsWith("--- ") || line.startsWith("+++ ")) {
-            inHunk = false
-            continue
-        }
-        if (hunkHeader.matches(line)) {
-            inHunk = true
-            continue
-        }
-        if (!inHunk) continue
-        if (line.startsWith("+")) added++
-        else if (line.startsWith("-")) removed++
-    }
-    // 兼容无 @@ 头的极简片段回退
-    if (added == 0 && removed == 0 && !diff.contains("@@ ")) {
-        for (line in diff.lineSequence()) {
-            if (line.startsWith("+") && !line.startsWith("+++ ")) added++
-            else if (line.startsWith("-") && !line.startsWith("--- ")) removed++
-        }
-    }
-    return added to removed
+    val b = parseDiffCached(diff)
+    return b.added to b.removed
 }
 
 /** 现代 IDE 风格 Diff 查看器：带状态色条、双行号分隔栏、增删徽章与内联有界高度保护。 */
@@ -122,11 +141,13 @@ fun DiffView(
     modifier: Modifier = Modifier,
     inlineCompact: Boolean = false,
 ) {
-    val lines = remember(change.diff) { parseDiff(change.diff) }
-    val initialLimit = if (inlineCompact) 28 else 320
+    val parsed = remember(change.diff) { parseDiffCached(change.diff) }
+    val lines = parsed.lines
+    val initialLimit = if (inlineCompact) 28 else 200
     var expanded by remember(change.diff, inlineCompact) { mutableStateOf(false) }
-    val visible = if (expanded) lines else lines.take(initialLimit)
-    val (added, removed) = remember(change.diff) { diffStats(change.diff) }
+    val visible = if (expanded) lines.take(800) else lines.take(initialLimit)
+    val added = parsed.added
+    val removed = parsed.removed
     val addedBg = G.diffAddedBg; val addedInk = G.diffAddedInk
     val removedBg = G.diffRemovedBg; val removedInk = G.diffRemovedInk
     val hunkBg = G.diffHunkBg; val hunkInk = G.diffHunkInk
@@ -141,7 +162,7 @@ fun DiffView(
         p.isNotEmpty() && !p.startsWith("本轮汇总") && p != "代码变更"
     }
     val largeOverwrite = remember(added, removed, change.kind) { isLargeOverwriteDiff(added, removed, change.kind) }
-    val firstLine = remember(change.diff) { firstChangedNewLine(change.diff) }
+    val firstLine = parsed.firstChangedLine
 
     val cleanPath = change.path.trimStart('/')
     val slash = cleanPath.lastIndexOf('/')

@@ -106,13 +106,13 @@ internal fun FileActionSheet(
                     } else {
                         QuickTile("查看预览", GaliaisIcons.Image, G.accent, G.accentContainer, Modifier.weight(1f)) { onDismiss(); onPrimaryOpen() }
                     }
-                    QuickTile("导出保存", GaliaisIcons.Send, G.success, G.successTint, Modifier.weight(1f)) { onDismiss(); onExport() }
+                    QuickTile("导出保存", GaliaisIcons.Upload, G.success, G.successTint, Modifier.weight(1f)) { onDismiss(); onExport() }
                 } else {
                     QuickTile("属性权限", GaliaisIcons.Info, G.accent, G.accentContainer, Modifier.weight(1f)) { onDismiss(); onProperties() }
                     QuickTile("压缩 ZIP", GaliaisIcons.Archive, G.warning, G.warningTint, Modifier.weight(1f)) { onDismiss(); onCompress() }
                 }
                 QuickTile("复制", GaliaisIcons.Copy, G.ink, G.surfaceSubtle, Modifier.weight(1f)) { onDismiss(); onCopy() }
-                QuickTile("移动", GaliaisIcons.Layers, G.ink, G.surfaceSubtle, Modifier.weight(1f)) { onDismiss(); onCut() }
+                QuickTile("移动", GaliaisIcons.Scissors, G.ink, G.surfaceSubtle, Modifier.weight(1f)) { onDismiss(); onCut() }
             }
 
             // 详细操作分组卡
@@ -192,7 +192,7 @@ internal fun CreateAndImportSheet(
 
             // 第一排 3 格核心高频动作
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                QuickTile("上传文件", GaliaisIcons.Send, G.onAccent, G.accent, Modifier.weight(1f)) { onDismiss(); onUploadMultiFiles() }
+                QuickTile("上传文件", GaliaisIcons.Upload, G.onAccent, G.accent, Modifier.weight(1f)) { onDismiss(); onUploadMultiFiles() }
                 QuickTile("新建文件", GaliaisIcons.FilePlus, G.accent, G.accentContainer, Modifier.weight(1f)) { onDismiss(); onCreateFile() }
                 QuickTile("新建目录", GaliaisIcons.FolderPlus, G.codex, G.codexTint, Modifier.weight(1f)) { onDismiss(); onCreateDir() }
             }
@@ -208,14 +208,14 @@ internal fun CreateAndImportSheet(
 
             SectionLabel("当前目录工具")
             CrispCard(padding = PaddingValues(0.dp)) {
-                SheetActionRow("创建符号链接 (ln -s)", GaliaisIcons.Plug) { onDismiss(); onCreateSymlink() }
+                SheetActionRow("创建符号链接 (ln -s)", GaliaisIcons.Link) { onDismiss(); onCreateSymlink() }
                 Hairline(Modifier.padding(start = 46.dp))
                 SheetActionRow("收藏当前目录到书签", GaliaisIcons.BookOpen) { onDismiss(); onBookmarkDir() }
                 Hairline(Modifier.padding(start = 46.dp))
                 SheetActionRow("打包导出当前目录为 ZIP", GaliaisIcons.Compress) { onDismiss(); onExportDirZip() }
                 onOpenDiskUsage?.let { du ->
                     Hairline(Modifier.padding(start = 46.dp))
-                    SheetActionRow("磁盘空间占用分析", GaliaisIcons.Activity) { onDismiss(); du() }
+                    SheetActionRow("磁盘空间占用分析", GaliaisIcons.BarChart) { onDismiss(); du() }
                 }
                 onUseAsProject?.let { useProj ->
                     Hairline(Modifier.padding(start = 46.dp))

@@ -260,9 +260,11 @@ data class LatexCompileResult(
 )
 
 /** 统一的会话时间线条目；Codex / Claude / 外部 Agent 的原始事件都会映射到这里。 */
+@androidx.compose.runtime.Immutable
 sealed interface TimelineItem {
     val id: String
 
+    @androidx.compose.runtime.Immutable
     data class UserMessage(
         override val id: String,
         val text: String,
@@ -272,6 +274,7 @@ sealed interface TimelineItem {
     ) : TimelineItem
 
     /** [phase]: Codex v2 `commentary`（过程旁白）/ `partial_answer` / `final_answer`。 */
+    @androidx.compose.runtime.Immutable
     data class AgentMessage(
         override val id: String,
         val text: String,
@@ -279,6 +282,7 @@ sealed interface TimelineItem {
         val phase: String? = null,
     ) : TimelineItem
 
+    @androidx.compose.runtime.Immutable
     data class Reasoning(
         override val id: String,
         val text: String,
@@ -287,9 +291,12 @@ sealed interface TimelineItem {
         val startedAtMs: Long? = null,
         val completedAtMs: Long? = null,
     ) : TimelineItem {
-        val summaryText: String get() = summaryParts?.toSortedMap()?.values?.joinToString("\n\n") ?: text
+        val summaryText: String by lazy(LazyThreadSafetyMode.NONE) {
+            summaryParts?.toSortedMap()?.values?.joinToString("\n\n") ?: text
+        }
         val durationMs: Long? get() = startedAtMs?.let { start -> completedAtMs?.let { end -> (end - start).coerceAtLeast(0L) } }
     }
+    @androidx.compose.runtime.Immutable
     data class Plan(
         override val id: String,
         val text: String,
@@ -301,6 +308,7 @@ sealed interface TimelineItem {
         val summary: String? = null,
         val artifactType: String = "plan",
     ) : TimelineItem
+    @androidx.compose.runtime.Immutable
     data class CommandRun(
         override val id: String,
         val command: String,
@@ -311,7 +319,9 @@ sealed interface TimelineItem {
         val actionSummary: String? = null,
         val durationMs: Long? = null,
     ) : TimelineItem
+    @androidx.compose.runtime.Immutable
     data class FileEdit(override val id: String, val changes: List<FileDiff>, val status: ItemStatus) : TimelineItem
+    @androidx.compose.runtime.Immutable
     data class ToolCall(
         override val id: String,
         val name: String,
@@ -320,9 +330,11 @@ sealed interface TimelineItem {
         val status: ItemStatus,
         val kind: String? = null,
     ) : TimelineItem
+    @androidx.compose.runtime.Immutable
     data class Delegation(override val id: String, val target: EngineKind, val task: String, val child: ConversationKey?,
         val result: String?, val status: ItemStatus) : TimelineItem
     /** 用户提交结构化提问、Elicitation 表单或方案审批后的时间线回执卡。 */
+    @androidx.compose.runtime.Immutable
     data class InteractionReceipt(
         override val id: String,
         val kind: String,
@@ -330,6 +342,7 @@ sealed interface TimelineItem {
         val entries: List<Pair<String, String>> = emptyList(),
         val status: ItemStatus = ItemStatus.COMPLETED,
     ) : TimelineItem
+    @androidx.compose.runtime.Immutable
     data class Notice(override val id: String, val text: String, val error: Boolean = false) : TimelineItem
 }
 

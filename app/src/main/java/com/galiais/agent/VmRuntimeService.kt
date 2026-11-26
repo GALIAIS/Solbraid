@@ -50,20 +50,46 @@ class VmRuntimeService : Service() {
         private const val CHANNEL = "linux-runtime"
         private const val NOTIFICATION = 2
         private const val RUNTIME_ASSETS = "galiais/runtime"
-        private const val MAXIMUM_EVENTS = 4096
-        private const val MAXIMUM_EVENT_BYTES = 8 * 1024 * 1024
+        private const val MAXIMUM_EVENTS = 8192
+        private const val MAXIMUM_EVENT_BYTES = 16 * 1024 * 1024
         private const val GUEST_NODE = "/opt/galiais-codex/usr/lib/chatgpt/resources/node"
         private const val GUEST_MUX = "/opt/galiais-codex/android/guest-mux.mjs"
     }
+
+    /** 同进程 LocalBinder 直接传递的结构化运行时事件包，避免每次事件都在主线程反复序列化与 JSONObject 重解析。 */
+    sealed interface RuntimePacket {
+        val approxBytes: Int
+        data class State(
+            val state: String,
+            val message: String,
+            val engineInfo: JSONObject?,
+            val reattached: Boolean,
+            val mode: String,
+            val progress: Float?,
+            val stepIndex: Int,
+            val stepTotal: Int,
+            val stepLabel: String,
+            val firstTimeSetup: Boolean,
+        ) : RuntimePacket {
+            override val approxBytes: Int get() = 256
+        }
+
+        data class Engine(
+            val engineName: String,
+            val data: JSONObject,
+            override val approxBytes: Int = 512,
+        ) : RuntimePacket
+    }
+
     inner class LocalBinder : Binder() { val runtime: VmRuntimeService get() = this@VmRuntimeService }
     private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     private val cancelled = AtomicBoolean(false)
     private val stopping = AtomicBoolean(false)
     private val destroyed = AtomicBoolean(false)
-    private val observers = CopyOnWriteArraySet<(String) -> Unit>()
-    private val events = ArrayDeque<String>()
-    private val serverRequests = linkedMapOf<String, JSONObject>()
+    private val observers = CopyOnWriteArraySet<(RuntimePacket) -> Unit>()
+    private val events = ArrayDeque<RuntimePacket>()
+    private val serverRequests = linkedMapOf<String, Pair<String, JSONObject>>()
     private var serverRequestBytes = 0
     private var eventBytes = 0
     private var drainScheduled = false
@@ -233,10 +259,12 @@ class VmRuntimeService : Service() {
         startEngine(mode)
     }
 
-    fun observe(callback: (String) -> Unit): AutoCloseable {
+    fun observe(callback: (RuntimePacket) -> Unit): AutoCloseable {
         observers.add(callback)
         callback(snapshot())
-        synchronized(serverRequests) { serverRequests.values.map { it.toString() } }.forEach(callback)
+        synchronized(serverRequests) {
+            serverRequests.values.map { (eng, data) -> RuntimePacket.Engine(eng, data, 1024) }
+        }.forEach(callback)
         return AutoCloseable { observers.remove(callback) }
     }
     private fun connection(name: String): CliRpcConnection = when (name) {
@@ -265,35 +293,48 @@ class VmRuntimeService : Service() {
         }
     }
     private fun removeServerRequest(id: Any, engineName: String) {
-        serverRequests.remove("$engineName:$id")?.let { serverRequestBytes -= it.toString().toByteArray(Charsets.UTF_8).size }
+        serverRequests.remove("$engineName:$id")?.let { (_, data) ->
+            serverRequestBytes = (serverRequestBytes - data.toString().length).coerceAtLeast(0)
+        }
     }
     private fun engineEvent(engineName: String, event: JSONObject) {
-        val packet = JSONObject().put("kind", "engine-event").put("engine", engineName).put("data", event)
-        if (engineName in setOf("claude", "agent-hub") && event.optString("method") == "galiais/requestResolved") synchronized(serverRequests) {
+        val method = event.optString("method")
+        if (engineName in setOf("claude", "agent-hub") && method == "galiais/requestResolved") synchronized(serverRequests) {
             removeServerRequest(event.getJSONObject("params").get("id"), engineName)
         }
-        if (engineName == "codex" && event.optString("method") == "serverRequest/resolved") synchronized(serverRequests) {
+        if (engineName == "codex" && method == "serverRequest/resolved") synchronized(serverRequests) {
             removeServerRequest(event.getJSONObject("params").get("requestId"), engineName)
         }
-        if (event.has("method") && event.has("id")) synchronized(serverRequests) {
-            val size = packet.toString().toByteArray(Charsets.UTF_8).size
+        var approx = 512
+        if (method.isNotEmpty() && event.has("id")) synchronized(serverRequests) {
+            val size = event.toString().length
+            approx = size.coerceAtLeast(512)
             check(serverRequests.size < 64 && serverRequestBytes + size <= 8 * 1024 * 1024) { "未处理的引擎审批请求超过限制；请重新连接并核对任务状态" }
             val key = "$engineName:${event.get("id")}"
             check(!serverRequests.containsKey(key)) { "引擎重复发送同一审批请求" }
-            serverRequests[key] = packet
+            serverRequests[key] = engineName to event
             serverRequestBytes += size
+        } else {
+            val params = event.optJSONObject("params")
+            if (params != null) {
+                val deltaLen = params.optString("delta").length + params.optString("data").length
+                if (deltaLen > 0) approx = (deltaLen + 256)
+            }
         }
-        emit(packet.toString())
+        emit(RuntimePacket.Engine(engineName, event, approx))
     }
-    private fun snapshot() = JSONObject().put("kind", "runtime-state").put("state", state).put("message", message)
-        .put("mode", activeMode)
-        .put("reattached", reattached)
-        .put("firstTimeSetup", firstTimeSetup)
-        .put("stepIndex", stepIndex)
-        .put("stepTotal", stepTotal)
-        .put("stepLabel", stepLabel)
-        .put("progress", progress?.toDouble() ?: JSONObject.NULL)
-        .put("engineInfo", engineInfo?.let(::JSONObject) ?: JSONObject.NULL).toString()
+    private fun snapshot() = RuntimePacket.State(
+        state = state,
+        message = message,
+        engineInfo = engineInfo?.let { runCatching { JSONObject(it) }.getOrNull() },
+        reattached = reattached,
+        mode = activeMode,
+        progress = progress,
+        stepIndex = stepIndex,
+        stepTotal = stepTotal,
+        stepLabel = stepLabel,
+        firstTimeSetup = firstTimeSetup,
+    )
 
     private fun update(next: String, text: String, progress: Float? = this.progress, step: Int = this.stepIndex, label: String = this.stepLabel) {
         state = next
@@ -306,11 +347,11 @@ class VmRuntimeService : Service() {
         main.post { getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification(notifyText)) }
         emit(snapshot())
     }
-    private fun emit(packet: String) {
+    private fun emit(packet: RuntimePacket) {
         if (observers.isEmpty()) return
         var overflow = false
         synchronized(events) {
-            val size = packet.toByteArray(Charsets.UTF_8).size
+            val size = packet.approxBytes
             if (events.size >= MAXIMUM_EVENTS || eventBytes + size > MAXIMUM_EVENT_BYTES) overflow = true
             else {
                 events.addLast(packet); eventBytes += size
@@ -322,7 +363,7 @@ class VmRuntimeService : Service() {
                             while (processed < 64) {
                                 val next = synchronized(events) {
                                     if (events.isEmpty()) { drainScheduled = false; null }
-                                    else events.removeFirst().also { eventBytes -= it.toByteArray(Charsets.UTF_8).size }
+                                    else events.removeFirst().also { eventBytes = (eventBytes - it.approxBytes).coerceAtLeast(0) }
                                 } ?: return
                                 observers.forEach { it(next) }
                                 processed++

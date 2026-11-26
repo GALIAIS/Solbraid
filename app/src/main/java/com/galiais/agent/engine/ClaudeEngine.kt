@@ -83,12 +83,282 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
             offset += page.size
         }
         val savedProvider = settings.claudeSessionProvider(key.id)
-        claudeTasks.remove(key.id)
-        latestPlanFile.remove(key.id)
-        repo.update(key) { it.copy(items = emptyList(), plan = emptyList(), planExplanation = null, loaded = true, running = it.running && key.id in connected, providerId = it.providerId ?: savedProvider) }
         val selectedOptions = settings.conversationOptions(key)
-        for (message in messages) handleMessage(key, message, live = false)
-        if (selectedOptions != null) repo.update(key) { selectedOptions.applyTo(it) }
+        val defaultPermMode = settings.state.value.claudePermissionMode
+        val initModel = repo.state(key)?.model
+        val initPermMode = repo.state(key)?.permissionMode
+
+        // 在后台计算线程一次性 O(N) 批量重建时间线、Diff、计划与用量，彻底消灭主线程 O(N²) 回放风暴
+        val built = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            val items = ArrayList<TimelineItem>(messages.size)
+            val idToIdx = HashMap<String, Int>(messages.size * 2)
+            fun upsertLocal(item: TimelineItem) {
+                val prevIdx = idToIdx[item.id]
+                if (prevIdx != null) items[prevIdx] = item
+                else {
+                    idToIdx[item.id] = items.size
+                    items.add(item)
+                }
+            }
+            val tasks = mutableListOf<PlanStep>()
+            var planExplanation: String? = null
+            val localPendingTaskCreate = HashMap<String, Int>()
+            var localLatestPlan: Pair<String, String>? = null
+            var curModel = initModel
+            var curPermMode = initPermMode
+            var curTokenUsage: TokenUsage? = null
+            val taskIdRe = Regex("""(?:Task\s*#|id["']?\s*[:=]\s*["']?)([A-Za-z0-9_-]+)""", RegexOption.IGNORE_CASE)
+
+            for (message in messages) {
+                val isSubagentMsg = !message.isNull("parent_tool_use_id") && message.has("parent_tool_use_id")
+                if (isSubagentMsg) continue
+                when (message.optString("type")) {
+                    "system" -> when (message.optString("subtype")) {
+                        "init" -> {
+                            message.str("model")?.let { curModel = it }
+                            message.str("permissionMode")?.takeIf { it in CLAUDE_PERMISSION_MODES }?.let { curPermMode = it }
+                        }
+                        "status" -> {
+                            message.str("permissionMode")?.takeIf { it in CLAUDE_PERMISSION_MODES }?.let { curPermMode = it }
+                        }
+                        "compact_boundary" -> {
+                            val meta = message.optJSONObject("compact_metadata")
+                            val triggerLabel = if (meta?.optString("trigger") == "auto") "上下文已自动压缩" else "上下文已压缩"
+                            val pre = meta?.optLong("pre_tokens", 0L) ?: 0L
+                            val post = meta?.optLong("post_tokens", 0L) ?: 0L
+                            fun fmtK(n: Long) = if (n >= 1000L) "%.1fk".format(n / 1000.0) else n.toString()
+                            val label = when {
+                                pre > 0L && post > 0L -> "$triggerLabel（${fmtK(pre)} → ${fmtK(post)} tokens）"
+                                pre > 0L -> "$triggerLabel（压缩前 ${fmtK(pre)} tokens）"
+                                else -> triggerLabel
+                            }
+                            upsertLocal(TimelineItem.Notice(message.optString("uuid", newId()), label))
+                            if (post > 0L) {
+                                curTokenUsage = TokenUsage(
+                                    totalTokens = post,
+                                    inputTokens = post,
+                                    cachedInputTokens = 0L,
+                                    outputTokens = 0L,
+                                    contextWindow = curTokenUsage?.contextWindow ?: inferModelContextWindow(curModel),
+                                    sessionTotalTokens = curTokenUsage?.sessionTotalTokens,
+                                )
+                            }
+                        }
+                    }
+                    "assistant" -> {
+                        val body = message.optJSONObject("message") ?: continue
+                        body.optJSONObject("usage")?.let { u ->
+                            val inputTok = u.optLong("input_tokens")
+                            val cacheRead = u.optLong("cache_read_input_tokens")
+                            val cacheWrite = u.optLong("cache_creation_input_tokens")
+                            val outTok = u.optLong("output_tokens")
+                            val totalIn = inputTok + cacheRead + cacheWrite
+                            if (totalIn + outTok > 0L) {
+                                curTokenUsage = TokenUsage(
+                                    totalTokens = totalIn + outTok,
+                                    inputTokens = totalIn,
+                                    cachedInputTokens = cacheRead,
+                                    cacheWriteTokens = cacheWrite,
+                                    outputTokens = outTok,
+                                    contextWindow = curTokenUsage?.contextWindow ?: inferModelContextWindow(curModel),
+                                    sessionTotalTokens = curTokenUsage?.sessionTotalTokens,
+                                )
+                            }
+                        }
+                        val messageId = body.optString("id", message.optString("uuid"))
+                        body.arr("content").objects().forEachIndexed { index, block ->
+                            val id = "$messageId:$index"
+                            when (block.optString("type")) {
+                                "text" -> upsertLocal(TimelineItem.AgentMessage(id, block.optString("text")))
+                                "thinking" -> block.str("thinking")?.takeIf { it.isNotBlank() }?.let { thinkingText ->
+                                    upsertLocal(TimelineItem.Reasoning(id = id, text = thinkingText, streaming = false))
+                                }
+                                "tool_use" -> {
+                                    val tName = block.optString("name")
+                                    val tInput = block.optJSONObject("input")
+                                    val toolUseId = block.optString("id")
+                                    when {
+                                        tName == "TodoWrite" && tInput != null -> {
+                                            val todos = tInput.arr("todos").objects().mapNotNull { t ->
+                                                val label = t.str("content") ?: t.str("activeForm") ?: return@mapNotNull null
+                                                PlanStep(label, normalizePlanStepStatus(t.optString("status", "pending")), t.str("id"), t.str("activeForm"), t.str("priority"))
+                                            }
+                                            tasks.clear(); tasks.addAll(todos)
+                                            if (todos.isNotEmpty()) planExplanation = "Claude Code 任务清单"
+                                        }
+                                        tName == "TaskCreate" && tInput != null -> {
+                                            val subject = tInput.str("subject") ?: tInput.str("description") ?: tInput.str("content")
+                                            if (!subject.isNullOrBlank()) {
+                                                val nextId = tInput.str("id") ?: (tasks.size + 1).toString()
+                                                val idx = tasks.size
+                                                tasks += PlanStep(subject, normalizePlanStepStatus(tInput.optString("status", "pending")), nextId, tInput.str("activeForm"), tInput.str("priority"))
+                                                if (toolUseId.isNotBlank()) localPendingTaskCreate[toolUseId] = idx
+                                                planExplanation = "Claude Code 任务清单"
+                                            }
+                                        }
+                                        tName == "TaskUpdate" && tInput != null -> {
+                                            val taskId = tInput.str("taskId") ?: tInput.str("id")
+                                            val rawStatus = tInput.str("status")
+                                            val idx = when {
+                                                taskId == null -> -1
+                                                else -> tasks.indexOfFirst { it.id == taskId }.takeIf { it >= 0 }
+                                                    ?: taskId.toIntOrNull()?.minus(1)?.takeIf { it in tasks.indices }
+                                                    ?: -1
+                                            }
+                                            if (idx >= 0) {
+                                                if (rawStatus.equals("deleted", ignoreCase = true)) tasks.removeAt(idx)
+                                                else {
+                                                    val old = tasks[idx]
+                                                    tasks[idx] = old.copy(
+                                                        step = tInput.str("subject") ?: tInput.str("content") ?: old.step,
+                                                        status = rawStatus?.let(::normalizePlanStepStatus) ?: old.status,
+                                                        activeForm = tInput.str("activeForm") ?: old.activeForm,
+                                                        priority = tInput.str("priority") ?: old.priority,
+                                                    )
+                                                }
+                                                planExplanation = if (tasks.isEmpty()) null else "Claude Code 任务清单"
+                                            }
+                                        }
+                                        tName == "EnterPlanMode" -> curPermMode = "plan"
+                                        tName == "ExitPlanMode" -> {
+                                            val planMd = tInput?.str("plan") ?: localLatestPlan?.second
+                                            val planPath = tInput?.str("planFilePath") ?: localLatestPlan?.first
+                                            if (!planMd.isNullOrBlank()) {
+                                                upsertLocal(TimelineItem.Plan(
+                                                    id = "claude-plan-${toolUseId.ifBlank { id }}",
+                                                    text = planMd,
+                                                    title = extractPlanTitle(planMd, planPath),
+                                                    filePath = planPath,
+                                                    status = ItemStatus.COMPLETED,
+                                                ))
+                                            }
+                                            curPermMode = defaultPermMode
+                                        }
+                                        tName in setOf("Write", "Edit") && tInput != null -> {
+                                            val path = tInput.str("file_path") ?: tInput.str("path")
+                                            if (!path.isNullOrBlank() && isClaudePlanFile(path)) {
+                                                val updatedContent = tInput.str("content") ?: run {
+                                                    val oldStr = tInput.str("old_string")
+                                                    val newStr = tInput.str("new_string")
+                                                    val prev = localLatestPlan?.takeIf { it.first == path }?.second
+                                                    when {
+                                                        prev != null && oldStr != null && newStr != null ->
+                                                            if (tInput.optBoolean("replace_all", false)) prev.replace(oldStr, newStr) else prev.replaceFirst(oldStr, newStr)
+                                                        !newStr.isNullOrBlank() && prev == null -> newStr
+                                                        else -> null
+                                                    }
+                                                }
+                                                if (!updatedContent.isNullOrBlank()) {
+                                                    localLatestPlan = path to updatedContent
+                                                    upsertLocal(TimelineItem.Plan(
+                                                        id = "claude-plan-file-${path.hashCode()}",
+                                                        text = updatedContent,
+                                                        title = extractPlanTitle(updatedContent, path),
+                                                        filePath = path,
+                                                        status = ItemStatus.COMPLETED,
+                                                        requestFeedback = false,
+                                                        artifactType = "implementation_plan",
+                                                    ))
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (tName == "mcp__galiais__$DELEGATE_TO_CODEX" || tName == "mcp__galiais__delegate_to_agent") {
+                                        val targetId = tInput?.str("agent_id")?.takeIf { it.isNotBlank() } ?: "codex"
+                                        upsertLocal(TimelineItem.Delegation(toolUseId, EngineKind.of(targetId), tInput?.optString("task") ?: "", null, null, ItemStatus.COMPLETED))
+                                    } else if (tName !in setOf("TodoWrite", "TaskCreate", "TaskUpdate")) {
+                                        upsertLocal(toolItem(block, live = false))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "user" -> {
+                        val body = message.optJSONObject("message") ?: continue
+                        val content = body.opt("content")
+                        if (content is String) {
+                            upsertLocal(TimelineItem.UserMessage(message.optString("uuid", newId()), content))
+                            continue
+                        }
+                        val blocks = (content as? JSONArray)?.objects() ?: continue
+                        val text = blocks.filter { it.optString("type") == "text" }.joinToString("\n") { it.optString("text") }
+                        if (text.isNotBlank() && message.optBoolean("isSynthetic").not()) {
+                            upsertLocal(TimelineItem.UserMessage(message.optString("uuid", newId()), text))
+                        }
+                        for (result in blocks.filter { it.optString("type") == "tool_result" }) {
+                            val output = blockText(result.opt("content"))
+                            val status = if (result.optBoolean("is_error")) ItemStatus.FAILED else ItemStatus.COMPLETED
+                            val toolUseId = result.optString("tool_use_id")
+                            localPendingTaskCreate.remove(toolUseId)?.let { idx ->
+                                val assignedId = taskIdRe.find(output)?.groupValues?.getOrNull(1)
+                                if (assignedId != null && idx in tasks.indices) {
+                                    tasks[idx] = tasks[idx].copy(id = assignedId)
+                                }
+                            }
+                            val existingIdx = idToIdx[toolUseId] ?: continue
+                            val existing = items[existingIdx]
+                            items[existingIdx] = when (existing) {
+                                is TimelineItem.CommandRun -> existing.copy(output = output.takeLast(200_000), status = status, exitCode = if (status == ItemStatus.FAILED) existing.exitCode else 0)
+                                is TimelineItem.FileEdit -> existing.copy(status = status)
+                                is TimelineItem.ToolCall -> existing.copy(result = output.take(20_000), status = status)
+                                is TimelineItem.Delegation -> existing.copy(result = output.take(20_000), status = status)
+                                else -> existing
+                            }
+                        }
+                    }
+                    "result" -> {
+                        val resUsage = message.optJSONObject("usage")
+                        val modelUsageObj = message.optJSONObject("modelUsage")
+                        var reportedWindow: Long? = null
+                        if (modelUsageObj != null) {
+                            val keys = modelUsageObj.keys()
+                            while (keys.hasNext()) {
+                                val entry = modelUsageObj.optJSONObject(keys.next()) ?: continue
+                                val cw = entry.optLong("contextWindow", 0L)
+                                if (cw > 0L) reportedWindow = if (reportedWindow == null) cw else maxOf(reportedWindow, cw)
+                            }
+                        }
+                        val turnIn = resUsage?.let { it.optLong("input_tokens") + it.optLong("cache_read_input_tokens") + it.optLong("cache_creation_input_tokens") } ?: 0L
+                        val turnOut = resUsage?.optLong("output_tokens") ?: 0L
+                        val turnSum = turnIn + turnOut
+                        if (reportedWindow != null || turnSum > 0L) {
+                            val win = reportedWindow ?: curTokenUsage?.contextWindow ?: inferModelContextWindow(curModel)
+                            curTokenUsage = curTokenUsage?.copy(contextWindow = win) ?: if (turnSum > 0L) {
+                                TokenUsage(turnSum, turnIn, resUsage?.optLong("cache_read_input_tokens") ?: 0L, turnOut, contextWindow = win)
+                            } else null
+                        }
+                    }
+                }
+            }
+            arrayOf(items, tasks.toList(), planExplanation, localLatestPlan, curModel, curPermMode, curTokenUsage)
+        }
+        @Suppress("UNCHECKED_CAST")
+        val loadedItems = built[0] as List<TimelineItem>
+        @Suppress("UNCHECKED_CAST")
+        val loadedPlan = built[1] as List<PlanStep>
+        val loadedPlanExpl = built[2] as String?
+        @Suppress("UNCHECKED_CAST")
+        val loadedLatestPlan = built[3] as Pair<String, String>?
+        val loadedModel = built[4] as String?
+        val loadedPermMode = built[5] as String?
+        val loadedUsage = built[6] as TokenUsage?
+
+        claudeTasks[key.id] = loadedPlan.toMutableList()
+        if (loadedLatestPlan != null) latestPlanFile[key.id] = loadedLatestPlan else latestPlanFile.remove(key.id)
+        repo.update(key) { base ->
+            val updated = base.copy(
+                items = loadedItems,
+                plan = loadedPlan,
+                planExplanation = loadedPlanExpl,
+                loaded = true,
+                running = base.running && key.id in connected,
+                providerId = base.providerId ?: savedProvider,
+                model = loadedModel ?: base.model,
+                permissionMode = loadedPermMode ?: base.permissionMode,
+                tokenUsage = loadedUsage ?: base.tokenUsage,
+            )
+            selectedOptions?.applyTo(updated) ?: updated
+        }
     }
 
     private fun normalizeDir(path: String): String = path.trim().trimEnd('/').ifEmpty { "/" }
