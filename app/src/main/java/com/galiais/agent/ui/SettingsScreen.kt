@@ -316,7 +316,7 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                 SettingsNavRow(
                     icon = GaliaisIcons.Info,
                     title = "关于 Solbraid",
-                    subtitle = "版本 ${BuildConfig.VERSION_NAME} · 本地多 Agent 编码环境",
+                    subtitle = "版本 ${BuildConfig.VERSION_NAME} · 用户协议与开放源代码许可",
                     iconTint = G.inkMuted,
                     iconBg = G.surfaceSubtle,
                     onClick = { onNavigate("settings/about") },

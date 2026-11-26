@@ -4,6 +4,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -24,6 +25,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -117,7 +119,13 @@ fun WorkspaceSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
 
 /** 关于 Solbraid 子页面。 */
 @Composable
-fun AboutSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState? = null, onBack: () -> Unit) {
+fun AboutSettingsScreen(
+    app: GaliaisApplication,
+    snackbar: SnackbarHostState? = null,
+    onNavigate: (String) -> Unit = {},
+    onBack: () -> Unit,
+) {
+    val context = LocalContext.current
     val runtime by app.runtime.snapshot.collectAsState()
     val cliStates by app.conversations.cliUpdates.states.collectAsState()
     val hubStatuses by app.conversations.hub.statuses.collectAsState()
@@ -136,11 +144,41 @@ fun AboutSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState? = 
                     TagPill("v${BuildConfig.VERSION_NAME}", fg = G.accent, bg = G.accentContainer)
                 }
                 Text(
-                    "Android 多 Agent 编码工具，支持本地 Linux 工作区、Codex、Claude Code 和可扩展的命令行 Agent。",
+                    "面向 Android 的全栈多引擎 AI 编程工作台，集成原生 VT500/SSH 终端、本地 Linux 运行时、统一文件管理与 Mobile-Use 能力。",
                     style = MaterialTheme.typography.bodyMedium,
                     color = G.inkMuted,
                 )
             }
+        }
+
+        SectionLabel("协议与许可")
+        CrispCard(padding = PaddingValues(0.dp)) {
+            SettingsNavRow(
+                icon = GaliaisIcons.FileLines,
+                title = "用户协议",
+                subtitle = "服务条款、本地执行边界、数据隐私与安全责任",
+                iconTint = G.accent,
+                iconBg = G.accentContainer,
+                onClick = { onNavigate("settings/about/agreement") },
+            )
+            Hairline(Modifier.padding(start = 66.dp))
+            SettingsNavRow(
+                icon = GaliaisIcons.BookOpen,
+                title = "开放源代码许可",
+                subtitle = "GNU AGPL-3.0 与第三方开源组件许可声明",
+                iconTint = G.codex,
+                iconBg = G.codexTint,
+                onClick = { onNavigate("settings/about/licenses") },
+            )
+            Hairline(Modifier.padding(start = 66.dp))
+            SettingsNavRow(
+                icon = GaliaisIcons.Globe,
+                title = "项目源代码仓库",
+                subtitle = "github.com/GALIAIS/Solbraid",
+                iconTint = G.inkMuted,
+                iconBg = G.surfaceSubtle,
+                onClick = { openExternalBrowserUrl(context, SOLBRAID_REPO_URL) },
+            )
         }
 
         SectionLabel("引擎与通道版本")

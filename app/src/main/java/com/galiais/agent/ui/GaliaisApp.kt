@@ -468,7 +468,16 @@ fun GaliaisApp(app: GaliaisApplication) {
             composable("settings/mobileuse") { MobileUseSettingsScreen(app, snackbar, onBack = ::safePopBack) }
             composable("settings/runtime") { RuntimeSettingsScreen(app, snackbar, onBack = ::safePopBack) }
             composable("settings/selfbuild") { SelfBuildSettingsScreen(app, snackbar, onBack = ::safePopBack) }
-            composable("settings/about") { AboutSettingsScreen(app, snackbar = snackbar, onBack = ::safePopBack) }
+            composable("settings/about") {
+                AboutSettingsScreen(
+                    app = app,
+                    snackbar = snackbar,
+                    onNavigate = ::safeNavigate,
+                    onBack = ::safePopBack,
+                )
+            }
+            composable("settings/about/agreement") { UserAgreementScreen(snackbar = snackbar, onBack = ::safePopBack) }
+            composable("settings/about/licenses") { OpenSourceLicensesScreen(snackbar = snackbar, onBack = ::safePopBack) }
 
             composable("terminal") {
                 val req = terminalRequest
