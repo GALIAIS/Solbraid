@@ -49,6 +49,7 @@ fun SelfBuildSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
     var androidHome by remember(saved.androidHome) { mutableStateOf(saved.androidHome) }
     var javaHome by remember(saved.javaHome) { mutableStateOf(saved.javaHome) }
     var aapt2Path by remember(saved.aapt2Path) { mutableStateOf(saved.aapt2Path) }
+    var signingPropertiesPath by remember(saved.signingPropertiesPath) { mutableStateOf(saved.signingPropertiesPath) }
     var timeoutText by remember(saved.watchdogTimeoutSec) { mutableStateOf(saved.watchdogTimeoutSec.toString()) }
     var customGradleArgs by remember(saved.customGradleArgs) { mutableStateOf(saved.customGradleArgs) }
 
@@ -88,7 +89,7 @@ fun SelfBuildSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
         }
     }
 
-    LaunchedEffect(runtime.ready, app.runtime.hubAvailable, saved.repoDir, saved.androidHome, saved.javaHome, saved.aapt2Path) {
+    LaunchedEffect(runtime.ready, app.runtime.hubAvailable, saved.repoDir, saved.androidHome, saved.javaHome, saved.aapt2Path, saved.signingPropertiesPath) {
         if (runtime.ready && app.runtime.hubAvailable) {
             runCatching { app.conversations.syncSelfBuildConfigNow() }
             refreshStatus(silent = true)
@@ -99,6 +100,7 @@ fun SelfBuildSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
         androidHome != saved.androidHome ||
         javaHome != saved.javaHome ||
         aapt2Path != saved.aapt2Path ||
+        signingPropertiesPath != saved.signingPropertiesPath ||
         timeoutText != saved.watchdogTimeoutSec.toString() ||
         customGradleArgs != saved.customGradleArgs
 
@@ -242,6 +244,16 @@ fun SelfBuildSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                 CrispCard {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         OutlinedTextField(
+                            value = signingPropertiesPath,
+                            onValueChange = { signingPropertiesPath = it },
+                            label = { Text("签名配置文件路径") },
+                            singleLine = true,
+                            shape = D.fieldShape,
+                            colors = galiaisTextFieldColors(),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Text("使用已安装版本的原签名密钥。配置文件包含 storeFile、storePassword、keyAlias、keyPassword；请存放在项目外的私有目录。安装前会校验证书。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                        OutlinedTextField(
                             value = repoDir,
                             onValueChange = { repoDir = it },
                             label = { Text("Solbraid 源码仓库目录") },
@@ -293,6 +305,7 @@ fun SelfBuildSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                                             androidHome = androidHome,
                                             javaHome = javaHome,
                                             aapt2Path = aapt2Path,
+                                            signingPropertiesPath = signingPropertiesPath,
                                             watchdogTimeoutSec = sec,
                                             customGradleArgs = customGradleArgs,
                                         ),
@@ -340,7 +353,7 @@ fun SelfBuildSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                         Triple("Android SDK 36", st.optBoolean("platform36Ok"), st.optString("androidHome").ifBlank { "未配置" }),
                         Triple("原生 ARM64 aapt2", st.optBoolean("aapt2Ok"), st.optString("aapt2Bin").ifBlank { "未检测到" }),
                         Triple("源码仓库", st.optBoolean("repoOk"), st.optString("repoDir").ifBlank { "未检测到" }),
-                        Triple("Debug Keystore", st.optBoolean("keystoreOk"), if (st.optBoolean("keystoreOk")) "已就绪" else "待生成"),
+                        Triple("签名配置", st.optBoolean("keystoreOk"), if (st.optBoolean("keystoreOk")) "已配置，安装前校验证书" else "请配置原签名密钥"),
                         Triple("离线 .so 零下载复用", st.optBoolean("nativeOfflineHydratable"), if (st.optBoolean("nativeOfflineHydratable")) "/opt/galiais-native 可用" else "不可用"),
                     )
                     Surface(Modifier.fillMaxWidth(), shape = D.shape(10.dp), color = G.surfaceSubtle) {
@@ -459,20 +472,29 @@ fun SelfBuildSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
     }
 
     if (confirmDialog == "apply" && !lastApkPath.isNullOrBlank()) {
+        val isProot = settings.effectiveRuntimeMode == com.galiais.agent.engine.RUNTIME_MODE_PROOT
         GaliaisConfirmDialog(
             title = "确认安装自编译 APK？",
-            message = "即将通过独立 Root 进程安装：$lastApkPath\n\n安装过程会重启 Solbraid 并中断当前前台页面。" +
-                if (saved.watchdogEnabled) "已启用首帧心跳看门狗（${saved.watchdogTimeoutSec}s），若启动异常将自动回滚上一版本。"
-                else "注意：当前看门狗已关闭，异常时需手动回滚。",
-            confirmText = "确认安装并重启",
+            message = if (isProot) {
+                "当前处于免 Root（PRoot）模式，即将通过 Android 原生系统安装器安装：$lastApkPath\n\n点击确认后将弹出系统安装界面，请按系统提示完成覆盖安装。"
+            } else {
+                "即将通过独立 Root 进程安装：$lastApkPath\n\n安装过程会重启 Solbraid 并中断当前前台页面。" +
+                    if (saved.watchdogEnabled) "已启用首帧心跳看门狗（${saved.watchdogTimeoutSec}s），若启动异常将自动回滚上一版本。"
+                    else "注意：当前看门狗已关闭，异常时需手动回滚。"
+            },
+            confirmText = if (isProot) "打开系统安装器" else "确认安装并重启",
             onConfirm = {
                 val apk = lastApkPath!!
                 confirmDialog = null
                 scope.launch {
-                    busyLabel = "正在移交独立看门狗安装 APK…"
+                    busyLabel = if (isProot) "正在调起 Android 系统安装器…" else "正在移交独立看门狗安装 APK…"
                     try {
-                        app.runtime.hubRequest("selfBuild/apply", jsonOf("apkPath" to apk, "confirmInstall" to true), timeoutMs = 30_000)
-                        app.conversations.notify("已移交看门狗安装，应用即将自动重启…")
+                        val res = app.runtime.hubRequest("selfBuild/apply", jsonOf("apkPath" to apk, "confirmInstall" to true), timeoutMs = 30_000)
+                        val mode = res.optString("mode")
+                        app.conversations.notify(
+                            if (mode == "android_system_installer") "已调起 Android 系统安装器，请在弹窗中确认安装"
+                            else "已移交看门狗安装，应用即将自动重启…",
+                        )
                     } catch (cancel: CancellationException) {
                         throw cancel
                     } catch (e: Exception) {
@@ -525,6 +547,7 @@ fun SelfBuildSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                 androidHome = def.androidHome
                 javaHome = def.javaHome
                 aapt2Path = def.aapt2Path
+                signingPropertiesPath = def.signingPropertiesPath
                 timeoutText = def.watchdogTimeoutSec.toString()
                 customGradleArgs = def.customGradleArgs
                 persistAndSync(def, toast = "已恢复默认配置（默认关闭）")

@@ -28,12 +28,13 @@ data class EnvironmentStatus(
     val chrootBytes: Long = 0L,
     val vmBytes: Long = 0L,
     val cacheBytes: Long = 0L,
+    val appCacheBytes: Long = 0L,
     val freeSpaceBytes: Long = 0L,
     val loading: Boolean = true,
     val legacyBackupPresent: Boolean = false,
 ) {
     val fullyInstalled: Boolean get() = chrootInstalled && vmProvisioned && codexInstalled && claudeInstalled && antigravityInstalled
-    val totalUsedBytes: Long get() = chrootBytes + cacheBytes
+    val totalUsedBytes: Long get() = chrootBytes + cacheBytes + appCacheBytes
 
     /** 返回指定模式是否已安装，避免切换模式后巡检尚未返回时界面误闪「安装运行环境」。 */
     fun isInstalledFor(targetMode: String): Boolean = when {
@@ -66,6 +67,96 @@ class LinuxRuntime(private val context: Context, val mode: String = RUNTIME_MODE
         fun prootBinariesPresent(context: Context): Boolean {
             val lib = File(context.applicationInfo.nativeLibraryDir)
             return File(lib, "libproot.so").canExecute() && File(lib, "libproot-loader.so").canExecute()
+        }
+
+        /**
+         * 修剪 `cache/file-viewer/` 目录（按修改时间 LRU 淘汰超出容量配额或过期文件），
+         * 可传入 keepFile 保护刚刚暂存准备打开的当前文件，杜绝单次查看大 APK/视频永久滞留数百 MB。
+         */
+        fun pruneViewerCacheDir(
+            context: Context,
+            keepFile: File? = null,
+            maxBytes: Long = 80L * 1024 * 1024,
+            maxAgeMs: Long = 24L * 3600_000L,
+        ): Long {
+            val viewerDir = File(context.cacheDir, "file-viewer")
+            if (!viewerDir.isDirectory) return 0L
+            val keepPath = runCatching { keepFile?.canonicalPath }.getOrNull()
+            val now = System.currentTimeMillis()
+            val files = viewerDir.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() }.orEmpty()
+            var keptBytes = 0L
+            var freed = 0L
+            for (f in files) {
+                val canon = runCatching { f.canonicalPath }.getOrNull()
+                if (keepPath != null && canon == keepPath) {
+                    keptBytes += f.length()
+                    continue
+                }
+                val len = f.length()
+                val expired = maxAgeMs > 0L && (now - f.lastModified()) > maxAgeMs
+                if (expired || keptBytes + len > maxBytes) {
+                    if (runCatching { f.delete() }.getOrDefault(false)) freed += len
+                } else {
+                    keptBytes += len
+                }
+            }
+            return freed
+        }
+
+        /** 应用启动时后台异步自动清理过期临时缓存（不触碰用户项目、会话或登录凭据）。 */
+        fun pruneTransientAppCaches(context: Context): Long {
+            var freed = 0L
+            freed += pruneViewerCacheDir(context)
+            val cache = context.cacheDir
+            val now = System.currentTimeMillis()
+            val tempCutoff = now - 2L * 3600_000L
+            val exportCutoff = now - 24L * 3600_000L
+            cache.listFiles()?.forEach { child ->
+                val name = child.name
+                val shouldDelete = when {
+                    name.startsWith("zip-in-") || name.startsWith("zip-out-") || name.startsWith("extract-") ||
+                        (name.startsWith("galiais-export-") && name.endsWith(".zip")) -> child.lastModified() < tempCutoff
+                    name == "root-fs-stage" && child.isDirectory -> {
+                        child.listFiles()?.forEach { sub ->
+                            if (sub.lastModified() < tempCutoff) {
+                                freed += safeSize(sub)
+                                runCatching { sub.deleteRecursively() }
+                            }
+                        }
+                        false
+                    }
+                    (name == "exports" || name == "self-build-apks") && child.isDirectory -> {
+                        child.listFiles()?.forEach { sub ->
+                            if (sub.lastModified() < exportCutoff) {
+                                freed += safeSize(sub)
+                                runCatching { sub.deleteRecursively() }
+                            }
+                        }
+                        false
+                    }
+                    else -> false
+                }
+                if (shouldDelete) {
+                    freed += safeSize(child)
+                    runCatching { child.deleteRecursively() }
+                }
+            }
+            return freed
+        }
+
+        private fun safeSize(file: File): Long {
+            if (!file.exists()) return 0L
+            if (file.isFile) return file.length()
+            var total = 0L
+            val stack = ArrayDeque<File>()
+            stack.addLast(file)
+            while (stack.isNotEmpty()) {
+                val cur = stack.removeLast()
+                cur.listFiles()?.forEach { c ->
+                    if (c.isDirectory) stack.addLast(c) else if (c.isFile) total += c.length()
+                }
+            }
+            return total
         }
     }
 
@@ -106,6 +197,7 @@ class LinuxRuntime(private val context: Context, val mode: String = RUNTIME_MODE
         val chrootBytes = if (root.exists()) allocatedBytes(root) else 0L
         val vmBytes = if (workspace.exists()) allocatedBytes(workspace) else 0L
         val cacheBytes = if (cacheDir.exists()) allocatedBytes(cacheDir) else 0L
+        val appCacheBytes = computeAppCacheBytes()
         val freeBytes = context.filesDir.usableSpace
         val rootComplete = File(context.filesDir, "linux/.galiais-ready").isFile &&
             runCatching { File(context.filesDir, "linux/home/agent/.galiais/vm/.provisioned").readText(Charsets.UTF_8).trim() == "native-direct-v1" }.getOrDefault(false)
@@ -126,10 +218,60 @@ class LinuxRuntime(private val context: Context, val mode: String = RUNTIME_MODE
             chrootBytes = chrootBytes,
             vmBytes = vmBytes,
             cacheBytes = cacheBytes,
+            appCacheBytes = appCacheBytes,
             freeSpaceBytes = freeBytes,
             loading = false,
             legacyBackupPresent = File(context.filesDir, "workspace-backups/pending-reset-restore.tgz").isFile,
         )
+    }
+
+    /** 统计可安全清理的应用暂存缓存与历史运行日志（含 cache/file-viewer、临时解压、npm-cache 与旧 agy 日志）。 */
+    private fun computeAppCacheBytes(): Long {
+        var total = 0L
+        val cache = context.cacheDir
+        if (cache.isDirectory) {
+            cache.listFiles()?.forEach { child ->
+                val n = child.name
+                if (n in setOf("file-viewer", "exports", "root-fs-stage") ||
+                    n.startsWith("zip-in-") || n.startsWith("zip-out-") || n.startsWith("extract-") ||
+                    (n.startsWith("galiais-export-") && n.endsWith(".zip"))) {
+                    total += allocatedBytes(child)
+                }
+            }
+        }
+        val agyLogDir = File(root, "home/agent/.gemini/antigravity-cli/log")
+        if (agyLogDir.isDirectory) total += allocatedBytes(agyLogDir)
+        val npmCache = File(root, "home/agent/.galiais/npm-cache")
+        if (npmCache.isDirectory) total += allocatedBytes(npmCache)
+        return total
+    }
+
+    /** 一键清理应用预览暂存、导出/压缩临时目录、npm 缓存与过期运行日志（保留最近 5 份日志与全部项目/会话/登录态）。 */
+    fun clearAppCache(): Long {
+        val before = computeAppCacheBytes()
+        val cache = context.cacheDir
+        if (cache.isDirectory) {
+            cache.listFiles()?.forEach { child ->
+                val n = child.name
+                if (n in setOf("file-viewer", "exports", "root-fs-stage") ||
+                    n.startsWith("zip-in-") || n.startsWith("zip-out-") || n.startsWith("extract-") ||
+                    (n.startsWith("galiais-export-") && n.endsWith(".zip"))) {
+                    deleteLocalTree(child)
+                }
+            }
+        }
+        val agyLogDir = File(root, "home/agent/.gemini/antigravity-cli/log")
+        if (agyLogDir.isDirectory) {
+            val logs = agyLogDir.listFiles()?.filter { it.isFile && it.name.endsWith(".log") }
+                ?.sortedByDescending { it.lastModified() }.orEmpty()
+            logs.drop(5).forEach { runCatching { it.delete() } }
+        }
+        val npmCache = File(root, "home/agent/.galiais/npm-cache")
+        if (npmCache.isDirectory) {
+            npmCache.listFiles()?.forEach { deleteLocalTree(it) }
+        }
+        val after = computeAppCacheBytes()
+        return (before - after).coerceAtLeast(0L)
     }
 
     /** 清理已下载的安装包缓存（files/runtime-downloads），释放约 1.15 GB 空间；不影响已运行的环境。 */

@@ -100,6 +100,8 @@ class VmRuntimeService : Service() {
     @Volatile var codexVersion: String? = null
         private set
     private var wakeLock: PowerManager.WakeLock? = null
+    private var turnWakeLock: PowerManager.WakeLock? = null
+    @Volatile private var activeTurnRunning = false
     private var installControl = RunControl()
     private val processLock = Any()
     private data class QueuedSend(val lockId: String, var sent: Boolean = false)
@@ -461,6 +463,29 @@ class VmRuntimeService : Service() {
         check(result.code == 0) { "未能停止后台引擎：${result.diagnostic.ifBlank { result.output }}" }
     }
 
+    fun setActiveTurnRunning(active: Boolean) {
+        main.post {
+            if (destroyed.get()) return@post
+            activeTurnRunning = active
+            if (active && state == "ready") {
+                try {
+                    val wl = turnWakeLock ?: getSystemService(PowerManager::class.java)
+                        .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "GALIAIS:active-turn")
+                        .also { it.setReferenceCounted(false); turnWakeLock = it }
+                    // 单次上限 25 分钟，防止异常泄露；任务活跃期间保护后台网络不被 Android Doze/netd 阻断（EPERM）
+                    wl.acquire(25 * 60 * 1000L)
+                } catch (_: Exception) {}
+                getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification("Agent 任务执行中（后台网络保活）"))
+            } else {
+                try { turnWakeLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
+                turnWakeLock = null
+                if (state == "ready") {
+                    getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification(message))
+                }
+            }
+        }
+    }
+
     fun applyKeepAlive(keep: Boolean) {
         if (state != "ready") return
         val connections = listOfNotNull(engine, claude, gateway, agentHub)
@@ -690,6 +715,8 @@ class VmRuntimeService : Service() {
             return
         }
         wakeLock?.let { if (it.isHeld) it.release() }; wakeLock = null
+        turnWakeLock?.let { if (it.isHeld) it.release() }; turnWakeLock = null
+        activeTurnRunning = false
         update(if (finalFailure == null) "stopped" else "error", finalFailure ?: "运行环境已停止", progress = null, step = 0, label = "")
         stopForeground(if (finalFailure == null) STOP_FOREGROUND_REMOVE else STOP_FOREGROUND_DETACH)
         stopSelf()
@@ -826,6 +853,8 @@ class VmRuntimeService : Service() {
     override fun onDestroy() {
         destroyed.set(true)
         wakeLock?.let { if (it.isHeld) it.release() }; wakeLock = null
+        turnWakeLock?.let { if (it.isHeld) it.release() }; turnWakeLock = null
+        activeTurnRunning = false
         if (busy && !stopping.get() && !maintaining) stopRuntime("运行服务已结束，任务未自动重试", killDaemons = !settings.keepRuntimeOnExit)
         else if (!busy) { worker.shutdown() }
         observers.clear()

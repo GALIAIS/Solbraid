@@ -29,6 +29,14 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 private val MULTI_NL_RE = Regex("\n{3,}")
+private val ACP_META_RUN_PREFIX_RE = Regex("^(?:run|call|tool)_+")
+private val ACP_META_TOOL_NAMES = setOf("update_steps", "update_focus", "task_boundary", "update_plan", "todowrite", "todo_write", "set_plan")
+
+internal fun normalizeAcpMetaToolName(title: String): String =
+    title.trim().lowercase().replace("-", "_").replace(Regex("\\s+"), "_").replace(ACP_META_RUN_PREFIX_RE, "")
+
+internal fun isAcpMetaToolTitle(title: String): Boolean =
+    normalizeAcpMetaToolName(title) in ACP_META_TOOL_NAMES
 
 /**
  * 手机版 Agent Harness 核心控制器：对接虚拟机内 `agent-hub.mjs`，统一调度所有外部
@@ -68,6 +76,7 @@ class AgentHubController(val repo: ConversationRepository) {
     private val configOptions = mutableMapOf<ConversationKey, List<AcpConfigOption>>()
     private val activeStreamMsgId = mutableMapOf<ConversationKey, String>()
     private val activeThoughtMsgId = mutableMapOf<ConversationKey, String>()
+    private val interceptedMetaToolIds = mutableMapOf<ConversationKey, MutableSet<String>>()
     private val commandStartedAt = mutableMapOf<String, Long>()
     private val adapters = mutableMapOf<String, UniversalAgentAdapter>()
     private val networkMutex = Mutex()
@@ -816,6 +825,7 @@ class AgentHubController(val repo: ConversationRepository) {
     internal fun clearTurnStream(key: ConversationKey) {
         activeStreamMsgId.remove(key)
         activeThoughtMsgId.remove(key)
+        interceptedMetaToolIds.remove(key)
     }
 
     private fun closeActiveThought(key: ConversationKey, endedAt: Long = System.currentTimeMillis()) {
@@ -872,6 +882,7 @@ class AgentHubController(val repo: ConversationRepository) {
             state.copy(
                 running = false,
                 turnStartedAt = null,
+                focusText = null,
                 turnDiff = effectiveDiff,
                 turnDurations = nextDurs,
                 items = nextItems,
@@ -882,6 +893,46 @@ class AgentHubController(val repo: ConversationRepository) {
     private fun handleHubPacket(packet: JSONObject) {
         val method = packet.optString("method")
         val params = packet.optJSONObject("params") ?: JSONObject()
+        if (packet.has("id") && method == "mobileUse/execute") {
+            val reqId = packet.get("id")
+            val action = params.optString("action")
+            val actionParams = params.optJSONObject("params") ?: JSONObject()
+            repo.scope.launch {
+                try {
+                    val mobile = (runtime.app as com.galiais.agent.GaliaisApplication).mobileUse
+                    val result = mobile.execute(action, actionParams)
+                    runCatching { runtime.hubRespond(reqId, result) }
+                } catch (cancel: CancellationException) {
+                    runCatching { runtime.hubReject(reqId, -32000, "手机操控请求已取消") }
+                    throw cancel
+                } catch (err: Exception) {
+                    runCatching { runtime.hubReject(reqId, -32000, err.message ?: "手机操控执行失败") }
+                }
+            }
+            return
+        }
+        if (packet.has("id") && method in setOf("selfBuild/installApk", "selfBuild/hostStatus", "selfBuild/hostRollback", "selfBuild/requestRollback")) {
+            val reqId = packet.get("id")
+            val apkPath = params.optString("apkPath")
+            repo.scope.launch {
+                try {
+                    val mobile = (runtime.app as com.galiais.agent.GaliaisApplication).mobileUse
+                    val result = when (method) {
+                        "selfBuild/hostStatus" -> mobile.selfBuildHostStatus()
+                        "selfBuild/hostRollback" -> mobile.rollbackSelfBuildApk()
+                        "selfBuild/requestRollback" -> mobile.rollbackSelfBuildApk(requireConfirmation = true)
+                        else -> mobile.installSelfBuildApk(apkPath)
+                    }
+                    runCatching { runtime.hubRespond(reqId, result) }
+                } catch (cancel: CancellationException) {
+                    runCatching { runtime.hubReject(reqId, -32000, "调起系统安装器已取消") }
+                    throw cancel
+                } catch (err: Exception) {
+                    runCatching { runtime.hubReject(reqId, -32000, err.message ?: "调起系统安装器失败") }
+                }
+            }
+            return
+        }
         if (packet.has("id") && method == "agent/delegate") {
             val reqId = packet.get("id")
             val fromKind = EngineKind.of(params.optString("agentId"))
@@ -1163,6 +1214,44 @@ class AgentHubController(val repo: ConversationRepository) {
         val key = ConversationKey(EngineKind.of(agentId), sessionId)
         when (params.optString("kind")) {
             "notice" -> repo.upsertItem(key, TimelineItem.Notice("notice-" + newId(), params.optString("text"), params.optBoolean("error")))
+            "thought-reset" -> {
+                closeActiveThought(key)
+                params.str("focus")?.takeIf { it.isNotBlank() }?.let { focus ->
+                    repo.update(key) { it.copy(focusText = focus) }
+                }
+            }
+            "turn-retry" -> {
+                // 先刷出已缓冲的流式分片，再清理上一轮失败尝试遗留的软错误文本或中断思考，避免重复拼接成巨型思考块。
+                repo.findItem(key, "")
+                val oldStreamId = activeStreamMsgId.remove(key)
+                val oldThoughtId = activeThoughtMsgId.remove(key)
+                val clearPartialThought = params.optBoolean("clearPartialThought", false)
+                val discardSoftReply = params.optBoolean("discardSoftReply", true)
+                val attempt = params.optInt("attempt", 1)
+                val maxAttempts = params.optInt("maxAttempts", 3)
+                val delaySec = ((params.optLong("delayMs", 2000L) + 500L) / 1000L).coerceAtLeast(1L)
+                val reason = params.str("reason").orEmpty().ifBlank { "网络波动" }
+                val statusText = params.str("focus") ?: "${reason}，${delaySec}秒后自动重试（第 ${attempt}/${maxAttempts} 次）…"
+                val endedAt = System.currentTimeMillis()
+                repo.update(key) { state ->
+                    val lastUserIdx = state.items.indexOfLast { it is TimelineItem.UserMessage }
+                    val nextItems = state.items.mapIndexedNotNull { idx, item ->
+                        if (idx <= lastUserIdx) return@mapIndexedNotNull item
+                        when {
+                            discardSoftReply && item is TimelineItem.AgentMessage && (item.id == oldStreamId || item.text.contains("network issue", ignoreCase = true) || item.text.trim().startsWith("⚠")) -> null
+                            clearPartialThought && item is TimelineItem.Reasoning && (item.id == oldThoughtId || item.streaming) -> null
+                            item is TimelineItem.Reasoning && item.streaming -> item.copy(
+                                text = item.text.trimEnd(),
+                                streaming = false,
+                                completedAtMs = item.completedAtMs ?: endedAt,
+                            )
+                            item is TimelineItem.AgentMessage && item.streaming -> item.copy(streaming = false)
+                            else -> item
+                        }
+                    }
+                    state.copy(items = nextItems, focusText = statusText)
+                }
+            }
             "acp-update" -> handleAcpUpdate(key, params.optJSONObject("update") ?: return)
         }
     }
@@ -1185,30 +1274,33 @@ class AgentHubController(val repo: ConversationRepository) {
                 repo.appendStreamingDelta(key, id, cleaned, "reasoning") { TimelineItem.Reasoning(id, "", streaming = true, startedAtMs = now) }
             }
             "tool_call", "tool_call_update" -> {
+                val callId = update.str("toolCallId") ?: ("tool-" + newId())
+                val title = update.str("title") ?: ""
+                val kindStr = update.str("kind")?.lowercase().orEmpty()
+                val rawInputObj = update.optJSONObject("rawInput")
+                val metaIds = interceptedMetaToolIds.getOrPut(key) { mutableSetOf() }
+                // 原生步骤清单与焦点状态工具拦截（兼容 Antigravity "Run update_steps" / "Run update_focus" / "Run task_boundary" 及其完成态更新）
+                if (callId in metaIds || isAcpMetaToolTitle(title)) {
+                    metaIds += callId
+                    if (rawInputObj != null) tryApplyAcpStepChecklist(key, title, rawInputObj)
+                    return
+                }
                 if (update.optString("sessionUpdate") == "tool_call") {
                     // 工具调用到来时切分流式消息段并完结前一段推理链，使思考→工具→再思考→回复层次清晰。
                     activeStreamMsgId.remove(key)
                     closeActiveThought(key)
                 }
-                val callId = update.str("toolCallId") ?: ("tool-" + newId())
-                val title = update.str("title") ?: ""
-                val kindStr = update.str("kind")?.lowercase().orEmpty()
                 val st = when (update.optString("status").lowercase()) {
                     "completed" -> ItemStatus.COMPLETED
                     "failed" -> ItemStatus.FAILED
                     else -> ItemStatus.RUNNING
                 }
-                val rawInputObj = update.optJSONObject("rawInput")
                 val input = update.opt("rawInput")?.takeUnless { it == JSONObject.NULL }?.toString() ?: ""
                 val rawOutputAny = update.opt("rawOutput")?.takeUnless { it == JSONObject.NULL }
                 val contentBlocks = update.arr("content").objects()
                 val diffBlocks = extractAcpFileDiffs(kindStr, rawInputObj, contentBlocks)
                 val outputText = extractAcpOutputText(rawOutputAny, contentBlocks)
 
-                // 原生步骤清单与焦点状态工具拦截（Antigravity update_steps / update_focus / task_boundary / TodoWrite / update_plan）
-                if (rawInputObj != null && tryApplyAcpStepChecklist(key, title, rawInputObj)) {
-                    return
-                }
                 // 原生计划 Artifact 文件识别（implementation_plan.md / plan.md / ArtifactMetadata 计划文档 / ACP locations）
                 val locations = update.arr("locations").objects()
                 val writtenPlan = extractAcpPlanArtifact(title, rawInputObj, diffBlocks, locations)
@@ -1270,12 +1362,14 @@ class AgentHubController(val repo: ConversationRepository) {
                             "fetch" -> title.ifBlank { "WebFetch" }
                             else -> title.ifBlank { "工具调用" }
                         }
-                        repo.mutateItem(key, callId, { TimelineItem.ToolCall(callId, normalizedName, input, outputText, st) }) {
+                        val preservedKind = kindStr.takeIf { it.isNotBlank() }
+                        repo.mutateItem(key, callId, { TimelineItem.ToolCall(callId, normalizedName, input, outputText, st, kind = preservedKind) }) {
                             if (it is TimelineItem.ToolCall) it.copy(
                                 name = normalizedName.ifBlank { it.name },
                                 input = input.ifBlank { it.input },
                                 result = outputText ?: it.result,
                                 status = st,
+                                kind = preservedKind ?: it.kind,
                             ) else it
                         }
                     }
@@ -1434,7 +1528,7 @@ class AgentHubController(val repo: ConversationRepository) {
     }
 
     private fun tryApplyAcpStepChecklist(key: ConversationKey, title: String, rawInput: JSONObject): Boolean {
-        val norm = title.trim().lowercase().replace("-", "_").replace(" ", "_")
+        val norm = normalizeAcpMetaToolName(title)
         if (norm == "update_focus") {
             val focus = rawInput.str("focus") ?: rawInput.str("status")
             if (!focus.isNullOrBlank()) {
@@ -1494,14 +1588,16 @@ class AgentHubController(val repo: ConversationRepository) {
         for (block in contentBlocks) {
             if (block.optString("type").equals("diff", ignoreCase = true)) {
                 val path = block.str("path") ?: continue
+                val precomputed = block.str("diff")
                 val oldText = block.optString("oldText", "")
                 val newText = block.optString("newText", "")
-                val editKind = when {
+                val editKind = block.str("kind")?.takeIf { it in setOf("add", "delete", "update") } ?: when {
                     oldText.isEmpty() && newText.isNotEmpty() -> "add"
                     newText.isEmpty() && oldText.isNotEmpty() -> "delete"
                     else -> "update"
                 }
-                diffs += FileDiff(path, editKind, unifiedDiff(path, oldText, newText))
+                val diffBody = precomputed ?: unifiedDiff(path, oldText, newText)
+                diffs += FileDiff(path, editKind, diffBody)
             }
         }
         if (diffs.isNotEmpty() || rawInput == null) return diffs
@@ -1576,6 +1672,8 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
                         completedAtMs = m.optLong("completedAtMs", 0L).takeIf { it > 0L },
                     ))
                     "tool" -> {
+                        val toolName = m.optString("name", "工具调用")
+                        if (isAcpMetaToolTitle(toolName)) return@forEach
                         val st = when (m.optString("status").lowercase()) {
                             "failed" -> ItemStatus.FAILED
                             "declined" -> ItemStatus.DECLINED
@@ -1593,7 +1691,7 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
                             diffs.isNotEmpty() -> add(TimelineItem.FileEdit(id, diffs, st))
                             !cmd.isNullOrBlank() || kindStr == "execute" -> add(TimelineItem.CommandRun(
                                 id = id,
-                                command = cmd ?: m.optString("name", "执行命令"),
+                                command = cmd ?: toolName.ifBlank { "执行命令" },
                                 cwd = m.str("cwd"),
                                 output = m.optString("result"),
                                 exitCode = if (m.has("exitCode")) m.optInt("exitCode") else if (st == ItemStatus.COMPLETED) 0 else null,
@@ -1602,10 +1700,11 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
                             ))
                             else -> add(TimelineItem.ToolCall(
                                 id = id,
-                                name = m.optString("name", "工具调用"),
+                                name = toolName,
                                 input = m.optString("input"),
                                 result = m.str("result"),
                                 status = st,
+                                kind = kindStr.takeIf { it.isNotBlank() },
                             ))
                         }
                     }
@@ -1767,6 +1866,7 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
             st.copy(
                 running = true,
                 turnStartedAt = System.currentTimeMillis(),
+                focusText = null,
                 turnDiff = null,
                 summary = st.summary.copy(
                     title = if (st.summary.title in setOf("新会话", "未命名会话")) preview else st.summary.title,
@@ -1803,7 +1903,11 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
                 repo.upsertItem(key, TimelineItem.Notice("cancelled-" + newId(), "已中断"))
             }
         } catch (e: Exception) {
-            repo.upsertItem(key, TimelineItem.Notice("error-" + newId(), e.message ?: "${kind.label} 执行失败", error = true))
+            val errMsg = e.message ?: "${kind.label} 执行失败"
+            val lastNotice = repo.state(key)?.items?.lastOrNull() as? TimelineItem.Notice
+            if (lastNotice == null || !lastNotice.error || lastNotice.text != errMsg) {
+                repo.upsertItem(key, TimelineItem.Notice("error-" + newId(), errMsg, error = true))
+            }
             throw e
         } finally {
             hub.finishTurn(key, returnedDiff)

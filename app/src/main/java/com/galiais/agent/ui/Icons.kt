@@ -302,4 +302,13 @@ object GaliaisIcons {
             stroke = "M4,8 H19.5 M16,4.5 L19.5,8 L16,11.5 M20,16 H4.5 M8,12.5 L4.5,16 L8,19.5",
         )
     }
+    /** 手机操控（Mobile-Use） */
+    val Smartphone: ImageVector by lazy {
+        duo(
+            name = "Smartphone",
+            secondary = "M7,3.5 A1.5,1.5 0 0 1 8.5,2 H15.5 A1.5,1.5 0 0 1 17,3.5 V20.5 A1.5,1.5 0 0 1 15.5,22 H8.5 A1.5,1.5 0 0 1 7,20.5 Z",
+            stroke = "M8.5,2 H15.5 A1.5,1.5 0 0 1 17,3.5 V20.5 A1.5,1.5 0 0 1 15.5,22 H8.5 A1.5,1.5 0 0 1 7,20.5 V3.5 A1.5,1.5 0 0 1 8.5,2 Z",
+            primaryFill = "M12,18.5 m-1,0 a1,1 0 1,0 2,0 a1,1 0 1,0 -2,0",
+        )
+    }
 }

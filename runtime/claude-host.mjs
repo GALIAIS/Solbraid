@@ -7,6 +7,7 @@ import {promisify} from "node:util";
 import {loadMcpServersForClaude} from "./extension-sync.mjs";
 import {loadEffectiveUserEnv} from "./env-ssh-hub.mjs";
 import {resolveCliInstallation, bundledCliInstallation} from "./cli-components.mjs";
+import {captureFileCheckpoint, resolveSafeHomePath} from "./safe-file-io.mjs";
 let installation = await resolveCliInstallation("claude");
 let sdkDirectory = installation.sdkDirectory;
 let executable = installation.binary;
@@ -384,6 +385,15 @@ async function openSession(params) {
       ...(Object.keys(extraSettings).length ? {settings:extraSettings} : {}),
       canUseTool:(toolName,input,request)=>{
         const {signal,...details}=request;
+        // 为 Claude Code 原生 Edit/Write 写前自动留存统一文件检查点（即使不在 Git 仓库中也可单文件一键撤回）
+        if (toolName === "Edit" || toolName === "MultiEdit" || toolName === "Write" || toolName === "NotebookEdit") {
+          const rawPath = input?.file_path || input?.path || input?.notebook_path;
+          if (typeof rawPath === "string" && rawPath.trim()) {
+            void resolveSafeHomePath(rawPath, {cwd, allowMissing: true})
+              .then(resolved => captureFileCheckpoint(resolved, {sessionId: id}))
+              .catch(() => {});
+          }
+        }
         // 委派工具本身会再向用户发起确认，这里不重复询问。
         if (delegateTools.has(toolName) && session.delegation) return Promise.resolve({behavior:"allow"});
         return ask(session,"permission",{toolName,input,...details},signal);

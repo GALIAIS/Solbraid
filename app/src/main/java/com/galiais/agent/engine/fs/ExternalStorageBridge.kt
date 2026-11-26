@@ -205,10 +205,17 @@ object ExternalStorageBridge {
 
     private fun ensureInViewerCache(context: Context, src: File, displayName: String): File {
         val viewerDir = File(context.cacheDir, "file-viewer").apply { mkdirs() }
-        if (src.parentFile?.canonicalFile == viewerDir.canonicalFile) return src
+        if (src.parentFile?.canonicalFile == viewerDir.canonicalFile) {
+            com.galiais.agent.LinuxRuntime.pruneViewerCacheDir(context, keepFile = src)
+            return src
+        }
         val safeName = sanitizeFilename(displayName)
         val dst = File(viewerDir, safeName)
-        src.inputStream().use { input -> dst.outputStream().use { input.copyTo(it) } }
+        // 若同名目标已存在且大小与修改时间一致则直接复用，并修剪其他过期暂存避免数百 MB 无限堆积
+        if (!dst.isFile || dst.length() != src.length() || dst.lastModified() < src.lastModified()) {
+            src.inputStream().use { input -> dst.outputStream().use { input.copyTo(it) } }
+        }
+        com.galiais.agent.LinuxRuntime.pruneViewerCacheDir(context, keepFile = dst)
         return dst
     }
 

@@ -303,6 +303,14 @@ class RuntimeClient(val app: Application) {
         return freed
     }
 
+    suspend fun clearAppCache(): Long {
+        val state = snapshotFlow.value.state
+        check(state in setOf("stopped", "error", "ready")) { "正在准备或维护运行环境，请稍后再清理缓存" }
+        val freed = withContext(Dispatchers.IO) { LinuxRuntime(app, settingsState.effectiveRuntimeMode).clearAppCache() }
+        refreshEnvironment()
+        return freed
+    }
+
     fun maintain(operation: String, deleteCache: Boolean, restart: Boolean) {
         require(operation in setOf(VmRuntimeService.OP_RESET_VM, VmRuntimeService.OP_DELETE_ALL, VmRuntimeService.OP_RESTORE_LEGACY)) { "未知维护操作" }
         app.startForegroundService(Intent(app, VmRuntimeService::class.java).setAction(VmRuntimeService.MAINTAIN)
@@ -313,6 +321,8 @@ class RuntimeClient(val app: Application) {
     }
 
     fun applyKeepAlive(keep: Boolean) { service?.applyKeepAlive(keep) }
+
+    fun setActiveTurnRunning(active: Boolean) { service?.setActiveTurnRunning(active) }
 
     private fun connected(): VmRuntimeService = service ?: throw EngineException(-32000, "本地运行服务未连接")
 

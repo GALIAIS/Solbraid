@@ -750,18 +750,46 @@ async function passthroughWithUsage(upstream, res, meta, allowFailover = false) 
       }
     } catch {}
   };
-  for await (const chunk of upstream.body) {
-    if (!usage._firstChunkAt) usage._firstChunkAt = Date.now();
-    res.write(chunk);
-    const text = tail + dec.decode(chunk, {stream: true});
-    const lines = text.split("\n");
-    tail = lines.pop() || "";
-    for (const line of lines) sniffLine(line);
+  let streamErr = null;
+  try {
+    for await (const chunk of upstream.body) {
+      if (!usage._firstChunkAt) usage._firstChunkAt = Date.now();
+      res.write(chunk);
+      const text = tail + dec.decode(chunk, {stream: true});
+      const lines = text.split("\n");
+      tail = lines.pop() || "";
+      for (const line of lines) sniffLine(line);
+    }
+    const rest = tail + dec.decode();
+    if (rest.trim()) sniffLine(rest);
+    res.end();
+  } catch (err) {
+    streamErr = err;
+    throw err;
+  } finally {
+    const aborted = Boolean(res.destroyed || streamErr?.name === "AbortError");
+    const status = streamErr ? (aborted ? 499 : 502) : (res.destroyed && !res.writableEnded ? 499 : upstream.status);
+    const errText = streamErr ? (aborted ? "用户中断或连接取消" : String(streamErr.message || streamErr)) : (status === 499 ? "客户端断开连接" : "");
+    void recordUsageEvent({...meta, ...finalizeUsageAccumulator(usage, meta.startedAt), ms: Date.now() - meta.startedAt, status, err: errText});
+    if (streamErr && typeof streamErr === "object") streamErr._usageRecorded = true;
   }
-  const rest = tail + dec.decode();
-  if (rest.trim()) sniffLine(rest);
-  res.end();
-  void recordUsageEvent({...meta, ...finalizeUsageAccumulator(usage, meta.startedAt), ms: Date.now() - meta.startedAt, status: upstream.status});
+}
+
+/** 统一保护所有协议转换流：无论成功、客户端中止(499)还是上游断流(502)，都精确记且仅记一条账本记录。 */
+async function runPipeWithUsage(meta, usage, startedAt, res, signal, pipeFn) {
+  let pipeErr = null;
+  try {
+    await pipeFn();
+  } catch (err) {
+    pipeErr = err;
+    throw err;
+  } finally {
+    const aborted = Boolean(signal?.aborted || res.destroyed || pipeErr?.name === "AbortError");
+    const status = pipeErr ? (aborted ? 499 : 502) : (aborted && !res.writableEnded ? 499 : 200);
+    const errText = pipeErr ? (aborted ? "用户中断或连接取消" : String(pipeErr.message || pipeErr)) : (status === 499 ? "客户端断开连接" : "");
+    void recordUsageEvent({...meta, ...finalizeUsageAccumulator(usage, startedAt), ms: Date.now() - startedAt, status, err: errText});
+    if (pipeErr && typeof pipeErr === "object") pipeErr._usageRecorded = true;
+  }
 }
 
 /** 为跨协议转换流套一层零拷贝用法与真实 TTFT/生成耗时嗅探器，安全支持流式与非 SSE JSON 回退。 */
@@ -926,7 +954,8 @@ async function handleCompatibleIngress(provider, route, subPath, body, req, res,
 
   let upstream;
   if (route === "openai-chat" && target.protocol === "openai_chat") {
-    upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/chat/completions", provider.queryParams), body, {}, signal, {stripStreamOptions: true});
+    const chatBody = stream && !body.stream_options ? {...body, stream_options: {include_usage: true}} : body;
+    upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/chat/completions", provider.queryParams), chatBody, {}, signal, {stripStreamOptions: true});
     if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, route, upstream.status, err, meta, startedAt, allowFailover); return; }
     await passthroughWithUsage(upstream, res, meta, allowFailover);
     return;
@@ -957,11 +986,12 @@ async function handleCompatibleIngress(provider, route, subPath, body, req, res,
   }
   if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, route, upstream.status, err, meta, startedAt, allowFailover); return; }
   const {wrapped, usage} = wrapUpstreamForUsage(upstream, startedAt);
-  if (target.protocol === "openai_responses") await pipeResponsesToCompatible(wrapped, writer);
-  else if (target.protocol === "openai_chat") await pipeChatToResponses(wrapped, res, model, new Map(), new Set(), writer);
-  else if (target.protocol === "anthropic_messages") await pipeAnthropicToResponses(wrapped, res, model, new Map(), new Set(), writer);
-  else await pipeGeminiToResponses(wrapped, res, model, new Map(), new Set(), writer);
-  void recordUsageEvent({...meta, ...finalizeUsageAccumulator(usage, startedAt), ms: Date.now() - startedAt, status: 200});
+  await runPipeWithUsage(meta, usage, startedAt, res, signal, async () => {
+    if (target.protocol === "openai_responses") await pipeResponsesToCompatible(wrapped, writer);
+    else if (target.protocol === "openai_chat") await pipeChatToResponses(wrapped, res, model, new Map(), new Set(), writer);
+    else if (target.protocol === "anthropic_messages") await pipeAnthropicToResponses(wrapped, res, model, new Map(), new Set(), writer);
+    else await pipeGeminiToResponses(wrapped, res, model, new Map(), new Set(), writer);
+  });
 }
 
 /** 为不支持原生 /responses/compact 的自定义服务商/协议合成兼容的 OpenAI Responses 上下文压缩响应。 */
@@ -1129,8 +1159,7 @@ async function handleCodexIngress(provider, subPath, body, req, res, signal, req
     const upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/chat/completions", provider.queryParams), chatReq, {Accept: "text/event-stream"}, signal, {stripStreamOptions: true});
     if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, "openai", upstream.status, err, meta, startedAt, allowFailover); return; }
     const {wrapped, usage} = wrapUpstreamForUsage(upstream, startedAt);
-    await pipeChatToResponses(wrapped, res, body.model, namespaceMap, customSet);
-    void recordUsageEvent({...meta, ...finalizeUsageAccumulator(usage, startedAt), ms: Date.now() - startedAt, status: 200});
+    await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeChatToResponses(wrapped, res, body.model, namespaceMap, customSet));
     return;
   }
   if (target.protocol === "anthropic_messages") {
@@ -1138,8 +1167,7 @@ async function handleCodexIngress(provider, subPath, body, req, res, signal, req
     const upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/v1/messages", provider.queryParams), antReq, {"anthropic-version": "2023-06-01", Accept: "text/event-stream"}, signal, {isAnthropic: true});
     if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, "openai", upstream.status, err, meta, startedAt, allowFailover); return; }
     const {wrapped, usage} = wrapUpstreamForUsage(upstream, startedAt);
-    await pipeAnthropicToResponses(wrapped, res, body.model, namespaceMap, customSet);
-    void recordUsageEvent({...meta, ...finalizeUsageAccumulator(usage, startedAt), ms: Date.now() - startedAt, status: 200});
+    await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeAnthropicToResponses(wrapped, res, body.model, namespaceMap, customSet));
     return;
   }
   const {req: gemReq, namespaceMap, customSet} = responsesToGeminiRequest(body);
@@ -1147,8 +1175,7 @@ async function handleCodexIngress(provider, subPath, body, req, res, signal, req
   const upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, `/models/${encodeURIComponent(modelName)}:streamGenerateContent`, {alt: "sse", ...provider.queryParams}), gemReq, {Accept: "text/event-stream"}, signal);
   if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, "openai", upstream.status, err, meta, startedAt, allowFailover); return; }
   const {wrapped, usage} = wrapUpstreamForUsage(upstream, startedAt);
-  await pipeGeminiToResponses(wrapped, res, body.model, namespaceMap, customSet);
-  void recordUsageEvent({...meta, ...finalizeUsageAccumulator(usage, startedAt), ms: Date.now() - startedAt, status: 200});
+  await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeGeminiToResponses(wrapped, res, body.model, namespaceMap, customSet));
 }
 
 async function handleClaudeIngress(provider, subPath, query, body, req, res, signal, reqMetaExtra = {}) {
@@ -1226,8 +1253,7 @@ async function handleClaudeIngress(provider, subPath, query, body, req, res, sig
     const upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/chat/completions", provider.queryParams), chatReq, {Accept: "text/event-stream"}, signal, {stripStreamOptions: true});
     if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, "anthropic", upstream.status, err, meta, startedAt, allowFailover); return; }
     const {wrapped, usage} = wrapUpstreamForUsage(upstream, startedAt);
-    await pipeChatToAnthropic(wrapped, res, body.model);
-    void recordUsageEvent({...meta, ...finalizeUsageAccumulator(usage, startedAt), ms: Date.now() - startedAt, status: 200});
+    await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeChatToAnthropic(wrapped, res, body.model));
     return;
   }
   if (target.protocol === "openai_responses") {
@@ -1235,8 +1261,7 @@ async function handleClaudeIngress(provider, subPath, query, body, req, res, sig
     const upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/responses", provider.queryParams), respReq, {Accept: "text/event-stream"}, signal);
     if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, "anthropic", upstream.status, err, meta, startedAt, allowFailover); return; }
     const {wrapped, usage} = wrapUpstreamForUsage(upstream, startedAt);
-    await pipeResponsesToAnthropic(wrapped, res, body.model);
-    void recordUsageEvent({...meta, ...finalizeUsageAccumulator(usage, startedAt), ms: Date.now() - startedAt, status: 200});
+    await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeResponsesToAnthropic(wrapped, res, body.model));
     return;
   }
   const gemReq = anthropicToGeminiRequest(body);
@@ -1244,8 +1269,7 @@ async function handleClaudeIngress(provider, subPath, query, body, req, res, sig
   const upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, `/models/${encodeURIComponent(modelName)}:streamGenerateContent`, {alt: "sse", ...provider.queryParams}), gemReq, {Accept: "text/event-stream"}, signal);
   if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, "anthropic", upstream.status, err, meta, startedAt, allowFailover); return; }
   const {wrapped, usage} = wrapUpstreamForUsage(upstream, startedAt);
-  await pipeGeminiToAnthropic(wrapped, res, body.model);
-  void recordUsageEvent({...meta, ...finalizeUsageAccumulator(usage, startedAt), ms: Date.now() - startedAt, status: 200});
+  await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeGeminiToAnthropic(wrapped, res, body.model));
 }
 
 async function handleHttp(req, res) {
@@ -1312,23 +1336,27 @@ async function handleHttp(req, res) {
         else await handleCompatibleIngress(picked.provider, route, subPath, effectiveBody, req, res, controller.signal, route === "gemini" ? "antigravity" : "chat", reqMetaExtra);
         return;
       } catch (err) {
+        // 无论是否配置故障转移，非 FailoverError 且尚未记账的异常/取消都必须落盘，彻底杜绝单服务商失败请求在用量中心凭空消失
+        if (!err?.isFailover && !err?._usageRecorded) {
+          const aborted = Boolean(controller.signal.aborted || res.destroyed || err?.name === "AbortError");
+          void recordUsageEvent({
+            startedAt: attemptStarted,
+            agent: route === "anthropic" ? "claude" : (route === "openai-responses" ? "codex" : (route === "gemini" ? "antigravity" : "chat")),
+            providerId: picked.provider.id,
+            providerName: picked.provider.name,
+            model: mappedModel || requestedModel,
+            requestedModel: requestedModel && mappedModel && requestedModel !== mappedModel ? requestedModel : "",
+            sessionId: inferredSessionId,
+            source: "gateway",
+            billingKind: picked.provider.billingKind,
+            priceRate: picked.provider.priceRate,
+            ms: Date.now() - attemptStarted,
+            status: aborted ? 499 : 502,
+            err: aborted ? "用户中断或连接取消" : (err?.message || String(err)),
+          });
+          if (err && typeof err === "object") err._usageRecorded = true;
+        }
         if (allowFailover && !res.headersSent && !controller.signal.aborted) {
-          if (!err?.isFailover) {
-            void recordUsageEvent({
-              startedAt: attemptStarted,
-              agent: route === "anthropic" ? "claude" : (route === "openai-responses" ? "codex" : (route === "gemini" ? "antigravity" : "chat")),
-              providerId: picked.provider.id,
-              providerName: picked.provider.name,
-              model: mappedModel || requestedModel,
-              requestedModel: requestedModel && mappedModel && requestedModel !== mappedModel ? requestedModel : "",
-              source: "gateway",
-              billingKind: picked.provider.billingKind,
-              priceRate: picked.provider.priceRate,
-              ms: Date.now() - attemptStarted,
-              status: 502,
-              err: err?.message || String(err),
-            });
-          }
           continue;
         }
         throw err;

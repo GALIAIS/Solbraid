@@ -114,6 +114,7 @@ exec chroot "$root" /usr/bin/setpriv --reuid="$uid" --regid="$uid" --groups=3003
     LANG=C.UTF-8 \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     PATH=/opt/galiais-codex/usr/lib/chatgpt/resources:/home/agent/.local/bin:/home/agent/.galiais/npm-global/bin:/usr/local/bin:/usr/bin:/bin \
+    GALIAIS_RUNTIME_MODE=root \
     GALIAIS_LAUNCH_ID="${GALIAIS_LAUNCH_ID:-}" \
     GALIAIS_RUNTIME_GENERATION="$nlib" \
     /bin/sh -c 'cd /home/agent/workspace && exec "$@"' -- "$@"

@@ -193,6 +193,12 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
         scope.launch {
             requestsFlow.collect { list -> syncApprovalNotification(list) }
         }
+        scope.launch {
+            conversationsFlow
+                .map { all -> all.values.any { it.running } }
+                .distinctUntilChanged()
+                .collect { anyRunning -> runtime.setActiveTurnRunning(anyRunning) }
+        }
     }
 
     fun resolveFromNotification(engineId: String, reqIdStr: String, allow: Boolean) {

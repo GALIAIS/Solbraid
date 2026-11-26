@@ -6,8 +6,12 @@ import com.galiais.agent.engine.ItemStatus
 import com.galiais.agent.engine.PlanStep
 import com.galiais.agent.engine.TimelineItem
 import com.galiais.agent.engine.computeStats
+import com.galiais.agent.engine.isAcpMetaToolTitle
+import com.galiais.agent.engine.normalizeAcpMetaToolName
 import com.galiais.agent.engine.parseElicitationSchema
 import com.galiais.agent.engine.parseRecommendedLabel
+import com.galiais.agent.ui.ToolCallKind
+import com.galiais.agent.ui.describeToolCall
 import com.galiais.agent.ui.extractTaskListMarker
 import com.galiais.agent.ui.groupIntoTurnBlocks
 import com.galiais.agent.ui.parseFileLinkTarget
@@ -186,5 +190,84 @@ class ChatInteractionSuiteTest {
         assertNull(blocks[1].finalMessage)
         assertEquals(1, blocks[1].trailingNotices.size)
         assertTrue(blocks[1].trailingNotices[0].error)
+    }
+
+    @Test
+    fun `describeToolCall does not misclassify Antigravity file reads as MCP`() {
+        val readWithKind = describeToolCall("File Solbraid/runtime/agent-hub.mjs", "", kindHint = "read")
+        assertEquals(ToolCallKind.READ_FILE, readWithKind.kind)
+        assertEquals("读取文件", readWithKind.badge)
+        assertEquals("agent-hub.mjs", readWithKind.summary)
+
+        val legacyReadWithoutKind = describeToolCall("File Solbraid/app/src/main/java/com/galiais/agent/engine/AppSettings.kt", "")
+        assertEquals(ToolCallKind.READ_FILE, legacyReadWithoutKind.kind)
+        assertEquals("AppSettings.kt", legacyReadWithoutKind.summary)
+
+        val editWithKind = describeToolCall("File Solbraid/runtime/acp-driver.mjs", "", kindHint = "edit")
+        assertEquals(ToolCallKind.EDIT_FILE, editWithKind.kind)
+        assertEquals("编辑文件", editWithKind.badge)
+
+        val trueAgyMcp = describeToolCall("Run mcp_solbraid_plugin_ctl_solbraid_self_build", """{"action":"status"}""", kindHint = "other")
+        assertEquals(ToolCallKind.MCP, trueAgyMcp.kind)
+        assertEquals("MCP", trueAgyMcp.badge)
+        assertTrue(trueAgyMcp.summary.contains("solbraid"))
+
+        val trueClaudeMcp = describeToolCall("mcp__github__search_code", """{"query":"test"}""")
+        assertEquals(ToolCallKind.MCP, trueClaudeMcp.kind)
+        assertEquals("MCP", trueClaudeMcp.badge)
+    }
+
+    @Test
+    fun `normalizeAcpMetaToolName strips Run prefix for Antigravity steps and focus`() {
+        assertEquals("update_steps", normalizeAcpMetaToolName("Run update_steps"))
+        assertEquals("update_focus", normalizeAcpMetaToolName("Run update_focus"))
+        assertEquals("task_boundary", normalizeAcpMetaToolName("Run task_boundary"))
+        assertTrue(isAcpMetaToolTitle("Run update_steps"))
+        assertTrue(isAcpMetaToolTitle("Run update_focus"))
+        assertFalse(isAcpMetaToolTitle("File Solbraid/runtime/agent-hub.mjs"))
+        assertFalse(isAcpMetaToolTitle("Run mcp_solbraid_plugin_ctl_solbraid_self_build"))
+    }
+
+    @Test
+    fun `unifiedDiff handles 4000-line files with minimal hunks instead of full-file replacement`() {
+        val baseLines = (1..4000).map { "line_$it = value_$it" }
+        val before = baseLines.joinToString("\n") + "\n"
+
+        // 单处修改（靠近尾部 3950 行）：旧算法会因 4000*4000 > 4_000_000 直接退化为 -4000/+4000
+        val singleMod = baseLines.toMutableList().apply { this[3949] = "line_3950 = UPDATED" }.joinToString("\n") + "\n"
+        val diffSingle = com.galiais.agent.engine.unifiedDiff("big.kt", before, singleMod)
+        val (add1, del1) = com.galiais.agent.ui.diffStats(diffSingle)
+        assertEquals(1, add1)
+        assertEquals(1, del1)
+        assertTrue(diffSingle.contains("@@ -3947,7 +3947,7 @@"))
+
+        // 首尾双处远距修改（第 15 行 + 第 3980 行）：验证 Myers / 锚点不会整文件误报
+        val dualMod = baseLines.toMutableList().apply {
+            this[14] = "line_15 = TOP_EDIT"
+            this[3979] = "line_3980 = BOTTOM_EDIT"
+        }.joinToString("\n") + "\n"
+        val diffDual = com.galiais.agent.engine.unifiedDiff("big.kt", before, dualMod)
+        val (add2, del2) = com.galiais.agent.ui.diffStats(diffDual)
+        assertEquals(2, add2)
+        assertEquals(2, del2)
+
+        // CRLF 与 LF 混用不产生假性全文件差异
+        val crlfCopy = baseLines.joinToString("\r\n") + "\r\n"
+        val diffEol = com.galiais.agent.engine.unifiedDiff("big.kt", before, crlfCopy)
+        assertEquals(0 to 0, com.galiais.agent.ui.diffStats(diffEol))
+    }
+
+    @Test
+    fun `computeMyersLineDiff stays aligned across insertions larger than 6 lines`() {
+        val beforeLines = (1..120).map { "row-$it" }
+        val inserted = (1..15).map { "new-inserted-$it" }
+        val afterLines = beforeLines.take(30) + inserted + beforeLines.drop(30)
+        val ops = com.galiais.agent.engine.computeMyersLineDiff(
+            beforeLines.joinToString("\n"),
+            afterLines.joinToString("\n"),
+            maxLines = 400,
+        )
+        assertEquals(15, ops.count { it.first == '+' })
+        assertEquals(0, ops.count { it.first == '-' })
     }
 }

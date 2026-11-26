@@ -2,6 +2,8 @@ import org.gradle.process.ExecOperations
 import com.android.build.api.artifact.SingleArtifact
 import groovy.json.JsonSlurper
 import javax.inject.Inject
+import java.util.Properties
+import java.io.File
 
 plugins {
     id("com.android.application")
@@ -126,6 +128,7 @@ android {
     buildFeatures {
         buildConfig = true
         compose = true
+        aidl = true
     }
     packaging {
         jniLibs {
@@ -139,6 +142,25 @@ android {
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
+    }
+    providers.gradleProperty("solbraidSigningProperties").orNull?.let { configPath ->
+        val signingFile = rootProject.file(configPath)
+        require(signingFile.isFile) { "未找到自构建签名配置文件" }
+        val values = Properties().apply { signingFile.reader(Charsets.UTF_8).use { load(it) } }
+        fun requiredValue(name: String): String = values.getProperty(name)?.takeIf { it.isNotBlank() }
+            ?: error("自构建签名配置缺少 $name")
+        val keyFile = File(requiredValue("storeFile")).let {
+            if (it.isAbsolute) it else File(signingFile.parentFile, it.path)
+        }
+        require(keyFile.isFile) { "未找到自构建签名密钥文件" }
+        val selfBuildSigning = signingConfigs.create("selfBuild") {
+            storeFile = keyFile
+            storePassword = requiredValue("storePassword")
+            keyAlias = requiredValue("keyAlias")
+            keyPassword = requiredValue("keyPassword")
+        }
+        buildTypes.getByName("debug").signingConfig = selfBuildSigning
+        buildTypes.getByName("release").signingConfig = selfBuildSigning
     }
     testOptions {
         unitTests.isReturnDefaultValues = true
@@ -175,6 +197,8 @@ dependencies {
     implementation("org.commonmark:commonmark:0.33.0")
     implementation("org.commonmark:commonmark-ext-gfm-tables:0.33.0")
     implementation("org.commonmark:commonmark-ext-gfm-strikethrough:0.33.0")
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
 }

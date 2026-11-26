@@ -259,8 +259,10 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
         StorageCard(
             env = env,
             canClean = env.cacheBytes > 0 && runtime.state in setOf("stopped", "error", "ready"),
+            canCleanAppCache = env.appCacheBytes > 0 && runtime.state in setOf("stopped", "error", "ready"),
             onRefresh = { app.runtime.refreshEnvironment(activeMode) },
             onClean = { dialog = "cache" },
+            onCleanAppCache = { dialog = "app-cache" },
         )
 
         SectionLabel("核心通道与 CLI 状态")
@@ -609,9 +611,27 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
                 scope.launch {
                     try {
                         val freed = app.runtime.clearDownloadCache()
-                        app.conversations.notify("已清理缓存，释放 ${formatBytes(freed)}")
+                        app.conversations.notify("已清理下载缓存，释放 ${formatBytes(freed)}")
                     } catch (error: Exception) {
                         app.conversations.notify(error.message ?: "清理缓存失败")
+                    }
+                }
+            },
+        )
+        "app-cache" -> ConfirmDialog(
+            title = "清理应用与运行缓存？",
+            body = "将清理 ${formatBytes(env.appCacheBytes)} 文件预览暂存、导出临时包与过期运行日志，保留最近日志及全部项目、会话与登录状态。",
+            confirm = "清理",
+            danger = true,
+            onDismiss = { dialog = null },
+            onConfirm = {
+                dialog = null
+                scope.launch {
+                    try {
+                        val freed = app.runtime.clearAppCache()
+                        app.conversations.notify("已清理应用缓存，释放 ${formatBytes(freed)}")
+                    } catch (error: Exception) {
+                        app.conversations.notify(error.message ?: "清理应用缓存失败")
                     }
                 }
             },
@@ -703,11 +723,19 @@ private fun ComponentPill(label: String, ok: Boolean, loading: Boolean) {
 }
 
 @Composable
-private fun StorageCard(env: EnvironmentStatus, canClean: Boolean, onRefresh: () -> Unit, onClean: () -> Unit) {
+private fun StorageCard(
+    env: EnvironmentStatus,
+    canClean: Boolean,
+    canCleanAppCache: Boolean,
+    onRefresh: () -> Unit,
+    onClean: () -> Unit,
+    onCleanAppCache: () -> Unit,
+) {
     val system = (env.chrootBytes - env.vmBytes).coerceAtLeast(0)
     val segments = listOf(
         Triple("系统与会话", system, G.accent),
         Triple("工作区与项目文件", env.vmBytes, G.codex),
+        Triple("应用与运行缓存", env.appCacheBytes, G.claude),
         Triple("历史下载缓存", env.cacheBytes, G.warning),
     )
     val total = segments.sumOf { it.second }
@@ -734,6 +762,7 @@ private fun StorageCard(env: EnvironmentStatus, canClean: Boolean, onRefresh: ()
             }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 SecondaryPillButton(if (env.loading) "统计中…" else "刷新统计", onClick = onRefresh, enabled = !env.loading)
+                if (env.appCacheBytes > 0) SecondaryPillButton("清理应用缓存", onClick = onCleanAppCache, enabled = canCleanAppCache)
                 if (env.cacheBytes > 0) SecondaryPillButton("清理下载缓存", onClick = onClean, enabled = canClean)
             }
         }

@@ -11,11 +11,29 @@ BACKUP_APK="$WORK_DIR/last-known-good.apk"
 CANDIDATE_APK="$WORK_DIR/candidate.apk"
 STATUS_FILE="$WORK_DIR/status.json"
 LOG_FILE="$WORK_DIR/watchdog.log"
-HEARTBEAT_FILE="/data/user/0/$PKG/files/self-update-healthy.json"
+HEARTBEAT_FILE="${SOLBRAID_APP_FILES:-/data/user/0/$PKG/files}/self-update-healthy.json"
+LOCK_DIR="$WORK_DIR/update.lock"
 TIMEOUT_SEC="${SOLBRAID_WATCHDOG_TIMEOUT:-20}"
 
 mkdir -p "$WORK_DIR"
 chmod 755 "$WORK_DIR" 2>/dev/null || true
+
+acquire_update_lock() {
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+        case "$owner" in ''|*[!0-9]*) echo 'ERROR: 自更新锁未就绪，请稍后重试' >&2; return 1 ;; esac
+        if kill -0 "$owner" 2>/dev/null; then echo 'ERROR: 已有安装或回滚正在进行' >&2; return 1; fi
+        rm -f "$LOCK_DIR/pid"
+        rmdir "$LOCK_DIR" || return 1
+        mkdir "$LOCK_DIR" || return 1
+    fi
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+}
+
+release_update_lock() {
+    rm -f "$LOCK_DIR/pid"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+}
 
 now_ms() {
     s=$(date +%s)
@@ -43,9 +61,9 @@ log_line() {
 backup_current_apk() {
     cur_path=$(pm path "$PKG" 2>/dev/null | head -n 1 | sed 's/^package://')
     if [ -n "$cur_path" ] && [ -f "$cur_path" ]; then
-        cp -f "$cur_path" "$BACKUP_APK.tmp"
+        cp -f "$cur_path" "$BACKUP_APK.tmp" || return 1
         chmod 644 "$BACKUP_APK.tmp" 2>/dev/null || true
-        mv -f "$BACKUP_APK.tmp" "$BACKUP_APK"
+        mv -f "$BACKUP_APK.tmp" "$BACKUP_APK" || return 1
         log_line "Backed up last-known-good APK from $cur_path"
         return 0
     fi
@@ -102,7 +120,7 @@ do_apply() {
 
     log_line "=== Self-update apply start: $src_apk ==="
     write_status "preparing" "false" "false" "正在备份当前稳定版本并校验候选 APK"
-    backup_current_apk || true
+    backup_current_apk || { write_status "backup_failed" "false" "false" "旧版本备份失败，已取消安装"; exit 1; }
 
     cp -f "$src_apk" "$CANDIDATE_APK.tmp"
     chmod 644 "$CANDIDATE_APK.tmp" 2>/dev/null || true
@@ -153,7 +171,7 @@ do_install_direct() {
     fi
     log_line "=== Self-update direct install (watchdog disabled): $src_apk ==="
     write_status "preparing" "false" "false" "正在备份当前稳定版本并准备直接安装（看门狗已关闭）"
-    backup_current_apk || true
+    backup_current_apk || { write_status "backup_failed" "false" "false" "旧版本备份失败，已取消安装"; exit 1; }
     cp -f "$src_apk" "$CANDIDATE_APK.tmp"
     chmod 644 "$CANDIDATE_APK.tmp" 2>/dev/null || true
     mv -f "$CANDIDATE_APK.tmp" "$CANDIDATE_APK"
@@ -178,6 +196,9 @@ case "$cmd" in
             echo '{"ok":false,"error":"缺少有效的候选 APK 路径"}'
             exit 1
         fi
+        acquire_update_lock || exit 1
+        trap release_update_lock EXIT
+        export SOLBRAID_UPDATE_LOCK_HELD=1
         sub_flag="--apply"
         if [ "${SOLBRAID_WATCHDOG_ENABLED:-true}" = "false" ]; then
             sub_flag="--install-direct"
@@ -187,13 +208,20 @@ case "$cmd" in
         else
             SOLBRAID_WATCHDOG_TIMEOUT="$TIMEOUT_SEC" nohup /system/bin/sh "$0" "$sub_flag" "$apk" </dev/null >>"$LOG_FILE" 2>&1 &
         fi
+        worker_pid=$!
+        [ ! -d "$LOCK_DIR" ] || printf '%s\n' "$worker_pid" > "$LOCK_DIR/pid"
+        trap - EXIT
         printf '{"ok":true,"spawned":true,"watchdogEnabled":%s,"timeoutSec":%s,"apk":"%s","statusFile":"%s","logFile":"%s"}\n' \
             "$([ "$sub_flag" = "--apply" ] && echo true || echo false)" "$TIMEOUT_SEC" "$apk" "$STATUS_FILE" "$LOG_FILE"
         ;;
     --apply)
+        [ "${SOLBRAID_UPDATE_LOCK_HELD:-}" = 1 ] || acquire_update_lock || exit 1
+        trap release_update_lock EXIT
         do_apply "${2:-}"
         ;;
     --install-direct)
+        [ "${SOLBRAID_UPDATE_LOCK_HELD:-}" = 1 ] || acquire_update_lock || exit 1
+        trap release_update_lock EXIT
         do_install_direct "${2:-}"
         ;;
     --spawn-rollback)
@@ -201,14 +229,22 @@ case "$cmd" in
             echo '{"ok":false,"error":"暂无可回滚的上一稳定版本备份"}'
             exit 1
         fi
+        acquire_update_lock || exit 1
+        trap release_update_lock EXIT
+        export SOLBRAID_UPDATE_LOCK_HELD=1
         if command -v setsid >/dev/null 2>&1; then
             setsid /system/bin/sh "$0" --rollback </dev/null >>"$LOG_FILE" 2>&1 &
         else
             nohup /system/bin/sh "$0" --rollback </dev/null >>"$LOG_FILE" 2>&1 &
         fi
+        worker_pid=$!
+        [ ! -d "$LOCK_DIR" ] || printf '%s\n' "$worker_pid" > "$LOCK_DIR/pid"
+        trap - EXIT
         printf '{"ok":true,"spawned":true,"rollback":true,"backupApk":"%s","statusFile":"%s","logFile":"%s"}\n' "$BACKUP_APK" "$STATUS_FILE" "$LOG_FILE"
         ;;
     --rollback)
+        [ "${SOLBRAID_UPDATE_LOCK_HELD:-}" = 1 ] || acquire_update_lock || exit 1
+        trap release_update_lock EXIT
         do_rollback "用户手动触发回滚"
         ;;
     --status)

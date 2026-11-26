@@ -185,10 +185,16 @@ export function recordUsageEvent(entry) {
     keyIdx: Number.isInteger(entry.keyIdx) ? entry.keyIdx : 0,
   };
   appendTail = appendTail.then(async () => {
-    await withCrossProcessLedgerLock(async () => {
-      await fs.mkdir(USAGE_DIR, {recursive: true, mode: 0o700});
-      await fs.appendFile(LEDGER_FILE, JSON.stringify(rec) + "\n", {encoding: "utf8", mode: 0o600});
-    });
+    const line = JSON.stringify(rec) + "\n";
+    await fs.mkdir(USAGE_DIR, {recursive: true, mode: 0o700});
+    try {
+      await withCrossProcessLedgerLock(async () => {
+        await fs.appendFile(LEDGER_FILE, line, {encoding: "utf8", mode: 0o600});
+      });
+    } catch {
+      // 跨进程锁极端竞争超时时，直接走 Linux O_APPEND 原子追加（单行远小于 PIPE_BUF），绝不静默丢行
+      await fs.appendFile(LEDGER_FILE, line, {encoding: "utf8", mode: 0o600});
+    }
   }).catch(err => {
     try { process.stderr.write(`[usage-ledger] write failed: ${err?.message || err}\n`); } catch {}
   });
@@ -541,7 +547,7 @@ export async function queryUsageSummary(params = {}) {
   // Heatmap respects agent/provider/model filters (ignoring single-day filter so user can click between days!)
   const heatmapRecords = allRecords.filter(r => matchesFilters(r, {...params, day: ""}));
   const filtered = inPeriod.filter(r => matchesFilters(r, params));
-  const limit = Math.min(250, Math.max(20, Number(params.limit || 120)));
+  const limit = Math.min(500, Math.max(20, Number(params.limit || 200)));
 
   return {
     period,

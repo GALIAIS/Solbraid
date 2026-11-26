@@ -43,6 +43,8 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
     val envConfig by app.envSsh.envConfig.collectAsState()
     val sshHosts by app.envSsh.sshHosts.collectAsState()
     val activeTunnels by app.envSsh.activeTunnels.collectAsState()
+    val mobileStatus by app.mobileUse.status.collectAsState()
+    androidx.compose.runtime.LaunchedEffect(runtime.ready, runtime.mode) { app.mobileUse.refreshStatus() }
     var openingPluginSurface by remember { mutableStateOf<Pair<String, String>?>(null) }
     var openingPluginPanel by remember { mutableStateOf<Pair<String, com.galiais.agent.engine.ChatArtifact>?>(null) }
 
@@ -251,6 +253,33 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                     iconTint = G.inkMuted,
                     iconBg = G.surfaceSubtle,
                     onClick = { onNavigate("settings/workspace") },
+                )
+                Hairline(Modifier.padding(start = 66.dp))
+                val mu = settings.mobileUse
+                val mobileSummary = when {
+                    mobileStatus.emergencyStopped -> "已紧急停止 · 点此解除熔断"
+                    !mu.enabled -> "已关闭 · 支持 Root / Shizuku / 无障碍三级手机操控"
+                    mobileStatus.activeBackend.id == "root" -> "已就绪 · Root 完全控机 · 14 项能力（GUI/硬件/通知/文件/宿主）"
+                    mobileStatus.activeBackend.id == "shizuku" -> "已就绪 · Shizuku 免 Root 进阶 · GUI/硬件/通知/包管理"
+                    mobileStatus.activeBackend.id == "accessibility" -> "已就绪 · 免 Root 无障碍 · 截屏 / UI 树 / 点击 / 通知 / Intent"
+                    else -> "待授权 · 开启 Root、Shizuku 或无障碍服务即可启用"
+                }
+                SettingsNavRow(
+                    icon = GaliaisIcons.Smartphone,
+                    title = "手机操控（Mobile-Use）",
+                    subtitle = mobileSummary,
+                    badge = when {
+                        mobileStatus.emergencyStopped -> "急停"
+                        mu.enabled && mobileStatus.activeBackend.id != "none" -> when (mobileStatus.activeBackend.id) {
+                            "root" -> "Root"
+                            "shizuku" -> "Shizuku"
+                            else -> "无障碍"
+                        }
+                        else -> null
+                    },
+                    iconTint = if (mobileStatus.emergencyStopped) G.danger else if (mu.enabled) G.accent else G.inkMuted,
+                    iconBg = if (mobileStatus.emergencyStopped) G.dangerTint else if (mu.enabled) G.accentContainer else G.surfaceSubtle,
+                    onClick = { onNavigate("settings/mobileuse") },
                 )
                 Hairline(Modifier.padding(start = 66.dp))
                 val sb = settings.selfBuild

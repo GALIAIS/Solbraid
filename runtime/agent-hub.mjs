@@ -5,7 +5,23 @@ import {randomBytes, randomUUID} from "node:crypto";
 import {execFile, spawn} from "node:child_process";
 import {promisify} from "node:util";
 import {createInterface} from "node:readline";
-import {AcpDriver} from "./acp-driver.mjs";
+import {
+  AcpDriver,
+  AcpStreamStallError,
+  normalizeAcpMetaToolName,
+  isAcpMetaToolName,
+  isSoftNetworkReply,
+  isRetryableAcpError,
+  formatAcpNetworkReason,
+  parseAgyInternalRetryLine,
+  computeRetryDelayMs,
+  filterDuplicateAcpMcpServers,
+  computeUnifiedDiff,
+  buildPerStepUsageRecords,
+  captureFileCheckpoint,
+  listFileCheckpoints,
+  revertFileCheckpoint,
+} from "./acp-driver.mjs";
 import {CliBridgeDriver} from "./cli-bridge-driver.mjs";
 import {createDevToolsHub} from "./dev-tools-hub.mjs";
 import {createCliUpdater, resolveCliInstallation, bundledCliInstallation, cliPathDirectories} from "./cli-components.mjs";
@@ -309,7 +325,59 @@ function sessionFile(agentId, sessionId) {
   return resolved;
 }
 
+const MAX_CACHED_SESSIONS = 12;
+
+function touchSessionCache(key, record) {
+  if (sessions.has(key)) sessions.delete(key);
+  sessions.set(key, record);
+  if (sessions.size <= MAX_CACHED_SESSIONS) return;
+  for (const candidateKey of [...sessions.keys()]) {
+    if (sessions.size <= MAX_CACHED_SESSIONS) break;
+    if (candidateKey === key || activeTurns.has(candidateKey) || drivers.has(candidateKey)) continue;
+    sessions.delete(candidateKey);
+  }
+}
+
+function compactRecordDiffsInPlace(record) {
+  if (!record || !Array.isArray(record.messages)) return;
+  for (const msg of record.messages) {
+    if (msg?.role !== "tool" || !Array.isArray(msg.diffs) || !msg.diffs.length) continue;
+    msg.diffs = msg.diffs.map(d => {
+      if (!d || typeof d !== "object") return d;
+      if (typeof d.diff === "string" && d.diff.length > 0 && d.oldText === undefined && d.newText === undefined) return d;
+      const diffText = typeof d.diff === "string" && d.diff.length > 0
+        ? d.diff.slice(0, 48_000)
+        : computeUnifiedDiff(d.path || "file", d.oldText || "", d.newText || "");
+      return {
+        path: String(d.path || ""),
+        kind: String(d.kind || "update"),
+        diff: diffText,
+      };
+    });
+  }
+}
+
+async function pruneAgyLogs(logDir, keepLatest = 20) {
+  try {
+    const names = await fs.readdir(logDir);
+    const candidates = names.filter(n => n.endsWith(".log") && /^(?:solbraid-acp-|acp-server-|acp-login-|cli-)/.test(n));
+    if (candidates.length <= keepLatest) return;
+    const activeFiles = new Set([...drivers.values()].map(d => d?._agyLogFile).filter(Boolean));
+    const stats = await Promise.all(candidates.map(async name => {
+      const full = path.join(logDir, name);
+      const st = await fs.stat(full).catch(() => null);
+      return st ? {full, mtimeMs: st.mtimeMs} : null;
+    }));
+    const sorted = stats.filter(Boolean).sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const item of sorted.slice(keepLatest)) {
+      if (activeFiles.has(item.full)) continue;
+      await fs.rm(item.full, {force: true}).catch(() => {});
+    }
+  } catch {}
+}
+
 async function saveSession(record) {
+  compactRecordDiffsInPlace(record);
   const dir = path.join(SESSIONS_ROOT, record.agentId);
   await fs.mkdir(dir, {recursive: true});
   const target = sessionFile(record.agentId, record.id);
@@ -318,6 +386,7 @@ async function saveSession(record) {
     await fs.writeFile(tmp, JSON.stringify(record), {encoding: "utf8", mode: 0o600});
     await fs.rename(tmp, target);
   } finally { await fs.rm(tmp, {force: true}); }
+  touchSessionCache(`${record.agentId}:${record.id}`, record);
 }
 
 async function listStoredSessions(agentId) {
@@ -338,11 +407,15 @@ async function listStoredSessions(agentId) {
 async function loadStoredSession(agentId, sessionId) {
   const file = sessionFile(agentId, sessionId);
   const key = `${agentId}:${sessionId}`;
-  if (sessions.has(key)) return sessions.get(key);
+  if (sessions.has(key)) {
+    const cached = sessions.get(key);
+    touchSessionCache(key, cached);
+    return cached;
+  }
   try {
     const data = JSON.parse(await fs.readFile(file, "utf8"));
     if (data?.agentId !== agentId || data?.id !== sessionId || !Array.isArray(data.messages)) throw new Error("会话记录无效，未覆盖原文件");
-    sessions.set(key, data);
+    touchSessionCache(key, data);
     return data;
   } catch (error) {
     if (error.code === "ENOENT") return null;
@@ -857,9 +930,18 @@ async function getDriver(manifest, cwd, providerInfo, sessionId, extraApiKey = n
   if (drivers.size >= 8) throw new Error("同时运行的外部 Agent 会话已达 8 个，请先停止空闲 Agent");
   const env = baseEnv(manifest, providerInfo, networkConfig, userEnv, effectiveKey, sessionId);
   let effectiveManifest = manifest;
+  let agyLogFile = null;
   const useAgyStreamJson = id === "antigravity" && (launchOpts.transport === "stream-json" || Boolean(providerInfo?.id));
   if (id === "antigravity" && !useAgyStreamJson) {
     const baseArgs = Array.isArray(manifest?.launch?.args) ? [...manifest.launch.args] : ["acp"];
+    const logDir = path.join(HOME, ".gemini", "antigravity-cli", "log");
+    await fs.mkdir(logDir, {recursive: true}).catch(() => {});
+    void pruneAgyLogs(logDir, 20);
+    const safeSid = String(sessionId || "sess").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 16);
+    agyLogFile = path.join(logDir, `solbraid-acp-${safeSid}-${Date.now()}.log`);
+    if (!baseArgs.includes("--disable-telemetry")) baseArgs.push("--disable-telemetry");
+    if (!baseArgs.includes("--gemini-dir")) baseArgs.push("--gemini-dir", path.join(HOME, ".gemini"));
+    if (!baseArgs.includes("--log-file")) baseArgs.push("--log-file", agyLogFile);
     if (launchOpts.bypassPermissions === true) baseArgs.push("--dangerously-skip-permissions");
     if (launchOpts.sandbox === true) baseArgs.push("--sandbox");
     if (typeof launchOpts.agentName === "string" && launchOpts.agentName.trim()) {
@@ -878,8 +960,13 @@ async function getDriver(manifest, cwd, providerInfo, sessionId, extraApiKey = n
         const chunk = typeof upd.content?.text === "string" ? upd.content.text : (typeof upd.text === "string" ? upd.text : "");
         if (chunk) {
           const now = Date.now();
+          turn.serverAccepted = true;
           if (!turn.firstTokenAt) turn.firstTokenAt = now;
           turn.lastTokenAt = now;
+          if (!turn.stepFirstTokenAt) turn.stepFirstTokenAt = now;
+          turn.stepLastTokenAt = now;
+          turn.stepThoughtChars = (turn.stepThoughtChars || 0) + chunk.length;
+          turn.stepOutChars = (turn.stepOutChars || 0) + chunk.length;
           if (!turn.currentThought) {
             turn.currentThought = {text: "", startedAtMs: now, completedAtMs: null};
             turn.thoughts.push(turn.currentThought);
@@ -889,6 +976,7 @@ async function getDriver(manifest, cwd, providerInfo, sessionId, extraApiKey = n
         }
       } else if (upd.sessionUpdate === "agent_message_chunk") {
         const now = Date.now();
+        turn.serverAccepted = true;
         if (turn.currentThought && !turn.currentThought.completedAtMs) {
           turn.currentThought.completedAtMs = now;
           turn.currentThought = null;
@@ -896,34 +984,57 @@ async function getDriver(manifest, cwd, providerInfo, sessionId, extraApiKey = n
         if (typeof upd.content?.text === "string" && upd.content.text.length > 0) {
           if (!turn.firstTokenAt) turn.firstTokenAt = now;
           turn.lastTokenAt = now;
+          if (!turn.stepFirstTokenAt) turn.stepFirstTokenAt = now;
+          turn.stepLastTokenAt = now;
+          turn.stepOutChars = (turn.stepOutChars || 0) + upd.content.text.length;
           turn.text += upd.content.text;
         }
       } else if (upd.sessionUpdate === "tool_call" || upd.sessionUpdate === "tool_call_update") {
         const now = Date.now();
+        turn.serverAccepted = true;
         const isStart = upd.sessionUpdate === "tool_call";
-        if (isStart && turn.currentThought && !turn.currentThought.completedAtMs) {
-          turn.currentThought.completedAtMs = now;
-          turn.currentThought = null;
-        }
         const tid = String(upd.toolCallId || `anon-${turn.toolMap.size}`);
-        const st = String(upd.status || (isStart ? "in_progress" : "")).toLowerCase();
-        if (isStart) {
-          if (turn.activeTools.size === 0 && !turn.toolActiveSince) turn.toolActiveSince = now;
-          turn.activeTools.add(tid);
-        } else if (st === "completed" || st === "failed") {
-          if (upd.toolCallId) turn.activeTools.delete(String(upd.toolCallId));
-          else turn.activeTools.clear();
-          if (turn.activeTools.size === 0 && turn.toolActiveSince > 0) {
-            turn.toolElapsedMs += Math.max(0, Date.now() - turn.toolActiveSince);
-            turn.toolActiveSince = 0;
+        if (!turn.metaToolIds) turn.metaToolIds = new Set();
+        const isMetaTool = turn.metaToolIds.has(tid) || isAcpMetaToolName(upd.title);
+        if (isMetaTool) {
+          turn.metaToolIds.add(tid);
+          recordTurnToolUpdate(turn, tid, upd, now);
+          if (turn.focusText && normalizeAcpMetaToolName(upd.title) === "update_focus") {
+            notify("agent/event", {agentId: id, sessionId, kind: "acp-update", update: {sessionUpdate: "focus_update", focus: turn.focusText}});
+          }
+        } else {
+          if (isStart && turn.currentThought && !turn.currentThought.completedAtMs) {
+            turn.currentThought.completedAtMs = now;
+            turn.currentThought = null;
+          }
+          const st = String(upd.status || (isStart ? "in_progress" : "")).toLowerCase();
+          if (isStart) {
+            if (turn.activeTools.size === 0 && !turn.toolActiveSince) turn.toolActiveSince = now;
+            turn.activeTools.add(tid);
+          } else if (st === "completed" || st === "failed") {
+            if (upd.toolCallId) turn.activeTools.delete(String(upd.toolCallId));
+            else turn.activeTools.clear();
+            if (turn.activeTools.size === 0 && turn.toolActiveSince > 0) {
+              const deltaToolMs = Math.max(0, Date.now() - turn.toolActiveSince);
+              turn.toolElapsedMs += deltaToolMs;
+              turn.stepToolElapsedMs = (turn.stepToolElapsedMs || 0) + deltaToolMs;
+              turn.toolActiveSince = 0;
+              // 工具执行完毕后下一轮 LLM API 请求即将发出，更新步骤起始时间基准
+              if (turn.awaitingNextStepStart) {
+                turn.stepStartedAt = Date.now();
+                turn.stepToolElapsedMs = 0;
+                turn.awaitingNextStepStart = false;
+              }
+            }
+          }
+          // 记录工具调用轨迹、实时步骤与焦点状态，确保重开会话后完整还原时间线
+          recordTurnToolUpdate(turn, tid, upd, now);
+          if (!isStart && (st === "completed" || st === "failed") && typeof turn.scanBrainArtifacts === "function") {
+            void turn.scanBrainArtifacts();
           }
         }
-        // 记录工具调用轨迹、实时步骤与焦点状态，确保重开会话后完整还原时间线
-        recordTurnToolUpdate(turn, tid, upd, now);
-        if (!isStart && (st === "completed" || st === "failed") && typeof turn.scanBrainArtifacts === "function") {
-          void turn.scanBrainArtifacts();
-        }
       } else if (upd.sessionUpdate === "plan") {
+        turn.serverAccepted = true;
         if (Array.isArray(upd.entries) && (upd.entries.length > 0 || upd.clear === true)) {
           turn.planSteps = upd.entries.map(e => ({
             step: String(e?.content || e?.title || e?.step || "").trim(),
@@ -948,12 +1059,74 @@ async function getDriver(manifest, cwd, providerInfo, sessionId, extraApiKey = n
           });
         }
       } else if (upd.sessionUpdate === "usage_update" && typeof upd.used === "number") {
+        const now = Date.now();
         if (turn.usageStart === null) turn.usageStart = upd.used;
         turn.usageEnd = upd.used;
         if (typeof upd.size === "number" && upd.size > 0) turn.contextWindow = upd.size;
+        // agy acp 每次模型 API 请求完成后都会下发一条 used > 0 的 usage_update，记录单步耗时/TTFT/上下文供逐请求入账
+        if (upd.used > 0) {
+          const sStart = turn.stepStartedAt || now;
+          const wallMs = Math.max(1, now - sStart);
+          const sToolMs = Math.min(wallMs, turn.stepToolElapsedMs || 0);
+          const apiMs = Math.max(1, wallMs - sToolMs);
+          const sFirst = turn.stepFirstTokenAt || 0;
+          const sLast = turn.stepLastTokenAt || 0;
+          const sTtft = sFirst > sStart ? Math.min(apiMs, Math.max(1, sFirst - sStart)) : 0;
+          const sGenRaw = sFirst > 0 && sLast > sFirst ? (sLast - sFirst) : 0;
+          const sGen = Math.max(0, Math.min(apiMs - sTtft, sGenRaw - Math.min(sGenRaw, sToolMs)));
+          if (!Array.isArray(turn.llmSteps)) turn.llmSteps = [];
+          turn.llmSteps.push({
+            endedAt: now,
+            used: upd.used,
+            contextWindow: typeof upd.size === "number" && upd.size > 0 ? upd.size : (turn.contextWindow || 0),
+            apiMs,
+            ttftMs: sTtft,
+            genMs: sGen,
+            streamed: sFirst > 0,
+            outChars: turn.stepOutChars || 0,
+            thoughtChars: turn.stepThoughtChars || 0,
+          });
+          turn.stepStartedAt = now;
+          turn.stepFirstTokenAt = 0;
+          turn.stepLastTokenAt = 0;
+          turn.stepToolElapsedMs = 0;
+          turn.stepOutChars = 0;
+          turn.stepThoughtChars = 0;
+          turn.awaitingNextStepStart = true;
+        }
       }
     }
-    notify("agent/event", {...evt, agentId: id, sessionId});
+    // 将 ACP diff 块中庞大的整文件 oldText/newText 预计算为紧凑 unified diff 后再转发给前端，避免 Socket 传输与主线程卡顿；
+    // 同时在首次观测到某文件 diff 时捕获写前检查点，使直接修改磁盘的 Agent 同样支持聊天页单文件一键撤回。
+    let forwardEvt = evt;
+    if (upd && (upd.sessionUpdate === "tool_call" || upd.sessionUpdate === "tool_call_update") && Array.isArray(upd.content) && upd.content.some(b => String(b?.type || "").toLowerCase() === "diff" && (b.oldText !== undefined || b.newText !== undefined) && !b.diff)) {
+      const turn = activeTurns.get(key);
+      if (turn && !turn.capturedCheckpoints) turn.capturedCheckpoints = new Set();
+      const baseCwd = cwd || path.join(HOME, "workspace");
+      const compactContent = upd.content.map(b => {
+        if (String(b?.type || "").toLowerCase() !== "diff" || !b.path || b.diff) return b;
+        const oldStr = String(b.oldText || "");
+        const newStr = String(b.newText || "");
+        const resolvedFile = path.resolve(baseCwd, String(b.path));
+        const cpKey = `${upd.toolCallId || "diff"}:${resolvedFile}`;
+        if ((resolvedFile === HOME || resolvedFile.startsWith(HOME + "/")) && (!turn || !turn.capturedCheckpoints.has(cpKey))) {
+          if (turn) turn.capturedCheckpoints.add(cpKey);
+          const existedBefore = b.oldText !== null && b.oldText !== undefined && !(oldStr === "" && newStr.length > 0 && String(b.kind || "").toLowerCase() === "add");
+          captureFileCheckpoint(resolvedFile, {
+            sessionId,
+            originalContent: existedBefore ? oldStr : null,
+          }).catch(() => {});
+        }
+        return {
+          type: "diff",
+          path: String(b.path),
+          kind: !oldStr && newStr ? "add" : (oldStr && !newStr ? "delete" : "update"),
+          diff: computeUnifiedDiff(b.path, oldStr, newStr),
+        };
+      });
+      forwardEvt = {...evt, update: {...upd, content: compactContent}};
+    }
+    notify("agent/event", {...forwardEvt, agentId: id, sessionId});
   };
   let drv;
   if (proto === "agy-stream-json") {
@@ -972,6 +1145,7 @@ async function getDriver(manifest, cwd, providerInfo, sessionId, extraApiKey = n
       manifest: effectiveManifest,
       env,
       cwd: cwd || path.join(HOME, "workspace"),
+      sessionId,
       onEvent,
       onPermissionRequest: async (agentId, params) => {
         try {
@@ -1058,6 +1232,7 @@ async function getDriver(manifest, cwd, providerInfo, sessionId, extraApiKey = n
   }
   drv._envKey = envKey;
   drv._sessionId = sessionId;
+  drv._agyLogFile = agyLogFile;
   drivers.set(key, drv);
   return drv;
 }
@@ -1174,7 +1349,14 @@ async function startHubDelegateServer() {
 async function mcpServersForSession(agentId, sessionId, cwd, allowDelegation) {
   const list = [];
   try {
-    const managed = await extSync.loadMcpServersForAcp(agentId, cwd);
+    let managed = await extSync.loadMcpServersForAcp(agentId, cwd);
+    // Antigravity 已自动读取 ~/.gemini/config/mcp_config.json，去除全局重复项避免每次会话重复预热同名 stdio MCP 进程
+    if (agentId === "antigravity" && Array.isArray(managed) && managed.length) {
+      const agyMcpPath = path.join(HOME, ".gemini", "config", "mcp_config.json");
+      const rawCfg = await fs.readFile(agyMcpPath, "utf8").then(JSON.parse).catch(() => null);
+      const globalNames = rawCfg?.mcpServers && typeof rawCfg.mcpServers === "object" ? Object.keys(rawCfg.mcpServers) : [];
+      managed = filterDuplicateAcpMcpServers(managed, globalNames);
+    }
     if (Array.isArray(managed) && managed.length) list.push(...managed);
   } catch {}
   if (!allowDelegation) return list;
@@ -1443,14 +1625,29 @@ class AgyStreamJsonDriver {
       let stderrTail = "";
       let settled = false;
       const seenTools = new Set();
-      const timeoutTimer = setTimeout(() => {
+      const activeTools = new Set();
+      let lastProgressAt = Date.now();
+      let stalledError = null;
+      const stallTimeoutMs = 120_000;
+      const killChild = () => {
         try {
           if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGTERM");
           else child.kill("SIGTERM");
         } catch {}
-      }, 20 * 60 * 1000);
+      };
+      const timeoutTimer = setTimeout(killChild, 20 * 60 * 1000);
+      const stallTimer = setInterval(() => {
+        if (settled) return;
+        if (activeTools.size > 0) { lastProgressAt = Date.now(); return; }
+        if (Date.now() - lastProgressAt >= stallTimeoutMs) {
+          stalledError = new AcpStreamStallError(stallTimeoutMs);
+          killChild();
+        }
+      }, 5_000);
+      stallTimer.unref?.();
       const rl = createInterface({input: child.stdout, crlfDelay: Infinity});
       rl.on("line", line => {
+        lastProgressAt = Date.now();
         const trimmed = line.trim();
         if (!trimmed.startsWith("{")) return;
         let obj;
@@ -1502,6 +1699,8 @@ class AgyStreamJsonDriver {
             const tid = `agy-step-${su.step_index ?? 0}`;
             const kind = seenTools.has(tid) ? "tool_call_update" : "tool_call";
             seenTools.add(tid);
+            if (st === "in_progress") activeTools.add(tid);
+            else activeTools.delete(tid);
             this.onEvent({
               kind: "acp-update",
               update: {
@@ -1534,6 +1733,7 @@ class AgyStreamJsonDriver {
         if (settled) return;
         settled = true;
         clearTimeout(timeoutTimer);
+        clearInterval(stallTimer);
         this.activeProcs.delete(child);
         reject(err);
       });
@@ -1545,7 +1745,9 @@ class AgyStreamJsonDriver {
         if (settled || !rlClosed || !procClosed) return;
         settled = true;
         clearTimeout(timeoutTimer);
+        clearInterval(stallTimer);
         this.activeProcs.delete(child);
+        if (stalledError) { reject(stalledError); return; }
         const ctxUsed = stepContextTokensOf(lastStepUsage || usage, true);
         const contextUsage = ctxUsed > 0 ? {used: ctxUsed, size: ctxWindowSize} : null;
         if (exitCode === 0) resolve({text: fullText, stopReason: "end_turn", remoteSessionId: convId, usage, contextUsage});
@@ -1839,49 +2041,48 @@ function upsertTurnPlan(turn, planObj) {
 
 function recordTurnToolUpdate(turn, tid, upd, now) {
   const title = String(upd.title || "");
-  const norm = title.trim().toLowerCase().replace(/[-\s]+/g, "_");
+  const norm = normalizeAcpMetaToolName(title);
+  if (!turn.metaToolIds) turn.metaToolIds = new Set();
   const rawInput = upd.rawInput && typeof upd.rawInput === "object" ? upd.rawInput : null;
-  if (rawInput) {
-    if (["update_steps", "update_plan", "todowrite", "todo_write", "set_plan"].includes(norm)) {
-      const arr = rawInput.steps || rawInput.plan || rawInput.todos || rawInput.entries;
-      if (Array.isArray(arr)) {
-        turn.planSteps = arr.map(s => ({
-          step: String(s?.title || s?.content || s?.step || "").trim(),
-          status: normalizeHubStepStatus(s?.status),
-          id: s?.id ? String(s.id) : undefined,
-          activeForm: s?.activeForm ? String(s.activeForm) : undefined,
-          priority: s?.priority ? String(s.priority) : undefined,
-        })).filter(s => s.step);
-        if (rawInput.explanation || rawInput.summary) turn.planExplanation = String(rawInput.explanation || rawInput.summary);
-        return;
-      }
-    }
-    if (norm === "update_focus") {
-      if (typeof rawInput.focus === "string" && rawInput.focus.trim()) {
-        turn.focusText = rawInput.focus.trim();
-      }
-      return;
-    }
-    if (norm === "task_boundary" && typeof rawInput.TaskName === "string") {
-      const list = Array.isArray(turn.planSteps) ? [...turn.planSteps] : [];
-      const idx = list.findIndex(s => s.step === rawInput.TaskName);
-      const entry = {
-        step: rawInput.TaskName,
-        status: "in_progress",
-        activeForm: rawInput.TaskStatus ? String(rawInput.TaskStatus) : undefined,
-        priority: rawInput.Mode ? String(rawInput.Mode) : undefined,
-      };
-      if (idx >= 0) list[idx] = entry;
-      else {
-        for (const item of list) {
-          if (item.status === "in_progress") item.status = "completed";
+  if (turn.metaToolIds.has(tid) || isAcpMetaToolName(title)) {
+    turn.metaToolIds.add(tid);
+    if (rawInput) {
+      if (["update_steps", "update_plan", "todowrite", "todo_write", "set_plan"].includes(norm)) {
+        const arr = rawInput.steps || rawInput.plan || rawInput.todos || rawInput.entries;
+        if (Array.isArray(arr)) {
+          turn.planSteps = arr.map(s => ({
+            step: String(s?.title || s?.content || s?.step || "").trim(),
+            status: normalizeHubStepStatus(s?.status),
+            id: s?.id ? String(s.id) : undefined,
+            activeForm: s?.activeForm ? String(s.activeForm) : undefined,
+            priority: s?.priority ? String(s.priority) : undefined,
+          })).filter(s => s.step);
+          if (rawInput.explanation || rawInput.summary) turn.planExplanation = String(rawInput.explanation || rawInput.summary);
         }
-        list.push(entry);
+      } else if (norm === "update_focus") {
+        const f = typeof rawInput.focus === "string" ? rawInput.focus : (typeof rawInput.status === "string" ? rawInput.status : "");
+        if (f.trim()) turn.focusText = f.trim();
+      } else if (norm === "task_boundary" && typeof rawInput.TaskName === "string") {
+        const list = Array.isArray(turn.planSteps) ? [...turn.planSteps] : [];
+        const idx = list.findIndex(s => s.step === rawInput.TaskName);
+        const entry = {
+          step: rawInput.TaskName,
+          status: "in_progress",
+          activeForm: rawInput.TaskStatus ? String(rawInput.TaskStatus) : undefined,
+          priority: rawInput.Mode ? String(rawInput.Mode) : undefined,
+        };
+        if (idx >= 0) list[idx] = entry;
+        else {
+          for (const item of list) {
+            if (item.status === "in_progress") item.status = "completed";
+          }
+          list.push(entry);
+        }
+        turn.planSteps = list;
+        if (rawInput.TaskStatus || rawInput.Mode) turn.planExplanation = String(rawInput.TaskStatus || rawInput.Mode);
       }
-      turn.planSteps = list;
-      if (rawInput.TaskStatus || rawInput.Mode) turn.planExplanation = String(rawInput.TaskStatus || rawInput.Mode);
-      return;
     }
+    return;
   }
   const kindStr = String(upd.kind || "").toLowerCase();
   const status = String(upd.status || "").toLowerCase() === "failed"
@@ -1891,11 +2092,15 @@ function recordTurnToolUpdate(turn, tid, upd, now) {
   const diffs = [];
   for (const b of contentBlocks) {
     if (String(b?.type || "").toLowerCase() === "diff" && b.path) {
+      const oldStr = String(b.oldText || "");
+      const newStr = String(b.newText || "");
+      const diffText = typeof b.diff === "string" && b.diff.length > 0
+        ? b.diff.slice(0, 48_000)
+        : computeUnifiedDiff(b.path, oldStr, newStr);
       diffs.push({
         path: String(b.path),
-        kind: !b.oldText && b.newText ? "add" : (b.oldText && !b.newText ? "delete" : "update"),
-        oldText: String(b.oldText || "").slice(0, 32_000),
-        newText: String(b.newText || "").slice(0, 32_000),
+        kind: b.kind ? String(b.kind) : (!oldStr && newStr ? "add" : (oldStr && !newStr ? "delete" : "update")),
+        diff: diffText,
       });
     }
   }
@@ -1947,6 +2152,89 @@ function recordTurnToolUpdate(turn, tid, upd, now) {
   }
 }
 
+function buildContextBridgedPrompt(record, text, userMsgId) {
+  const prior = (record.messages || [])
+    .filter(msg => (msg.role === "user" || msg.role === "agent") && msg.id !== userMsgId && typeof msg.text === "string" && msg.text.trim())
+    .slice(-16);
+  if (prior.length === 0) return text;
+  let budget = 20_000;
+  const picked = [];
+  for (let i = prior.length - 1; i >= 0 && budget > 0; i--) {
+    const msg = prior[i];
+    const chunk = msg.text.trim().slice(0, Math.min(2000, budget));
+    picked.unshift(`${msg.role === "user" ? "用户" : "助手"}：${chunk}`);
+    budget -= chunk.length;
+  }
+  return `[以下为此会话此前的对话上下文，请自然承接继续回答，勿提及此系统提示]\n${picked.join("\n\n")}\n\n[当前用户消息]\n${text}`;
+}
+
+function sleepCancellable(turn, delayMs) {
+  if (!delayMs || delayMs <= 0) return Promise.resolve(!turn.cancelled);
+  if (turn.cancelled) return Promise.resolve(false);
+  return new Promise(resolve => {
+    let done = false;
+    const finish = ok => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (turn.abortRetry === onAbort) turn.abortRetry = null;
+      resolve(ok);
+    };
+    const onAbort = () => finish(false);
+    turn.abortRetry = onAbort;
+    const timer = setTimeout(() => finish(true), delayMs);
+    timer.unref?.();
+  });
+}
+
+function startAgyLogMonitor(logFile, onInternalRetry) {
+  if (!logFile || typeof onInternalRetry !== "function") return {stop() {}};
+  let stopped = false;
+  let offset = 0;
+  let remainder = "";
+  let polling = false;
+  const initPromise = fs.stat(logFile).then(st => { offset = st.size; }, () => { offset = 0; });
+  const poll = async () => {
+    if (stopped || polling) return;
+    polling = true;
+    try {
+      await initPromise;
+      if (stopped) return;
+      const st = await fs.stat(logFile).catch(() => null);
+      if (!st || st.size <= offset) return;
+      const readLen = Math.min(st.size - offset, 65_536);
+      const fh = await fs.open(logFile, "r");
+      let chunk = "";
+      try {
+        const buf = Buffer.allocUnsafe(readLen);
+        const {bytesRead} = await fh.read(buf, 0, readLen, offset);
+        offset += bytesRead;
+        chunk = buf.subarray(0, bytesRead).toString("utf8");
+      } finally {
+        await fh.close();
+      }
+      if (stopped || !chunk) return;
+      const combined = remainder + chunk;
+      const lines = combined.split(/\r?\n/);
+      remainder = lines.pop() || "";
+      for (const line of lines) {
+        if (stopped) break;
+        const parsed = parseAgyInternalRetryLine(line);
+        if (parsed) onInternalRetry(parsed);
+      }
+    } catch {}
+    finally { polling = false; }
+  };
+  const timer = setInterval(() => { void poll(); }, 1200);
+  timer.unref?.();
+  return {
+    stop() {
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
+}
+
 async function handleRequest(method, params = {}) {
   if (method === "agents/install" || method === "agents/uninstall") {
     if (packageOperation) throw new Error("已有安装或卸载任务，请完成后再试");
@@ -1976,7 +2264,13 @@ async function dispatchRequest(method, params = {}) {
     }
     if (!pluginControlServer) {
       try {
-        const ctlOpts = process.env.SOLBRAID_PLUGIN_CTL_SOCKET ? {socketPath: process.env.SOLBRAID_PLUGIN_CTL_SOCKET} : {};
+        const ctlOpts = {
+          ...(process.env.SOLBRAID_PLUGIN_CTL_SOCKET ? {socketPath: process.env.SOLBRAID_PLUGIN_CTL_SOCKET} : {}),
+          onMobileUse: (action, actionParams = {}) => askClient("mobileUse/execute", {action, params: actionParams}),
+          onHostInstallApk: apkPath => askClient("selfBuild/installApk", {apkPath}),
+          onHostStatus: () => askClient("selfBuild/hostStatus", {}),
+          onHostRollbackRequest: () => askClient("selfBuild/requestRollback", {}),
+        };
         pluginControlServer = await startPluginControlServer(pluginKernel, ctlOpts);
       } catch (ctlErr) {
         console.error("插件控制通道启动失败：", ctlErr?.message || ctlErr);
@@ -2304,10 +2598,10 @@ async function dispatchRequest(method, params = {}) {
       if (images.length && m.protocol !== "acp") throw new Error("此 CLI 驱动不支持图片输入");
       const sessKey = `${m.id}:${record.id}`;
       if (typeof params.apiKey === "string" && params.apiKey.trim()) sessionApiKeys.set(sessKey, params.apiKey.trim());
-      const drv = m.protocol === "plugin-driver"
+      let drv = m.protocol === "plugin-driver"
         ? null
         : await getDriver(m, record.cwd, params.provider || null, record.id, params.apiKey || null, record.launchOpts || null);
-      const isAgyStreamJson = drv instanceof AgyStreamJsonDriver;
+      let isAgyStreamJson = drv instanceof AgyStreamJsonDriver;
       if (m.protocol === "acp" && !isAgyStreamJson && drv) await attachAcpSession(drv, record);
       const now = Date.now();
       const userMsgId = (typeof params.clientMessageId === "string" && params.clientMessageId.trim())
@@ -2330,6 +2624,7 @@ async function dispatchRequest(method, params = {}) {
         currentThought: null,
         timelineOrder: [],
         toolMap: new Map(),
+        metaToolIds: new Set(),
         planMap: new Map(),
         planSteps: null,
         planExplanation: null,
@@ -2337,6 +2632,7 @@ async function dispatchRequest(method, params = {}) {
         brainBaseline,
         _scanningBrain: false,
         usageStart: record.lastContextUsed ?? null,
+        initialContextUsed: Math.max(0, Number(record.lastContextUsed || 0)),
         usageEnd: null,
         contextWindow: record.lastContextWindow ?? null,
         firstTokenAt: 0,
@@ -2344,6 +2640,17 @@ async function dispatchRequest(method, params = {}) {
         activeTools: new Set(),
         toolActiveSince: 0,
         toolElapsedMs: 0,
+        llmSteps: [],
+        stepStartedAt: now,
+        stepFirstTokenAt: 0,
+        stepLastTokenAt: 0,
+        stepToolElapsedMs: 0,
+        stepOutChars: 0,
+        stepThoughtChars: 0,
+        awaitingNextStepStart: false,
+        cancelled: false,
+        abortRetry: null,
+        serverAccepted: false,
       };
       if (m.id === "antigravity") {
         turn.scanBrainArtifacts = async () => {
@@ -2396,20 +2703,7 @@ async function dispatchRequest(method, params = {}) {
         let promptTextForDriver = text;
         const consumedContextBridge = Boolean(record.pendingContextBridge);
         if (consumedContextBridge) {
-          const prior = (record.messages || [])
-            .filter(msg => (msg.role === "user" || msg.role === "agent") && msg.id !== userMsgId && typeof msg.text === "string" && msg.text.trim())
-            .slice(-16);
-          if (prior.length > 0) {
-            let budget = 20_000;
-            const picked = [];
-            for (let i = prior.length - 1; i >= 0 && budget > 0; i--) {
-              const msg = prior[i];
-              const chunk = msg.text.trim().slice(0, Math.min(2000, budget));
-              picked.unshift(`${msg.role === "user" ? "用户" : "助手"}：${chunk}`);
-              budget -= chunk.length;
-            }
-            promptTextForDriver = `[以下为此会话此前的对话上下文，请自然承接继续回答，勿提及此系统提示]\n${picked.join("\n\n")}\n\n[当前用户消息]\n${text}`;
-          }
+          promptTextForDriver = buildContextBridgedPrompt(record, text, userMsgId);
           record.pendingContextBridge = false;
         }
         const beforeHook = await pluginKernel.runBeforePromptHooks({
@@ -2487,29 +2781,186 @@ async function dispatchRequest(method, params = {}) {
           replyText = res.text || turn.text || "";
           stopReason = res.stopReason || "end_turn";
           exactUsage = res.usage || null;
-        } else if (isAgyStreamJson) {
-          const res = await drv.prompt(record.id, promptTextForDriver, {
-            cwd: record.cwd,
-            model: record.model,
-            effort: record.effort,
-            mode: record.mode,
-            remoteSessionId: record.remoteSessionId,
-          });
-          replyText = res.text || turn.text || "";
-          stopReason = res.stopReason || "end_turn";
-          if (res.remoteSessionId) record.remoteSessionId = res.remoteSessionId;
-          exactUsage = res.usage || null;
-          driverContextUsage = res.contextUsage || null;
-        } else if (m.protocol === "acp") {
-          const blocks = [];
-          if (promptTextForDriver) blocks.push({type: "text", text: promptTextForDriver});
-          for (const img of images) {
-            if (img?.base64) blocks.push({type: "image", mimeType: img.mimeType || "image/jpeg", data: img.base64});
+        } else if (isAgyStreamJson || m.protocol === "acp") {
+          const maxRetries = 3;
+          let activePromptText = promptTextForDriver;
+          let includeImages = true;
+          let lastAttemptRemoteId = record.remoteSessionId;
+          let lastAttemptHadAccepted = false;
+          for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            let internalCircuitError = null;
+            let rejectInternalCircuit = null;
+            const circuitPromise = new Promise((_, reject) => { rejectInternalCircuit = reject; });
+            circuitPromise.catch(() => {});
+            let logMonitor = {stop() {}};
+            try {
+              if (!drv || drv.closed) {
+                drv = await getDriver(m, record.cwd, params.provider || null, record.id, params.apiKey || null, record.launchOpts || null);
+                isAgyStreamJson = drv instanceof AgyStreamJsonDriver;
+              }
+              if (m.protocol === "acp" && !isAgyStreamJson && drv) {
+                await attachAcpSession(drv, record);
+              }
+              if (attempt > 0) {
+                notify("agent/event", {
+                  agentId: m.id,
+                  sessionId: record.id,
+                  kind: "acp-update",
+                  update: {sessionUpdate: "focus_update", focus: `连接已重建，正在继续生成（第 ${attempt}/${maxRetries} 次重试）…`},
+                });
+                if (!isAgyStreamJson && record.remoteSessionId && record.remoteSessionId === lastAttemptRemoteId && lastAttemptHadAccepted) {
+                  activePromptText = "上一轮请求因网络波动中断，请直接从中断处继续完成上一条用户请求，无需重复已完成步骤。";
+                  includeImages = false;
+                } else if (record.pendingContextBridge) {
+                  activePromptText = buildContextBridgedPrompt(record, text, userMsgId);
+                  record.pendingContextBridge = false;
+                  includeImages = true;
+                } else {
+                  activePromptText = promptTextForDriver;
+                  includeImages = true;
+                }
+              }
+              lastAttemptRemoteId = record.remoteSessionId;
+              turn.serverAccepted = false;
+              logMonitor = (!isAgyStreamJson && m.id === "antigravity" && drv?._agyLogFile)
+                ? startAgyLogMonitor(drv._agyLogFile, info => {
+                  if (turn.cancelled) return;
+                  const reasonLabel = formatAcpNetworkReason(info.reason);
+                  const focusMsg = `网络波动（${reasonLabel}），Antigravity 正在重试（第 ${info.attempt} 次）…`;
+                  if (turn.currentThought && !turn.currentThought.completedAtMs) {
+                    turn.currentThought.completedAtMs = Date.now();
+                    turn.currentThought = null;
+                  }
+                  notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "thought-reset", focus: focusMsg});
+                  // 若底层连续失败 3 次（或后台网络受限 EPERM 连续 2 次），快速熔断并重建进程以刷新 Go HTTP/2 连接池与 DNS，避免干等 10+ 分钟
+                  if (!internalCircuitError && (info.attempt >= 3 || (info.isSocketPermissionError && info.attempt >= 2))) {
+                    internalCircuitError = new Error(info.reason || "网络连续重试失败");
+                    internalCircuitError.code = "ACP_INTERNAL_RETRY_LOOP";
+                    internalCircuitError.retryable = true;
+                    drv?.cancel?.(record.remoteSessionId).catch(() => {});
+                    rejectInternalCircuit?.(internalCircuitError);
+                  }
+                })
+                : {stop() {}};
+              if (isAgyStreamJson) {
+                const res = await drv.prompt(record.id, activePromptText, {
+                  cwd: record.cwd,
+                  model: record.model,
+                  effort: record.effort,
+                  mode: record.mode,
+                  remoteSessionId: record.remoteSessionId,
+                });
+                replyText = res.text || turn.text || "";
+                stopReason = res.stopReason || "end_turn";
+                if (res.remoteSessionId) record.remoteSessionId = res.remoteSessionId;
+                exactUsage = res.usage || null;
+                driverContextUsage = res.contextUsage || null;
+              } else {
+                const blocks = [];
+                if (activePromptText) blocks.push({type: "text", text: activePromptText});
+                if (includeImages) {
+                  for (const img of images) {
+                    if (img?.base64) blocks.push({type: "image", mimeType: img.mimeType || "image/jpeg", data: img.base64});
+                  }
+                }
+                const res = await Promise.race([
+                  drv.prompt(record.remoteSessionId, blocks, {stallTimeoutMs: 120_000}),
+                  circuitPromise,
+                ]);
+                stopReason = res?.stopReason || "end_turn";
+                replyText = turn.text;
+                exactUsage = res?.usage || null;
+              }
+              logMonitor.stop();
+              if (turn.cancelled || stopReason === "cancelled") {
+                stopReason = "cancelled";
+                break;
+              }
+              const softErr = isSoftNetworkReply(replyText);
+              const silentEmpty = stopReason === "end_turn" && !replyText.trim() && turn.toolMap.size === 0 && turn.planMap.size === 0;
+              if (softErr || silentEmpty) {
+                const err = new Error(softErr ? replyText.trim() : "服务端未返回任何内容，连接可能已中断");
+                err.retryable = true;
+                err.isSoftNetwork = true;
+                throw err;
+              }
+              break;
+            } catch (attemptErr) {
+              logMonitor.stop();
+              if (turn.cancelled || stopReason === "cancelled") {
+                stopReason = "cancelled";
+                replyText = isSoftNetworkReply(turn.text) ? "" : turn.text;
+                break;
+              }
+              const canRetry = attempt < maxRetries && isRetryableAcpError(attemptErr);
+              if (!canRetry) {
+                if (attemptErr?.isSoftNetwork || attemptErr?.code === "ACP_INTERNAL_RETRY_LOOP") {
+                  const reasonLabel = formatAcpNetworkReason(attemptErr.message);
+                  throw new Error(`网络连接异常（${reasonLabel}），已自动重试 ${attempt} 次仍失败，请检查网络或代理后重试`);
+                }
+                throw attemptErr;
+              }
+              // 记录自动重试前失败的那次直连请求，避免用量中心漏掉重试消耗
+              if (!params.provider?.id) {
+                const retryFailMs = Math.max(1, Date.now() - (turn.stepStartedAt || turnStartMs));
+                void usageLedger.recordUsageEvent({
+                  agent: m.id,
+                  providerId: `official_${m.id}`,
+                  providerName: m.id === "antigravity" ? "Google 官方" : `${m.name} 官方`,
+                  model: record.model || m.id,
+                  ms: retryFailMs,
+                  status: 502,
+                  err: `自动重试前失败：${attemptErr.message || "网络异常"}`.slice(0, 300),
+                  billingKind: "plan",
+                  sessionId: record.id,
+                  source: "direct",
+                });
+              }
+              turn.stepStartedAt = Date.now();
+              turn.stepFirstTokenAt = 0;
+              turn.stepLastTokenAt = 0;
+              turn.stepToolElapsedMs = 0;
+              turn.stepOutChars = 0;
+              turn.stepThoughtChars = 0;
+              turn.awaitingNextStepStart = false;
+              lastAttemptHadAccepted = Boolean(turn.serverAccepted);
+              const hadTools = turn.toolMap.size > 0;
+              if (turn.currentThought && !turn.currentThought.completedAtMs) {
+                turn.currentThought.completedAtMs = Date.now();
+                turn.currentThought = null;
+              }
+              turn.text = "";
+              if (!hadTools) {
+                turn.thoughts = [];
+                turn.timelineOrder = turn.timelineOrder.filter(entry => entry.type !== "thought");
+              }
+              const delayMs = computeRetryDelayMs(attempt);
+              const reasonLabel = formatAcpNetworkReason(attemptErr.message);
+              const delaySec = Math.max(1, Math.round(delayMs / 1000));
+              const retryFocus = `${reasonLabel}，${delaySec}秒后重建连接并重试（第 ${attempt + 1}/${maxRetries} 次）…`;
+              notify("agent/event", {
+                agentId: m.id,
+                sessionId: record.id,
+                kind: "turn-retry",
+                attempt: attempt + 1,
+                maxAttempts: maxRetries,
+                delayMs,
+                reason: reasonLabel,
+                focus: retryFocus,
+                clearPartialThought: !hadTools,
+                discardSoftReply: true,
+              });
+              // 主动重启底层进程以清空失效的 Go HTTP/2 连接池与陈旧 DNS/TUN 套接字，同时完整保留磁盘上的远端会话轨迹
+              stopSessionDriver(key);
+              drv = null;
+              const keepGoing = await sleepCancellable(turn, delayMs);
+              if (!keepGoing || turn.cancelled) {
+                stopReason = "cancelled";
+                replyText = "";
+                break;
+              }
+            }
           }
-          const res = await drv.prompt(record.remoteSessionId, blocks);
-          stopReason = res?.stopReason || "end_turn";
-          replyText = turn.text;
-          exactUsage = res?.usage || null;
         } else {
           let effectivePrompt = promptTextForDriver;
           if (record.messages.length <= 1) {
@@ -2681,31 +3132,56 @@ async function dispatchRequest(method, params = {}) {
           thoughtTokens: reasoning,
           totalTokens: rawTotal > 0 ? Math.max(rawTotal, inTok + outTok) : (inTok + outTok),
         };
-        // 直连账号（未经过本地 provider-gateway）在此统一写入用量账本，排除工具执行时间并标记精确/估算状态。
+        // 直连账号（未经过本地 provider-gateway）在此按观测到的逐次 LLM 步骤精确守恒拆分入账，避免多步回合被压成 1 条
         if (!params.provider?.id) {
-          void usageLedger.recordUsageEvent({
-            agent: m.id,
-            providerId: `official_${m.id}`,
-            providerName: m.id === "antigravity" ? "Google 官方" : `${m.name} 官方`,
-            model: record.model || m.id,
-            in: inTok,
-            out: outTok,
+          const isTurnCancelled = Boolean(turn.cancelled || stopReason === "cancelled");
+          const stepRows = buildPerStepUsageRecords({
+            steps: turn.llmSteps,
+            inTok,
+            outTok,
             cacheRead,
             cacheWrite,
             reasoning,
-            inNormalized: true,
-            ms: apiDurationMs,
+            usageStart: turn.initialContextUsed ?? 0,
+            turnStartMs,
+            doneAt,
+            apiDurationMs,
             ttftMs,
             genMs,
             streamed: turn.firstTokenAt > 0,
-            exact: hasExactUsage,
+            hasExactUsage,
             contextUsed: record.lastContextUsed || (inTok + outTok),
             contextWindow: effectiveWindow || 0,
-            status: 200,
-            billingKind: "plan",
-            sessionId: record.id,
-            source: "direct",
           });
+          for (let si = 0; si < stepRows.length; si++) {
+            const row = stepRows[si];
+            const isLastCancelled = isTurnCancelled && si === stepRows.length - 1;
+            void usageLedger.recordUsageEvent({
+              t: row.t,
+              agent: m.id,
+              providerId: `official_${m.id}`,
+              providerName: m.id === "antigravity" ? "Google 官方" : `${m.name} 官方`,
+              model: record.model || m.id,
+              in: row.in,
+              out: row.out,
+              cacheRead: row.cacheRead,
+              cacheWrite: row.cacheWrite,
+              reasoning: row.reasoning,
+              inNormalized: true,
+              ms: row.ms,
+              ttftMs: row.ttftMs,
+              genMs: row.genMs,
+              streamed: row.streamed,
+              exact: row.exact,
+              contextUsed: row.contextUsed,
+              contextWindow: row.contextWindow,
+              status: isLastCancelled ? 499 : 200,
+              err: isLastCancelled ? "用户中断" : "",
+              billingKind: "plan",
+              sessionId: record.id,
+              source: "direct",
+            });
+          }
         }
         const turnDiff = await devTools.captureGitDiff(record.cwd);
         notify("sessions/completed", {agentId: m.id, sessionId: record.id, stopReason, turnDiff, usage: normalizedUsage, contextUsage: finalContextUsage});
@@ -2728,20 +3204,50 @@ async function dispatchRequest(method, params = {}) {
           record.pendingContextBridge = true;
         }
         if (!params.provider?.id) {
+          // 中途异常或取消前已完成的模型步骤同样补记入账，杜绝长回合中途失败后已耗 Token 归零
+          const completedSteps = Array.isArray(turn.llmSteps) ? turn.llmSteps.filter(s => s && s.used > 0) : [];
+          for (const st of completedSteps) {
+            const estOutStep = Math.max(0, Math.round((st.outChars || 0) / 3.2));
+            const estInStep = Math.max(0, st.used - estOutStep);
+            void usageLedger.recordUsageEvent({
+              t: st.endedAt || Date.now(),
+              agent: m.id,
+              providerId: `official_${m.id}`,
+              providerName: m.id === "antigravity" ? "Google 官方" : `${m.name} 官方`,
+              model: record.model || m.id,
+              in: estInStep,
+              out: estOutStep,
+              inNormalized: true,
+              ms: Math.max(1, st.apiMs || 1),
+              ttftMs: st.ttftMs || 0,
+              genMs: st.genMs || 0,
+              streamed: Boolean(st.streamed),
+              exact: false,
+              contextUsed: st.used,
+              contextWindow: st.contextWindow || turn.contextWindow || 0,
+              status: 200,
+              billingKind: "plan",
+              sessionId: record.id,
+              source: "direct",
+            });
+          }
+          const isCancelledErr = Boolean(turn.cancelled) || /用户中断|cancelled|canceled/i.test(String(error?.message || ""));
           void usageLedger.recordUsageEvent({
             agent: m.id,
             providerId: `official_${m.id}`,
             providerName: m.id === "antigravity" ? "Google 官方" : `${m.name} 官方`,
             model: record.model || m.id,
-            ms: Math.max(0, Date.now() - turnStartMs),
-            status: 500,
-            err: error.message || "Execution failed",
+            ms: Math.max(1, Date.now() - (turn.stepStartedAt || turnStartMs)),
+            status: isCancelledErr ? 499 : 500,
+            err: isCancelledErr ? "用户中断" : (error.message || "Execution failed"),
             billingKind: "plan",
             sessionId: record.id,
             source: "direct",
           });
         }
-        if (turn.text && !replySaved) record.messages.push({id: `agent-${Date.now()}`, role: "agent", text: turn.text, ts: Date.now()});
+        if (turn.text && !replySaved && !isSoftNetworkReply(turn.text)) {
+          record.messages.push({id: `agent-${Date.now()}`, role: "agent", text: turn.text, ts: Date.now()});
+        }
         record.messages.push({id: `error-${Date.now()}`, role: "notice", text: error.message, error: true, ts: Date.now()});
         record.updatedAt = Date.now();
         notify("sessions/failed", {agentId: m.id, sessionId: record.id, message: error.message});
@@ -2756,6 +3262,11 @@ async function dispatchRequest(method, params = {}) {
       const m = resolveManifestOrNull(agentId);
       const record = await loadStoredSession(agentId, params.sessionId).catch(() => null);
       const key = `${agentId}:${params.sessionId}`;
+      const activeTurn = activeTurns.get(key);
+      if (activeTurn) {
+        activeTurn.cancelled = true;
+        try { activeTurn.abortRetry?.(); } catch {}
+      }
       for (const waiter of pendingClientReqs.values()) {
         if (`${waiter.params.agentId}:${waiter.params.sessionId}` === key) waiter.reject(new Error("用户中断了会话"));
       }
@@ -2833,11 +3344,22 @@ async function dispatchRequest(method, params = {}) {
         try { pAbort.abort(new Error("会话已删除")); } catch {}
       }
       pluginKernel.cancelPluginDriver(agentId, params.sessionId);
+      const deletingTurn = activeTurns.get(key);
+      if (deletingTurn) {
+        deletingTurn.cancelled = true;
+        try { deletingTurn.abortRetry?.(); } catch {}
+      }
       activeTurns.delete(key);
       stopSessionDriver(key);
       sessionApiKeys.delete(key);
       await fs.rm(sessionFile(agentId, params.sessionId), {force: true});
       sessions.delete(key);
+      if (agentId === "antigravity") {
+        const safeSid = String(params.sessionId || "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+        if (safeSid) {
+          await fs.rm(path.join(HOME, ".gemini", "antigravity-cli", "solbraid-sessions", `settings-${safeSid}.json`), {force: true}).catch(() => {});
+        }
+      }
       // 若该已卸载插件驱动目录下不再有任何残留会话文件，顺带回收空目录
       await fs.rmdir(path.join(SESSIONS_ROOT, agentId)).catch(() => {});
       return {ok: true};
@@ -3179,15 +3701,78 @@ async function dispatchRequest(method, params = {}) {
     case "selfBuild/saveConfig":
       return await pluginKernel.saveSelfBuildConfig(params || {});
     case "selfBuild/status":
-      return await pluginKernel.manageSelfBuild({...(params || {}), action: "status", source: "ui"});
+      return await pluginKernel.manageSelfBuild({...(params || {}), action: "status", source: "ui",
+        onHostStatus: () => askClient("selfBuild/hostStatus", {}),
+      });
     case "selfBuild/bootstrap":
       return await pluginKernel.manageSelfBuild({...(params || {}), action: "bootstrap", source: "ui"});
     case "selfBuild/build":
       return await pluginKernel.manageSelfBuild({...(params || {}), action: "build", source: "ui"});
     case "selfBuild/apply":
-      return await pluginKernel.manageSelfBuild({...(params || {}), action: "apply", source: "ui"});
+      return await pluginKernel.manageSelfBuild({
+        ...(params || {}),
+        action: "apply",
+        source: "ui",
+        onHostInstallApk: apkPath => askClient("selfBuild/installApk", {apkPath}),
+      });
     case "selfBuild/rollback":
-      return await pluginKernel.manageSelfBuild({...(params || {}), action: "rollback", source: "ui"});
+      return await pluginKernel.manageSelfBuild({...(params || {}), action: "rollback", source: "ui",
+        onHostRollbackApk: () => askClient("selfBuild/hostRollback", {}),
+      });
+    case "mobileUse/execute":
+      return await askClient("mobileUse/execute", {
+        action: String(params?.action || "status"),
+        params: params?.params && typeof params.params === "object" ? params.params : {},
+      });
+
+    case "files/listCheckpoints": {
+      const baseCwd = params?.cwd || path.join(HOME, "workspace");
+      const rawPath = String(params?.filePath || "").trim();
+      const target = rawPath ? path.resolve(baseCwd, rawPath) : "";
+      if (target && target !== HOME && !target.startsWith(HOME + "/")) {
+        throw new Error("文件路径超出用户目录边界，拒绝访问");
+      }
+      const checkpoints = await listFileCheckpoints({
+        sessionId: String(params?.sessionId || "default"),
+        filePath: target,
+      });
+      return {checkpoints};
+    }
+
+    case "files/revertCheckpoint": {
+      const baseCwd = params?.cwd || path.join(HOME, "workspace");
+      const rawPath = String(params?.filePath || "").trim();
+      if (!rawPath) throw new Error("缺少要回滚的文件路径");
+      const target = path.resolve(baseCwd, rawPath);
+      if (target !== HOME && !target.startsWith(HOME + "/")) {
+        throw new Error("文件路径超出用户目录边界，拒绝回滚");
+      }
+      const sid = String(params?.sessionId || "default");
+      try {
+        return await revertFileCheckpoint({
+          sessionId: sid,
+          checkpointId: String(params?.checkpointId || ""),
+          filePath: target,
+        });
+      } catch (cpErr) {
+        // 无独立文件检查点时（例如 Codex/Claude 通过 CLI 直接修改），尝试在 Git 工作区回退该单文件（先备份当前版保证可逆）
+        const dir = path.dirname(target);
+        const rel = path.relative(baseCwd, target);
+        try {
+          await execFileAsync("git", ["rev-parse", "--is-inside-work-tree"], {cwd: baseCwd, timeout: 4000});
+          const undoCp = await captureFileCheckpoint(target, {sessionId: sid}).catch(() => null);
+          await execFileAsync("git", ["checkout", "--", rel], {cwd: baseCwd, timeout: 8000});
+          return {
+            reverted: true,
+            action: "git_restored",
+            filePath: target,
+            undoCheckpointId: undoCp?.id || null,
+          };
+        } catch {
+          throw new Error(`未找到「${path.basename(target)}」的修改前快照且当前目录非 Git 跟踪文件：${cpErr.message}`);
+        }
+      }
+    }
 
     case "registry/getConfig":
       return communityRegistry.sanitizeConfig(await communityRegistry.loadConfig());

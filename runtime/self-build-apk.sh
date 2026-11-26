@@ -2,17 +2,14 @@
 # Solbraid 本机纯本地 ARM64 APK 自迭代构建流水线
 # 能力：
 #   1. status    : 检测本机 ARM64 JDK 17 / Android SDK (android-36) / 原生 aapt2 / 签名密钥 / 源码目录就绪度
-#   2. bootstrap : 一键配置 ARM64 依赖（openjdk-17 / 原生 aapt2 / debug.keystore）并从 /opt/galiais-native 零下载复用离线 .so
+#   2. bootstrap : 配置 ARM64 依赖并复用离线组件；签名密钥必须由用户提供原版本密钥
 #   3. build     : 运行单测 + 单 ABI (arm64-v8a) Gradle 编译 + 运行时完整性校验，输出可直接安装的 APK
 #   4. apply     : 经明确确认（--yes）后移交独立 Root 启动看门狗安装并验证首帧心跳（异常自动回滚）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOME_DIR="${HOME:-/home/agent}"
-WATCHDOG_PATHS=(
-    "/data/user/0/com.galiais.agent/files/vm-runtime/self-update-watchdog.sh"
-    "$SCRIPT_DIR/self-update-watchdog.sh"
-)
+SIGNING_PROPERTIES="${SOLBRAID_SIGNING_PROPERTIES:-$HOME_DIR/.galiais/self-build-signing.properties}"
 HEARTBEAT_FILE="/data/user/0/com.galiais.agent/files/self-update-healthy.json"
 WATCHDOG_STATUS_FILE="/data/local/tmp/solbraid-self-update/status.json"
 
@@ -128,7 +125,7 @@ cmd_status() {
     local repo_ok="false"
     [ -n "$repo_dir" ] && repo_ok="true"
     local keystore_ok="false"
-    [ -f "$HOME_DIR/.android/debug.keystore" ] && keystore_ok="true"
+    [ -r "$SIGNING_PROPERTIES" ] && keystore_ok="true"
     local native_ready="false"
     [ -f "/opt/galiais-native/libbin_node.so" ] && native_ready="true"
 
@@ -147,6 +144,7 @@ cmd_status() {
         add_missing "arm64-aapt2"
     fi
     [ "$repo_ok" = "true" ] || add_missing "solbraid-git-repo"
+    [ "$keystore_ok" = "true" ] || add_missing "原版本签名配置"
 
     local ready="true"
     [ -n "$missing_json" ] && ready="false"
@@ -203,16 +201,6 @@ cmd_bootstrap() {
         fi
     fi
 
-    local java_home
-    java_home="$(detect_java_home || true)"
-    if [ -n "$java_home" ] && [ ! -f "$HOME_DIR/.android/debug.keystore" ] && [ -x "$java_home/bin/keytool" ]; then
-        "$java_home/bin/keytool" -genkeypair -v \
-            -keystore "$HOME_DIR/.android/debug.keystore" \
-            -storepass android -alias androiddebugkey -keypass android \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1 || true
-    fi
-
     local repo_dir
     repo_dir="$(detect_repo_dir "$repo_arg" || true)"
     if [ -n "$repo_dir" ]; then
@@ -247,6 +235,7 @@ cmd_build() {
     [ -n "$java_home" ] || { echo "ERROR: 未找到 JDK 17，请先运行 self-build-apk.sh bootstrap 安装 openjdk-17-jdk" >&2; exit 1; }
     [ -f "$android_home/platforms/android-36/android.jar" ] || { echo "ERROR: 未找到 Android SDK platforms/android-36 ($android_home)" >&2; exit 1; }
     [ -n "$repo_dir" ] || { echo "ERROR: 未找到 Solbraid 源码仓库（请传入 --repo <path>）" >&2; exit 1; }
+    [ -r "$SIGNING_PROPERTIES" ] || { echo "ERROR: 请先配置已安装版本的原签名密钥" >&2; exit 1; }
     if [ "$arch" = "aarch64" ] && [ -z "$aapt2_bin" ]; then
         echo "ERROR: ARM64 环境缺少原生 aapt2，请安装 apt-get install -y aapt2 或设置 SOLBRAID_AAPT2_BIN" >&2
         exit 1
@@ -270,6 +259,7 @@ cmd_build() {
     local gradle_args=(
         "--no-daemon"
         "-PsolbraidAbis=$abis"
+        "-PsolbraidSigningProperties=$SIGNING_PROPERTIES"
         "-Dorg.gradle.jvmargs=-Xmx${heap_mb}m -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8"
     )
     if [ -n "$aapt2_bin" ]; then
@@ -310,16 +300,6 @@ cmd_build() {
         "$(json_escape "$out_apk")" "$size" "$sha" "$variant" "$abis"
 }
 
-find_watchdog() {
-    local cand
-    for cand in "${WATCHDOG_PATHS[@]}"; do
-        if [ -f "$cand" ]; then
-            echo "$cand"
-            return
-        fi
-    done
-}
-
 cmd_apply() {
     local apk=""
     local confirmed="false"
@@ -332,20 +312,7 @@ cmd_apply() {
     [ "$confirmed" = "true" ] || { echo "ERROR: 安全护栏：安装并重启 App 必须显式传入 --yes" >&2; exit 1; }
     [ -n "$apk" ] && [ -f "$apk" ] || { echo "ERROR: 无效 APK 路径：$apk" >&2; exit 1; }
 
-    local watchdog
-    watchdog="$(find_watchdog || true)"
-    [ -n "$watchdog" ] || { echo "ERROR: 未找到 self-update-watchdog.sh" >&2; exit 1; }
-
-    local wd_enabled="${SOLBRAID_WATCHDOG_ENABLED:-true}"
-    local wd_timeout="${SOLBRAID_WATCHDOG_TIMEOUT:-20}"
-    if [ "$(id -u)" = "0" ]; then
-        SOLBRAID_WATCHDOG_ENABLED="$wd_enabled" SOLBRAID_WATCHDOG_TIMEOUT="$wd_timeout" /system/bin/sh "$watchdog" --spawn "$apk"
-    elif command -v su >/dev/null 2>&1; then
-        su -c "SOLBRAID_WATCHDOG_ENABLED='$wd_enabled' SOLBRAID_WATCHDOG_TIMEOUT='$wd_timeout' /system/bin/sh '$watchdog' --spawn '$apk'"
-    else
-        echo "ERROR: 当前环境无 Root 权限（su 不可用），无法自动拉起独立看门狗安装 APK；请手动安装：$apk" >&2
-        exit 1
-    fi
+    node "$SCRIPT_DIR/plugin-mcp.mjs" --self-build-apply "$apk"
 }
 
 cmd_rollback() {
@@ -358,18 +325,7 @@ cmd_rollback() {
     done
     [ "$confirmed" = "true" ] || { echo "ERROR: 安全护栏：回滚并重启 App 必须显式传入 --yes" >&2; exit 1; }
 
-    local watchdog
-    watchdog="$(find_watchdog || true)"
-    [ -n "$watchdog" ] || { echo "ERROR: 未找到 self-update-watchdog.sh" >&2; exit 1; }
-
-    if [ "$(id -u)" = "0" ]; then
-        /system/bin/sh "$watchdog" --spawn-rollback
-    elif command -v su >/dev/null 2>&1; then
-        su -c "/system/bin/sh '$watchdog' --spawn-rollback"
-    else
-        echo "ERROR: 当前环境无 Root 权限（su 不可用），无法执行看门狗回滚" >&2
-        exit 1
-    fi
+    node "$SCRIPT_DIR/plugin-mcp.mjs" --self-build-rollback
 }
 
 sub="${1:-status}"

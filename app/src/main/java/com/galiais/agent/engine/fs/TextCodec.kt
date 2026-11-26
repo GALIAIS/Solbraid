@@ -14,6 +14,8 @@ enum class TextEncoding(val id: String, val label: String, val charsetName: Stri
     GB18030("gb18030", "GBK / GB18030", "GB18030", false),
     UTF_16_LE("utf-16le", "UTF-16 LE", "UTF-16LE", true),
     UTF_16_BE("utf-16be", "UTF-16 BE", "UTF-16BE", true),
+    SHIFT_JIS("shift_jis", "Shift-JIS", "Shift_JIS", false),
+    BIG5("big5", "Big5 繁体", "Big5", false),
     ISO_8859_1("iso-8859-1", "ISO-8859-1", "ISO-8859-1", false),
     ;
 
@@ -53,6 +55,9 @@ data class DecodedTextDocument(
     val lineEnding: LineEnding,
     val totalBytes: Long,
     val truncated: Boolean,
+    val hasTrailingNewline: Boolean = false,
+    val mixedLineEndings: Boolean = false,
+    val revision: FileRevision? = null,
 )
 
 data class TextPageChunk(
@@ -62,6 +67,17 @@ data class TextPageChunk(
     val totalBytes: Long,
     val pageIndex: Int,
     val totalPages: Int,
+    val startLineNumber: Int = 1,
+    val lineCount: Int = 0,
+)
+
+/** 超大文件稀疏行号索引（每 strideBytes 建立 1 个锚点，100MB 仅占用 < 4KB 内存）。 */
+data class SparseLineIndex(
+    val fileSize: Long,
+    val strideBytes: Int,
+    val lineAtAnchor: IntArray,
+    val totalLines: Int,
+    val encoding: TextEncoding = TextEncoding.UTF_8,
 )
 
 /** 编码探测、换行符规范化、魔数识别、大文件分页读取与哈希校验工具。 */
@@ -214,18 +230,78 @@ object TextCodec {
         return nonText > checkLen * 0.15
     }
 
+    private fun isValidUtf8Slice(bytes: ByteArray, rawStart: Int, rawLen: Int): Boolean {
+        if (rawLen <= 0 || rawStart >= bytes.size) return true
+        var start = rawStart.coerceIn(0, bytes.size)
+        val end = (rawStart + rawLen).coerceAtMost(bytes.size)
+        // 若切片起点落在文件中间，跳过最多 3 个 UTF-8 续字节（10xxxxxx），避免因切片切在多字节字符中间导致误判
+        if (start > 0) {
+            var skipped = 0
+            while (start < end && skipped < 3 && (bytes[start].toInt() and 0xC0) == 0x80) {
+                start++
+                skipped++
+            }
+        }
+        // 若切片终点未到文件末尾，裁剪末尾可能被截断的 UTF-8 引导字节序列
+        var trimEnd = end
+        if (trimEnd < bytes.size && trimEnd > start) {
+            var back = 0
+            while (trimEnd > start && back < 4 && (bytes[trimEnd - 1].toInt() and 0x80) != 0) {
+                val lead = bytes[trimEnd - 1].toInt() and 0xFF
+                trimEnd--
+                back++
+                if ((lead and 0xC0) != 0x80) break
+            }
+        }
+        if (trimEnd <= start) return true
+        val decoder = Charsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+        return runCatching { decoder.decode(ByteBuffer.wrap(bytes, start, trimEnd - start)); true }.getOrDefault(false)
+    }
+
+    /** 三段抽样（头 64KB + 中 32KB + 尾 32KB）严格校验 UTF-8，彻底消除前英文后 GBK 乱码误判。 */
     fun detectEncoding(bytes: ByteArray): TextEncoding {
         if (bytes.size >= 3 && bytes[0] == 0xEF.toByte() && bytes[1] == 0xBB.toByte() && bytes[2] == 0xBF.toByte()) return TextEncoding.UTF_8_BOM
         if (bytes.size >= 2 && bytes[0] == 0xFF.toByte() && bytes[1] == 0xFE.toByte()) return TextEncoding.UTF_16_LE
         if (bytes.size >= 2 && bytes[0] == 0xFE.toByte() && bytes[1] == 0xFF.toByte()) return TextEncoding.UTF_16_BE
-        val decoder = Charsets.UTF_8.newDecoder()
-            .onMalformedInput(CodingErrorAction.REPORT)
-            .onUnmappableCharacter(CodingErrorAction.REPORT)
-        val okUtf8 = runCatching { decoder.decode(ByteBuffer.wrap(bytes, 0, minOf(bytes.size, 65_536))); true }.getOrDefault(false)
-        return if (okUtf8) TextEncoding.UTF_8 else TextEncoding.GB18030
+        val headOk = isValidUtf8Slice(bytes, 0, minOf(bytes.size, 65_536))
+        if (!headOk) return TextEncoding.GB18030
+        if (bytes.size > 65_536) {
+            val midStart = (bytes.size / 2 - 16_384).coerceAtLeast(65_536)
+            if (!isValidUtf8Slice(bytes, midStart, 32_768)) return TextEncoding.GB18030
+            val tailStart = (bytes.size - 32_768).coerceAtLeast(0)
+            if (!isValidUtf8Slice(bytes, tailStart, 32_768)) return TextEncoding.GB18030
+        }
+        return TextEncoding.UTF_8
     }
 
-    fun decodeBytes(bytes: ByteArray, encodingOverride: TextEncoding? = null, totalBytes: Long = bytes.size.toLong(), truncated: Boolean = false): DecodedTextDocument {
+    fun sha256Hex(bytes: ByteArray): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        md.update(bytes)
+        return md.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    fun sha256File(file: File): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        val buf = ByteArray(65_536)
+        file.inputStream().use { input ->
+            while (true) {
+                val n = input.read(buf)
+                if (n <= 0) break
+                md.update(buf, 0, n)
+            }
+        }
+        return md.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    fun decodeBytes(
+        bytes: ByteArray,
+        encodingOverride: TextEncoding? = null,
+        totalBytes: Long = bytes.size.toLong(),
+        truncated: Boolean = false,
+        revision: FileRevision? = null,
+    ): DecodedTextDocument {
         val enc = encodingOverride ?: detectEncoding(bytes)
         val payload = when {
             enc == TextEncoding.UTF_8_BOM && bytes.size >= 3 && bytes[0] == 0xEF.toByte() && bytes[1] == 0xBB.toByte() && bytes[2] == 0xBF.toByte() ->
@@ -236,17 +312,55 @@ object TextCodec {
             else -> bytes
         }
         val rawText = String(payload, enc.charset())
-        val crlfCount = rawText.windowed(2).count { it == "\r\n" }
-        val lfCount = rawText.count { it == '\n' } - crlfCount
-        val lineEnding = if (crlfCount > lfCount && crlfCount > 0) LineEnding.CRLF else LineEnding.LF
+        var crlfCount = 0
+        var lfOnlyCount = 0
+        var crOnlyCount = 0
+        var i = 0
+        while (i < rawText.length) {
+            val ch = rawText[i]
+            if (ch == '\r') {
+                if (i + 1 < rawText.length && rawText[i + 1] == '\n') {
+                    crlfCount++
+                    i += 2
+                    continue
+                } else {
+                    crOnlyCount++
+                }
+            } else if (ch == '\n') {
+                lfOnlyCount++
+            }
+            i++
+        }
+        val lineEnding = if (crlfCount > lfOnlyCount && crlfCount > 0) LineEnding.CRLF else LineEnding.LF
+        val mixed = (crlfCount > 0 && lfOnlyCount > 0) || crOnlyCount > 0
         val normalized = rawText.replace("\r\n", "\n").replace('\r', '\n')
-        return DecodedTextDocument(normalized, enc, lineEnding, totalBytes, truncated)
+        val hasTrailing = normalized.endsWith("\n")
+        return DecodedTextDocument(
+            text = normalized,
+            encoding = enc,
+            lineEnding = lineEnding,
+            totalBytes = totalBytes,
+            truncated = truncated,
+            hasTrailingNewline = hasTrailing,
+            mixedLineEndings = mixed,
+            revision = revision,
+        )
     }
 
-    fun encodeText(text: String, encoding: TextEncoding, lineEnding: LineEnding): ByteArray {
-        val normalized = text.replace("\r\n", "\n").replace('\r', '\n')
+    fun encodeText(
+        text: String,
+        encoding: TextEncoding,
+        lineEnding: LineEnding,
+        preserveTrailingNewline: Boolean? = null,
+        includeBom: Boolean = true,
+    ): ByteArray {
+        var normalized = text.replace("\r\n", "\n").replace('\r', '\n')
+        if (preserveTrailingNewline == true && normalized.isNotEmpty() && !normalized.endsWith("\n")) {
+            normalized += "\n"
+        }
         val finalText = if (lineEnding == LineEnding.CRLF) normalized.replace("\n", "\r\n") else normalized
         val body = finalText.toByteArray(encoding.charset())
+        if (!includeBom) return body
         val bom = when (encoding) {
             TextEncoding.UTF_8_BOM -> byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte())
             TextEncoding.UTF_16_LE -> byteArrayOf(0xFF.toByte(), 0xFE.toByte())
@@ -256,25 +370,290 @@ object TextCodec {
         return bom + body
     }
 
-    /** 按页读取大文本文件（64KB/页，自动对齐行边界，零 OOM）。 */
-    fun readTextPage(file: File, pageIndex: Int, pageBytes: Int = 64 * 1024, encoding: TextEncoding = TextEncoding.UTF_8): TextPageChunk {
+    /** 流式构建超大文件稀疏行号索引（每 256KB 一个锚点，支持毫秒级真实行号查询与跳行）。 */
+    private fun isUtf16(encoding: TextEncoding) = encoding == TextEncoding.UTF_16_LE || encoding == TextEncoding.UTF_16_BE
+
+    private fun endsLineFeed(byte: Byte, previous: Byte, offset: Long, encoding: TextEncoding): Boolean = when (encoding) {
+        TextEncoding.UTF_16_LE -> offset % 2L == 1L && previous == 10.toByte() && byte == 0.toByte()
+        TextEncoding.UTF_16_BE -> offset % 2L == 1L && previous == 0.toByte() && byte == 10.toByte()
+        else -> byte == 10.toByte()
+    }
+
+    fun buildSparseLineIndex(file: File, strideBytes: Int = 256 * 1024, encoding: TextEncoding = TextEncoding.UTF_8): SparseLineIndex {
+        require(strideBytes > 0 && (!isUtf16(encoding) || strideBytes % 2 == 0)) { "行索引步长必须与编码对齐" }
+        val total = file.length().coerceAtLeast(0L)
+        val anchorCount = ((total / strideBytes).toInt() + 1).coerceAtLeast(1)
+        val anchors = IntArray(anchorCount)
+        anchors[0] = 1
+        var line = 1
+        var offset = 0L
+        var nextAnchorIdx = 1
+        val buf = ByteArray(65_536)
+        var previous: Byte = 0
+        file.inputStream().use { input ->
+            while (true) {
+                val n = input.read(buf)
+                if (n <= 0) break
+                for (i in 0 until n) {
+                    val pos = offset + i
+                    while (nextAnchorIdx < anchorCount && pos >= nextAnchorIdx.toLong() * strideBytes) {
+                        anchors[nextAnchorIdx] = line
+                        nextAnchorIdx++
+                    }
+                    if (endsLineFeed(buf[i], previous, pos, encoding)) line++
+                    previous = buf[i]
+                }
+                offset += n
+            }
+        }
+        while (nextAnchorIdx < anchorCount) {
+            anchors[nextAnchorIdx] = line
+            nextAnchorIdx++
+        }
+        return SparseLineIndex(total, strideBytes, anchors, line, encoding)
+    }
+
+    /** 根据稀疏行索引计算精确的 1-based 行号。 */
+    fun lineNumberAtOffset(file: File, byteOffset: Long, index: SparseLineIndex?, encoding: TextEncoding = index?.encoding ?: TextEncoding.UTF_8): Int {
+        if (byteOffset <= 0L) return 1
+        val clamped = byteOffset.coerceAtMost(file.length().coerceAtLeast(0L))
+        var startPos = 0L
+        var line = 1
+        if (index != null && index.lineAtAnchor.isNotEmpty() && index.strideBytes > 0) {
+            val anchorIdx = (clamped / index.strideBytes).toInt().coerceIn(0, index.lineAtAnchor.lastIndex)
+            startPos = anchorIdx.toLong() * index.strideBytes
+            line = index.lineAtAnchor[anchorIdx]
+        }
+        val toRead = clamped - startPos
+        if (toRead <= 0L) return line
+        RandomAccessFile(file, "r").use { raf ->
+            raf.seek(startPos)
+            val buf = ByteArray(minOf(65_536L, toRead).toInt())
+            var remain = toRead
+            var previous: Byte = 0
+            while (remain > 0L) {
+                val n = raf.read(buf, 0, minOf(buf.size.toLong(), remain).toInt())
+                if (n <= 0) break
+                for (i in 0 until n) {
+                    if (endsLineFeed(buf[i], previous, clamped - remain + i, encoding)) line++
+                    previous = buf[i]
+                }
+                remain -= n
+            }
+        }
+        return line
+    }
+
+    /** 根据 1-based 行号快速定位字节偏移与页号（用于超大文件跳行）。 */
+    fun byteOffsetForLine(file: File, targetLine: Int, index: SparseLineIndex?): Long {
+        if (targetLine <= 1) return 0L
+        var startPos = 0L
+        var curLine = 1
+        val encoding = index?.encoding ?: file.inputStream().use { input ->
+            val head = ByteArray(4)
+            val n = input.read(head)
+            detectEncoding(head.copyOf(n.coerceAtLeast(0)))
+        }
+        if (index != null && index.lineAtAnchor.isNotEmpty()) {
+            var lo = 0
+            var hi = index.lineAtAnchor.lastIndex
+            while (lo < hi) {
+                val mid = (lo + hi + 1) ushr 1
+                if (index.lineAtAnchor[mid] <= targetLine) lo = mid else hi = mid - 1
+            }
+            startPos = lo.toLong() * index.strideBytes
+            curLine = index.lineAtAnchor[lo]
+        }
+        RandomAccessFile(file, "r").use { raf ->
+            raf.seek(startPos)
+            val buf = ByteArray(65_536)
+            var pos = startPos
+            var previous: Byte = 0
+            while (curLine < targetLine) {
+                val n = raf.read(buf)
+                if (n <= 0) break
+                for (i in 0 until n) {
+                    if (endsLineFeed(buf[i], previous, pos + i, encoding)) {
+                        curLine++
+                        if (curLine == targetLine) return pos + i + 1
+                    }
+                    previous = buf[i]
+                }
+                pos += n
+            }
+            return pos
+        }
+    }
+
+    /**
+     * 按页读取文本；相邻页共享同一边界算法，UTF-16 按码元和代理对对齐。
+     */
+    fun readTextPage(
+        file: File,
+        pageIndex: Int,
+        pageBytes: Int = 64 * 1024,
+        encoding: TextEncoding = TextEncoding.UTF_8,
+        lineIndex: SparseLineIndex? = null,
+    ): TextPageChunk {
         val total = file.length().coerceAtLeast(0L)
         val totalPages = ((total + pageBytes - 1) / pageBytes).toInt().coerceAtLeast(1)
         val safePage = pageIndex.coerceIn(0, totalPages - 1)
-        val start = safePage.toLong() * pageBytes
-        val len = minOf(pageBytes.toLong(), (total - start).coerceAtLeast(0L)).toInt()
-        val buf = ByteArray(len)
+        if (total == 0L) {
+            return TextPageChunk("", 0L, 0L, 0L, 0, 1, startLineNumber = 1, lineCount = 1)
+        }
+        val rawStart = safePage.toLong() * pageBytes
+        val rawEnd = minOf(total, rawStart + pageBytes)
+        val maxLookAhead = 4096
+
+        var alignedStart = rawStart
+        var alignedEnd = rawEnd
         RandomAccessFile(file, "r").use { raf ->
-            raf.seek(start)
-            var off = 0
-            while (off < len) {
-                val n = raf.read(buf, off, len - off)
+            fun boundary(raw: Long): Long {
+                if (raw <= 0L || raw >= total) return raw.coerceIn(0L, total)
+                val start = if (isUtf16(encoding)) raw - raw % 2L else raw
+                raf.seek(start)
+                val probe = ByteArray(minOf(maxLookAhead.toLong(), total - start).toInt())
+                val got = readFully(raf, probe, probe.size)
+                var previous: Byte = 0
+                for (i in 0 until got) {
+                    if (endsLineFeed(probe[i], previous, start + i, encoding)) return start + i + 1
+                    previous = probe[i]
+                }
+                var end = start + got
+                if (end == total) return end
+                if (isUtf16(encoding)) {
+                    end -= end % 2L
+                    if (end >= 2L) {
+                        raf.seek(end - 2)
+                        val a = raf.readUnsignedByte()
+                        val b = raf.readUnsignedByte()
+                        val unit = if (encoding == TextEncoding.UTF_16_LE) a or (b shl 8) else (a shl 8) or b
+                        if (unit in 0xD800..0xDBFF) end -= 2
+                    }
+                } else if (encoding == TextEncoding.UTF_8 || encoding == TextEncoding.UTF_8_BOM) {
+                    raf.seek(end)
+                    var next = raf.read()
+                    while (end > start && (next and 0xC0) == 0x80) {
+                        end--
+                        raf.seek(end)
+                        next = raf.read()
+                    }
+                }
+                return end
+            }
+            alignedStart = boundary(rawStart)
+            alignedEnd = boundary(rawEnd)
+            if (alignedStart > alignedEnd) alignedStart = alignedEnd
+            val readLen = (alignedEnd - alignedStart).toInt().coerceAtLeast(0)
+            val buf = ByteArray(readLen)
+            if (readLen > 0) {
+                raf.seek(alignedStart)
+                readFully(raf, buf, readLen)
+            }
+            val bomBytes = if (alignedStart == 0L && encoding == TextEncoding.UTF_8_BOM &&
+                buf.size >= 3 && buf[0] == 0xEF.toByte() && buf[1] == 0xBB.toByte() && buf[2] == 0xBF.toByte()
+            ) 3 else if (alignedStart == 0L && isUtf16(encoding) && buf.size >= 2 &&
+                ((buf[0] == 0xFF.toByte() && buf[1] == 0xFE.toByte()) || (buf[0] == 0xFE.toByte() && buf[1] == 0xFF.toByte()))
+            ) 2 else 0
+            val payload = if (bomBytes > 0) buf.copyOfRange(bomBytes, buf.size) else buf
+            val text = encoding.charset().newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(payload)).toString().replace("\r\n", "\n")
+            val startLine = lineNumberAtOffset(file, alignedStart, lineIndex, encoding)
+            val linesInChunk = if (text.isEmpty()) 0 else text.count { it == '\n' } + if (text.endsWith("\n")) 0 else 1
+            return TextPageChunk(
+                content = text,
+                startOffset = alignedStart,
+                endOffset = alignedEnd,
+                totalBytes = total,
+                pageIndex = safePage,
+                totalPages = totalPages,
+                startLineNumber = startLine,
+                lineCount = linesInChunk.coerceAtLeast(1),
+            )
+        }
+    }
+
+    /** 流式搜索超大文本文件（零 OOM，返回行号、字节偏移与对应分页索引）。 */
+    fun searchLargeFile(
+        file: File,
+        query: String,
+        useRegex: Boolean = false,
+        caseSensitive: Boolean = false,
+        encoding: TextEncoding = TextEncoding.UTF_8,
+        pageBytes: Int = 64 * 1024,
+        maxHits: Int = 120,
+    ): List<LargeSearchHit> {
+        if (query.isEmpty() || !file.isFile) return emptyList()
+        val regex = if (useRegex) {
+            val opts = if (caseSensitive) emptySet() else setOf(RegexOption.IGNORE_CASE)
+            runCatching { Regex(query, opts) }.getOrNull() ?: return emptyList()
+        } else null
+        val hits = mutableListOf<LargeSearchHit>()
+        val charset = encoding.charset()
+        var lineNo = 1
+        var byteOffset = 0L
+        val lineBuf = java.io.ByteArrayOutputStream(256)
+        val chunk = ByteArray(65_536)
+        file.inputStream().use { input ->
+            while (hits.size < maxHits) {
+                val n = input.read(chunk)
                 if (n <= 0) break
-                off += n
+                var segStart = 0
+                for (i in 0 until n) {
+                    if (chunk[i] == '\n'.code.toByte()) {
+                        lineBuf.write(chunk, segStart, i - segStart)
+                        val lineBytesLen = lineBuf.size() + 1L
+                        val text = String(lineBuf.toByteArray(), charset).trimEnd('\r')
+                        val matched = if (regex != null) regex.containsMatchIn(text) else text.contains(query, ignoreCase = !caseSensitive)
+                        if (matched) {
+                            hits += LargeSearchHit(
+                                lineNumber = lineNo,
+                                byteOffset = byteOffset,
+                                pageIndex = (byteOffset / pageBytes).toInt(),
+                                previewLine = text.trim().take(160),
+                            )
+                            if (hits.size >= maxHits) break
+                        }
+                        byteOffset += lineBytesLen
+                        lineNo++
+                        lineBuf.reset()
+                        segStart = i + 1
+                    }
+                }
+                if (segStart < n && hits.size < maxHits) {
+                    if (lineBuf.size() < 256 * 1024) {
+                        lineBuf.write(chunk, segStart, n - segStart)
+                    } else {
+                        byteOffset += (n - segStart)
+                    }
+                }
             }
         }
-        val text = String(buf, encoding.charset()).replace("\r\n", "\n")
-        return TextPageChunk(text, start, start + len, total, safePage, totalPages)
+        if (hits.size < maxHits && lineBuf.size() > 0) {
+            val text = String(lineBuf.toByteArray(), charset).trimEnd('\r')
+            val matched = if (regex != null) regex.containsMatchIn(text) else text.contains(query, ignoreCase = !caseSensitive)
+            if (matched) {
+                hits += LargeSearchHit(
+                    lineNumber = lineNo,
+                    byteOffset = byteOffset,
+                    pageIndex = (byteOffset / pageBytes).toInt(),
+                    previewLine = text.trim().take(160),
+                )
+            }
+        }
+        return hits
+    }
+
+    private fun readFully(raf: RandomAccessFile, buf: ByteArray, len: Int): Int {
+        var off = 0
+        while (off < len) {
+            val n = raf.read(buf, off, len - off)
+            if (n <= 0) break
+            off += n
+        }
+        return off
     }
 
     /** 读取指定偏移的十六进制页（默认 4KB/页 = 256 行）。 */

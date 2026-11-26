@@ -1,7 +1,15 @@
 package com.galiais.agent.engine
 
 import android.util.Base64
+import com.galiais.agent.GaliaisApplication
+import com.galiais.agent.engine.fs.FileRef
+import com.galiais.agent.engine.fs.FileScope
+import com.galiais.agent.engine.fs.LineEnding
+import com.galiais.agent.engine.fs.TextCodec
+import com.galiais.agent.engine.fs.TextEncoding
+import com.galiais.agent.engine.fs.UnifiedFileRepository
 import org.json.JSONArray
+import java.io.File
 
 data class FileEntry(val name: String, val path: String, val directory: Boolean)
 
@@ -15,9 +23,17 @@ data class GitCommit(val hash: String, val subject: String, val author: String, 
 
 data class GitOverview(val isRepo: Boolean, val statusText: String, val diffs: List<FileDiff>)
 
-/** 通过 Codex app-server 操作本地 Linux 工作区；文件操作由用户在界面中直接发起。 */
+/**
+ * 本地 Linux 工作区操作门面：
+ * - 文件读写优先直通 [UnifiedFileRepository] 统一安全事务引擎（支持 8KB 二进制魔数守卫、三段 GBK/UTF-16 编码探测、原子保权保软链写回，彻底告别全量 Base64 传输）；
+ * - 命令执行、模糊搜索与 Git 视图仍通过 Codex app-server 提供原生支持。
+ */
 class WorkspaceFiles(private val runtime: RuntimeClient, private val environment: EnvSshRepository) {
     private fun check(path: String) = require(path.startsWith("/") && !path.contains('\u0000') && path.split('/').none { it == ".." }) { "路径无效" }
+
+    private fun fileManager(): UnifiedFileRepository? = (runtime.app as? GaliaisApplication)?.fileManager
+
+    private fun refFor(path: String): FileRef = FileRef(FileScope.LINUX_WORKSPACE, path)
 
     suspend fun list(path: String): List<FileEntry> {
         check(path)
@@ -33,7 +49,6 @@ class WorkspaceFiles(private val runtime: RuntimeClient, private val environment
 
     suspend fun read(path: String, limit: Int = 256 * 1024): FilePreview {
         check(path)
-        val bytes = Base64.decode(runtime.requestObject(EngineKind.CODEX, "fs/readFile", jsonOf("path" to path)).optString("dataBase64"), Base64.DEFAULT)
         val ext = path.substringAfterLast('.', "").lowercase()
         val imgMime = when (ext) {
             "png" -> "image/png"
@@ -43,16 +58,44 @@ class WorkspaceFiles(private val runtime: RuntimeClient, private val environment
             "bmp" -> "image/bmp"
             else -> null
         }
+        val fm = fileManager()
+        if (fm != null) {
+            val ref = refFor(path)
+            val node = runCatching { fm.stat(ref) }.getOrNull()
+            if (node != null && !node.isDirectory) {
+                if (imgMime != null && node.size in 1L..(8L * 1024 * 1024)) {
+                    val imgBytes = fm.stageReadableFile(ref, maxBytes = 8L * 1024 * 1024).readBytes()
+                    if (imgBytes.isNotEmpty()) return FilePreview.Image(imgBytes, imgMime)
+                }
+                val head = fm.readHeaderBytes(ref, 8192)
+                if (TextCodec.looksBinary(head)) {
+                    return FilePreview.Binary(node.size.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+                }
+                val (doc, _) = fm.readTextDocument(ref, maxBytes = limit.toLong())
+                return FilePreview.Text(doc.text, doc.truncated || node.size > limit.toLong())
+            }
+        }
+        val bytes = Base64.decode(runtime.requestObject(EngineKind.CODEX, "fs/readFile", jsonOf("path" to path)).optString("dataBase64"), Base64.DEFAULT)
         if (imgMime != null && bytes.isNotEmpty() && bytes.size <= 8 * 1024 * 1024) {
             return FilePreview.Image(bytes, imgMime)
         }
         val head = bytes.copyOf(minOf(bytes.size, limit))
-        if (head.take(8000).any { it == 0.toByte() }) return FilePreview.Binary(bytes.size)
-        return FilePreview.Text(String(head, Charsets.UTF_8), bytes.size > limit)
+        if (TextCodec.looksBinary(head)) return FilePreview.Binary(bytes.size)
+        val doc = TextCodec.decodeBytes(head, totalBytes = bytes.size.toLong(), truncated = bytes.size > limit)
+        return FilePreview.Text(doc.text, bytes.size > limit)
     }
 
     suspend fun readBytes(path: String, maxBytes: Int = 8 * 1024 * 1024): ByteArray {
         check(path)
+        val fm = fileManager()
+        if (fm != null) {
+            val ref = refFor(path)
+            val node = runCatching { fm.stat(ref) }.getOrNull()
+            if (node != null && !node.isDirectory) {
+                require(node.size <= maxBytes.toLong()) { "文件超过大小上限（${maxBytes / (1024 * 1024)} MB）" }
+                return fm.stageReadableFile(ref, maxBytes = maxBytes.toLong()).readBytes()
+            }
+        }
         val raw = Base64.decode(runtime.requestObject(EngineKind.CODEX, "fs/readFile", jsonOf("path" to path)).optString("dataBase64"), Base64.DEFAULT)
         require(raw.size <= maxBytes) { "文件超过大小上限（${maxBytes / (1024 * 1024)} MB）" }
         return raw
@@ -61,13 +104,33 @@ class WorkspaceFiles(private val runtime: RuntimeClient, private val environment
     suspend fun writeBytes(path: String, bytes: ByteArray, maxBytes: Int = 8 * 1024 * 1024) {
         check(path)
         require(bytes.size <= maxBytes) { "文件超过 ${maxBytes / (1024 * 1024)} MB，无法直接传入工作区" }
+        val fm = fileManager()
+        if (fm != null) {
+            val tmp = File.createTempFile("ws-write-", ".tmp", runtime.app.cacheDir)
+            try {
+                tmp.writeBytes(bytes)
+                fm.writeLocalFileTo(refFor(path), tmp)
+                return
+            } finally {
+                tmp.delete()
+            }
+        }
         val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
         runtime.requestObject(EngineKind.CODEX, "fs/writeFile", jsonOf("path" to path, "dataBase64" to b64))
     }
 
     suspend fun write(path: String, content: String) {
         val bytes = content.toByteArray(Charsets.UTF_8)
-        require(bytes.size <= 2 * 1024 * 1024) { "文件超过 2 MB，不支持在线保存" }
+        require(bytes.size <= 4 * 1024 * 1024) { "文件超过 4 MB，不支持在线保存" }
+        val fm = fileManager()
+        if (fm != null) {
+            val ref = refFor(path)
+            val existing = runCatching { fm.readTextDocument(ref, maxBytes = 256 * 1024).first }.getOrNull()
+            val enc = existing?.encoding ?: TextEncoding.UTF_8
+            val eol = existing?.lineEnding ?: LineEnding.LF
+            fm.writeTextDocument(ref, content, enc, eol)
+            return
+        }
         writeBytes(path, bytes)
     }
 

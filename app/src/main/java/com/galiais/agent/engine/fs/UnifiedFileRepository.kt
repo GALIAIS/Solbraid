@@ -89,7 +89,7 @@ class UnifiedFileRepository(
     val backupOnRootEdit: StateFlow<Boolean> = backupOnRootEditFlow.asStateFlow()
 
     private val runtimeMode: String get() = settings.state.value.effectiveRuntimeMode
-    private val hasRoot: Boolean get() = runtime.rootAvailable.value == true
+    internal val hasRoot: Boolean get() = runtime.rootAvailable.value == true
     val activeTab: FileTab get() = tabsFlow.value.firstOrNull { it.id == activeTabIdFlow.value } ?: tabsFlow.value.first()
 
     // ── 标签页与导航管理 ──────────────────────────────────────────────────
@@ -362,10 +362,10 @@ class UnifiedFileRepository(
 
     // ── 核心目录枚举与元数据（自动透明提权，永不误报无权限） ────────────────
 
-    suspend fun list(scope: FileScope, path: String): List<FileNode> = withContext(Dispatchers.IO) {
+    suspend fun list(scope: FileScope, path: String, includeHidden: Boolean = false): List<FileNode> = withContext(Dispatchers.IO) {
         val norm = normalizeVfsPath(path)
         if (scope == FileScope.ANDROID_STORAGE && norm.startsWith("saf://")) {
-            return@withContext listSafPath(norm)
+            return@withContext listSafPath(norm, includeHidden)
         }
         val phys = physicalPathFor(scope, norm)
         val rawNodes = when {
@@ -383,10 +383,10 @@ class UnifiedFileRepository(
                 }
             }
         }
-        applySortAndFilter(rawNodes)
+        if (includeHidden) rawNodes else applySortAndFilter(rawNodes)
     }
 
-    private fun listSafPath(safPath: String): List<FileNode> {
+    internal fun parseSafRef(safPath: String): Triple<MountedSafTree, Uri, String> {
         val withoutScheme = safPath.removePrefix("saf://")
         val treeId = withoutScheme.substringBefore('/')
         val tree = safTreesFlow.value.firstOrNull { it.id == treeId }
@@ -394,7 +394,16 @@ class UnifiedFileRepository(
         val treeUri = Uri.parse(tree.uriString)
         val docIdEncoded = withoutScheme.substringAfter('/', "")
         val docId = if (docIdEncoded.isEmpty()) DocumentsContract.getTreeDocumentId(treeUri) else Uri.decode(docIdEncoded)
-        return applySortAndFilter(LocalFsHelper.listSafChildren(app, treeUri, docId, "saf://$treeId"))
+        return Triple(tree, treeUri, docId)
+    }
+
+    internal fun isSafPath(scope: FileScope, path: String): Boolean =
+        scope == FileScope.ANDROID_STORAGE && path.startsWith("saf://")
+
+    private fun listSafPath(safPath: String, includeHidden: Boolean = false): List<FileNode> {
+        val (tree, treeUri, docId) = parseSafRef(safPath)
+        val children = LocalFsHelper.listSafChildren(app, treeUri, docId, "saf://${tree.id}")
+        return if (includeHidden) children else applySortAndFilter(children)
     }
 
     private fun applySortAndFilter(nodes: List<FileNode>): List<FileNode> {
@@ -417,6 +426,10 @@ class UnifiedFileRepository(
 
     suspend fun stat(ref: FileRef): FileNode = withContext(Dispatchers.IO) {
         val norm = ref.normalizedPath
+        if (isSafPath(ref.scope, norm)) {
+            val (_, treeUri, docId) = parseSafRef(norm)
+            return@withContext LocalFsHelper.statSafDocument(app, treeUri, docId, norm)
+        }
         val phys = physicalPathFor(ref.scope, norm)
         if (usesRootBackend(ref.scope)) {
             rootDaemon.statNode(phys, ref.scope, norm)
@@ -424,6 +437,63 @@ class UnifiedFileRepository(
             runCatching { LocalFsHelper.statLocalFile(File(phys), ref.scope, norm) }
                 .getOrElse { if (hasRoot) rootDaemon.statNode(phys, ref.scope, norm) else throw it }
         }
+    }
+
+    /** 快速判断文件或相对路径目标是否已存在（完整兼容四域与 saf://）。 */
+    suspend fun exists(ref: FileRef): Boolean = withContext(Dispatchers.IO) {
+        runCatching { stat(ref); true }.getOrDefault(false)
+    }
+
+    /** 判断目录下某个相对路径（支持 a/b/c.kt 与 saf://）是否已存在，若存在返回对应 FileRef。 */
+    suspend fun findExistingInDirectory(scope: FileScope, parentDir: String, relativePath: String): FileRef? = withContext(Dispatchers.IO) {
+        val segments = runCatching { splitValidatedRelativePath(relativePath) }.getOrNull() ?: return@withContext null
+        val normDir = normalizeVfsPath(parentDir)
+        if (isSafPath(scope, normDir)) {
+            val (tree, treeUri, startDocId) = runCatching { parseSafRef(normDir) }.getOrNull() ?: return@withContext null
+            var curDocId = startDocId
+            for (idx in segments.indices) {
+                val found = LocalFsHelper.findSafChildByName(app, treeUri, curDocId, segments[idx]) ?: return@withContext null
+                if (idx < segments.lastIndex && !found.second) return@withContext null
+                curDocId = found.first
+            }
+            return@withContext FileRef(scope, "saf://${tree.id}/${Uri.encode(curDocId)}")
+        }
+        val full = normalizeVfsPath(if (normDir == "/") "/${segments.joinToString("/")}" else "$normDir/${segments.joinToString("/")}")
+        val ref = FileRef(scope, full)
+        if (exists(ref)) ref else null
+    }
+
+    /** 仅读取文件前 maxBytes（默认 8KB）用于快速魔数/二进制守卫，避免盲读整个大文件。 */
+    suspend fun readHeaderBytes(ref: FileRef, maxBytes: Int = 8192): ByteArray = withContext(Dispatchers.IO) {
+        val norm = ref.normalizedPath
+        if (isSafPath(ref.scope, norm)) {
+            val (_, treeUri, docId) = parseSafRef(norm)
+            LocalFsHelper.openSafInput(app, treeUri, docId).use { input ->
+                val buf = ByteArray(maxBytes)
+                var got = 0
+                while (got < maxBytes) {
+                    val n = input.read(buf, got, maxBytes - got)
+                    if (n <= 0) break
+                    got += n
+                }
+                return@withContext buf.copyOf(got)
+            }
+        }
+        val phys = File(physicalPathFor(ref.scope, norm))
+        if (!usesRootBackend(ref.scope) && phys.isFile && phys.canRead()) {
+            phys.inputStream().use { input ->
+                val buf = ByteArray(maxBytes)
+                var got = 0
+                while (got < maxBytes) {
+                    val n = input.read(buf, got, maxBytes - got)
+                    if (n <= 0) break
+                    got += n
+                }
+                return@withContext buf.copyOf(got)
+            }
+        }
+        val staged = stageReadableFile(ref, maxBytes = maxBytes.toLong())
+        staged.readBytes().let { if (it.size > maxBytes) it.copyOf(maxBytes) else it }
     }
 
     suspend fun queryMountInfo(scope: FileScope, path: String): MountInfo? = withContext(Dispatchers.IO) {
@@ -451,65 +521,125 @@ class UnifiedFileRepository(
         }
     }
 
-    /** 将任意存储域的文件准备为本地可直接读的 File（普通文件零拷贝返回原路径，Root/SAF 文件高速暂存到缓存）。 */
+    /** 将任意存储域的文件准备为本地可直接读的 File（普通文件零拷贝返回原路径，Root/SAF/伪文件高速暂存到缓存）。 */
     suspend fun stageReadableFile(ref: FileRef, maxBytes: Long = -1L): File = withContext(Dispatchers.IO) {
         val norm = ref.normalizedPath
-        if (ref.scope == FileScope.ANDROID_STORAGE && norm.startsWith("saf://")) {
-            val withoutScheme = norm.removePrefix("saf://")
-            val treeId = withoutScheme.substringBefore('/')
-            val docId = Uri.decode(withoutScheme.substringAfter('/'))
-            val tree = safTreesFlow.value.firstOrNull { it.id == treeId } ?: error("SAF 挂载已失效")
-            val dst = File(File(app.cacheDir, "file-viewer").apply { mkdirs() }, ExternalStorageBridge.sanitizeFilename(docId.substringAfterLast('/')))
-            LocalFsHelper.openSafInput(app, Uri.parse(tree.uriString), docId).use { input ->
-                dst.outputStream().use { input.copyTo(it) }
+        if (isSafPath(ref.scope, norm)) {
+            val (_, treeUri, docId) = parseSafRef(norm)
+            val viewerDir = File(app.cacheDir, "file-viewer").apply { mkdirs() }
+            val safeName = ExternalStorageBridge.sanitizeFilename(docId.substringAfterLast('/').ifBlank { "saf_file" })
+            val dst = File(viewerDir, "${UUID.randomUUID().toString().take(6)}_$safeName")
+            LocalFsHelper.openSafInput(app, treeUri, docId).use { input ->
+                dst.outputStream().use { out ->
+                    if (maxBytes > 0L) copyAtMost(input, out, maxBytes) else input.copyTo(out)
+                }
             }
+            com.galiais.agent.LinuxRuntime.pruneViewerCacheDir(app, keepFile = dst)
             return@withContext dst
         }
         val phys = File(physicalPathFor(ref.scope, norm))
-        if (!usesRootBackend(ref.scope) && phys.isFile && phys.canRead() && (maxBytes <= 0L || phys.length() <= maxBytes)) {
+        val isPseudoFs = norm.startsWith("/proc/") || norm.startsWith("/sys/") ||
+            phys.absolutePath.startsWith("/proc/") || phys.absolutePath.startsWith("/sys/")
+        if (!usesRootBackend(ref.scope) && !isPseudoFs && phys.isFile && phys.canRead() && (maxBytes <= 0L || phys.length() <= maxBytes)) {
             return@withContext phys
         }
         val viewerDir = File(app.cacheDir, "file-viewer").apply { mkdirs() }
         val safeName = ExternalStorageBridge.sanitizeFilename(ref.name)
         val outFile = File(viewerDir, "${UUID.randomUUID().toString().take(6)}_$safeName")
-        if (phys.isFile && phys.canRead()) {
+        val effectiveCap = when {
+            maxBytes > 0L -> maxBytes
+            isPseudoFs -> 1_048_576L
+            else -> -1L
+        }
+        if (!usesRootBackend(ref.scope) && phys.exists() && !phys.isDirectory && phys.canRead()) {
             phys.inputStream().use { input ->
                 outFile.outputStream().use { out ->
-                    if (maxBytes > 0L) {
-                        val buf = ByteArray(65_536)
-                        var remain = maxBytes
-                        while (remain > 0L) {
-                            val n = input.read(buf, 0, minOf(buf.size.toLong(), remain).toInt())
-                            if (n <= 0) break
-                            out.write(buf, 0, n)
-                            remain -= n
-                        }
-                    } else input.copyTo(out)
+                    if (effectiveCap > 0L) copyAtMost(input, out, effectiveCap) else input.copyTo(out)
                 }
             }
+            com.galiais.agent.LinuxRuntime.pruneViewerCacheDir(app, keepFile = outFile)
             outFile
         } else if (hasRoot) {
-            rootDaemon.stageFileToReadable(phys.absolutePath, outFile, maxBytes)
+            rootDaemon.stageFileToReadable(phys.absolutePath, outFile, effectiveCap)
+            com.galiais.agent.LinuxRuntime.pruneViewerCacheDir(app, keepFile = outFile)
             outFile
         } else {
             throw IllegalStateException("无权读取文件：${ref.path}")
         }
     }
 
-    /** 将本地暂存文件写入任意目标路径（Root 路径自动原子提交并完整保留原权限、属主和 SELinux 上下文）。 */
-    suspend fun writeLocalFileTo(ref: FileRef, stagedSrc: File) = withContext(Dispatchers.IO) {
-        assertWriteAllowed(ref.scope, ref.normalizedPath)
-        val phys = File(physicalPathFor(ref.scope, ref.normalizedPath))
-        val needRoot = usesRootBackend(ref.scope) || (!phys.parentFile.let { it != null && it.canWrite() } && hasRoot) || (phys.exists() && !phys.canWrite() && hasRoot)
+    private fun copyAtMost(input: java.io.InputStream, output: java.io.OutputStream, maxBytes: Long) {
+        val buf = ByteArray(65_536)
+        var remain = maxBytes
+        while (remain > 0L) {
+            val n = input.read(buf, 0, minOf(buf.size.toLong(), remain).toInt())
+            if (n <= 0) break
+            output.write(buf, 0, n)
+            remain -= n
+        }
+    }
+
+    /**
+     * 将本地暂存文件原子写入任意目标路径（四域全覆盖）：
+     * - `saf://`：通过 DocumentsContract 流式写回；
+     * - Root 域：通过 RootFsDaemon 透传软链、保留 mode/uid:gid/SELinux 并原子替换（保护分区先检只读挂载）；
+     * - 本地普通域：透传软链不摧毁链接、保留原 POSIX 权限（不丢 `+x`）、同目录临时文件 `fsync + rename`。
+     */
+    suspend fun writeLocalFileTo(ref: FileRef, stagedSrc: File, createModeOctal: String? = null) = withContext(Dispatchers.IO) {
+        val norm = ref.normalizedPath
+        if (isSafPath(ref.scope, norm)) {
+            val (_, treeUri, docId) = parseSafRef(norm)
+            LocalFsHelper.openSafOutput(app, treeUri, docId).use { out ->
+                stagedSrc.inputStream().use { input -> input.copyTo(out) }
+                out.flush()
+            }
+            return@withContext
+        }
+        assertWriteAllowed(ref.scope, norm)
+        val phys = File(physicalPathFor(ref.scope, norm))
+        if (ref.scope == FileScope.HOST_ROOT && hasRoot) {
+            val mount = runCatching { rootDaemon.queryMountInfo(phys.absolutePath) }.getOrNull()
+            if (mount?.readOnly == true) {
+                throw IllegalStateException("目标分区（${mount.mountPoint}）当前为只读挂载（ro），无法直接写入")
+            }
+        }
+        val needRoot = usesRootBackend(ref.scope) ||
+            (!phys.parentFile.let { it != null && it.canWrite() } && hasRoot) ||
+            (phys.exists() && !phys.canWrite() && hasRoot)
         if (needRoot) {
-            rootDaemon.commitStagedFileAtomic(stagedSrc, phys.absolutePath, createBackup = backupOnRootEditFlow.value && ref.scope.isRootElevated)
+            rootDaemon.commitStagedFileAtomic(
+                stagedSrc = stagedSrc,
+                physicalDst = phys.absolutePath,
+                createBackup = backupOnRootEditFlow.value && ref.scope.isRootElevated,
+                createModeOctal = createModeOctal ?: "644",
+            )
         } else {
-            phys.parentFile?.mkdirs()
-            val tmp = File(phys.parentFile, ".${phys.name}.solbraid.${UUID.randomUUID().toString().take(6)}")
+            val (targetFile, origMode) = LocalFsHelper.resolveWritableTargetPreservingSymlink(phys)
+            targetFile.parentFile?.mkdirs()
+            val tmp = File(targetFile.parentFile, ".${targetFile.name}.solbraid.${UUID.randomUUID().toString().take(6)}")
+            val modeToApply = origMode ?: createModeOctal?.trim()?.toIntOrNull(8)
             try {
-                stagedSrc.inputStream().use { input -> tmp.outputStream().use { input.copyTo(it); it.fd.sync() } }
-                if (!tmp.renameTo(phys)) {
-                    stagedSrc.inputStream().use { input -> phys.outputStream().use { input.copyTo(it); it.fd.sync() } }
+                stagedSrc.inputStream().use { input ->
+                    tmp.outputStream().use { out ->
+                        input.copyTo(out)
+                        out.flush()
+                        out.fd.sync()
+                    }
+                }
+                if (modeToApply != null) {
+                    runCatching { android.system.Os.chmod(tmp.absolutePath, modeToApply) }
+                }
+                if (!tmp.renameTo(targetFile)) {
+                    stagedSrc.inputStream().use { input ->
+                        targetFile.outputStream().use { out ->
+                            input.copyTo(out)
+                            out.flush()
+                            out.fd.sync()
+                        }
+                    }
+                    if (modeToApply != null) {
+                        runCatching { android.system.Os.chmod(targetFile.absolutePath, modeToApply) }
+                    }
                     tmp.delete()
                 }
             } catch (e: Exception) {
@@ -522,28 +652,115 @@ class UnifiedFileRepository(
     suspend fun readTextDocument(ref: FileRef, encodingOverride: TextEncoding? = null, maxBytes: Long = 2L * 1024 * 1024): Pair<DecodedTextDocument, String> =
         withContext(Dispatchers.IO) {
             val node = runCatching { stat(ref) }.getOrNull()
+            if (node?.isSpecialFile == true) {
+                throw IllegalStateException("不支持以文本方式打开特殊设备或管道文件：${ref.name}")
+            }
             val totalSize = node?.size ?: -1L
             val truncated = totalSize > maxBytes
             val staged = stageReadableFile(ref, maxBytes = if (truncated) maxBytes else -1L)
             val bytes = staged.readBytes()
-            val doc = TextCodec.decodeBytes(bytes, encodingOverride, totalBytes = if (totalSize >= 0L) totalSize else bytes.size.toLong(), truncated = truncated)
-            val rev = "${node?.lastModifiedMs ?: staged.lastModified()}:${node?.size ?: bytes.size}"
-            doc to rev
+            val sha = TextCodec.sha256Hex(bytes)
+            val effectiveSize = if (totalSize > 0L) totalSize else bytes.size.toLong()
+            val revision = FileRevision(
+                mtimeMs = node?.lastModifiedMs ?: staged.lastModified(),
+                sizeBytes = effectiveSize,
+                sha256 = sha,
+            )
+            val doc = TextCodec.decodeBytes(
+                bytes = bytes,
+                encodingOverride = encodingOverride,
+                totalBytes = effectiveSize,
+                truncated = truncated,
+                revision = revision,
+            )
+            doc to revision.encode()
         }
 
-    suspend fun writeTextDocument(ref: FileRef, text: String, encoding: TextEncoding, lineEnding: LineEnding): String =
-        withContext(Dispatchers.IO) {
-            val bytes = TextCodec.encodeText(text, encoding, lineEnding)
-            val tmp = rootDaemon.newStageFile("edit-")
-            try {
-                tmp.writeBytes(bytes)
-                writeLocalFileTo(ref, tmp)
-            } finally {
-                tmp.delete()
-            }
-            val node = runCatching { stat(ref) }.getOrNull()
-            "${node?.lastModifiedMs ?: System.currentTimeMillis()}:${node?.size ?: bytes.size}"
+    suspend fun writeTextDocument(
+        ref: FileRef,
+        text: String,
+        encoding: TextEncoding,
+        lineEnding: LineEnding,
+        preserveTrailingNewline: Boolean? = null,
+        createModeOctal: String? = null,
+    ): String = withContext(Dispatchers.IO) {
+        val bytes = TextCodec.encodeText(text, encoding, lineEnding, preserveTrailingNewline)
+        val tmp = rootDaemon.newStageFile("edit-")
+        try {
+            tmp.writeBytes(bytes)
+            writeLocalFileTo(ref, tmp, createModeOctal = createModeOctal)
+        } finally {
+            tmp.delete()
         }
+        val node = runCatching { stat(ref) }.getOrNull()
+        val rev = FileRevision(
+            mtimeMs = node?.lastModifiedMs ?: System.currentTimeMillis(),
+            sizeBytes = node?.size ?: bytes.size.toLong(),
+            sha256 = TextCodec.sha256Hex(bytes),
+        )
+        rev.encode()
+    }
+
+    /**
+     * 超大文件零 OOM 局部字节窗口替换：
+     * 流式拼装 `[0..startOffset) + replacementBytes + [endOffset..EOF)` 到临时文件后原子写回（完整保留权限/软链/SAF）。
+     */
+    suspend fun patchFileByteRange(
+        ref: FileRef,
+        startOffset: Long,
+        endOffset: Long,
+        replacementBytes: ByteArray,
+        expectedSizeBytes: Long? = null,
+        expectedMtimeMs: Long? = null,
+    ): FileNode = withContext(Dispatchers.IO) {
+        require(startOffset >= 0L && endOffset >= startOffset) { "无效的字节编辑区间：$startOffset..$endOffset" }
+        val currentNode = runCatching { stat(ref) }.getOrNull()
+        if (currentNode != null && expectedSizeBytes != null && expectedSizeBytes >= 0L && currentNode.size != expectedSizeBytes) {
+            throw IllegalStateException("编辑期间文件大小已变更（磁盘 ${currentNode.size} B ≠ 预期 $expectedSizeBytes B），请重新加载该页后再保存")
+        }
+        if (currentNode != null && expectedMtimeMs != null && expectedMtimeMs > 0L && currentNode.lastModifiedMs > 0L && currentNode.lastModifiedMs != expectedMtimeMs) {
+            throw IllegalStateException("编辑期间磁盘文件已被其他进程修改，请重新加载该页后再保存")
+        }
+        val stagedSrc = stageReadableFile(ref)
+        val total = stagedSrc.length()
+        val safeStart = startOffset.coerceIn(0L, total)
+        val safeEnd = endOffset.coerceIn(safeStart, total)
+        val patchedTmp = rootDaemon.newStageFile("patch-")
+        try {
+            java.io.RandomAccessFile(stagedSrc, "r").use { raf ->
+                patchedTmp.outputStream().use { out ->
+                    val buf = ByteArray(65_536)
+                    // 1) 拷贝前缀 [0..safeStart)
+                    var remain = safeStart
+                    while (remain > 0L) {
+                        val n = raf.read(buf, 0, minOf(buf.size.toLong(), remain).toInt())
+                        if (n <= 0) break
+                        out.write(buf, 0, n)
+                        remain -= n
+                    }
+                    // 2) 写入替换段
+                    if (replacementBytes.isNotEmpty()) out.write(replacementBytes)
+                    // 3) 拷贝后缀 [safeEnd..total)
+                    if (safeEnd < total) {
+                        raf.seek(safeEnd)
+                        while (true) {
+                            val n = raf.read(buf)
+                            if (n <= 0) break
+                            out.write(buf, 0, n)
+                        }
+                    }
+                    out.flush()
+                    out.fd.sync()
+                }
+            }
+            writeLocalFileTo(ref, patchedTmp)
+        } finally {
+            patchedTmp.delete()
+        }
+        runCatching { stat(ref) }.getOrElse {
+            FileNode(ref.scope, ref.normalizedPath, ref.name, isDirectory = false, size = total - (safeEnd - safeStart) + replacementBytes.size, lastModifiedMs = System.currentTimeMillis())
+        }
+    }
 
     // ── 基本目录/文件/权限/链接/回收站操作 ─────────────────────────────────
 
@@ -557,17 +774,212 @@ class UnifiedFileRepository(
         }
     }
 
-    suspend fun createEmptyFile(ref: FileRef) = withContext(Dispatchers.IO) {
-        val tmp = rootDaemon.newStageFile("empty-")
-        try { writeLocalFileTo(ref, tmp) } finally { tmp.delete() }
+    /** 在指定目录下创建单级或多级文件夹（支持 `a/b/c` 与 `saf://` 外部挂载目录）。 */
+    suspend fun createDirectoryIn(scope: FileScope, parentDir: String, relativePath: String): FileRef = withContext(Dispatchers.IO) {
+        val segments = splitValidatedRelativePath(relativePath)
+        val normDir = normalizeVfsPath(parentDir)
+        if (isSafPath(scope, normDir)) {
+            val (tree, treeUri, startDocId) = parseSafRef(normDir)
+            var curDocId = startDocId
+            for (seg in segments) {
+                val existing = LocalFsHelper.findSafChildByName(app, treeUri, curDocId, seg)
+                curDocId = when {
+                    existing != null && existing.second -> existing.first
+                    existing != null -> throw IllegalStateException("路径冲突：「$seg」已是普通文件")
+                    else -> LocalFsHelper.createSafDocument(app, treeUri, curDocId, DocumentsContract.Document.MIME_TYPE_DIR, seg)
+                }
+            }
+            return@withContext FileRef(scope, "saf://${tree.id}/${Uri.encode(curDocId)}")
+        }
+        val fullPath = normalizeVfsPath(if (normDir == "/") "/${segments.joinToString("/")}" else "$normDir/${segments.joinToString("/")}")
+        mkdir(scope, fullPath)
+        FileRef(scope, fullPath)
     }
 
+    /**
+     * 安全创建文件（全四域 + `saf://` + 多级路径级联建目录 + 防重名清空三选一策略 + 初始内容与权限位预设）。
+     * 默认采用 [CreateConflictPolicy.FAIL_IF_EXISTS]，遇到已有目标时抛出 [FileAlreadyExistsVfsException]，绝不静默截断原文件。
+     */
+    suspend fun createFileInDirectory(
+        scope: FileScope,
+        parentDir: String,
+        relativePath: String,
+        initialBytes: ByteArray = ByteArray(0),
+        octalMode: String = "644",
+        conflictPolicy: CreateConflictPolicy = CreateConflictPolicy.FAIL_IF_EXISTS,
+    ): FileRef = withContext(Dispatchers.IO) {
+        val segments = splitValidatedRelativePath(relativePath)
+        val normDir = normalizeVfsPath(parentDir)
+        val leafName = segments.last()
+        val parentSegments = segments.dropLast(1)
+
+        if (isSafPath(scope, normDir)) {
+            val (tree, treeUri, startDocId) = parseSafRef(normDir)
+            var curDocId = startDocId
+            for (seg in parentSegments) {
+                val existing = LocalFsHelper.findSafChildByName(app, treeUri, curDocId, seg)
+                curDocId = when {
+                    existing != null && existing.second -> existing.first
+                    existing != null -> throw IllegalStateException("路径冲突：「$seg」已是普通文件")
+                    else -> LocalFsHelper.createSafDocument(app, treeUri, curDocId, DocumentsContract.Document.MIME_TYPE_DIR, seg)
+                }
+            }
+            val existingLeaf = LocalFsHelper.findSafChildByName(app, treeUri, curDocId, leafName)
+            var targetDocId: String
+            if (existingLeaf != null) {
+                val existingRef = FileRef(scope, "saf://${tree.id}/${Uri.encode(existingLeaf.first)}")
+                if (existingLeaf.second) throw IllegalStateException("同名文件夹已存在：$leafName")
+                when (conflictPolicy) {
+                    CreateConflictPolicy.FAIL_IF_EXISTS -> throw FileAlreadyExistsVfsException(existingRef)
+                    CreateConflictPolicy.AUTO_RENAME -> {
+                        val freeName = pickUniqueSafName(treeUri, curDocId, leafName)
+                        targetDocId = LocalFsHelper.createSafDocument(app, treeUri, curDocId, TextCodec.guessMimeType(freeName), freeName)
+                    }
+                    CreateConflictPolicy.OVERWRITE_WITH_BACKUP -> {
+                        val bakName = pickUniqueSafName(treeUri, curDocId, "$leafName.bak")
+                        val bakDocId = LocalFsHelper.createSafDocument(app, treeUri, curDocId, "application/octet-stream", bakName)
+                        LocalFsHelper.openSafInput(app, treeUri, existingLeaf.first).use { input ->
+                            LocalFsHelper.openSafOutput(app, treeUri, bakDocId).use { out -> input.copyTo(out); out.flush() }
+                        }
+                        targetDocId = existingLeaf.first
+                    }
+                }
+            } else {
+                targetDocId = LocalFsHelper.createSafDocument(app, treeUri, curDocId, TextCodec.guessMimeType(leafName), leafName)
+            }
+            if (initialBytes.isNotEmpty() || conflictPolicy == CreateConflictPolicy.OVERWRITE_WITH_BACKUP) {
+                LocalFsHelper.openSafOutput(app, treeUri, targetDocId).use { out ->
+                    if (initialBytes.isNotEmpty()) out.write(initialBytes)
+                    out.flush()
+                }
+            }
+            return@withContext FileRef(scope, "saf://${tree.id}/${Uri.encode(targetDocId)}")
+        }
+
+        val targetParentDir = if (parentSegments.isEmpty()) normDir else {
+            val sub = normalizeVfsPath(if (normDir == "/") "/${parentSegments.joinToString("/")}" else "$normDir/${parentSegments.joinToString("/")}")
+            mkdir(scope, sub)
+            sub
+        }
+        val baseRef = FileRef(scope, joinVfsPath(targetParentDir, leafName))
+        createFile(baseRef, initialBytes, octalMode = octalMode, conflictPolicy = conflictPolicy)
+    }
+
+    private fun pickUniqueSafName(treeUri: Uri, parentDocId: String, name: String): String {
+        val stem = name.substringBeforeLast('.', name)
+        val ext = name.substringAfterLast('.', "").let { if (it == name || it.isEmpty()) "" else ".$it" }
+        var idx = 1
+        var candidate = name
+        while (LocalFsHelper.findSafChildByName(app, treeUri, parentDocId, candidate) != null) {
+            candidate = "$stem ($idx)$ext"
+            idx++
+        }
+        return candidate
+    }
+
+    /** 独占/策略化创建指定路径文件（绝不静默清空已有文件）。 */
+    suspend fun createFile(
+        ref: FileRef,
+        initialBytes: ByteArray = ByteArray(0),
+        octalMode: String = "644",
+        conflictPolicy: CreateConflictPolicy = CreateConflictPolicy.FAIL_IF_EXISTS,
+    ): FileRef = withContext(Dispatchers.IO) {
+        val norm = ref.normalizedPath
+        if (isSafPath(ref.scope, norm)) {
+            throw IllegalStateException("在外部 SAF 目录新建文件请使用 createFileInDirectory")
+        }
+        assertWriteAllowed(ref.scope, norm)
+        val safeMode = octalMode.trim().takeIf { Regex("^[0-7]{3,4}$").matches(it) } ?: "644"
+        val modeInt = safeMode.toInt(8)
+
+        fun buildUniqueRef(baseRef: FileRef): FileRef {
+            val baseName = baseRef.name
+            val stem = baseName.substringBeforeLast('.', baseName)
+            val ext = baseName.substringAfterLast('.', "").let { if (it == baseName || it.isEmpty()) "" else ".$it" }
+            var idx = 1
+            var candidate = baseRef
+            while (runCatching {
+                    val p = File(physicalPathFor(candidate.scope, candidate.normalizedPath))
+                    if (usesRootBackend(candidate.scope)) {
+                        runCatching { rootDaemon.statNode(p.absolutePath, candidate.scope, candidate.normalizedPath); true }.getOrDefault(false)
+                    } else p.exists()
+                }.getOrDefault(false)
+            ) {
+                candidate = FileRef(baseRef.scope, joinVfsPath(baseRef.parentPath, "$stem ($idx)$ext"))
+                idx++
+            }
+            return candidate
+        }
+
+        val targetRef = when (conflictPolicy) {
+            CreateConflictPolicy.AUTO_RENAME -> buildUniqueRef(ref)
+            else -> ref
+        }
+        val phys = File(physicalPathFor(targetRef.scope, targetRef.normalizedPath))
+        val needRoot = usesRootBackend(targetRef.scope) ||
+            (!phys.parentFile.let { it != null && it.canWrite() } && hasRoot) ||
+            (phys.exists() && !phys.canWrite() && hasRoot)
+
+        if (conflictPolicy == CreateConflictPolicy.OVERWRITE_WITH_BACKUP) {
+            val alreadyExists = runCatching { stat(targetRef); true }.getOrDefault(false)
+            if (alreadyExists) {
+                val bakRef = buildUniqueRef(FileRef(targetRef.scope, joinVfsPath(targetRef.parentPath, "${targetRef.name}.bak")))
+                val stagedOld = stageReadableFile(targetRef)
+                writeLocalFileTo(bakRef, stagedOld)
+            }
+            val tmp = rootDaemon.newStageFile("create-")
+            try {
+                tmp.writeBytes(initialBytes)
+                writeLocalFileTo(targetRef, tmp, createModeOctal = safeMode)
+            } finally {
+                tmp.delete()
+            }
+            return@withContext targetRef
+        }
+
+        // FAIL_IF_EXISTS 与 AUTO_RENAME 均使用底层原子独占创建（O_EXCL / Root EEXIST）
+        if (needRoot) {
+            val tmp = rootDaemon.newStageFile("create-")
+            try {
+                tmp.writeBytes(initialBytes)
+                rootDaemon.commitStagedFileAtomic(
+                    stagedSrc = tmp,
+                    physicalDst = phys.absolutePath,
+                    createBackup = false,
+                    createModeOctal = safeMode,
+                    failIfExists = true,
+                )
+            } catch (e: IllegalStateException) {
+                if (e.message == "EEXIST") throw FileAlreadyExistsVfsException(targetRef)
+                throw e
+            } finally {
+                tmp.delete()
+            }
+        } else {
+            try {
+                LocalFsHelper.createFileExclusiveLocal(phys, initialBytes, modeInt)
+            } catch (_: FileAlreadyExistsException) {
+                throw FileAlreadyExistsVfsException(targetRef)
+            }
+        }
+        targetRef
+    }
+
+    suspend fun createEmptyFile(ref: FileRef): FileRef =
+        createFile(ref, ByteArray(0), octalMode = "644", conflictPolicy = CreateConflictPolicy.FAIL_IF_EXISTS)
+
     suspend fun rename(ref: FileRef, newName: String): FileRef = withContext(Dispatchers.IO) {
+        val norm = ref.normalizedPath
+        if (isSafPath(ref.scope, norm)) {
+            val (tree, treeUri, docId) = parseSafRef(norm)
+            val newDocId = LocalFsHelper.renameSafDocument(app, treeUri, docId, newName.trim())
+            return@withContext FileRef(ref.scope, "saf://${tree.id}/${Uri.encode(newDocId)}")
+        }
         val dstPath = joinVfsPath(ref.parentPath, newName)
-        assertWriteAllowed(ref.scope, ref.normalizedPath)
+        assertWriteAllowed(ref.scope, norm)
         assertWriteAllowed(ref.scope, dstPath)
-        require(!rootDaemon.isUnremovablePath(ref.scope, ref.normalizedPath)) { "不允许重命名受保护的系统或工作区根目录" }
-        val srcFile = File(physicalPathFor(ref.scope, ref.normalizedPath))
+        require(!rootDaemon.isUnremovablePath(ref.scope, norm)) { "不允许重命名受保护的系统或工作区根目录" }
+        val srcFile = File(physicalPathFor(ref.scope, norm))
         val dstFile = File(physicalPathFor(ref.scope, dstPath))
         if (usesRootBackend(ref.scope) || !srcFile.renameTo(dstFile)) {
             if (hasRoot) rootDaemon.rename(srcFile.absolutePath, dstFile.absolutePath)
@@ -576,7 +988,16 @@ class UnifiedFileRepository(
         FileRef(ref.scope, dstPath)
     }
 
-    suspend fun duplicate(ref: FileRef): FileRef = withContext(Dispatchers.IO) {
+    suspend fun duplicate(ref: FileRef, parentDir: String = ref.parentPath): FileRef = withContext(Dispatchers.IO) {
+        if (isSafPath(ref.scope, ref.path)) {
+            val node = stat(ref)
+            val stem = node.name.substringBeforeLast('.', node.name)
+            val ext = node.name.removePrefix(stem)
+            val target = prepareTransferTarget(ref.scope, parentDir, "${stem}_copy$ext", node.isDirectory, ConflictPolicy.RENAME)
+                ?: error("无法创建副本")
+            copySingleRef(ref, target, AtomicBoolean(false)) {}
+            return@withContext target
+        }
         val parent = ref.parentPath
         val base = ref.name
         val stem = base.substringBeforeLast('.', base)
@@ -594,6 +1015,11 @@ class UnifiedFileRepository(
 
     suspend fun delete(ref: FileRef, moveToTrash: Boolean = false) = withContext(Dispatchers.IO) {
         val norm = ref.normalizedPath
+        if (isSafPath(ref.scope, norm)) {
+            val (_, treeUri, docId) = parseSafRef(norm)
+            check(LocalFsHelper.deleteSafDocument(app, treeUri, docId)) { "删除外部 SAF 文档失败" }
+            return@withContext
+        }
         assertWriteAllowed(ref.scope, norm)
         require(!rootDaemon.isUnremovablePath(ref.scope, norm)) { "不允许删除系统核心目录或默认工作区根目录：$norm" }
         val phys = File(physicalPathFor(ref.scope, norm))

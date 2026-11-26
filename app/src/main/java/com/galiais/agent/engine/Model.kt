@@ -312,8 +312,14 @@ sealed interface TimelineItem {
         val durationMs: Long? = null,
     ) : TimelineItem
     data class FileEdit(override val id: String, val changes: List<FileDiff>, val status: ItemStatus) : TimelineItem
-    data class ToolCall(override val id: String, val name: String, val input: String, val result: String?,
-        val status: ItemStatus) : TimelineItem
+    data class ToolCall(
+        override val id: String,
+        val name: String,
+        val input: String,
+        val result: String?,
+        val status: ItemStatus,
+        val kind: String? = null,
+    ) : TimelineItem
     data class Delegation(override val id: String, val target: EngineKind, val task: String, val child: ConversationKey?,
         val result: String?, val status: ItemStatus) : TimelineItem
     /** 用户提交结构化提问、Elicitation 表单或方案审批后的时间线回执卡。 */

@@ -91,6 +91,14 @@ export function createRegistryServer({
   const itemsDir = path.join(root, "items");
   const quarantineDir = path.join(root, "quarantine");
   const adminTokenFile = path.join(root, "admin.token");
+  let mutationTail = Promise.resolve();
+  async function acquireMutation() {
+    const previous = mutationTail;
+    let release;
+    mutationTail = new Promise(resolve => { release = resolve; });
+    await previous;
+    return release;
+  }
 
   let resolvedAdminToken = String(adminToken || process.env.SOLBRAID_REGISTRY_ADMIN_TOKEN || "").trim();
   if (!resolvedAdminToken) {
@@ -144,6 +152,7 @@ export function createRegistryServer({
   }
 
   const server = http.createServer(async (req, res) => {
+    let releaseMutation = null;
     try {
       if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
       const url = new URL(req.url || "/", "http://127.0.0.1");
@@ -182,6 +191,7 @@ export function createRegistryServer({
       if (req.method === "POST" && dlMatch) {
         const id = decodeURIComponent(dlMatch[1]);
         const body = await readBody(req).catch(() => ({}));
+        releaseMutation = await acquireMutation();
         const catalog = await readJsonSafe(catalogFile, {schemaVersion: "1.0.0", items: []});
         const entry = (catalog.items || []).find(it => it.id === id && (!body.kind || it.kind === body.kind));
         if (!entry || entry.audit?.verdict !== "approved") {
@@ -209,6 +219,7 @@ export function createRegistryServer({
         if (!RESOURCE_KINDS.includes(kind) || !SAFE_RESOURCE_ID_RE.test(id) || id.includes("..")) {
           return sendJson(res, 400, {error: "无效的资源类型或标识"});
         }
+        releaseMutation = await acquireMutation();
         const catalog = await readJsonSafe(catalogFile, {schemaVersion: "1.0.0", updatedAt: 0, items: []});
         const existing = (catalog.items || []).find(x => x.id === id && x.kind === kind);
         if (!existing) return sendJson(res, 404, {error: "未找到该资源"});
@@ -248,6 +259,12 @@ export function createRegistryServer({
         };
 
         const audit = await reviewResourceBundle(bundle, {llmConfig, requireLlm});
+        releaseMutation = await acquireMutation();
+        const catalog = await readJsonSafe(catalogFile, {schemaVersion: "1.0.0", updatedAt: 0, items: []});
+        const prev = (catalog.items || []).find(x => x.id === bundle.id && x.kind === bundle.kind);
+        if (prev && !actor.isAdmin && prev.ownerId !== actor.ownerId) {
+          return sendJson(res, 403, {error: `资源 ${kind}/${id} 已归属其他作者，无权覆盖更新`});
+        }
         const subId = `sub-${randomUUID().slice(0, 8)}`;
         const subs = await readJsonSafe(submissionsFile, []);
         subs.unshift({
@@ -270,15 +287,15 @@ export function createRegistryServer({
         }
 
         const now = Date.now();
-        await writeJsonAtomic(path.join(itemsDir, bundle.kind, `${bundle.id}.json`), {
+        const bundleFile = path.join(itemsDir, bundle.kind, `${bundle.id}.json`);
+        const previousBundle = await readJsonSafe(bundleFile, null);
+        const publishedBundle = {
           ...bundle,
           sha256: audit.sha256,
           audit,
           publishedAt: now,
           updatedAt: now,
-        });
-        const catalog = await readJsonSafe(catalogFile, {schemaVersion: "1.0.0", updatedAt: 0, items: []});
-        const prev = (catalog.items || []).find(x => x.id === bundle.id && x.kind === bundle.kind);
+        };
         const ownerId = prev?.ownerId || actor.ownerId;
         const entry = {
           id: bundle.id,
@@ -297,13 +314,26 @@ export function createRegistryServer({
         };
         catalog.items = [entry, ...(catalog.items || []).filter(x => !(x.id === bundle.id && x.kind === bundle.kind))];
         catalog.updatedAt = now;
-        await writeJsonAtomic(catalogFile, catalog);
+        await writeJsonAtomic(bundleFile, publishedBundle);
+        try {
+          await writeJsonAtomic(catalogFile, catalog);
+        } catch (error) {
+          try {
+            if (previousBundle) await writeJsonAtomic(bundleFile, previousBundle);
+            else await fs.rm(bundleFile, {force: true});
+          } catch (restoreError) {
+            throw new AggregateError([error, restoreError], "发布失败，资源包恢复失败");
+          }
+          throw error;
+        }
         return sendJson(res, 201, {status: "approved", submissionId: subId, audit, item: entry});
       }
 
       sendJson(res, 404, {error: "Not Found"});
     } catch (err) {
       sendJson(res, 500, {error: err?.message || String(err)});
+    } finally {
+      releaseMutation?.();
     }
   });
   server.adminToken = resolvedAdminToken;

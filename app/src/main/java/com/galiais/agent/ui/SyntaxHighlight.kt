@@ -76,6 +76,44 @@ object SyntaxHighlight {
         }
     }
 
+    /**
+     * 窗口化语法高亮（突破 40KB 硬限制至 350KB）：
+     * - <= 40KB：全文走缓存高亮；
+     * - 40KB..350KB：仅高亮可视区附近行对齐切片（约 36KB），前后区保持纯色，严格保持字符索引 1:1 对应；
+     * - > 350KB：退化为纯色以避免低端设备掉帧。
+     */
+    fun highlightWindowed(
+        code: String,
+        language: String?,
+        palette: CodePalette = CodePalettes.githubDark,
+        visibleStartChar: Int = 0,
+        visibleEndChar: Int = 36_000,
+    ): AnnotatedString {
+        if (code.length <= 40_000) return highlight(code, language, palette)
+        if (code.length > 350_000) return AnnotatedString(code, SpanStyle(color = palette.ink))
+        val maxWindow = 36_000
+        val rawStart = visibleStartChar.coerceIn(0, code.length)
+        val rawEnd = visibleEndChar.coerceIn(rawStart, (rawStart + maxWindow).coerceAtMost(code.length))
+        // 对齐到完整行边界，防止切在注释/字符串中间导致高亮错位
+        val winStart = if (rawStart == 0) 0 else code.lastIndexOf('\n', rawStart - 1).let { if (it < 0) 0 else it + 1 }
+        val winEnd = if (rawEnd >= code.length) code.length else code.indexOf('\n', rawEnd).let { if (it < 0) code.length else it }
+        val clampedEnd = minOf(winEnd, winStart + maxWindow).coerceAtLeast(winStart)
+        val slice = code.substring(winStart, clampedEnd)
+        val styledSlice = highlight(slice, language, palette)
+        return buildAnnotatedString {
+            if (winStart > 0) {
+                append(code.substring(0, winStart))
+                addStyle(SpanStyle(color = palette.ink), 0, winStart)
+            }
+            append(styledSlice)
+            if (clampedEnd < code.length) {
+                val tailStart = length
+                append(code.substring(clampedEnd))
+                addStyle(SpanStyle(color = palette.ink), tailStart, length)
+            }
+        }
+    }
+
     fun highlight(code: String, language: String?, palette: CodePalette = CodePalettes.githubDark): AnnotatedString {
         val plainColor = palette.ink
         val commentColor = palette.comment

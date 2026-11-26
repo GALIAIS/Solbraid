@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="mobile_use_accessibility_desc">允许 Solbraid 在免 Root（PRoot）或无 Root 环境下，经你授权后由 AI 执行手机截屏、界面结构读取、点击、滑动与中文文本输入，并在操控期间显示实时悬浮紧急停止按钮。</string>
+</resources>

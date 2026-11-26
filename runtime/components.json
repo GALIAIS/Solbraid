@@ -50,6 +50,7 @@
     "provider-translators.mjs",
     "usage-ledger.mjs",
     "agent-hub.mjs",
+    "safe-file-io.mjs",
     "acp-driver.mjs",
     "cli-bridge-driver.mjs",
     "dev-tools-hub.mjs",

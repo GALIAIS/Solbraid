@@ -88,6 +88,7 @@ import com.galiais.agent.engine.fs.pasteClipboard
 import com.galiais.agent.engine.fs.search
 import com.galiais.agent.ui.files.BatchRenameDialog
 import com.galiais.agent.ui.files.CodeEditorDialog
+import com.galiais.agent.ui.files.CreateFileDialog
 import com.galiais.agent.ui.files.CompactRootStatusBar
 import com.galiais.agent.ui.files.CreateAndImportSheet
 import com.galiais.agent.ui.files.DiskUsageAnalyzerSheet
@@ -311,9 +312,27 @@ fun FilesScreen(
             fm.navigate(node.scope, node.path)
             return
         }
+        if (node.isSpecialFile) {
+            app.conversations.notify("特殊设备或管道文件无法直接打开：${node.name}")
+            return
+        }
         fm.recordRecent(node.ref)
-        val cat = TextCodec.classifyFile(node.name, ByteArray(0))
-        if (cat == ViewerCategory.TEXT_CODE) editorTarget = node.ref to null else viewerTarget = node.ref
+        val quickCat = TextCodec.classifyFile(node.name, ByteArray(0))
+        if (quickCat != ViewerCategory.TEXT_CODE) {
+            viewerTarget = node.ref
+            return
+        }
+        // 无扩展名或未知后缀文件：先仅读 8KB 文件头执行魔数/二进制守卫，避免将 ELF/SQLite/压缩包强解码为文本
+        val hasKnownTextExt = SyntaxHighlight.languageFromPath(node.name) != null || node.extension in setOf("txt", "log", "md", "markdown", "csv", "tsv")
+        if (hasKnownTextExt || node.size == 0L) {
+            editorTarget = node.ref to null
+            return
+        }
+        scope.launch {
+            val header = runCatching { fm.readHeaderBytes(node.ref, 8192) }.getOrDefault(ByteArray(0))
+            val resolved = TextCodec.classifyFile(node.name, header)
+            if (resolved == ViewerCategory.TEXT_CODE) editorTarget = node.ref to null else viewerTarget = node.ref
+        }
     }
 
     val parentPath = remember(path) {
@@ -810,7 +829,7 @@ fun FilesScreen(
             onCut = { fm.setClipboard(ClipboardMode.CUT, listOf(node.ref)); app.conversations.notify("已剪切：${node.name}") },
             onDuplicate = {
                 scope.launch {
-                    runCatching { fm.duplicate(node.ref) }
+                    runCatching { fm.duplicate(node.ref, parentDir = path) }
                         .onSuccess { app.conversations.notify("已创建副本：${it.name}"); reload++ }
                         .onFailure { app.conversations.notify("创建副本失败：${it.message}") }
                 }
@@ -972,20 +991,28 @@ fun FilesScreen(
     // ── 基础文本输入与确认弹窗 ──────────────────────────────────────────────
 
     if (creatingFile) {
-        SingleInputDialog("新建文件", "文件名（如 notes.md、app.py）", confirmLabel = "创建并编辑", onConfirm = { name ->
-            val ref = FileRef(activeScope, joinVfsPath(path, name))
-            scope.launch {
-                runCatching { fm.createEmptyFile(ref) }
-                    .onSuccess { reload++; editorTarget = ref to null }
-                    .onFailure { app.conversations.notify("创建失败：${it.message}") }
-            }
-        }) { creatingFile = false }
+        CreateFileDialog(
+            app = app,
+            fileScope = activeScope,
+            currentDir = path,
+            onCreated = { createdRef, openInEditor ->
+                creatingFile = false
+                reload++
+                app.conversations.notify("已创建文件：${createdRef.name}")
+                if (openInEditor) editorTarget = createdRef to null
+            },
+            onOpenExisting = { existingRef ->
+                creatingFile = false
+                editorTarget = existingRef to null
+            },
+            onDismiss = { creatingFile = false },
+        )
     }
 
     if (creatingDir) {
-        SingleInputDialog("新建文件夹", "文件夹名称", confirmLabel = "创建", onConfirm = { name ->
+        SingleInputDialog("新建文件夹", "文件夹名或相对路径（如 src/utils）", confirmLabel = "创建", onConfirm = { name ->
             scope.launch {
-                runCatching { fm.mkdir(activeScope, joinVfsPath(path, name)) }
+                runCatching { fm.createDirectoryIn(activeScope, path, name) }
                     .onSuccess { app.conversations.notify("已创建目录：$name"); reload++ }
                     .onFailure { app.conversations.notify("创建失败：${it.message}") }
             }

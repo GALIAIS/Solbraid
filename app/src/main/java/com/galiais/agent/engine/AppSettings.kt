@@ -4,6 +4,7 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import com.galiais.agent.engine.mobile.MobileUseConfig
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -103,6 +104,8 @@ data class SettingsState(
     val downloadNetwork: DownloadNetworkConfig = DownloadNetworkConfig(),
     /** 本机纯本地 ARM64 APK 自迭代闭环配置（默认关闭，可在设置完全自由配置）。 */
     val selfBuild: SelfBuildConfig = SelfBuildConfig(),
+    /** 双模式 AI 手机操控（Mobile-Use）配置：chroot/Root 与 PRoot/无障碍统一护栏与后端路由。 */
+    val mobileUse: MobileUseConfig = MobileUseConfig(),
 ) {
     /** 兼容旧调用：明暗模式。 */
     val themeMode: String get() = theme.mode
@@ -256,6 +259,7 @@ data class SelfBuildConfig(
     val androidHome: String = "/home/agent/android-sdk",
     val javaHome: String = "",
     val aapt2Path: String = "",
+    val signingPropertiesPath: String = "/home/agent/.galiais/self-build-signing.properties",
     val targetAbis: String = "arm64-v8a",
     val variant: String = "debug",
     val gradleHeapMb: Int = 4096,
@@ -292,6 +296,7 @@ data class SelfBuildConfig(
             androidHome = cleanSdk,
             javaHome = cleanJava,
             aapt2Path = cleanAapt2,
+            signingPropertiesPath = cleanPath(signingPropertiesPath, "签名配置文件", allowEmpty = false),
             customGradleArgs = cleanExtra,
         )
     }
@@ -307,6 +312,7 @@ data class SelfBuildConfig(
         .put("androidHome", androidHome)
         .put("javaHome", javaHome)
         .put("aapt2Path", aapt2Path)
+        .put("signingPropertiesPath", signingPropertiesPath)
         .put("targetAbis", targetAbis)
         .put("variant", variant)
         .put("gradleHeapMb", gradleHeapMb)
@@ -328,6 +334,7 @@ data class SelfBuildConfig(
                     androidHome = obj.optString("androidHome", "/home/agent/android-sdk").ifBlank { "/home/agent/android-sdk" },
                     javaHome = obj.optString("javaHome", ""),
                     aapt2Path = obj.optString("aapt2Path", ""),
+                    signingPropertiesPath = obj.optString("signingPropertiesPath", "/home/agent/.galiais/self-build-signing.properties"),
                     targetAbis = obj.optString("targetAbis", "arm64-v8a").takeIf { it in SELF_BUILD_ABIS } ?: "arm64-v8a",
                     variant = obj.optString("variant", "debug").takeIf { it in SELF_BUILD_VARIANTS } ?: "debug",
                     gradleHeapMb = obj.optInt("gradleHeapMb", 4096).takeIf { it in SELF_BUILD_HEAP_OPTIONS } ?: 4096,
@@ -562,6 +569,7 @@ class AppSettings(context: Context) {
             roleRoutes = loadRoleRoutes(ids),
             downloadNetwork = DownloadNetworkConfig.fromJson(prefs.getString("runtime.downloadNetwork", null)),
             selfBuild = SelfBuildConfig.fromJson(prefs.getString(SELF_BUILD_CONFIG_KEY, null)),
+            mobileUse = MobileUseConfig.fromJson(prefs.getString(MOBILE_USE_CONFIG_KEY, null)),
         )
     }
 
@@ -573,6 +581,11 @@ class AppSettings(context: Context) {
     fun setSelfBuildConfig(config: SelfBuildConfig) {
         val validated = config.validated()
         edit { putString(SELF_BUILD_CONFIG_KEY, validated.toJson().toString()) }
+    }
+
+    fun setMobileUseConfig(config: MobileUseConfig) {
+        val validated = config.validated()
+        edit { putString(MOBILE_USE_CONFIG_KEY, validated.toJson().toString()) }
     }
 
     private fun loadRoleRoutes(validProviderIds: Set<String>): Map<String, RoleRouteConfig> {
@@ -1141,5 +1154,6 @@ class AppSettings(context: Context) {
         const val SSH_TUNNELS_KEY = "ssh.tunnels.v1"
         const val CHAT_DRAFT_PREFIX = "chat.draft."
         const val SELF_BUILD_CONFIG_KEY = "selfbuild.config.v1"
+        const val MOBILE_USE_CONFIG_KEY = "mobileuse.config.v1"
     }
 }

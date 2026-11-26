@@ -2,4 +2,6 @@
 <paths>
     <cache-path name="exports" path="exports/" />
     <cache-path name="file_viewer" path="file-viewer/" />
+    <cache-path name="self_build_apks" path="self-build-apks/" />
+    <cache-path name="mobile_shots" path="mobile-shots/" />
 </paths>

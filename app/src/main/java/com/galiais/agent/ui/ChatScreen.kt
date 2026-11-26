@@ -129,7 +129,12 @@ import com.galiais.agent.engine.TimelineItem
 import com.galiais.agent.engine.TokenUsage
 import com.galiais.agent.engine.WorkspaceFiles
 import com.galiais.agent.engine.extractArtifactsFromItems
+import com.galiais.agent.engine.fs.FileRef
+import com.galiais.agent.engine.fs.FileScope
+import com.galiais.agent.engine.fs.normalizeVfsPath
+import com.galiais.agent.engine.jsonOf
 import com.galiais.agent.engine.selectedModel
+import com.galiais.agent.ui.files.CodeEditorDialog
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -193,6 +198,9 @@ fun ChatScreen(
     var deleting by remember { mutableStateOf(false) }
     var showDiffs by remember { mutableStateOf(false) }
     var inspectedDiffs by remember { mutableStateOf<List<FileDiff>?>(null) }
+    var diffEditorTarget by remember { mutableStateOf<Pair<FileRef, Int>?>(null) }
+    var pendingRevertFile by remember { mutableStateOf<String?>(null) }
+    var revertingSingleFile by remember { mutableStateOf(false) }
     var showPreview by remember { mutableStateOf(false) }
     var showInfo by remember { mutableStateOf(false) }
     var showMentions by remember { mutableStateOf(false) }
@@ -1056,10 +1064,33 @@ fun ChatScreen(
                 onOpenPanel = { pid, art -> studioPluginId = pid; studioArtifact = art },
                 onInjectPrompt = { txt -> replaceDraft(if (draft.isBlank()) txt else "$draft\n$txt") },
             )
+            val resolveDiffAbsPath: (String) -> String = remember(cwd) {
+                { rawPath ->
+                    val trimmed = rawPath.trim()
+                    val joined = when {
+                        trimmed.startsWith("/") -> trimmed
+                        !cwd.isNullOrBlank() -> cwd.trimEnd('/') + "/" + trimmed.trimStart('/')
+                        else -> "/home/agent/workspace/" + trimmed.trimStart('/')
+                    }
+                    normalizeVfsPath(joined)
+                }
+            }
+            val diffActions = remember(key, cwd) {
+                DiffActionCallbacks(
+                    onOpenInEditor = { rawPath, lineNo ->
+                        val absPath = resolveDiffAbsPath(rawPath)
+                        diffEditorTarget = FileRef(FileScope.LINUX_WORKSPACE, absPath) to lineNo.coerceAtLeast(1)
+                    },
+                    onRevertFile = { rawPath ->
+                        pendingRevertFile = resolveDiffAbsPath(rawPath)
+                    },
+                )
+            }
             // 单容器浮层架构：消息列表延伸至底部透明输入框后方，/ 与 @ 悬浮窗叠加于列表之上不挤压 LazyColumn 重排。
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 CompositionLocalProvider(
                     LocalFileLinkHandler provides openFileLink,
+                    LocalDiffActions provides diffActions,
                     LocalPluginMessageFooter provides (pluginMessageFooterSlots to { slot, msg -> triggerPluginUiSlot(slot, msg.text) }),
                 ) {
                 LazyColumn(
@@ -1148,6 +1179,7 @@ fun ChatScreen(
                             activeTurnStartedAt = state?.turnStartedAt,
                             expandByDefault = settings.expandThinking,
                             cwd = cwd,
+                            focusText = state?.focusText,
                             editingUserMessageId = editingTarget?.id,
                             onOpenConversation = onOpenConversation,
                             onCancelDelegation = { app.conversations.cancelDelegation(key) },
@@ -2456,11 +2488,91 @@ fun ChatScreen(
             dismissButton = { TextButton(onClick = { claudeRewindTarget = null }) { Text("取消", color = G.inkMuted) } },
         )
     }
+    val sheetDiffActions = remember(key, cwd) {
+        DiffActionCallbacks(
+            onOpenInEditor = { rawPath, lineNo ->
+                val trimmed = rawPath.trim()
+                val joined = when {
+                    trimmed.startsWith("/") -> trimmed
+                    !cwd.isNullOrBlank() -> cwd.trimEnd('/') + "/" + trimmed.trimStart('/')
+                    else -> "/home/agent/workspace/" + trimmed.trimStart('/')
+                }
+                inspectedDiffs = null
+                showDiffs = false
+                diffEditorTarget = FileRef(FileScope.LINUX_WORKSPACE, normalizeVfsPath(joined)) to lineNo.coerceAtLeast(1)
+            },
+            onRevertFile = { rawPath ->
+                val trimmed = rawPath.trim()
+                val joined = when {
+                    trimmed.startsWith("/") -> trimmed
+                    !cwd.isNullOrBlank() -> cwd.trimEnd('/') + "/" + trimmed.trimStart('/')
+                    else -> "/home/agent/workspace/" + trimmed.trimStart('/')
+                }
+                pendingRevertFile = normalizeVfsPath(joined)
+            },
+        )
+    }
     inspectedDiffs?.let { diffs ->
-        DiffOverviewSheet(null, diffs, cwd = cwd, onDismiss = { inspectedDiffs = null })
+        CompositionLocalProvider(LocalDiffActions provides sheetDiffActions) {
+            DiffOverviewSheet(null, diffs, cwd = cwd, onDismiss = { inspectedDiffs = null })
+        }
     }
     if (showDiffs) {
-        DiffOverviewSheet(state?.turnDiff, fileEdits, cwd = cwd, onDismiss = { showDiffs = false })
+        CompositionLocalProvider(LocalDiffActions provides sheetDiffActions) {
+            DiffOverviewSheet(state?.turnDiff, fileEdits, cwd = cwd, onDismiss = { showDiffs = false })
+        }
+    }
+    diffEditorTarget?.let { (ref, lineNo) ->
+        CodeEditorDialog(
+            app = app,
+            fileRef = ref,
+            initialLine = lineNo,
+            onDismiss = { diffEditorTarget = null },
+            onSendToAgent = { _, mention ->
+                diffEditorTarget = null
+                replaceDraft(if (draft.isBlank()) "@$mention " else "$draft @$mention ")
+                composerFocus.requestFocus()
+            },
+        )
+    }
+    pendingRevertFile?.let { targetAbsPath ->
+        val displayName = targetAbsPath.substringAfterLast('/').ifBlank { targetAbsPath }
+        GaliaisConfirmDialog(
+            title = "撤回单文件修改？",
+            message = "将恢复「$displayName」到本轮 Agent 修改前的快照状态（回滚前会自动保存当前版本以便二次反悔）。",
+            confirmText = if (revertingSingleFile) "回滚中…" else "确认撤回",
+            danger = true,
+            onConfirm = {
+                if (revertingSingleFile) return@GaliaisConfirmDialog
+                revertingSingleFile = true
+                scope.launch {
+                    try {
+                        val res = app.runtime.hubRequest(
+                            "files/revertCheckpoint",
+                            jsonOf(
+                                "sessionId" to key.id,
+                                "filePath" to targetAbsPath,
+                                "cwd" to (cwd ?: "/home/agent/workspace"),
+                            ),
+                            15_000,
+                        )
+                        val action = res.optString("action")
+                        val note = when (action) {
+                            "deleted" -> "已撤回新建文件：$displayName"
+                            "git_restored" -> "已通过 Git 还原：$displayName（已留存回滚前快照）"
+                            else -> "已还原文件：$displayName（已留存回滚前快照）"
+                        }
+                        app.conversations.notify(note)
+                    } catch (e: Exception) {
+                        app.conversations.notify("单文件撤回失败：${e.message}")
+                    } finally {
+                        revertingSingleFile = false
+                        pendingRevertFile = null
+                    }
+                }
+            },
+            onDismiss = { if (!revertingSingleFile) pendingRevertFile = null },
+        )
     }
     if (showPreview) {
         LivePreviewSheet(app, onDismiss = { showPreview = false })

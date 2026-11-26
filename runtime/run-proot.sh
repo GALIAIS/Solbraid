@@ -31,8 +31,8 @@ export PROOT_TMP_DIR="$cache/proot-tmp"
 export TMPDIR="$cache/proot-tmp"
 if test "$mode_root" = 1; then
     exec "$nlib/libproot.so" --link2symlink -0 -r "$root" -b /dev -b /proc -b /sys -b "$nlib:/opt/galiais-native" -b "$nlib/libbin_codex.so:$codex_path" -w / \
-        /usr/bin/env -i HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt GALIAIS_RUNTIME_MODE=proot GALIAIS_RUNTIME_GENERATION="$nlib" "$@"
+        /usr/bin/env -i HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt GALIAIS_RUNTIME_MODE=proot GALIAIS_LAUNCH_ID="${GALIAIS_LAUNCH_ID:-}" GALIAIS_RUNTIME_GENERATION="$nlib" "$@"
 else
     exec "$nlib/libproot.so" --link2symlink -i 60000:60000 -r "$root" -b /dev -b /proc -b /sys -b "$nlib:/opt/galiais-native" -b "$nlib/libbin_codex.so:$codex_path" -w /home/agent/workspace \
-        /usr/bin/env -i HOME=/home/agent USER=agent LOGNAME=agent PATH=/opt/galiais-codex/usr/lib/chatgpt/resources:/home/agent/.local/bin:/home/agent/.galiais/npm-global/bin:/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt GALIAIS_RUNTIME_MODE=proot GALIAIS_RUNTIME_GENERATION="$nlib" "$@"
+        /usr/bin/env -i HOME=/home/agent USER=agent LOGNAME=agent PATH=/opt/galiais-codex/usr/lib/chatgpt/resources:/home/agent/.local/bin:/home/agent/.galiais/npm-global/bin:/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt GALIAIS_RUNTIME_MODE=proot GALIAIS_LAUNCH_ID="${GALIAIS_LAUNCH_ID:-}" GALIAIS_RUNTIME_GENERATION="$nlib" "$@"
 fi

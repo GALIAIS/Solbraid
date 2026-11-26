@@ -11,6 +11,15 @@ import {pathToFileURL, fileURLToPath} from "node:url";
 import {scanStaticSecurity} from "./ai-reviewer.mjs";
 import {spawnIsolatedPluginWorker} from "./plugin-worker-host.mjs";
 import {readDownloadNetwork, downloadEnvironment} from "./download-network.mjs";
+import {
+  safeReadTextFile,
+  safeEditFile,
+  safeCreateFile,
+  streamSearchFile,
+  revertFileCheckpoint,
+  atomicWriteTextFile,
+  resolveSafeHomePath,
+} from "./safe-file-io.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -1609,7 +1618,7 @@ export class PluginKernel {
       const abs = path.resolve(filesDir, rel);
       if (!abs.startsWith(path.resolve(filesDir) + path.sep)) continue;
       await fs.mkdir(path.dirname(abs), {recursive: true});
-      await fs.writeFile(abs, content, {encoding: "utf8", mode: 0o644});
+      await atomicWriteTextFile(abs, content, {captureCheckpoint: false, preserveMetadata: false, defaultMode: 0o644});
     }
     await writeJsonAtomic(path.join(snapDir, "meta.json"), {
       id: snapId,
@@ -1879,7 +1888,7 @@ export class PluginKernel {
           throw new Error(`非法文件路径越界：${rel}`);
         }
         await fs.mkdir(path.dirname(abs), {recursive: true});
-        await fs.writeFile(abs, content, {encoding: "utf8", mode: 0o644});
+        await atomicWriteTextFile(abs, content, {captureCheckpoint: false, preserveMetadata: false, defaultMode: 0o644});
       }
     } catch (writeErr) {
       await fs.rm(stageDir, {recursive: true, force: true}).catch(() => {});
@@ -2347,6 +2356,7 @@ export class PluginKernel {
       androidHome: "/home/agent/android-sdk",
       javaHome: "",
       aapt2Path: "",
+      signingPropertiesPath: "/home/agent/.galiais/self-build-signing.properties",
       targetAbis: "arm64-v8a",
       variant: "debug",
       gradleHeapMb: 4096,
@@ -2390,6 +2400,7 @@ export class PluginKernel {
       androidHome: cleanPath(merged.androidHome, defaults.androidHome) || defaults.androidHome,
       javaHome: cleanPath(merged.javaHome, ""),
       aapt2Path: cleanPath(merged.aapt2Path, ""),
+      signingPropertiesPath: cleanPath(merged.signingPropertiesPath, defaults.signingPropertiesPath) || defaults.signingPropertiesPath,
       targetAbis: abis,
       variant,
       gradleHeapMb,
@@ -2424,6 +2435,9 @@ export class PluginKernel {
     apkPath = "",
     confirmInstall = false,
     confirmRollback = false,
+    onHostInstallApk = null,
+    onHostRollbackApk = null,
+    onHostStatus = null,
   } = {}) {
     const act = String(action || "status").trim().toLowerCase();
     const cfg = await this.getSelfBuildConfig();
@@ -2444,6 +2458,7 @@ export class PluginKernel {
       ANDROID_HOME: cfg.androidHome,
       ANDROID_SDK_ROOT: cfg.androidHome,
       SOLBRAID_GRADLE_HEAP_MB: String(cfg.gradleHeapMb),
+      SOLBRAID_SIGNING_PROPERTIES: cfg.signingPropertiesPath,
       SOLBRAID_WATCHDOG_ENABLED: cfg.watchdogEnabled ? "true" : "false",
       SOLBRAID_WATCHDOG_TIMEOUT: String(cfg.watchdogTimeoutSec),
       ...(cfg.javaHome ? {JAVA_HOME: cfg.javaHome} : {}),
@@ -2478,6 +2493,7 @@ export class PluginKernel {
         maxBuffer: 1024 * 1024,
       });
       const parsed = JSON.parse(String(stdout || "{}").trim() || "{}");
+      const hostStatus = typeof onHostStatus === "function" ? await onHostStatus() : {};
       return {
         ok: true,
         enabled: cfg.enabled,
@@ -2488,6 +2504,7 @@ export class PluginKernel {
         scriptAvailable: hasScript,
         watchdogAvailable: hasWatchdog,
         ...parsed,
+        ...hostStatus,
       };
     }
 
@@ -2561,14 +2578,8 @@ export class PluginKernel {
       const st = await fs.stat(realApk).catch(() => null);
       if (!st?.isFile()) throw new Error(`候选路径不是有效文件：${cleanApk}`);
       if (process.platform === "win32") throw new Error("自动启动看门狗安装仅支持 Android Root 环境");
-      const {stdout, stderr} = await execFileAsync("bash", [scriptPath, "apply", realApk, "--yes"], {
-        env: buildEnv,
-        timeout: 20_000,
-        maxBuffer: 512 * 1024,
-      });
-      let parsed = null;
-      try { parsed = JSON.parse(String(stdout || "").trim()); } catch {}
-      return parsed || {ok: true, output: String(stdout || stderr || "").trim()};
+      if (typeof onHostInstallApk !== "function") throw new Error("Android 安装服务未连接，请重新连接应用");
+      return await onHostInstallApk(realApk);
     }
 
     if (act === "rollback") {
@@ -2579,14 +2590,8 @@ export class PluginKernel {
         throw new Error("安全护栏：回滚上一稳定版本将重启 Solbraid，请确认后传入 confirmRollback: true");
       }
       if (process.platform === "win32") throw new Error("看门狗回滚仅支持 Android Root 环境");
-      const {stdout, stderr} = await execFileAsync("bash", [scriptPath, "rollback", "--yes"], {
-        env: buildEnv,
-        timeout: 20_000,
-        maxBuffer: 512 * 1024,
-      });
-      let parsed = null;
-      try { parsed = JSON.parse(String(stdout || "").trim()); } catch {}
-      return parsed || {ok: true, output: String(stdout || stderr || "").trim()};
+      if (typeof onHostRollbackApk !== "function") throw new Error("Android 回滚服务未连接，请重新连接应用");
+      return await onHostRollbackApk();
     }
 
     throw new Error(`不支持的自构建动作：${act}（可选 status | bootstrap | build | apply | rollback）`);
@@ -2869,7 +2874,118 @@ export async function startPluginControlServer(kernel, options = {}) {
       case "listTranslators":
         return {translators: kernel.snapshot().translators};
       case "selfBuild":
-        return await serialize(() => kernel.manageSelfBuild({...params, source: "agent"}));
+        return await serialize(() => kernel.manageSelfBuild({
+          ...params,
+          source: "agent",
+          onHostInstallApk: options.onHostInstallApk || null,
+          onHostStatus: options.onHostStatus || null,
+        }));
+      case "selfBuildRequestRollback": {
+        if (typeof options.onHostRollbackRequest !== "function") throw new Error("Android 回滚服务未连接");
+        return await options.onHostRollbackRequest();
+      }
+      case "fileRead": {
+        const target = await resolveSafeHomePath(params.path, {cwd: params.cwd, allowedRoot: kernel.home});
+        const res = await safeReadTextFile(target, {
+          startLine: params.startLine ?? params.line,
+          endLine: params.endLine,
+          limit: params.limit,
+          encoding: params.encoding,
+        });
+        return {
+          path: target,
+          encoding: res.encoding,
+          lineEnding: res.lineEnding,
+          startLine: res.startLine,
+          endLine: res.endLine,
+          lineCount: res.lineCount,
+          totalLines: res.totalLines,
+          totalBytes: res.totalBytes,
+          truncated: res.truncated,
+          sha256: res.sha256,
+          content: res.numberedContent,
+        };
+      }
+      case "fileEdit":
+        return await serialize(async () => {
+          const target = await resolveSafeHomePath(params.path, {cwd: params.cwd, allowedRoot: kernel.home});
+          return await safeEditFile(target, {
+            oldText: params.oldText,
+            newText: params.newText,
+            replaceAll: params.replaceAll,
+            edits: params.edits,
+            startLine: params.startLine,
+            endLine: params.endLine,
+            expectedSha256: params.expectedSha256,
+            sessionId: params.sessionId || "agent-fs",
+          });
+        });
+      case "fileCreate":
+        return await serialize(async () => {
+          const target = await resolveSafeHomePath(params.path, {cwd: params.cwd, allowedRoot: kernel.home, allowMissing: true});
+          return await safeCreateFile(target, String(params.content ?? ""), {
+            conflictPolicy: params.conflictPolicy || "fail_if_exists",
+            encoding: params.encoding || "utf-8",
+            lineEnding: params.lineEnding || "LF",
+            mode: params.mode,
+            sessionId: params.sessionId || "agent-fs",
+          });
+        });
+      case "fileSearch": {
+        const target = await resolveSafeHomePath(params.path, {cwd: params.cwd, allowedRoot: kernel.home});
+        return await streamSearchFile(target, {
+          query: params.query,
+          useRegex: Boolean(params.useRegex),
+          caseSensitive: Boolean(params.caseSensitive),
+          maxHits: params.maxHits,
+        });
+      }
+      case "fileRevert":
+        return await serialize(async () => {
+          const target = await resolveSafeHomePath(params.path, {cwd: params.cwd, allowedRoot: kernel.home, allowMissing: true});
+          return await revertFileCheckpoint({
+            sessionId: params.sessionId || "agent-fs",
+            checkpointId: String(params.checkpointId || ""),
+            filePath: target,
+          });
+        });
+      case "mobileStatus":
+      case "mobileScreenshot":
+      case "mobileUiTree":
+      case "mobileTap":
+      case "mobileSwipe":
+      case "mobileType":
+      case "mobileKey":
+      case "mobileApp":
+      case "mobileClipboard":
+      case "mobileDevice":
+      case "mobileIntent":
+      case "mobileNotification":
+      case "mobileFiles":
+      case "mobileHost": {
+        if (typeof options.onMobileUse !== "function") {
+          throw new Error("Android 手机操控桥接通道未就绪，请确认运行环境已连接到 Solbraid 宿主");
+        }
+        const mobileActionMap = {
+          mobileStatus: "status",
+          mobileScreenshot: "screenshot",
+          mobileUiTree: "ui_tree",
+          mobileTap: "tap",
+          mobileSwipe: "swipe",
+          mobileType: "type",
+          mobileKey: "key",
+          mobileApp: "app",
+          mobileClipboard: "clipboard",
+          mobileDevice: "device",
+          mobileIntent: "intent",
+          mobileNotification: "notification",
+          mobileFiles: "files",
+          mobileHost: "host",
+        };
+        const mobileAction = mobileActionMap[action];
+        const call = () => options.onMobileUse(mobileAction, params || {});
+        return mobileAction === "status" ? await call() : await serialize(call);
+      }
       default:
         throw new Error(`未知插件控制动作：${action}`);
     }

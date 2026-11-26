@@ -288,7 +288,7 @@ internal fun UserMessageBubble(
 
 @Composable
 private fun SmartToolCallCard(item: TimelineItem.ToolCall, onOpenArtifact: ((ChatArtifact) -> Unit)? = null) {
-    val parsed = remember(item.name, item.input) { describeToolCall(item.name, item.input) }
+    val parsed = remember(item.name, item.input, item.kind) { describeToolCall(item.name, item.input, item.kind) }
     val widgetArtifact = remember(item.id, item.name, item.input) { extractArtifactsFromItems(listOf(item)).firstOrNull() }
     if (widgetArtifact != null && item.status != ItemStatus.RUNNING) {
         InlineVisualArtifactCard(artifact = widgetArtifact, onOpenStudio = onOpenArtifact)
@@ -363,6 +363,7 @@ internal enum class ToolCallKind {
     SKILL,
     PLAN_TODO,
     IMAGE,
+    MOBILE,
     MCP,
     GENERIC,
 }
@@ -402,6 +403,7 @@ internal fun toolKindIcon(kind: ToolCallKind): ImageVector = when (kind) {
     ToolCallKind.SKILL -> GaliaisIcons.BookOpen
     ToolCallKind.PLAN_TODO -> GaliaisIcons.ListCheck
     ToolCallKind.IMAGE -> GaliaisIcons.Image
+    ToolCallKind.MOBILE -> GaliaisIcons.Smartphone
     ToolCallKind.MCP -> GaliaisIcons.Plug
     ToolCallKind.GENERIC -> GaliaisIcons.Wrench
 }
@@ -442,46 +444,136 @@ internal fun commandRunIcon(item: TimelineItem.CommandRun): ImageVector {
     return if (first == "git") GaliaisIcons.GitBranch else GaliaisIcons.Terminal
 }
 
-internal fun describeToolCall(rawName: String, input: String): ToolCallMeta {
+private val TOOL_RUN_PREFIX_RE = Regex("^(?:run|call|tool)\\s+", RegexOption.IGNORE_CASE)
+private val TOOL_ACTION_PREFIX_RE = Regex("^(?:file|read|view|edit|write|delete|remove|search|find|list|fetch|open)\\s+", RegexOption.IGNORE_CASE)
+
+private fun formatMcpToolLabel(cleanName: String): String {
+    val body = when {
+        cleanName.startsWith("mcp__", ignoreCase = true) -> cleanName.substring(5)
+        cleanName.startsWith("mcp_", ignoreCase = true) -> cleanName.substring(4)
+        cleanName.startsWith("mcp/", ignoreCase = true) -> cleanName.substring(4)
+        else -> cleanName
+    }
+    return body
+        .replace("__", " · ")
+        .replace("/", " · ")
+        .replace("solbraid_plugin_ctl_solbraid_", "solbraid · ")
+        .replace("solbraid_plugin_ctl_", "solbraid · ")
+        .ifBlank { cleanName }
+}
+
+internal fun describeToolCall(rawName: String, input: String, kindHint: String? = null): ToolCallMeta {
     val name = rawName.trim()
-    val lower = name.lowercase()
+    val cleanName = name.replace(TOOL_RUN_PREFIX_RE, "").trim().ifBlank { name }
+    val lower = cleanName.lowercase()
+    val kindLower = kindHint?.trim()?.lowercase().orEmpty()
     val obj = runCatching { JSONObject(input) }.getOrNull()
     fun str(vararg keys: String): String? = keys.firstNotNullOfOrNull { k ->
         obj?.optString(k)?.takeIf { it.isNotBlank() }
     }
     val plainFallback = input.trim().takeIf { it.isNotEmpty() && !it.startsWith("{") && !it.startsWith("[") }?.lineSequence()?.firstOrNull()?.take(80)
-    return when {
-        lower == "read" || lower == "cat" || lower.contains("read_file") || lower.contains("read_many") || lower.contains("view_file") || lower.contains("open_file") || lower.contains("get_file") || name.startsWith("读取") ->
-            ToolCallMeta("读取文件", str("file_path", "path", "file", "target_file")?.substringAfterLast('/') ?: plainFallback ?: name, "codex", ToolCallKind.READ_FILE)
-        lower == "ls" || lower == "tree" || lower.contains("list_dir") || lower.contains("list_files") || lower.contains("directory") || name.startsWith("列出") ->
-            ToolCallMeta("浏览目录", str("path", "dir", "directory", "dir_path") ?: plainFallback ?: name, "codex", ToolCallKind.LIST_DIR)
-        lower.contains("delete_file") || lower.contains("remove_file") ->
-            ToolCallMeta("删除文件", str("file_path", "path")?.substringAfterLast('/') ?: name, "warning", ToolCallKind.DELETE_FILE)
-        lower == "edit" || lower == "write" || lower == "multiedit" || lower.contains("edit_file") || lower.contains("write_file") || lower.contains("create_file") || lower.contains("replace") || lower.contains("patch") || lower.contains("notebookedit") ->
-            ToolCallMeta("编辑文件", str("file_path", "path", "notebook_path")?.substringAfterLast('/') ?: plainFallback ?: name, "codex", ToolCallKind.EDIT_FILE)
-        lower == "websearch" || lower.contains("web_search") || lower.contains("search_web") || lower.contains("google_search") || name == "网页搜索" ->
-            ToolCallMeta("网页搜索", str("query", "q") ?: plainFallback ?: name, "claude", ToolCallKind.WEB_SEARCH)
-        lower == "webfetch" || lower.contains("web_fetch") || lower.contains("fetch") || lower.contains("read_url") || lower.contains("browser") ->
-            ToolCallMeta("网页读取", str("url", "uri") ?: plainFallback ?: name, "claude", ToolCallKind.WEB_FETCH)
-        lower == "grep" || lower == "rg" || (lower.contains("search") && !lower.contains("web")) ->
-            ToolCallMeta("搜索代码", str("pattern", "query", "regex") ?: plainFallback ?: name, "accent", ToolCallKind.SEARCH_CODE)
-        lower == "glob" || lower.contains("find") ->
-            ToolCallMeta("查找文件", str("pattern", "path", "glob") ?: plainFallback ?: name, "accent", ToolCallKind.FIND_FILES)
-        lower == "bash" || lower == "shell" || lower.contains("exec") || lower.contains("terminal") || lower.contains("run_command") ->
-            ToolCallMeta("执行命令", str("command", "cmd") ?: plainFallback ?: name, "codex", ToolCallKind.TERMINAL)
-        lower == "agent" || lower == "task" || lower.contains("subagent") || lower.contains("collab") || name.startsWith("子代理") ->
-            ToolCallMeta("子代理", str("description", "subagent_type", "prompt") ?: plainFallback ?: name.removePrefix("子代理").trim().ifBlank { name }, "claude", ToolCallKind.SUBAGENT)
-        lower == "skill" || lower.contains("skill") ->
-            ToolCallMeta("技能", str("skill", "name") ?: plainFallback ?: name, "warning", ToolCallKind.SKILL)
-        lower == "todowrite" || lower.contains("todo") || lower == "update_plan" || lower == "plan" ->
-            ToolCallMeta("任务清单", str("explanation", "title") ?: "更新执行计划", "accent", ToolCallKind.PLAN_TODO)
-        lower.contains("image") || lower.contains("screenshot") ->
-            ToolCallMeta("查看图片", str("path", "file_path", "url")?.substringAfterLast('/') ?: plainFallback ?: name, "claude", ToolCallKind.IMAGE)
-        lower.startsWith("mcp__") || name.contains("/") || name.contains(".") -> {
-            val clean = name.removePrefix("mcp__").replace("__", " · ").replace(".", " · ")
-            ToolCallMeta("MCP", str("query", "path", "url", "command")?.let { "$clean · $it" } ?: clean, "claude", ToolCallKind.MCP)
+    val strippedSubject = cleanName.replace(TOOL_ACTION_PREFIX_RE, "").trim().ifBlank { cleanName }
+    fun pathSummary(): String {
+        val fromInput = str("file_path", "path", "Path", "TargetFile", "file", "target_file", "notebook_path")
+        if (fromInput != null) return fromInput.substringAfterLast('/')
+        if (strippedSubject != cleanName && strippedSubject.isNotBlank()) return strippedSubject.substringAfterLast('/')
+        return plainFallback ?: cleanName
+    }
+    // Solbraid 统一安全文件工具（即使通过 MCP 通道暴露，在时间线中也按原生文件工具呈现，绝不误标成生硬的「MCP」）
+    when {
+        lower.endsWith("solbraid_file_read") ->
+            return ToolCallMeta("读取文件", pathSummary(), "codex", ToolCallKind.READ_FILE)
+        lower.endsWith("solbraid_file_edit") ->
+            return ToolCallMeta("编辑文件", pathSummary(), "codex", ToolCallKind.EDIT_FILE)
+        lower.endsWith("solbraid_file_create") ->
+            return ToolCallMeta("创建文件", pathSummary(), "codex", ToolCallKind.EDIT_FILE)
+        lower.endsWith("solbraid_file_search") ->
+            return ToolCallMeta("搜索文件", str("query", "pattern") ?: pathSummary(), "accent", ToolCallKind.SEARCH_CODE)
+        lower.endsWith("solbraid_file_revert") ->
+            return ToolCallMeta("撤回文件", pathSummary(), "warning", ToolCallKind.EDIT_FILE)
+        // Solbraid 双模式 Mobile-Use 手机操控工具：按原生手机操控卡片呈现，不误标成「MCP」
+        lower.endsWith("solbraid_mobile_status") ->
+            return ToolCallMeta("手机状态", "查询 Mobile-Use 驱动状态", "accent", ToolCallKind.MOBILE)
+        lower.endsWith("solbraid_mobile_screenshot") ->
+            return ToolCallMeta("手机截屏", "捕获当前手机画面", "claude", ToolCallKind.IMAGE)
+        lower.endsWith("solbraid_mobile_ui_tree") ->
+            return ToolCallMeta("读取界面", str("query") ?: "解析当前 UI 节点树", "accent", ToolCallKind.MOBILE)
+        lower.endsWith("solbraid_mobile_tap") -> {
+            val target = str("text", "contentDesc", "resourceId")
+                ?: if (obj?.has("x") == true && obj.has("y")) "(${obj.optInt("x")}, ${obj.optInt("y")})" else "屏幕坐标"
+            return ToolCallMeta(if (obj?.optBoolean("longPress") == true) "长按屏幕" else "点击屏幕", target, "codex", ToolCallKind.MOBILE)
         }
-        else -> ToolCallMeta("工具", str("file_path", "path", "command", "query", "pattern", "description") ?: plainFallback ?: name, "accent", ToolCallKind.GENERIC)
+        lower.endsWith("solbraid_mobile_swipe") ->
+            return ToolCallMeta("滑动屏幕", str("direction") ?: "手势滑动", "codex", ToolCallKind.MOBILE)
+        lower.endsWith("solbraid_mobile_type") ->
+            return ToolCallMeta("输入文本", str("text")?.take(48) ?: "输入文字", "codex", ToolCallKind.MOBILE)
+        lower.endsWith("solbraid_mobile_key") ->
+            return ToolCallMeta("系统按键", str("key") ?: "按键事件", "codex", ToolCallKind.MOBILE)
+        lower.endsWith("solbraid_mobile_app") -> {
+            val op = str("operation") ?: "list"
+            val subj = str("name", "packageName", "query") ?: op
+            return ToolCallMeta("手机应用", "$op · $subj", "accent", ToolCallKind.MOBILE)
+        }
+        lower.endsWith("solbraid_mobile_clipboard") ->
+            return ToolCallMeta("剪贴板", str("operation") ?: "read", "accent", ToolCallKind.MOBILE)
+        lower.endsWith("solbraid_mobile_device") ->
+            return ToolCallMeta("设备控制", str("operation") ?: "telemetry", "accent", ToolCallKind.MOBILE)
+        lower.endsWith("solbraid_mobile_intent") ->
+            return ToolCallMeta("跨应用直达", str("url", "page", "operation") ?: "intent", "claude", ToolCallKind.MOBILE)
+        lower.endsWith("solbraid_mobile_notification") ->
+            return ToolCallMeta("手机通知", str("operation", "query") ?: "list", "accent", ToolCallKind.MOBILE)
+        lower.endsWith("solbraid_mobile_files") ->
+            return ToolCallMeta("手机文件", str("hostPath", "guestPath", "operation") ?: "list", "codex", ToolCallKind.MOBILE)
+        lower.endsWith("solbraid_mobile_host") ->
+            return ToolCallMeta("宿主底层", str("command", "service", "operation") ?: "host", "warning", ToolCallKind.TERMINAL)
+    }
+    val isTrueMcp = lower.startsWith("mcp__") ||
+        lower.startsWith("mcp_") ||
+        lower.startsWith("mcp/") ||
+        lower == "call_mcp_tool" ||
+        lower == "list_resources" ||
+        lower == "read_resource" ||
+        kindLower == "mcp"
+    if (isTrueMcp) {
+        val clean = formatMcpToolLabel(cleanName)
+        return ToolCallMeta("MCP", str("tool", "name", "query", "path", "url", "command")?.let { "$clean · $it" } ?: clean, "claude", ToolCallKind.MCP)
+    }
+    when (kindLower) {
+        "read" -> return ToolCallMeta("读取文件", pathSummary(), "codex", ToolCallKind.READ_FILE)
+        "edit", "write" -> return ToolCallMeta("编辑文件", pathSummary(), "codex", ToolCallKind.EDIT_FILE)
+        "delete" -> return ToolCallMeta("删除文件", pathSummary(), "warning", ToolCallKind.DELETE_FILE)
+        "search" -> return ToolCallMeta("搜索代码", str("pattern", "query", "Query", "regex") ?: strippedSubject, "accent", ToolCallKind.SEARCH_CODE)
+        "fetch" -> return ToolCallMeta("网页读取", str("url", "uri", "Url") ?: strippedSubject, "claude", ToolCallKind.WEB_FETCH)
+        "execute" -> return ToolCallMeta("执行命令", str("command", "cmd", "CommandLine") ?: cleanName, "codex", ToolCallKind.TERMINAL)
+    }
+    return when {
+        lower == "read" || lower == "cat" || lower.startsWith("file ") || lower.startsWith("read ") || lower.startsWith("view ") || lower.contains("read_file") || lower.contains("read_many") || lower.contains("view_file") || lower.contains("open_file") || lower.contains("get_file") || name.startsWith("读取") ->
+            ToolCallMeta("读取文件", pathSummary(), "codex", ToolCallKind.READ_FILE)
+        lower == "ls" || lower == "tree" || lower.startsWith("list ") || lower.contains("list_dir") || lower.contains("list_files") || lower.contains("directory") || name.startsWith("列出") ->
+            ToolCallMeta("浏览目录", str("path", "dir", "directory", "dir_path", "DirectoryPath") ?: strippedSubject, "codex", ToolCallKind.LIST_DIR)
+        lower.contains("delete_file") || lower.contains("remove_file") || lower.startsWith("delete ") ->
+            ToolCallMeta("删除文件", pathSummary(), "warning", ToolCallKind.DELETE_FILE)
+        lower == "edit" || lower == "write" || lower == "multiedit" || lower.startsWith("edit ") || lower.startsWith("write ") || lower.contains("edit_file") || lower.contains("write_file") || lower.contains("create_file") || lower.contains("replace") || lower.contains("patch") || lower.contains("notebookedit") ->
+            ToolCallMeta("编辑文件", pathSummary(), "codex", ToolCallKind.EDIT_FILE)
+        lower == "websearch" || lower.contains("web_search") || lower.contains("search_web") || lower.contains("google_search") || name == "网页搜索" ->
+            ToolCallMeta("网页搜索", str("query", "q") ?: plainFallback ?: cleanName, "claude", ToolCallKind.WEB_SEARCH)
+        lower == "webfetch" || lower.contains("web_fetch") || lower.contains("fetch") || lower.contains("read_url") || lower.contains("browser") ->
+            ToolCallMeta("网页读取", str("url", "uri") ?: plainFallback ?: cleanName, "claude", ToolCallKind.WEB_FETCH)
+        lower == "grep" || lower == "rg" || (lower.contains("search") && !lower.contains("web")) ->
+            ToolCallMeta("搜索代码", str("pattern", "query", "Query", "regex") ?: plainFallback ?: strippedSubject, "accent", ToolCallKind.SEARCH_CODE)
+        lower == "glob" || lower.contains("find") ->
+            ToolCallMeta("查找文件", str("pattern", "path", "glob") ?: plainFallback ?: strippedSubject, "accent", ToolCallKind.FIND_FILES)
+        lower == "bash" || lower == "shell" || lower.contains("exec") || lower.contains("terminal") || lower.contains("run_command") ->
+            ToolCallMeta("执行命令", str("command", "cmd", "CommandLine") ?: plainFallback ?: cleanName, "codex", ToolCallKind.TERMINAL)
+        lower == "agent" || lower == "task" || lower.contains("subagent") || lower.contains("collab") || name.startsWith("子代理") ->
+            ToolCallMeta("子代理", str("description", "subagent_type", "prompt") ?: plainFallback ?: cleanName.removePrefix("子代理").trim().ifBlank { cleanName }, "claude", ToolCallKind.SUBAGENT)
+        lower == "skill" || lower.contains("skill") ->
+            ToolCallMeta("技能", str("skill", "name") ?: plainFallback ?: cleanName, "warning", ToolCallKind.SKILL)
+        lower == "todowrite" || lower.contains("todo") || lower == "update_plan" || lower == "update_steps" || lower == "update_focus" || lower == "task_boundary" || lower == "plan" ->
+            ToolCallMeta("任务清单", str("focus", "explanation", "title") ?: "更新执行计划", "accent", ToolCallKind.PLAN_TODO)
+        lower.contains("image") || lower.contains("screenshot") ->
+            ToolCallMeta("查看图片", str("path", "file_path", "url")?.substringAfterLast('/') ?: plainFallback ?: cleanName, "claude", ToolCallKind.IMAGE)
+        else -> ToolCallMeta("工具", str("file_path", "path", "command", "query", "pattern", "description") ?: plainFallback ?: cleanName, "accent", ToolCallKind.GENERIC)
     }
 }
 

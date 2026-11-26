@@ -19,3 +19,9 @@
 -keep class com.galiais.agent.VmRuntimeService { *; }
 -keep class com.galiais.agent.MainActivity { *; }
 -keep class com.galiais.agent.GaliaisApplication { *; }
+-keep class com.galiais.agent.engine.mobile.SolbraidAccessibilityService { *; }
+-keep class com.galiais.agent.engine.mobile.SolbraidNotificationListenerService { *; }
+-keep class com.galiais.agent.engine.mobile.SolbraidShizukuUserService { *; }
+-keep class com.galiais.agent.engine.mobile.ISolbraidShizukuService** { *; }
+-keep class com.galiais.agent.engine.mobile.MobileUseStopReceiver { *; }
+-keep class rikka.shizuku.** { *; }

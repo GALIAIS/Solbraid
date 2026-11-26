@@ -94,13 +94,16 @@ internal class RootFsDaemon(private val context: Context) {
     fun close() = synchronized(lock) { closeLocked() }
 
     /** 在常驻 su 会话中同步执行一条命令并返回完整 stdout 与退出码；断连自动重连一次。 */
-    fun exec(script: String): ExecOutput = synchronized(lock) {
-        for (attempt in 0..1) {
+    fun exec(script: String, retryOnDisconnect: Boolean = true, beforeExecute: () -> Unit = {}): ExecOutput = synchronized(lock) {
+        val lastAttempt = if (retryOnDisconnect) 1 else 0
+        for (attempt in 0..lastAttempt) {
             try {
+                beforeExecute()
                 ensureConnectedLocked()
                 val w = writer!!
                 val r = reader!!
                 val sentinel = "__GALIAIS_RFS_${UUID.randomUUID().toString().replace("-", "")}__"
+                beforeExecute()
                 w.write("{\n")
                 w.write(script)
                 w.write("\n} 2>&1\n")
@@ -120,7 +123,7 @@ internal class RootFsDaemon(private val context: Context) {
                 return ExecOutput(rc, sb.toString())
             } catch (e: Exception) {
                 closeLocked()
-                if (attempt == 1) throw e
+                if (attempt == lastAttempt) throw e
             }
         }
         error("Root 命令执行失败")
@@ -253,18 +256,28 @@ internal class RootFsDaemon(private val context: Context) {
         )
     }
 
-    /** 将任意 Root 权限文件高速拷贝到应用私有缓存文件（自动赋权为应用可读），避免 Base64 膨胀与大小截断。 */
+    /** 将任意 Root 权限文件高速拷贝到应用私有缓存文件（自动赋权为应用可读，兼容 /proc /sys 伪文件并拦截特殊设备）。 */
     fun stageFileToReadable(physicalSrc: String, destFile: File, maxBytes: Long = -1L) {
         destFile.parentFile?.mkdirs()
         val qSrc = shQuote(physicalSrc)
         val qDst = shQuote(destFile.absolutePath)
-        val copyCmd = if (maxBytes > 0L) {
-            "dd if=$qSrc of=$qDst bs=65536 count=${(maxBytes + 65_535L) / 65_536L} 2>/dev/null || head -c $maxBytes $qSrc > $qDst"
+        val isPseudoFs = physicalSrc.startsWith("/proc/") || physicalSrc.startsWith("/sys/")
+        val effectiveLimit = when {
+            maxBytes > 0L -> maxBytes
+            isPseudoFs -> 1_048_576L // /proc 与 /sys 伪文件默认封顶 1 MB，避免无限流或 cp 读空
+            else -> -1L
+        }
+        val specialGuard = if (isPseudoFs) "" else {
+            "if [ -b $qSrc ] || [ -c $qSrc ] || [ -p $qSrc ] || [ -S $qSrc ]; then echo \"不支持直接读取特殊设备或管道文件\"; exit 21; fi"
+        }
+        val copyCmd = if (effectiveLimit > 0L) {
+            "head -c $effectiveLimit -- $qSrc > $qDst 2>/dev/null || dd if=$qSrc of=$qDst bs=65536 count=${(effectiveLimit + 65_535L) / 65_536L} 2>/dev/null"
         } else {
-            "cp -fL -- $qSrc $qDst || cat $qSrc > $qDst"
+            "cp -fL -- $qSrc $qDst || cat -- $qSrc > $qDst"
         }
         val script = """
             [ -e $qSrc ] || { echo "源文件不存在"; exit 2; }
+            $specialGuard
             $copyCmd || exit 1
             chown $appUid:$appUid $qDst 2>/dev/null || true
             chmod 600 $qDst 2>/dev/null || true
@@ -288,40 +301,71 @@ internal class RootFsDaemon(private val context: Context) {
         if (out.exitCode != 0) throw IllegalStateException(out.stdout.ifBlank { "Root 读取目录失败：$physicalSrc" })
     }
 
-    /** 将本地暂存文件原子写入 Root 目标路径，并完整保留原文件的 mode / uid:gid / SELinux 上下文（可选自动 .bak 备份）。 */
-    fun commitStagedFileAtomic(stagedSrc: File, physicalDst: String, createBackup: Boolean = false) {
+    /**
+     * 将本地暂存文件原子写入 Root 目标路径：
+     * - 若目标是符号链接：先 `readlink -f` 解析真实目标（拒绝悬空软链），在真实目标目录执行原子替换，绝不摧毁原软链；
+     * - 完整保留原文件的 mode / uid:gid / SELinux 上下文（新建时按 `createModeOctal` 赋权）；
+     * - 当 `failIfExists = true` 时，目标已存在直接返回 EEXIST(17)，防止静默覆盖；
+     * - 可选生成 `.bak` 自动备份。
+     */
+    fun commitStagedFileAtomic(
+        stagedSrc: File,
+        physicalDst: String,
+        createBackup: Boolean = false,
+        createModeOctal: String = "644",
+        failIfExists: Boolean = false,
+    ) {
+        val safeMode = createModeOctal.trim().takeIf { Regex("^[0-7]{3,4}$").matches(it) } ?: "644"
         val qSrc = shQuote(stagedSrc.absolutePath)
         val qDst = shQuote(physicalDst)
-        val tmpDst = "$physicalDst.galiais.tmp.${UUID.randomUUID().toString().take(8)}"
-        val qTmp = shQuote(tmpDst)
-        val qParent = shQuote(File(physicalDst).parent ?: "/")
+        val suffix = UUID.randomUUID().toString().take(8)
+        val failGuard = if (failIfExists) {
+            "if [ -e $qDst ] || [ -L $qDst ]; then echo \"EEXIST\"; exit 17; fi"
+        } else ""
         val backupPart = if (createBackup) {
-            "if [ -f $qDst ]; then cp -p -- $qDst ${shQuote("$physicalDst.bak")} 2>/dev/null || true; fi"
+            "if [ -f \"\$__target\" ]; then cp -p -- \"\$__target\" \"\$__target.bak\" 2>/dev/null || true; fi"
         } else ""
         val script = """
-            mkdir -p -- $qParent || exit 1
+            $failGuard
+            __target=$qDst
+            if [ -L $qDst ]; then
+              [ -e $qDst ] || { echo "DANGLING_SYMLINK"; exit 22; }
+              __target=${'$'}(readlink -f -- $qDst 2>/dev/null) || { echo "无法解析符号链接目标"; exit 22; }
+            fi
+            if [ -d "${'$'}__target" ]; then echo "EISDIR"; exit 21; fi
+            __parent=${'$'}(dirname -- "${'$'}__target")
+            mkdir -p -- "${'$'}__parent" || exit 1
+            __tmp="${'$'}__target.galiais.tmp.$suffix"
             __has=0; __mode=""; __ug=""; __ctx=""
-            if [ -e $qDst ]; then
+            if [ -e "${'$'}__target" ]; then
               __has=1
-              __mode=${'$'}(stat -c '%a' -- $qDst 2>/dev/null || true)
-              __ug=${'$'}(stat -c '%u:%g' -- $qDst 2>/dev/null || true)
-              __ctx=${'$'}(stat -c '%C' -- $qDst 2>/dev/null || true)
+              __mode=${'$'}(stat -c '%a' -- "${'$'}__target" 2>/dev/null || true)
+              __ug=${'$'}(stat -c '%u:%g' -- "${'$'}__target" 2>/dev/null || true)
+              __ctx=${'$'}(stat -c '%C' -- "${'$'}__target" 2>/dev/null || true)
             fi
             $backupPart
-            cp -f -- $qSrc $qTmp || exit 1
+            (dd if=$qSrc of="${'$'}__tmp" bs=65536 conv=fsync 2>/dev/null || cp -f -- $qSrc "${'$'}__tmp") || { rm -f -- "${'$'}__tmp"; exit 1; }
             if [ "${'$'}__has" = 1 ]; then
-              [ -n "${'$'}__mode" ] && chmod "${'$'}__mode" $qTmp 2>/dev/null || true
-              [ -n "${'$'}__ug" ] && chown "${'$'}__ug" $qTmp 2>/dev/null || true
-              if [ -n "${'$'}__ctx" ] && [ "${'$'}__ctx" != "?" ]; then chcon "${'$'}__ctx" $qTmp 2>/dev/null || true; fi
+              [ -n "${'$'}__mode" ] && chmod "${'$'}__mode" "${'$'}__tmp" 2>/dev/null || true
+              [ -n "${'$'}__ug" ] && chown "${'$'}__ug" "${'$'}__tmp" 2>/dev/null || true
+              if [ -n "${'$'}__ctx" ] && [ "${'$'}__ctx" != "?" ]; then chcon "${'$'}__ctx" "${'$'}__tmp" 2>/dev/null || true; fi
             else
-              chmod 644 $qTmp 2>/dev/null || true
-              __pug=${'$'}(stat -c '%u:%g' -- $qParent 2>/dev/null || true)
-              [ -n "${'$'}__pug" ] && chown "${'$'}__pug" $qTmp 2>/dev/null || true
+              chmod $safeMode "${'$'}__tmp" 2>/dev/null || true
+              __pug=${'$'}(stat -c '%u:%g' -- "${'$'}__parent" 2>/dev/null || true)
+              [ -n "${'$'}__pug" ] && chown "${'$'}__pug" "${'$'}__tmp" 2>/dev/null || true
             fi
-            mv -f -- $qTmp $qDst || { rm -f -- $qTmp; exit 1; }
+            mv -f -- "${'$'}__tmp" "${'$'}__target" || { rm -f -- "${'$'}__tmp"; exit 1; }
         """.trimIndent()
         val out = exec(script)
-        if (out.exitCode != 0) throw IllegalStateException(out.stdout.ifBlank { "Root 原子写入失败：$physicalDst" })
+        if (out.exitCode != 0) {
+            val msg = out.stdout.trim()
+            if (out.exitCode == 17 || msg == "EEXIST") throw IllegalStateException("EEXIST")
+            if (out.exitCode == 22 || msg == "DANGLING_SYMLINK") throw IllegalStateException("目标为悬空符号链接，已拒绝覆盖：$physicalDst")
+            if (msg.contains("Read-only file system", ignoreCase = true)) {
+                throw IllegalStateException("目标分区处于只读挂载状态（Read-only file system），无法写入：$physicalDst")
+            }
+            throw IllegalStateException(msg.ifBlank { "Root 原子写入失败：$physicalDst" })
+        }
     }
 
     fun mkdir(physicalPath: String) = requireOk("mkdir -p -- ${shQuote(physicalPath)}", "创建目录失败")
@@ -329,6 +373,8 @@ internal class RootFsDaemon(private val context: Context) {
         requireOk("mv -- ${shQuote(oldPhysical)} ${shQuote(newPhysical)}", "重命名/移动失败")
     fun copyRecursive(srcPhysical: String, dstPhysical: String) =
         requireOk("cp -a -- ${shQuote(srcPhysical)} ${shQuote(dstPhysical)}", "复制失败")
+    fun copyDirectoryContents(srcPhysical: String, dstPhysical: String) =
+        requireOk("cp -a -- ${shQuote(srcPhysical.trimEnd('/') + "/.")} ${shQuote(dstPhysical.trimEnd('/') + "/")}", "复制目录失败")
     fun remove(physicalPath: String) = requireOk("rm -rf -- ${shQuote(physicalPath)}", "删除失败")
     fun chmod(physicalPath: String, octal: String, recursive: Boolean) {
         require(Regex("^[0-7]{3,4}$").matches(octal.trim())) { "权限格式无效（需 3-4 位八进制，例如 755 或 0644）" }

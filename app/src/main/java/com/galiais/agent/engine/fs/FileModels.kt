@@ -68,6 +68,65 @@ fun joinVfsPath(dir: String, name: String): String {
     return if (base == "/") "/$cleanName" else "$base/$cleanName"
 }
 
+/** 校验并拆分相对路径（支持 `a/b/c.kt` 级联创建，严禁路径穿越 `..`、空段与 NUL 字符）。 */
+fun splitValidatedRelativePath(rawRelativePath: String): List<String> {
+    val normalized = rawRelativePath.replace('\\', '/').trim().trim('/')
+    require(normalized.isNotEmpty()) { "路径不能为空" }
+    require(!normalized.contains('\u0000')) { "路径包含非法字符" }
+    val segments = normalized.split('/')
+    require(segments.all { it.isNotEmpty() && it != "." && it != ".." }) {
+        "路径不能包含空段、. 或 ..：$rawRelativePath"
+    }
+    return segments
+}
+
+/** 新建文件冲突策略。 */
+enum class CreateConflictPolicy(val label: String) {
+    FAIL_IF_EXISTS("重名时阻止"),
+    AUTO_RENAME("自动编号重命名"),
+    OVERWRITE_WITH_BACKUP("备份后覆盖"),
+}
+
+/** 独占创建遇到重名目标时抛出的结构化异常，便于 UI 弹出三选一决策。 */
+class FileAlreadyExistsVfsException(
+    val existingRef: FileRef,
+    message: String = "目标文件已存在：${existingRef.name}",
+) : IllegalStateException(message)
+
+/** 基于修改时间、文件大小与内容 SHA-256 的精确修订锚点（解决同秒等长替换误判）。 */
+data class FileRevision(
+    val mtimeMs: Long,
+    val sizeBytes: Long,
+    val sha256: String,
+) {
+    fun encode(): String = "$mtimeMs:$sizeBytes:$sha256"
+
+    fun contentDiffersFrom(other: FileRevision): Boolean = when {
+        sha256.isNotEmpty() && other.sha256.isNotEmpty() -> sha256 != other.sha256
+        else -> mtimeMs != other.mtimeMs || sizeBytes != other.sizeBytes
+    }
+
+    companion object {
+        fun decode(raw: String?): FileRevision? {
+            if (raw.isNullOrBlank()) return null
+            val parts = raw.split(':')
+            if (parts.size < 2) return null
+            val mtime = parts[0].toLongOrNull() ?: return null
+            val size = parts[1].toLongOrNull() ?: return null
+            val sha = parts.getOrNull(2).orEmpty()
+            return FileRevision(mtime, size, sha)
+        }
+    }
+}
+
+/** 超大文件流式搜索命中项。 */
+data class LargeSearchHit(
+    val lineNumber: Int,
+    val byteOffset: Long,
+    val pageIndex: Int,
+    val previewLine: String,
+)
+
 /** 文件或目录的完整元数据节点。 */
 data class FileNode(
     val scope: FileScope,

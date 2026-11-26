@@ -18,7 +18,19 @@ import {
   anthropicToGeminiRequest,
 } from "../runtime/provider-translators.mjs";
 import {estimateCostUsd} from "../runtime/usage-ledger.mjs";
-import {AcpDriver} from "../runtime/acp-driver.mjs";
+import {
+  AcpDriver,
+  AcpStreamStallError,
+  normalizeAcpMetaToolName,
+  isAcpMetaToolName,
+  isSoftNetworkReply,
+  isRetryableAcpError,
+  formatAcpNetworkReason,
+  parseAgyInternalRetryLine,
+  filterDuplicateAcpMcpServers,
+  computeUnifiedDiff,
+  buildPerStepUsageRecords,
+} from "../runtime/acp-driver.mjs";
 import {CliBridgeDriver} from "../runtime/cli-bridge-driver.mjs";
 import {createDevToolsHub} from "../runtime/dev-tools-hub.mjs";
 import {PluginKernel, validatePluginManifest, negotiateCapabilities, validateSduiTree, startPluginControlServer} from "../runtime/plugin-kernel.mjs";
@@ -1231,12 +1243,16 @@ async function testSelfEvolvingPluginPipeline() {
   };
 
   try {
-    // 1. MCP initialize & tools/list 必须完整暴露 15 个自进化运维工具（含本机 APK 自迭代 solbraid_self_build）
+    // 1. MCP initialize & tools/list 必须完整暴露 34 个工具（15 插件运维 + 5 安全文件 + 14 Mobile-Use 手机操控）
     const initResp = await rpc("initialize", {protocolVersion: "2025-06-18"});
     assert.equal(initResp.result.serverInfo.name, "solbraid-plugin-ctl");
     const listTools = await rpc("tools/list");
-    assert.equal(listTools.result.tools.length, 15);
+    assert.equal(listTools.result.tools.length, 34);
     assert.ok(listTools.result.tools.some(t => t.name === "solbraid_self_build"));
+    assert.ok(listTools.result.tools.some(t => t.name === "solbraid_file_edit"));
+    assert.ok(listTools.result.tools.some(t => t.name === "solbraid_mobile_screenshot"));
+    assert.ok(listTools.result.tools.some(t => t.name === "solbraid_mobile_device"));
+    assert.ok(listTools.result.tools.some(t => t.name === "solbraid_mobile_host"));
 
     const sbStatus = await callTool("solbraid_self_build", {action: "status"});
     assert.equal(sbStatus.isError, false);
@@ -2802,12 +2818,552 @@ async function testEditAndResendRuntimeContracts() {
   assert.ok(!hubSrc.includes("if (record.pendingContextBridge && !record.remoteSessionId)"), "agent-hub must not skip ACP context bridge after attachAcpSession");
 }
 
+async function testAntigravityResilienceAndWatchdog() {
+  // 1. 元工具名称归一化（含 Antigravity "Run " 前缀）
+  assert.equal(normalizeAcpMetaToolName("Run update_steps"), "update_steps");
+  assert.equal(normalizeAcpMetaToolName("Run update_focus"), "update_focus");
+  assert.equal(normalizeAcpMetaToolName("Run task_boundary"), "task_boundary");
+  assert.equal(isAcpMetaToolName("Run update_steps"), true);
+  assert.equal(isAcpMetaToolName("Run update_focus"), true);
+  assert.equal(isAcpMetaToolName("File Solbraid/runtime/agent-hub.mjs"), false);
+  assert.equal(isAcpMetaToolName("Run mcp_solbraid_plugin_ctl_solbraid_self_build"), false);
+
+  // 2. 软网络报错与可重试错误识别
+  assert.equal(isSoftNetworkReply("\n⚠ There was a network issue connecting to the server, please try again.\n"), true);
+  assert.equal(isSoftNetworkReply("⚠ Service unavailable, please try again later."), true);
+  assert.equal(isSoftNetworkReply("A".repeat(450) + " There was a network issue connecting to the server, please try again."), false);
+  assert.equal(isSoftNetworkReply("已为你修复了所有问题。"), false);
+
+  assert.equal(isRetryableAcpError(new AcpStreamStallError(120_000)), true);
+  assert.equal(isRetryableAcpError(new Error("stream reading error: unexpected EOF")), true);
+  assert.equal(isRetryableAcpError(new Error("write udp 198.18.0.1:47714->1.1.1.1:53: write: operation not permitted")), true);
+  assert.equal(isRetryableAcpError(new Error("read: software caused connection abort")), true);
+  assert.equal(isRetryableAcpError(new Error("You are not logged into Antigravity")), false);
+  assert.equal(isRetryableAcpError(new Error("HTTP 401 unauthorized")), false);
+  assert.equal(isRetryableAcpError(new Error("用户中断了会话")), false);
+  assert.equal(formatAcpNetworkReason("write udp 198.18.0.1->1.1.1.1:53: write: operation not permitted"), "后台网络受限");
+  assert.equal(formatAcpNetworkReason("stream reading error: unexpected EOF"), "流式连接意外断开");
+
+  // 3. 解析真实 agy 底层重试日志行
+  const p1 = parseAgyInternalRetryLine("I1125 14:50:13.644948 4826 run.go:308] Run: attempt 2 failed (stream reading error: unexpected EOF), retrying in 5.783761838s");
+  assert.equal(p1?.attempt, 2);
+  assert.equal(p1?.reason, "stream reading error: unexpected EOF");
+  assert.equal(p1?.isSocketPermissionError, false);
+  const p2 = parseAgyInternalRetryLine("I1125 13:37:44.231986 3823 run.go:308] Run: attempt 3 failed (request failed: write: operation not permitted), retrying in 8s");
+  assert.equal(p2?.attempt, 3);
+  assert.equal(p2?.isSocketPermissionError, true);
+
+  // 4. 去重 Antigravity 全局 mcp_config.json 已注册的 MCP 服务
+  const deduped = filterDuplicateAcpMcpServers(
+    [{name: "solbraid_plugin_ctl"}, {name: "project_only_mcp"}],
+    ["solbraid_plugin_ctl"],
+  );
+  assert.deepEqual(deduped.map(s => s.name), ["project_only_mcp"]);
+
+  // 5. 实测 AcpDriver 静默卡死看门狗：纯模型沉默超时应触发 AcpStreamStallError 并发送 session/cancel
+  const stallServer = `
+    const readline = require('readline');
+    const rl = readline.createInterface({input: process.stdin});
+    const send = o => process.stdout.write(JSON.stringify(o) + '\\n');
+    rl.on('line', l => {
+      const m = JSON.parse(l);
+      if (m.method === 'initialize') return send({jsonrpc:'2.0', id:m.id, result:{protocolVersion:1, agentCapabilities:{loadSession:true}}});
+      if (m.method === 'session/new') return send({jsonrpc:'2.0', id:m.id, result:{sessionId:'s-stall'}});
+      if (m.method === 'session/prompt') {
+        send({jsonrpc:'2.0', method:'session/update', params:{sessionId:'s-stall', update:{sessionUpdate:'agent_thought_chunk', content:{type:'text', text:'thinking...'}}}});
+        // 故意挂起不再发任何事件
+      }
+      if (m.method === 'session/cancel') {
+        send({jsonrpc:'2.0', method:'session/update', params:{sessionId:'s-stall', update:{sessionUpdate:'focus_update', focus:'CANCEL_ACK'}}});
+      }
+    });
+  `;
+  let sawCancelAck = false;
+  const stallDrv = new AcpDriver({
+    agentId: "acp-stall-test",
+    manifest: {name: "ACPStall", launch: {command: process.execPath, args: ["-e", stallServer]}},
+    env: process.env,
+    cwd: rootDir,
+    onEvent: e => { if (e.update?.focus === "CANCEL_ACK") sawCancelAck = true; },
+    onPermissionRequest: async () => ({outcome: {outcome: "cancelled"}}),
+  });
+  try {
+    const s = await stallDrv.newSession(rootDir, []);
+    await assert.rejects(
+      () => stallDrv.prompt(s.sessionId, [{type: "text", text: "hang"}], {stallTimeoutMs: 220}),
+      err => err instanceof AcpStreamStallError && err.code === "ACP_STREAM_STALL" && err.retryable === true,
+    );
+    await new Promise(r => setTimeout(r, 80));
+    assert.equal(sawCancelAck, true, "AcpDriver stall watchdog must notify session/cancel");
+  } finally {
+    stallDrv.close();
+  }
+
+  // 6. 实测工具执行中与等待用户审批时绝不误判为流卡死
+  const activeToolAndPermServer = `
+    const readline = require('readline');
+    const rl = readline.createInterface({input: process.stdin});
+    const send = o => process.stdout.write(JSON.stringify(o) + '\\n');
+    let permCb = null;
+    rl.on('line', l => {
+      const m = JSON.parse(l);
+      if (m.id && !m.method) { if (permCb) { permCb(m.result); permCb = null; } return; }
+      if (m.method === 'initialize') return send({jsonrpc:'2.0', id:m.id, result:{protocolVersion:1, agentCapabilities:{loadSession:true}}});
+      if (m.method === 'session/new') return send({jsonrpc:'2.0', id:m.id, result:{sessionId:'s-busy'}});
+      if (m.method === 'session/prompt') {
+        send({jsonrpc:'2.0', method:'session/update', params:{sessionId:'s-busy', update:{sessionUpdate:'tool_call', toolCallId:'t-long', title:'gradle build', kind:'execute', status:'in_progress'}}});
+        setTimeout(() => {
+          send({jsonrpc:'2.0', method:'session/update', params:{sessionId:'s-busy', update:{sessionUpdate:'tool_call_update', toolCallId:'t-long', status:'completed'}}});
+          send({jsonrpc:'2.0', id:99, method:'session/request_permission', params:{sessionId:'s-busy', toolCall:{title:'bash'}, options:[{optionId:'allow_once',name:'Allow',kind:'allow_once'}]}});
+          permCb = () => {
+            send({jsonrpc:'2.0', method:'session/update', params:{sessionId:'s-busy', update:{sessionUpdate:'agent_message_chunk', content:{type:'text', text:'ALL_GOOD'}}}});
+            send({jsonrpc:'2.0', id:m.id, result:{stopReason:'end_turn'}});
+          };
+        }, 340);
+      }
+    });
+  `;
+  const busyEvents = [];
+  const busyDrv = new AcpDriver({
+    agentId: "acp-busy-test",
+    manifest: {name: "ACPBusy", launch: {command: process.execPath, args: ["-e", activeToolAndPermServer]}},
+    env: process.env,
+    cwd: rootDir,
+    onEvent: e => busyEvents.push(e),
+    onPermissionRequest: async () => {
+      await new Promise(r => setTimeout(r, 340));
+      return {outcome: {outcome: "selected", optionId: "allow_once"}};
+    },
+  });
+  try {
+    const s = await busyDrv.newSession(rootDir, []);
+    const res = await busyDrv.prompt(s.sessionId, [{type: "text", text: "build"}], {stallTimeoutMs: 180});
+    assert.equal(res.stopReason, "end_turn");
+    assert.ok(busyEvents.some(e => e.update?.content?.text === "ALL_GOOD"));
+  } finally {
+    busyDrv.close();
+  }
+
+  // 7. agent-hub 关键桌面级抗断网与去重契约校验
+  const hubSrc = fs.readFileSync(path.join(rootDir, "runtime", "agent-hub.mjs"), "utf8");
+  assert.ok(hubSrc.includes('"--disable-telemetry"'), "agent-hub must disable agy telemetry spam");
+  assert.ok(hubSrc.includes('"--gemini-dir"'), "agent-hub must pass absolute --gemini-dir to agy acp");
+  assert.ok(hubSrc.includes('"--log-file"'), "agent-hub must pass --log-file to agy acp for live retry monitoring");
+  assert.ok(hubSrc.includes("startAgyLogMonitor"), "agent-hub must monitor agy internal retry loops");
+  assert.ok(hubSrc.includes("filterDuplicateAcpMcpServers"), "agent-hub must deduplicate Antigravity global MCP servers");
+  assert.ok(hubSrc.includes('kind: "turn-retry"'), "agent-hub must notify turn-retry on transient network failures");
+}
+
+async function testDiffCompactCacheAndPerStepUsage() {
+  // 1. 3500 行大文件首尾双处小改动 + 超 32KB 尾部改动：输出最小 hunk 而非整文件数千行替换
+  const baseLines = Array.from({length: 3500}, (_, i) => `const line_${i + 1} = "payload_${i + 1}_padding_for_size_test";`);
+  const before = baseLines.join("\n") + "\n";
+  assert.ok(before.length > 120_000, "fixture should exceed legacy 32KB slice limit");
+  const modifiedLines = [...baseLines];
+  modifiedLines[19] = 'const line_20 = "TOP_UPDATED";';
+  modifiedLines[3449] = 'const line_3450 = "BOTTOM_UPDATED_PAST_32KB";';
+  const after = modifiedLines.join("\n") + "\n";
+  const diff = computeUnifiedDiff("runtime/agent-hub.mjs", before, after);
+  assert.ok(diff.length < 2000, `expected compact unified diff, got ${diff.length} bytes`);
+  assert.ok(diff.includes('-const line_20 = "payload_20_padding_for_size_test";'));
+  assert.ok(diff.includes('+const line_20 = "TOP_UPDATED";'));
+  assert.ok(diff.includes('+const line_3450 = "BOTTOM_UPDATED_PAST_32KB";'));
+  const addedCount = diff.split("\n").filter(l => l.startsWith("+") && !l.startsWith("+++")).length;
+  const removedCount = diff.split("\n").filter(l => l.startsWith("-") && !l.startsWith("---")).length;
+  assert.equal(addedCount, 2);
+  assert.equal(removedCount, 2);
+
+  // 2. CRLF 与 LF 混用不产生假性全文件差异
+  const crlf = baseLines.join("\r\n") + "\r\n";
+  const eolDiff = computeUnifiedDiff("runtime/agent-hub.mjs", before, crlf);
+  assert.equal(eolDiff.split("\n").filter(l => l.startsWith("@@")).length, 0);
+
+  // 3. Antigravity 多步回合按实测真机数据逐请求守恒拆分
+  const steps = [
+    {endedAt: 1795653222705, used: 10194, contextWindow: 1048576, apiMs: 4587, ttftMs: 1200, genMs: 800, streamed: true, outChars: 120, thoughtChars: 80},
+    {endedAt: 1795653226478, used: 15510, contextWindow: 1048576, apiMs: 3750, ttftMs: 1100, genMs: 700, streamed: true, outChars: 40, thoughtChars: 20},
+  ];
+  const rows = buildPerStepUsageRecords({
+    steps,
+    inTok: 25569,
+    outTok: 135,
+    cacheRead: 10111,
+    cacheWrite: 0,
+    reasoning: 94,
+    usageStart: 0,
+    turnStartMs: 1795653218118,
+    doneAt: 1795653226500,
+    apiDurationMs: 8337,
+    hasExactUsage: true,
+    contextWindow: 1048576,
+  });
+  assert.equal(rows.length, 2);
+  assert.equal(rows.reduce((s, r) => s + r.in, 0), 25569);
+  assert.equal(rows.reduce((s, r) => s + r.out, 0), 135);
+  assert.equal(rows.reduce((s, r) => s + r.cacheRead, 0), 10111);
+  assert.equal(rows.reduce((s, r) => s + r.reasoning, 0), 94);
+  assert.equal(rows[0].cacheRead, 0);
+  assert.equal(rows[1].cacheRead, 10111);
+  assert.equal(rows[0].contextUsed, 10194);
+  assert.equal(rows[1].contextUsed, 15510);
+
+  // 4. 校验缓存治理与全链路记账源码契约
+  const hubSrc = fs.readFileSync(path.join(rootDir, "runtime", "agent-hub.mjs"), "utf8");
+  assert.ok(hubSrc.includes("compactRecordDiffsInPlace"), "agent-hub must slim legacy bloated oldText/newText diffs");
+  assert.ok(hubSrc.includes("pruneAgyLogs"), "agent-hub must rotate antigravity log files");
+  assert.ok(hubSrc.includes("touchSessionCache"), "agent-hub must bound in-memory session cache with LRU");
+  assert.ok(hubSrc.includes("buildPerStepUsageRecords"), "agent-hub must emit per-step usage records");
+  const gwSrc = fs.readFileSync(path.join(rootDir, "runtime", "provider-gateway.mjs"), "utf8");
+  assert.ok(gwSrc.includes("runPipeWithUsage"), "provider-gateway must guard all protocol pipes with finally usage accounting");
+  assert.ok(gwSrc.includes("_usageRecorded"), "provider-gateway must record single-provider failures without duplicates");
+}
+
+async function testPerfectReadEditCreateRuntime() {
+  const {
+    safeReadTextFile,
+    atomicWriteTextFile,
+    listFileCheckpoints,
+    revertFileCheckpoint,
+    pruneCheckpointRoot,
+  } = await import(pathToFileURL(path.join(rootDir, "runtime", "acp-driver.mjs")).href);
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "solbraid-perfect-io-"));
+  const cpRoot = path.join(tmp, "checkpoints");
+  try {
+    // 1. 二进制文件必须被 safeReadTextFile 拦截，不得吐乱码
+    const binFile = path.join(tmp, "sample.bin");
+    fs.writeFileSync(binFile, Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x00, 0x01, 0x02, 0x03]));
+    await assert.rejects(() => safeReadTextFile(binFile), /Binary file cannot be read as text/i);
+
+    // 2. 流式按行分页读取 + 软截断提示
+    const bigTxt = path.join(tmp, "big.log");
+    const lines = Array.from({length: 1200}, (_, i) => `LINE_${i + 1}: 中文内容日志测试 ${"x".repeat(40)}`);
+    fs.writeFileSync(bigTxt, lines.join("\n") + "\n", "utf8");
+    const slice = await safeReadTextFile(bigTxt, {line: 100, limit: 10});
+    assert.equal(slice.lineCount, 10);
+    assert.ok(slice.content.includes("LINE_100:"));
+    assert.ok(slice.content.includes("LINE_109:"));
+    assert.ok(!slice.content.includes("LINE_110:"));
+    assert.equal(slice.truncated, true);
+
+    // 超过 maxFullReadBytes 未传 limit 时自动降级只读前 500 行，不触发整文件 OOM
+    const softGuard = await safeReadTextFile(bigTxt, {maxFullReadBytes: 1024});
+    assert.equal(softGuard.lineCount, 500);
+    assert.equal(softGuard.truncated, true);
+    assert.ok(softGuard.content.includes("Pass line=501"));
+
+    // 3. 原子保权写入 + 写前检查点 + 单文件可逆回滚
+    const scriptFile = path.join(tmp, "deploy.sh");
+    fs.writeFileSync(scriptFile, "#!/usr/bin/env bash\necho v1\n", {mode: 0o755});
+    if (process.platform !== "win32") fs.chmodSync(scriptFile, 0o755);
+    const wRes = await atomicWriteTextFile(scriptFile, "#!/usr/bin/env bash\necho v2\n", {
+      sessionId: "sess-io-1",
+      checkpointRoot: cpRoot,
+    });
+    assert.ok(wRes.checkpoint && wRes.checkpoint.id);
+    assert.equal(fs.readFileSync(scriptFile, "utf8"), "#!/usr/bin/env bash\necho v2\n");
+    if (process.platform !== "win32") {
+      assert.equal(fs.statSync(scriptFile).mode & 0o777, 0o755, "atomicWriteTextFile must preserve +x mode");
+    }
+
+    // 检查点列表与单文件回滚（回滚后应恢复 v1，且自动生成可反悔的 undoCheckpointId）
+    const cps = await listFileCheckpoints({checkpointRoot: cpRoot, sessionId: "sess-io-1", filePath: scriptFile});
+    assert.equal(cps.length, 1);
+    const rev = await revertFileCheckpoint({checkpointRoot: cpRoot, sessionId: "sess-io-1", filePath: scriptFile});
+    assert.equal(rev.reverted, true);
+    assert.equal(rev.action, "restored");
+    assert.ok(rev.undoCheckpointId);
+    assert.equal(fs.readFileSync(scriptFile, "utf8"), "#!/usr/bin/env bash\necho v1\n");
+
+    // 4. 新建文件写前检查点（existed=false）回滚时应干净删除新建文件
+    const freshFile = path.join(tmp, "newly_created.txt");
+    await atomicWriteTextFile(freshFile, "hello new\n", {sessionId: "sess-io-1", checkpointRoot: cpRoot});
+    assert.equal(fs.existsSync(freshFile), true);
+    const revNew = await revertFileCheckpoint({checkpointRoot: cpRoot, sessionId: "sess-io-1", filePath: freshFile});
+    assert.equal(revNew.action, "deleted");
+    assert.equal(fs.existsSync(freshFile), false);
+
+    // 5. LRU 裁剪配额校验
+    for (let i = 0; i < 6; i++) {
+      await atomicWriteTextFile(scriptFile, `v${i}\n`, {sessionId: "sess-prune", checkpointRoot: cpRoot});
+    }
+    await pruneCheckpointRoot(cpRoot, {maxPerSession: 3, maxTotalBytes: 20 * 1024 * 1024});
+    const afterPrune = await listFileCheckpoints({checkpointRoot: cpRoot, sessionId: "sess-prune"});
+    assert.ok(afterPrune.length <= 3, `expected <=3 checkpoints after prune, got ${afterPrune.length}`);
+
+    // 6. agent-hub / claude-host / plugin-mcp 契约校验
+    const hubSrc = fs.readFileSync(path.join(rootDir, "runtime", "agent-hub.mjs"), "utf8");
+    assert.ok(hubSrc.includes('case "files/revertCheckpoint":'), "agent-hub must expose files/revertCheckpoint");
+    assert.ok(hubSrc.includes('case "files/listCheckpoints":'), "agent-hub must expose files/listCheckpoints");
+    assert.ok(hubSrc.includes("captureFileCheckpoint("), "agent-hub must capture pre-edit checkpoints on ACP diff");
+    const claudeSrc = fs.readFileSync(path.join(rootDir, "runtime", "claude-host.mjs"), "utf8");
+    assert.ok(claudeSrc.includes("captureFileCheckpoint("), "claude-host must capture pre-edit checkpoints in canUseTool");
+
+    // 7. 统一安全文件引擎（safe-file-io.mjs）高级能力：GB18030+CRLF 保真、多段原子替换、expectedSha256 冲突锁、O_EXCL 独占创建、超大文件流式补丁与搜索
+    const {
+      safeEditFile,
+      safeCreateFile,
+      streamSearchFile,
+      encodeTextBuffer,
+      decodeTextBuffer,
+    } = await import(pathToFileURL(path.join(rootDir, "runtime", "safe-file-io.mjs")).href);
+
+    // 7a. GB18030 + CRLF 文件读/改/写全程无损保留编码与换行
+    const gbkFile = path.join(tmp, "legacy_gbk.ini");
+    const gbkRaw = encodeTextBuffer("title=中文原始配置\nmode=old\n", "gb18030", "CRLF");
+    fs.writeFileSync(gbkFile, gbkRaw);
+    const gbkRead = await safeReadTextFile(gbkFile);
+    assert.equal(gbkRead.encoding, "gb18030");
+    assert.equal(gbkRead.lineEnding, "CRLF");
+    assert.ok(gbkRead.content.includes("中文原始配置"));
+    assert.ok(gbkRead.sha256 && gbkRead.sha256.length === 64);
+
+    // 乐观锁冲突检测（错误 sha256 必须中止，不破坏原文件）
+    await assert.rejects(
+      () => safeEditFile(gbkFile, {oldText: "mode=old", newText: "mode=new", expectedSha256: "0".repeat(64)}),
+      /CONFLICT/,
+    );
+    // 正确 sha256 精准局部替换 -> 保留 GB18030 与 CRLF 并返回紧凑 Diff
+    const gbkEdit = await safeEditFile(gbkFile, {
+      oldText: "mode=old",
+      newText: "mode=中文新值",
+      expectedSha256: gbkRead.sha256,
+      sessionId: "sess-gbk",
+      checkpointRoot: cpRoot,
+    });
+    assert.equal(gbkEdit.edited, true);
+    assert.equal(gbkEdit.encoding, "gb18030");
+    assert.equal(gbkEdit.lineEnding, "CRLF");
+    assert.ok(gbkEdit.diff.includes("-mode=old") && gbkEdit.diff.includes("+mode=中文新值"));
+    const gbkAfterBuf = fs.readFileSync(gbkFile);
+    const gbkDecoded = decodeTextBuffer(gbkAfterBuf);
+    assert.equal(gbkDecoded.encoding, "gb18030");
+    assert.equal(gbkDecoded.lineEnding, "CRLF");
+    assert.ok(gbkDecoded.text.includes("mode=中文新值"));
+
+    // 7b. safeCreateFile 独占创建防覆写（O_EXCL）+ auto_rename + .sh 自动 0755 + 级联目录
+    const nestedSh = path.join(tmp, "deep", "dir", "run.sh");
+    const cRes = await safeCreateFile(nestedSh, "#!/usr/bin/env bash\necho ok\n", {
+      sessionId: "sess-create",
+      checkpointRoot: cpRoot,
+    });
+    assert.equal(cRes.created, true);
+    if (process.platform !== "win32") {
+      assert.equal(fs.statSync(nestedSh).mode & 0o777, 0o755);
+    }
+    await assert.rejects(() => safeCreateFile(nestedSh, "WIPE"), /EEXIST/);
+    assert.ok(fs.readFileSync(nestedSh, "utf8").includes("echo ok"), "existing file must never be wiped");
+    const renamedRes = await safeCreateFile(nestedSh, "#!/usr/bin/env bash\necho copy\n", {
+      conflictPolicy: "auto_rename",
+      sessionId: "sess-create",
+      checkpointRoot: cpRoot,
+    });
+    assert.ok(renamedRes.path.endsWith("run (1).sh"));
+
+    // 7c. 多段原子编辑：第 2 段失配时整文件不落盘
+    const multiFile = path.join(tmp, "multi.txt");
+    fs.writeFileSync(multiFile, "alpha=1\nbeta=2\ngamma=3\n", "utf8");
+    await assert.rejects(
+      () => safeEditFile(multiFile, {edits: [{oldText: "alpha=1", newText: "alpha=9"}, {oldText: "NON_EXIST", newText: "x"}]}),
+      /未在文件中找到/,
+    );
+    assert.equal(fs.readFileSync(multiFile, "utf8"), "alpha=1\nbeta=2\ngamma=3\n");
+
+    // 7d. >4MB 超大文件零 OOM 流式行区间补丁与流式搜索
+    const hugeFile = path.join(tmp, "huge_5mb.log");
+    const hugeLines = [];
+    for (let i = 1; i <= 45000; i++) hugeLines.push(`ROW_${i}_PAYLOAD_${"Z".repeat(85)}`);
+    fs.writeFileSync(hugeFile, hugeLines.join("\n") + "\n", "utf8");
+    assert.ok(fs.statSync(hugeFile).size > 4 * 1024 * 1024);
+    const patchRes = await safeEditFile(hugeFile, {startLine: 20000, endLine: 20001, newText: "PATCHED_20000_MARKER"});
+    assert.equal(patchRes.streamingPatch, true);
+    const searchRes = await streamSearchFile(hugeFile, {query: "PATCHED_20000_MARKER"});
+    assert.equal(searchRes.hitCount, 1);
+    assert.equal(searchRes.hits[0].lineNumber, 20000);
+
+    // 7e. 端到端通过 plugin-mcp.mjs + startPluginControlServer 验证全部 5 个 Agent 统一文件工具
+    const {PluginKernel, startPluginControlServer} = await import(pathToFileURL(path.join(rootDir, "runtime", "plugin-kernel.mjs")).href);
+    const mcpHome = path.join(tmp, "mcp-home");
+    fs.mkdirSync(path.join(mcpHome, "workspace"), {recursive: true});
+    const testKernel = new PluginKernel({home: mcpHome});
+    await testKernel.boot();
+    const ctlSock = process.platform === "win32"
+      ? `\\\\.\\pipe\\solbraid-fs-test-${process.pid}-${Date.now()}`
+      : path.join(mcpHome, ".galiais", "run", "plugin-ctl.sock");
+    const ctlTok = path.join(mcpHome, ".galiais", "run", "plugin-ctl.token");
+    const ctlSrv = await startPluginControlServer(testKernel, {socketPath: ctlSock, tokenFile: ctlTok});
+    try {
+      const mcpChild = spawn(process.execPath, [path.join(rootDir, "runtime", "plugin-mcp.mjs")], {
+        env: {...process.env, HOME: mcpHome, SOLBRAID_PLUGIN_CTL_SOCKET: ctlSock, SOLBRAID_PLUGIN_CTL_TOKEN: ctlSrv.token},
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      const mcpRl = createInterface({input: mcpChild.stdout});
+      const pendingMcp = new Map();
+      mcpRl.on("line", line => {
+        if (!line.trim()) return;
+        const msg = JSON.parse(line);
+        const w = pendingMcp.get(msg.id);
+        if (w) { pendingMcp.delete(msg.id); w(msg); }
+      });
+      let seq = 0;
+      const rpc = (method, params = {}) => new Promise((resolve, reject) => {
+        const id = ++seq;
+        const t = setTimeout(() => reject(new Error(`MCP timeout: ${method}`)), 10_000);
+        pendingMcp.set(id, msg => { clearTimeout(t); resolve(msg); });
+        mcpChild.stdin.write(JSON.stringify({jsonrpc: "2.0", id, method, params}) + "\n");
+      });
+      const listResp = await rpc("tools/list");
+      const toolNames = (listResp.result?.tools || []).map(t => t.name);
+      for (const reqTool of ["solbraid_file_read", "solbraid_file_edit", "solbraid_file_create", "solbraid_file_search", "solbraid_file_revert"]) {
+        assert.ok(toolNames.includes(reqTool), `plugin-mcp missing ${reqTool}`);
+      }
+      const wsDir = path.join(mcpHome, "workspace");
+      const cTool = await rpc("tools/call", {name: "solbraid_file_create", arguments: {path: "demo/hello.txt", cwd: wsDir, content: "v1\nline2\n"}});
+      assert.equal(cTool.result?.isError, false);
+      const rTool = await rpc("tools/call", {name: "solbraid_file_read", arguments: {path: "demo/hello.txt", cwd: wsDir}});
+      const rData = JSON.parse(rTool.result.content[0].text);
+      assert.ok(rData.content.includes("1: v1"));
+      const eTool = await rpc("tools/call", {name: "solbraid_file_edit", arguments: {path: "demo/hello.txt", cwd: wsDir, oldText: "v1", newText: "v2", expectedSha256: rData.sha256}});
+      const eData = JSON.parse(eTool.result.content[0].text);
+      assert.equal(eData.edited, true);
+      assert.ok(eData.diff.includes("+v2"));
+      const sTool = await rpc("tools/call", {name: "solbraid_file_search", arguments: {path: "demo/hello.txt", cwd: wsDir, query: "v2"}});
+      assert.equal(JSON.parse(sTool.result.content[0].text).hitCount, 1);
+      const revTool = await rpc("tools/call", {name: "solbraid_file_revert", arguments: {path: "demo/hello.txt", cwd: wsDir}});
+      assert.equal(JSON.parse(revTool.result.content[0].text).action, "restored");
+      assert.equal(fs.readFileSync(path.join(wsDir, "demo/hello.txt"), "utf8"), "v1\nline2\n");
+      mcpChild.stdin.end();
+      await new Promise(r => mcpChild.once("exit", r));
+    } finally {
+      await ctlSrv.close();
+      await testKernel.dispose();
+    }
+  } finally {
+    fs.rmSync(tmp, {recursive: true, force: true});
+  }
+}
+
+async function testMobileUseAndDualModeParity() {
+  // 1. chroot 与 PRoot 启动脚本及自构建回退契约核验
+  const runProot = fs.readFileSync(path.join(rootDir, "runtime", "run-proot.sh"), "utf8");
+  assert.ok(runProot.includes('GALIAIS_LAUNCH_ID="${GALIAIS_LAUNCH_ID:-}"'), "run-proot.sh must forward GALIAIS_LAUNCH_ID");
+  const runLinux = fs.readFileSync(path.join(rootDir, "runtime", "run-linux.sh"), "utf8");
+  assert.ok(runLinux.includes("GALIAIS_RUNTIME_MODE=root"), "run-linux.sh must export GALIAIS_RUNTIME_MODE=root");
+  for (const launcher of ["launch-engine.sh", "launch-claude.sh", "launch-gateway.sh", "launch-agent-hub.sh"]) {
+    const body = fs.readFileSync(path.join(rootDir, "runtime", launcher), "utf8");
+    assert.ok(body.includes("GALIAIS_APP_FILES"), `${launcher} must honor GALIAIS_APP_FILES instead of hardcoding /data/user/0`);
+  }
+  const selfBuildSh = fs.readFileSync(path.join(rootDir, "runtime", "self-build-apk.sh"), "utf8");
+  assert.ok(selfBuildSh.includes("--self-build-apply"), "self-build-apk.sh must delegate apply through host installer bridge");
+
+  // 2. 端到端通过 plugin-mcp.mjs + startPluginControlServer 验证全部 9 个 Mobile-Use 工具（含多模态图片返回）
+  const {PluginKernel, startPluginControlServer} = await import(pathToFileURL(path.join(rootDir, "runtime", "plugin-kernel.mjs")).href);
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "solbraid-mobile-use-"));
+  const calls = [];
+  const fakeJpegB64 = Buffer.from([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]).toString("base64");
+  const kernel = new PluginKernel({home: tmp});
+  await kernel.boot();
+  const sock = process.platform === "win32"
+    ? `\\\\.\\pipe\\solbraid-mobile-test-${process.pid}-${Date.now()}`
+    : path.join(tmp, ".galiais", "run", "plugin-ctl.sock");
+  const tokFile = path.join(tmp, ".galiais", "run", "plugin-ctl.token");
+  const srv = await startPluginControlServer(kernel, {
+    socketPath: sock,
+    tokenFile: tokFile,
+    onMobileUse: async (action, params) => {
+      calls.push({action, params});
+      if (action === "screenshot") {
+        return {
+          ok: true,
+          backend: "accessibility",
+          guestPath: "/home/agent/.galiais/mobile-shots/shot-demo.jpg",
+          screenWidth: 1080,
+          screenHeight: 2400,
+          width: 720,
+          height: 1600,
+          bytes: 6,
+          mimeType: "image/jpeg",
+          _mcpImageBase64: fakeJpegB64,
+          _mcpMimeType: "image/jpeg",
+        };
+      }
+      return {ok: true, action, echoed: params};
+    },
+  });
+  try {
+    const child = spawn(process.execPath, [path.join(rootDir, "runtime", "plugin-mcp.mjs")], {
+      env: {...process.env, HOME: tmp, SOLBRAID_PLUGIN_CTL_SOCKET: sock, SOLBRAID_PLUGIN_CTL_TOKEN: srv.token},
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const rl = createInterface({input: child.stdout});
+    const pending = new Map();
+    rl.on("line", line => {
+      if (!line.trim()) return;
+      const msg = JSON.parse(line);
+      const w = pending.get(msg.id);
+      if (w) { pending.delete(msg.id); w(msg); }
+    });
+    let seq = 0;
+    const rpc = (method, params = {}) => new Promise((resolve, reject) => {
+      const id = ++seq;
+      const t = setTimeout(() => reject(new Error(`Mobile MCP timeout: ${method}`)), 10_000);
+      pending.set(id, msg => { clearTimeout(t); resolve(msg); });
+      child.stdin.write(JSON.stringify({jsonrpc: "2.0", id, method, params}) + "\n");
+    });
+
+    const expectedMobileTools = [
+      ["solbraid_mobile_status", {}],
+      ["solbraid_mobile_screenshot", {maxWidth: 720, annotate: true}],
+      ["solbraid_mobile_ui_tree", {maxNodes: 80, allWindows: true}],
+      ["solbraid_mobile_tap", {nodeIndex: 0, doubleTap: true}],
+      ["solbraid_mobile_swipe", {direction: "up", drag: false}],
+      ["solbraid_mobile_type", {text: "你好Solbraid", submit: true}],
+      ["solbraid_mobile_key", {key: "back"}],
+      ["solbraid_mobile_app", {operation: "info", packageName: "com.galiais.agent"}],
+      ["solbraid_mobile_clipboard", {operation: "write", text: "剪贴板测试"}],
+      ["solbraid_mobile_device", {operation: "telemetry"}],
+      ["solbraid_mobile_intent", {operation: "open_settings", page: "wifi"}],
+      ["solbraid_mobile_notification", {operation: "otp"}],
+      ["solbraid_mobile_files", {operation: "list", hostPath: "/sdcard"}],
+      ["solbraid_mobile_host", {operation: "logcat", lines: 50}],
+    ];
+    for (const [toolName, args] of expectedMobileTools) {
+      const resp = await rpc("tools/call", {name: toolName, arguments: args});
+      assert.equal(resp.result?.isError, false, `${toolName} should succeed`);
+      if (toolName === "solbraid_mobile_screenshot") {
+        assert.equal(resp.result.content.length, 2, "screenshot must return image + text blocks");
+        assert.equal(resp.result.content[0].type, "image");
+        assert.equal(resp.result.content[0].mimeType, "image/jpeg");
+        assert.equal(resp.result.content[0].data, fakeJpegB64);
+        assert.equal(resp.result.content[1].type, "text");
+        const meta = JSON.parse(resp.result.content[1].text);
+        assert.equal(meta._mcpImageBase64, undefined, "base64 must be stripped from text summary");
+        assert.equal(meta.backend, "accessibility");
+      } else {
+        const data = JSON.parse(resp.result.content[0].text);
+        assert.equal(data.ok, true);
+      }
+    }
+    assert.equal(calls.length, 14);
+    child.stdin.end();
+    await new Promise(r => child.once("exit", r));
+  } finally {
+    await srv.close();
+    await kernel.dispose();
+    fs.rmSync(tmp, {recursive: true, force: true});
+  }
+}
+
 await testProviderTranslators();
 await testUsageLedger();
 await testProviderGatewayE2E();
 await testMermaidCycleAndShapes();
 await testExtensionSyncClaudeHooks();
 await testAcpDriver();
+await testAntigravityResilienceAndWatchdog();
+await testDiffCompactCacheAndPerStepUsage();
+await testPerfectReadEditCreateRuntime();
+await testMobileUseAndDualModeParity();
 await testCliBridgeDriver();
 await testGuestMux();
 await testDevToolsAndDelegateMcp();

@@ -336,6 +336,7 @@ fun GaliaisApp(app: GaliaisApplication) {
             composable("settings/codex") { CodexSettingsScreen(app, snackbar, onBack = ::safePopBack, onOpenProviders = { safeNavigate("settings/providers") }) }
             composable("settings/claude") { ClaudeSettingsScreen(app, snackbar, onBack = ::safePopBack, onOpenProviders = { safeNavigate("settings/providers") }) }
             composable("settings/workspace") { WorkspaceSettingsScreen(app, snackbar, onBack = ::safePopBack) }
+            composable("settings/mobileuse") { MobileUseSettingsScreen(app, snackbar, onBack = ::safePopBack) }
             composable("settings/runtime") { RuntimeSettingsScreen(app, snackbar, onBack = ::safePopBack) }
             composable("settings/selfbuild") { SelfBuildSettingsScreen(app, snackbar, onBack = ::safePopBack) }
             composable("settings/about") { AboutSettingsScreen(app, snackbar = snackbar, onBack = ::safePopBack) }
@@ -428,6 +429,20 @@ fun GaliaisApp(app: GaliaisApplication) {
             currentRoute = currentLogicalRoute,
             cwd = settings.defaultCwd,
         )
+        val mobileApproval by app.mobileUse.pendingApproval.collectAsState()
+        mobileApproval?.let { request ->
+            GaliaisAlertDialog(
+                title = "确认手机操作",
+                confirmText = "允许本次",
+                dismissText = "拒绝",
+                onConfirm = { app.mobileUse.resolveApproval(request.id, true) },
+                onDismissRequest = { app.mobileUse.resolveApproval(request.id, false) },
+            ) {
+                Text("${request.action} · ${request.packageName}", color = G.ink)
+                Text(request.details, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                Text(if (request.returnToApp) "确认后请在 30 秒内返回目标应用。授权仅限本次操作。" else "授权仅限本次操作。", color = G.inkMuted)
+            }
+        }
     }
     }
 }

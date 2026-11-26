@@ -25,6 +25,10 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
     private val msgStartedAt = mutableMapOf<String, Long>()
     private val msgFirstTokenAt = mutableMapOf<String, Long>()
     private val msgLastTokenAt = mutableMapOf<String, Long>()
+    /** 按单条 API message.id 暂存其精确流式耗时（durMs, ttftMs, genMs），供 assistant 逐请求入账使用。 */
+    private val msgTimingById = mutableMapOf<String, Triple<Long, Long, Long>>()
+    /** 记录本轮已逐条入账的 assistant message.id，避免同一消息多次下发或 result 汇总重复记账。 */
+    private val turnBilledMsgIds = mutableMapOf<String, MutableSet<String>>()
     private val turnTtftSum = mutableMapOf<String, Long>()
     private val turnTtftCount = mutableMapOf<String, Int>()
     private val turnGenMsSum = mutableMapOf<String, Long>()
@@ -140,6 +144,10 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
     }
 
     override suspend fun create(cwd: String, options: CreateOptions): ConversationKey {
+        return createSession(cwd, options)
+    }
+
+    private suspend fun createSession(cwd: String, options: CreateOptions, restoredOptions: ConversationOptions? = null): ConversationKey {
         val state = settings.state.value
         val providerId = when (options.providerId) {
             null -> state.claudeProviderId
@@ -149,11 +157,13 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
         val model = options.model ?: state.claudeModel.takeIf { providerId == state.claudeProviderId }
             ?: providerId?.let { state.provider(it)?.models?.firstOrNull() }
         val useModelDefaults = model != null && providerId == state.claudeProviderId && (options.model == null || options.model == state.claudeModel)
-        val effort = state.claudeEffort.takeIf { useModelDefaults }
-        val fastMode = state.claudeFastMode.takeIf { useModelDefaults }
-        val permissionMode = if (state.claudePermissionMode == "auto" && !useModelDefaults) "default" else state.claudePermissionMode
+        val effort = if (restoredOptions != null) restoredOptions.effort else state.claudeEffort.takeIf { useModelDefaults }
+        val fastMode = if (restoredOptions != null) restoredOptions.fastMode else state.claudeFastMode.takeIf { useModelDefaults }
+        val permissionMode = restoredOptions?.permissionMode
+            ?: if (state.claudePermissionMode == "auto" && !useModelDefaults) "default" else state.claudePermissionMode
+        val reasoningSummary = restoredOptions?.reasoningSummary ?: state.defaultReasoningSummaryFor(kind)
         val opts = sessionOptions(cwd, providerId, model, effort, permissionMode,
-            state.defaultReasoningSummaryFor(kind), fastMode).put("allowDelegation", options.allowDelegation)
+            reasoningSummary, fastMode).put("allowDelegation", options.allowDelegation)
         if (providerId != null) repo.syncProvidersNow()
         repo.envSsh.syncBeforeLaunch()
         val opened = call("session/open", opts)
@@ -168,7 +178,7 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                 model = opts.str("model") ?: it.model,
                 effort = effort,
                 permissionMode = permissionMode,
-                reasoningSummary = state.defaultReasoningSummaryFor(kind),
+                reasoningSummary = reasoningSummary,
                 fastMode = fastMode,
             )
         }
@@ -387,7 +397,7 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                 latestPlanFile.remove(key.id)
                 settings.setClaudeSessionProvider(key.id, null)
                 settings.removeConversationOptions(key)
-                val newKey = create(
+                val newKey = createSession(
                     cwd = cwd,
                     options = CreateOptions(
                         providerId = current.providerId ?: "",
@@ -395,6 +405,7 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                         parent = current.summary.parent,
                         allowDelegation = settings.state.value.delegationEnabled && current.summary.parent == null,
                     ),
+                    restoredOptions = ConversationOptions.from(current),
                 )
                 repo.update(newKey) { st ->
                     st.copy(
@@ -648,8 +659,18 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
     }
 
     private fun handleMessage(key: ConversationKey, message: JSONObject, live: Boolean) {
-        // 子代理内部的消息不进入主时间线，避免刷屏。
-        if (!message.isNull("parent_tool_use_id") && message.has("parent_tool_use_id")) return
+        // 子代理内部的消息不进入主时间线，但直连模式仍需将其模型请求的真实 Token 逐条记入用量账本。
+        val isSubagentMsg = !message.isNull("parent_tool_use_id") && message.has("parent_tool_use_id")
+        if (isSubagentMsg) {
+            if (live && message.optString("type") == "assistant") {
+                val body = message.optJSONObject("message")
+                val usage = body?.optJSONObject("usage")
+                if (body != null && usage != null) {
+                    recordClaudeAssistantUsage(key, body, usage, isSubagent = true)
+                }
+            }
+            return
+        }
         when (message.optString("type")) {
             "system" -> when (message.optString("subtype")) {
                 "init" -> {
@@ -715,7 +736,10 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
             "stream_event" -> if (live) onStream(key, message.optJSONObject("event") ?: return)
             "assistant" -> {
                 val body = message.optJSONObject("message") ?: return
-                body.optJSONObject("usage")?.let { updateClaudeUsage(key, it) }
+                body.optJSONObject("usage")?.let { u ->
+                    updateClaudeUsage(key, u)
+                    if (live) recordClaudeAssistantUsage(key, body, u, isSubagent = false)
+                }
                 val messageId = body.optString("id", message.optString("uuid"))
                 body.arr("content").objects().forEachIndexed { index, block ->
                     val id = "$messageId:$index"
@@ -934,14 +958,10 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                     }
                 }
                 val failed = message.optBoolean("is_error") || message.optString("subtype") != "success"
+                val billedThisTurn = turnBilledMsgIds.remove(key.id)?.size ?: 0
                 if (live && repo.state(key)?.providerId == null) {
                     val st = repo.state(key)
                     val prevUsage = st?.tokenUsage
-                    val inTok = if (resUsage != null) {
-                        resUsage.optLong("input_tokens") + resUsage.optLong("cache_read_input_tokens") + resUsage.optLong("cache_creation_input_tokens")
-                    } else (prevUsage?.inputTokens ?: 0L)
-                    val outTok = resUsage?.optLong("output_tokens") ?: (prevUsage?.outputTokens ?: 0L)
-                    // 优先采用官方 SDK 上报的 duration_api_ms（纯 API 耗时，排除本地工具执行与审批等待）
                     val apiDurMs = message.optLong("duration_api_ms", 0L).takeIf { it > 0L }
                     val wallDurMs = message.optLong("duration_ms", 0L).takeIf { it > 0L }
                         ?: st?.turnStartedAt?.let { (System.currentTimeMillis() - it).coerceAtLeast(0L) }
@@ -952,28 +972,57 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                     val genMs = (turnGenMsSum.remove(key.id) ?: 0L).coerceAtMost(claudeDur)
                     msgStartedAt.remove(key.id); msgFirstTokenAt.remove(key.id); msgLastTokenAt.remove(key.id)
                     val isApiKeyPayg = settings.state.value.hasClaudeKey && !settings.state.value.hasClaudeOauthToken
-                    val reportedCost = message.optDouble("total_cost_usd", -1.0).takeIf { it >= 0.0 && isApiKeyPayg }
-                    repo.hub.recordDirectUsage(
-                        agent = "claude",
-                        model = st?.model ?: "claude",
-                        inputTokens = inTok,
-                        outputTokens = outTok,
-                        cacheReadTokens = resUsage?.optLong("cache_read_input_tokens") ?: (prevUsage?.cachedInputTokens ?: 0L),
-                        cacheWriteTokens = resUsage?.optLong("cache_creation_input_tokens") ?: (prevUsage?.cacheWriteTokens ?: 0L),
-                        durationMs = claudeDur,
-                        ttftMs = avgTurnTtft,
-                        genMs = genMs,
-                        streamed = ttftCnt > 0 || genMs > 0L,
-                        exact = true,
-                        contextUsed = prevUsage?.totalTokens ?: 0L,
-                        contextWindow = reportedWindow ?: prevUsage?.contextWindow,
-                        billingKind = if (isApiKeyPayg) "payg" else "plan",
-                        costUsd = reportedCost,
-                        status = if (failed) 500 else 200,
-                        error = if (failed) message.optString("subtype") else "",
-                        providerName = "Anthropic 官方",
-                        sessionId = key.id,
-                    )
+                    val isInterrupted = message.optString("subtype").contains("interrupt", ignoreCase = true) ||
+                        message.optString("subtype").contains("cancel", ignoreCase = true)
+                    // 本轮已按 assistant 逐条记账时，成功回合不再重复写入整轮总和；仅当本轮未记过任何请求或失败/中断时兜底入账
+                    if (billedThisTurn == 0) {
+                        val inTok = if (resUsage != null) {
+                            resUsage.optLong("input_tokens") + resUsage.optLong("cache_read_input_tokens") + resUsage.optLong("cache_creation_input_tokens")
+                        } else (prevUsage?.inputTokens ?: 0L)
+                        val outTok = resUsage?.optLong("output_tokens") ?: (prevUsage?.outputTokens ?: 0L)
+                        val reportedCost = message.optDouble("total_cost_usd", -1.0).takeIf { it >= 0.0 && isApiKeyPayg }
+                        repo.hub.recordDirectUsage(
+                            agent = "claude",
+                            model = st?.model ?: "claude",
+                            inputTokens = inTok,
+                            outputTokens = outTok,
+                            cacheReadTokens = resUsage?.optLong("cache_read_input_tokens") ?: (prevUsage?.cachedInputTokens ?: 0L),
+                            cacheWriteTokens = resUsage?.optLong("cache_creation_input_tokens") ?: (prevUsage?.cacheWriteTokens ?: 0L),
+                            durationMs = claudeDur,
+                            ttftMs = avgTurnTtft,
+                            genMs = genMs,
+                            streamed = ttftCnt > 0 || genMs > 0L,
+                            exact = true,
+                            contextUsed = prevUsage?.totalTokens ?: 0L,
+                            contextWindow = reportedWindow ?: prevUsage?.contextWindow,
+                            billingKind = if (isApiKeyPayg) "payg" else "plan",
+                            costUsd = reportedCost,
+                            status = when {
+                                isInterrupted -> 499
+                                failed -> 500
+                                else -> 200
+                            },
+                            error = if (failed || isInterrupted) message.optString("subtype") else "",
+                            providerName = "Anthropic 官方",
+                            sessionId = key.id,
+                        )
+                    } else if (failed || isInterrupted) {
+                        repo.hub.recordDirectUsage(
+                            agent = "claude",
+                            model = st?.model ?: "claude",
+                            inputTokens = 0L,
+                            outputTokens = 0L,
+                            durationMs = 1L,
+                            billingKind = if (isApiKeyPayg) "payg" else "plan",
+                            status = if (isInterrupted) 499 else 500,
+                            error = message.optString("subtype").ifBlank { if (isInterrupted) "用户中断" else "error" },
+                            providerName = "Anthropic 官方",
+                            sessionId = key.id,
+                        )
+                    }
+                } else {
+                    turnTtftSum.remove(key.id); turnTtftCount.remove(key.id); turnGenMsSum.remove(key.id)
+                    msgStartedAt.remove(key.id); msgFirstTokenAt.remove(key.id); msgLastTokenAt.remove(key.id)
                 }
                 if (failed && live) {
                     val detail = message.optJSONArray("errors")?.strings()?.joinToString("\n")?.ifBlank { null } ?: message.str("result") ?: message.optString("subtype")
@@ -1037,6 +1086,47 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
         }
     }
 
+    private fun recordClaudeAssistantUsage(key: ConversationKey, body: JSONObject, usage: JSONObject, isSubagent: Boolean) {
+        val st = repo.state(key)
+        if (st?.providerId != null) return
+        val msgId = body.str("id")?.takeIf { it.isNotBlank() } ?: return
+        val billed = turnBilledMsgIds.getOrPut(key.id) { mutableSetOf() }
+        if (!billed.add(msgId)) return
+        val input = usage.optLong("input_tokens")
+        val cacheRead = usage.optLong("cache_read_input_tokens")
+        val cacheWrite = usage.optLong("cache_creation_input_tokens")
+        val output = usage.optLong("output_tokens")
+        val totalIn = input + cacheRead + cacheWrite
+        if (totalIn <= 0L && output <= 0L) return
+        val timing = if (isSubagent) null else msgTimingById.remove(msgId)
+        val now = System.currentTimeMillis()
+        val fallbackDur = if (isSubagent) 1L else (msgStartedAt[key.id]?.let { (now - it).coerceAtLeast(1L) } ?: 1L)
+        val durMs = timing?.first ?: fallbackDur
+        val ttftMs = timing?.second ?: 0L
+        val genMs = timing?.third ?: 0L
+        val isApiKeyPayg = settings.state.value.hasClaudeKey && !settings.state.value.hasClaudeOauthToken
+        val modelName = body.str("model")?.takeIf { it.isNotBlank() } ?: st?.model ?: "claude"
+        repo.hub.recordDirectUsage(
+            agent = "claude",
+            model = modelName,
+            inputTokens = totalIn,
+            outputTokens = output,
+            cacheReadTokens = cacheRead,
+            cacheWriteTokens = cacheWrite,
+            durationMs = durMs,
+            ttftMs = ttftMs,
+            genMs = genMs,
+            streamed = ttftMs > 0L || genMs > 0L,
+            exact = true,
+            contextUsed = totalIn + output,
+            contextWindow = st?.tokenUsage?.contextWindow ?: inferModelContextWindow(modelName),
+            billingKind = if (isApiKeyPayg) "payg" else "plan",
+            status = 200,
+            providerName = "Anthropic 官方",
+            sessionId = key.id,
+        )
+    }
+
     private fun onStream(key: ConversationKey, event: JSONObject) {
         when (event.optString("type")) {
             "message_start" -> {
@@ -1046,15 +1136,24 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                 msgLastTokenAt.remove(key.id)
             }
             "message_stop" -> {
+                val now = System.currentTimeMillis()
+                val msgId = streaming[key.id]
                 val started = msgStartedAt.remove(key.id)
                 val first = msgFirstTokenAt.remove(key.id)
                 val last = msgLastTokenAt.remove(key.id)
-                if (started != null && first != null && first >= started) {
-                    turnTtftSum[key.id] = (turnTtftSum[key.id] ?: 0L) + (first - started)
+                val durMs = if (started != null) (now - started).coerceAtLeast(1L) else 1L
+                val ttftMs = if (started != null && first != null && first >= started) (first - started).coerceAtMost(durMs) else 0L
+                val genMs = if (first != null && last != null && last > first) (last - first).coerceAtMost(durMs) else 0L
+                if (!msgId.isNullOrBlank()) {
+                    if (msgTimingById.size > 64) msgTimingById.clear()
+                    msgTimingById[msgId] = Triple(durMs, ttftMs, genMs)
+                }
+                if (ttftMs > 0L) {
+                    turnTtftSum[key.id] = (turnTtftSum[key.id] ?: 0L) + ttftMs
                     turnTtftCount[key.id] = (turnTtftCount[key.id] ?: 0) + 1
                 }
-                if (first != null && last != null && last > first) {
-                    turnGenMsSum[key.id] = (turnGenMsSum[key.id] ?: 0L) + (last - first)
+                if (genMs > 0L) {
+                    turnGenMsSum[key.id] = (turnGenMsSum[key.id] ?: 0L) + genMs
                 }
             }
             "content_block_delta" -> {
@@ -1287,7 +1386,8 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
 
     override fun reset() {
         connected.clear(); modelCatalogs.clear(); streaming.clear(); dialogRequests.clear(); commandStartedAt.clear(); sessionCumulativeTokens.clear()
-        msgStartedAt.clear(); msgFirstTokenAt.clear(); msgLastTokenAt.clear(); turnTtftSum.clear(); turnTtftCount.clear(); turnGenMsSum.clear()
+        msgStartedAt.clear(); msgFirstTokenAt.clear(); msgLastTokenAt.clear(); msgTimingById.clear(); turnBilledMsgIds.clear()
+        turnTtftSum.clear(); turnTtftCount.clear(); turnGenMsSum.clear()
         claudeTasks.clear(); pendingTaskCreateTool.clear(); latestPlanFile.clear()
         turnWaiters.values.forEach { it.completeExceptionally(IllegalStateException("运行环境已停止")) }
         turnWaiters.clear()

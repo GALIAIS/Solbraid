@@ -379,6 +379,25 @@ fun UsageScreen(
     var inspectRow by remember { mutableStateOf<UsageRequestRow?>(null) }
     var topMenuOpen by remember { mutableStateOf(false) }
 
+    // 任一会话产生新 Token 用量或结束回合时自动触发账本刷新，避免切回用量中心看到滞后快照
+    val runningCount = remember(conversations) { conversations.values.count { it.running } }
+    val tokenPulse = remember(conversations) {
+        conversations.values.sumOf { (it.tokenUsage?.totalTokens ?: 0L) + (it.tokenUsage?.sessionTotalTokens ?: 0L) }
+    }
+    var prevRunningCount by remember { mutableIntStateOf(runningCount) }
+    var prevTokenPulse by remember { mutableStateOf(tokenPulse) }
+    LaunchedEffect(runningCount, tokenPulse, runtime.ready) {
+        if (!runtime.ready) return@LaunchedEffect
+        val finished = runningCount < prevRunningCount
+        val tokensChanged = tokenPulse != prevTokenPulse && prevTokenPulse > 0L
+        prevRunningCount = runningCount
+        prevTokenPulse = tokenPulse
+        if (finished || tokensChanged) {
+            delay(450)
+            tick++
+        }
+    }
+
     LaunchedEffect(searchInput) {
         delay(220)
         debouncedSearch = searchInput.trim()

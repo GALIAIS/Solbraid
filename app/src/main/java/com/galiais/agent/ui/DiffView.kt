@@ -19,6 +19,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -42,9 +43,33 @@ import com.galiais.agent.engine.FileDiff
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
+/** 聊天页 Diff 卡片协同动作回调：一键跳编辑器定位改动行 + 单文件一键撤回。 */
+data class DiffActionCallbacks(
+    val onOpenInEditor: ((path: String, lineNumber: Int) -> Unit)? = null,
+    val onRevertFile: ((path: String) -> Unit)? = null,
+)
+
+val LocalDiffActions = compositionLocalOf<DiffActionCallbacks?> { null }
+
 private data class DiffLine(val kind: Char, val text: String, val oldNumber: Int?, val newNumber: Int?)
 
 private val hunkHeader = Regex("^@@ -(\\d+)(?:,\\d+)? \\+(\\d+)(?:,\\d+)? @@.*")
+
+/** 提取 Diff 中首个新增/变更行的新文件行号，供「编辑」按钮直接精准定位。 */
+internal fun firstChangedNewLine(diff: String): Int {
+    val parsed = parseDiff(diff)
+    parsed.firstOrNull { it.kind == '+' && (it.newNumber ?: 0) > 0 }?.newNumber?.let { return it }
+    for (raw in diff.lineSequence()) {
+        val m = hunkHeader.matchEntire(raw) ?: continue
+        val n = m.groupValues[2].toIntOrNull()
+        if (n != null && n > 0) return n
+    }
+    return 1
+}
+
+/** 识别 Agent 大范围覆写（非纯新增文件且删除 >= 200 行且总变更 >= 350 行），提醒用户注意核验或一键回滚。 */
+internal fun isLargeOverwriteDiff(added: Int, removed: Int, kind: String): Boolean =
+    kind != "add" && removed >= 200 && (added + removed) >= 350
 
 private fun parseDiff(diff: String): List<DiffLine> {
     val lines = ArrayList<DiffLine>()
@@ -110,6 +135,14 @@ fun DiffView(
     var copied by remember { mutableStateOf(false) }
     LaunchedEffect(copied) { if (copied) { delay(1300); copied = false } }
 
+    val diffActions = LocalDiffActions.current
+    val isRealFilePath = remember(change.path) {
+        val p = change.path.trim()
+        p.isNotEmpty() && !p.startsWith("本轮汇总") && p != "代码变更"
+    }
+    val largeOverwrite = remember(added, removed, change.kind) { isLargeOverwriteDiff(added, removed, change.kind) }
+    val firstLine = remember(change.diff) { firstChangedNewLine(change.diff) }
+
     val cleanPath = change.path.trimStart('/')
     val slash = cleanPath.lastIndexOf('/')
     val dir = if (slash >= 0) cleanPath.substring(0, slash + 1) else ""
@@ -119,7 +152,7 @@ fun DiffView(
         modifier.fillMaxWidth(),
         shape = D.shape(11.dp),
         color = G.surface,
-        border = BorderStroke(0.75.dp, G.border),
+        border = BorderStroke(0.75.dp, if (largeOverwrite) G.warning.copy(alpha = 0.55f) else G.border),
     ) {
         Column {
             Row(
@@ -184,6 +217,32 @@ fun DiffView(
                             .padding(horizontal = 5.dp, vertical = 1.dp),
                     )
                 }
+                if (isRealFilePath && diffActions?.onOpenInEditor != null && change.kind != "delete") {
+                    Row(
+                        modifier = Modifier
+                            .clip(D.shape(5.dp))
+                            .clickable { diffActions.onOpenInEditor.invoke(change.path, firstLine) }
+                            .padding(horizontal = 4.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Icon(GaliaisIcons.Edit, contentDescription = "编辑文件", tint = G.accent, modifier = Modifier.size(11.5.dp))
+                        Text("编辑", fontSize = 10.5.sp, color = G.accent, fontWeight = FontWeight.Medium)
+                    }
+                }
+                if (isRealFilePath && diffActions?.onRevertFile != null) {
+                    Row(
+                        modifier = Modifier
+                            .clip(D.shape(5.dp))
+                            .clickable { diffActions.onRevertFile.invoke(change.path) }
+                            .padding(horizontal = 4.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Icon(GaliaisIcons.Undo, contentDescription = "撤回单文件", tint = G.warning, modifier = Modifier.size(11.5.dp))
+                        Text("撤回", fontSize = 10.5.sp, color = G.warning, fontWeight = FontWeight.Medium)
+                    }
+                }
                 if (change.diff.isNotBlank()) {
                     Row(
                         modifier = Modifier.clip(D.shape(5.dp)).clickable {
@@ -197,6 +256,30 @@ fun DiffView(
                     ) {
                         Icon(if (copied) GaliaisIcons.Check else GaliaisIcons.Copy, contentDescription = null, tint = if (copied) G.success else G.inkMuted, modifier = Modifier.size(11.5.dp))
                         Text(if (copied) "已复制" else "复制", fontSize = 10.5.sp, color = if (copied) G.success else G.inkMuted)
+                    }
+                }
+            }
+            if (largeOverwrite) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(G.warningTint)
+                        .padding(horizontal = 10.dp, vertical = 5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Icon(GaliaisIcons.AlertTriangle, contentDescription = null, tint = G.warning, modifier = Modifier.size(13.dp))
+                    Text(
+                        "大范围覆写（+$added / -$removed 行），请仔细核验改动",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = G.ink,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (isRealFilePath && diffActions?.onRevertFile != null) {
+                        TagPill("一键回滚", fg = G.warning, bg = G.surface, border = G.warning.copy(alpha = 0.45f), onClick = {
+                            diffActions.onRevertFile.invoke(change.path)
+                        })
                     }
                 }
             }

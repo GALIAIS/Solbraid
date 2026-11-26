@@ -36,6 +36,12 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
     private val stepStartedAt = mutableMapOf<String, Long>()
     private val stepFirstTokenAt = mutableMapOf<String, Long>()
     private val stepLastTokenAt = mutableMapOf<String, Long>()
+    /** 正在 attach/load 的线程集合：屏蔽冷启动历史重放的 tokenUsage 幽灵入账。 */
+    private val hydratingThreads = mutableSetOf<String>()
+    /** 最近结束回合时间：允许 turn/completed 后 4 秒内到达的尾包 tokenUsage 正常入账，防止竞态漏记。 */
+    private val recentlyEndedTurns = mutableMapOf<String, Long>()
+    /** 记录每个线程（含子代理线程）真实使用的自定义服务商 ID，杜绝走本地网关的线程被重复记成 official_codex。 */
+    private val threadProviderIds = mutableMapOf<String, String>()
     private val accountVersionFlow = MutableStateFlow(0)
     /** 账户事件计数；设置页据此重新读取账户。 */
     val accountVersion: StateFlow<Int> = accountVersionFlow.asStateFlow()
@@ -137,9 +143,15 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         )
         if (settings.delegationEnabled) params.put("dynamicTools", JSONArray().put(delegateTool()).put(delegateToAgentTool()))
         if (saved != null) params.put("serviceTier", current?.serviceTier ?: JSONObject.NULL)
-        val resumed = call("thread/resume", params)
+        hydratingThreads += key.id
+        val resumed = try {
+            call("thread/resume", params)
+        } finally {
+            hydratingThreads -= key.id
+        }
         attached += key.id
         val providerId = CustomProvider.fromCodexProviderId(resumed.str("modelProvider"))
+        if (providerId != null) threadProviderIds[key.id] = providerId else threadProviderIds.remove(key.id)
         repo.update(key) { state ->
             state.copy(providerId = providerId,
                 model = if (state.model == current?.model) resumed.str("model") ?: state.model else state.model,
@@ -179,6 +191,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
             if (turn.optString("status") == "inProgress") activeTurn = tid
         }
         val providerId = CustomProvider.fromCodexProviderId(thread.str("modelProvider"))
+        if (providerId != null) threadProviderIds[key.id] = providerId else threadProviderIds.remove(key.id)
         repo.update(key) { state ->
             state.copy(summary = summary(thread, state.summary.parent), items = items, loaded = true,
                 running = activeTurn != null, activeTurnId = activeTurn,
@@ -232,6 +245,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         val thread = started.getJSONObject("thread")
         val key = key(thread.getString("id"))
         attached += key.id
+        if (provider != null) threadProviderIds[key.id] = provider.id else threadProviderIds.remove(key.id)
         repo.update(key) { state ->
             state.copy(summary = summary(thread, options.parent ?: state.summary.parent).copy(title = state.summary.title.takeUnless { it == "新会话" } ?: "新会话"),
                 loaded = true, providerId = provider?.id, model = started.str("model") ?: resolvedModel,
@@ -915,8 +929,18 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         val threadKey = params.str("threadId")?.let(::key)
         when (event.method) {
             "thread/started" -> params.obj("thread")?.let { thread ->
-                val key = key(thread.getString("id"))
-                repo.update(key) { it.copy(summary = summary(thread, it.summary.parent).let { s -> if (it.summary.title != "新会话" && thread.str("name") == null) s.copy(title = it.summary.title) else s }) }
+                val tid = thread.getString("id")
+                val key = key(tid)
+                val parentKey = thread.str("parentThreadId")?.let(::key)
+                val startedProvider = CustomProvider.fromCodexProviderId(thread.str("modelProvider"))
+                    ?: parentKey?.let { repo.state(it)?.providerId ?: threadProviderIds[it.id] }
+                if (startedProvider != null) threadProviderIds[tid] = startedProvider
+                repo.update(key) {
+                    it.copy(
+                        summary = summary(thread, it.summary.parent).let { s -> if (it.summary.title != "新会话" && thread.str("name") == null) s.copy(title = it.summary.title) else s },
+                        providerId = it.providerId ?: startedProvider,
+                    )
+                }
             }
             "thread/status/changed" -> threadKey?.let { key ->
                 val active = params.obj("status")?.optString("type") == "active"
@@ -938,6 +962,8 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                 repo.settings.removeConversationOptions(key)
                 submittedOptions.remove(key.id)
                 billedTotalUsage.remove(key.id)
+                recentlyEndedTurns.remove(key.id)
+                threadProviderIds.remove(key.id)
                 stepStartedAt.remove(key.id); stepFirstTokenAt.remove(key.id); stepLastTokenAt.remove(key.id)
                 repo.remove(key)
             }
@@ -1006,10 +1032,17 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                     contextWindow = window,
                 )
                 val prevBilled = billedTotalUsage[key.id]
-                val wasRunning = repo.state(key)?.running == true
+                val curState = repo.state(key)
+                val wasRunning = curState?.running == true
+                val withinGrace = recentlyEndedTurns[key.id]?.let { System.currentTimeMillis() - it <= 4_000L } == true
+                val resolvedProviderId = curState?.providerId
+                    ?: threadProviderIds[key.id]
+                    ?: curState?.summary?.parent?.let { repo.state(it)?.providerId ?: threadProviderIds[it.id] }
+                // 若线程尚未完成加载且全局 Codex 默认服务商指向自定义网关，则绝不误判为官方直连，杜绝与网关重复记账
+                val routedViaGateway = resolvedProviderId != null || (curState?.loaded != true && settings.codexProviderId != null)
                 repo.update(key) { it.copy(tokenUsage = snapshot) }
-                // 仅在会话活跃运行且累计 total 严格递增时按增量入账，杜绝重连重放与压缩后回落干扰计费
-                if (repo.state(key)?.providerId == null && wasRunning) {
+                // 活跃运行或回合刚结束 4 秒宽限期内且累计 total 严格递增时按增量入账；冷启动 attach/load 期间只更新基线不重复入账
+                if (!routedViaGateway && key.id !in hydratingThreads && (wasRunning || withinGrace)) {
                     val deltaIn: Long
                     val deltaOut: Long
                     val deltaCache: Long
@@ -1030,7 +1063,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                     billedTotalUsage[key.id] = billSnapshot
                     if (deltaIn > 0L || deltaOut > 0L) {
                         val now = System.currentTimeMillis()
-                        val stepStart = stepStartedAt[key.id] ?: repo.state(key)?.turnStartedAt ?: now
+                        val stepStart = stepStartedAt[key.id] ?: curState?.turnStartedAt ?: now
                         val stepDurMs = (now - stepStart).coerceAtLeast(1L)
                         val firstAt = stepFirstTokenAt.remove(key.id)
                         val lastAt = stepLastTokenAt.remove(key.id)
@@ -1039,7 +1072,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                         stepStartedAt[key.id] = now
                         repo.hub.recordDirectUsage(
                             agent = "codex",
-                            model = repo.state(key)?.model ?: "codex",
+                            model = curState?.model ?: settings.codexModel ?: "codex",
                             inputTokens = deltaIn,
                             outputTokens = deltaOut,
                             cacheReadTokens = deltaCache,
@@ -1072,16 +1105,19 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
             }
             "turn/completed" -> threadKey?.let { key ->
                 finishReasoning(key)
+                recentlyEndedTurns[key.id] = System.currentTimeMillis()
                 val turn = params.obj("turn") ?: JSONObject()
                 val turnId = turn.str("id")
                 val error = turn.obj("error")
+                val curState = repo.state(key)
+                val resolvedProviderId = curState?.providerId ?: threadProviderIds[key.id]
                 if (error != null) {
                     repo.upsertItem(key, TimelineItem.Notice("error-${turn.optString("id")}", error.optString("message"), error = true))
-                    if (repo.state(key)?.providerId == null) {
-                        val elapsed = repo.state(key)?.turnStartedAt?.let { (System.currentTimeMillis() - it).coerceAtLeast(0L) } ?: 0L
+                    if (resolvedProviderId == null) {
+                        val elapsed = curState?.turnStartedAt?.let { (System.currentTimeMillis() - it).coerceAtLeast(1L) } ?: 1L
                         repo.hub.recordDirectUsage(
                             agent = "codex",
-                            model = repo.state(key)?.model ?: "codex",
+                            model = curState?.model ?: settings.codexModel ?: "codex",
                             inputTokens = 0L,
                             outputTokens = 0L,
                             durationMs = elapsed,
@@ -1091,7 +1127,23 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                             sessionId = key.id,
                         )
                     }
-                } else if (turn.optString("status") == "interrupted") repo.upsertItem(key, TimelineItem.Notice("interrupted-${turn.optString("id")}", "已中断"))
+                } else if (turn.optString("status") == "interrupted") {
+                    repo.upsertItem(key, TimelineItem.Notice("interrupted-${turn.optString("id")}", "已中断"))
+                    if (resolvedProviderId == null) {
+                        val elapsed = curState?.turnStartedAt?.let { (System.currentTimeMillis() - it).coerceAtLeast(1L) } ?: 1L
+                        repo.hub.recordDirectUsage(
+                            agent = "codex",
+                            model = curState?.model ?: settings.codexModel ?: "codex",
+                            inputTokens = 0L,
+                            outputTokens = 0L,
+                            durationMs = elapsed,
+                            status = 499,
+                            error = "用户中断",
+                            providerName = "OpenAI 官方",
+                            sessionId = key.id,
+                        )
+                    }
+                }
                 repo.update(key) { state ->
                     val durMs = (if (turn.has("durationMs") && !turn.isNull("durationMs")) turn.optLong("durationMs", -1L).takeIf { it >= 0L } else null)
                         ?: state.turnStartedAt?.let { (System.currentTimeMillis() - it).coerceAtLeast(0L) }
@@ -1431,6 +1483,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
     override fun reset() {
         repo.conversations.value.keys.filter { it.engine == kind }.forEach { finishReasoning(it) }
         attached.clear(); legacyRequests.clear(); submittedOptions.clear(); billedTotalUsage.clear()
+        hydratingThreads.clear(); recentlyEndedTurns.clear(); threadProviderIds.clear()
         stepStartedAt.clear(); stepFirstTokenAt.clear(); stepLastTokenAt.clear()
         loginFlowMutable.value = null
         turnWaiters.values.forEach { it.completeExceptionally(IllegalStateException("运行环境已停止")) }

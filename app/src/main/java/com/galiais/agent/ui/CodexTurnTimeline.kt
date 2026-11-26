@@ -208,6 +208,7 @@ fun LazyListScope.turnBlockItems(
     activeTurnStartedAt: Long?,
     expandByDefault: Boolean,
     cwd: String? = null,
+    focusText: String? = null,
     editingUserMessageId: String? = null,
     onOpenConversation: (ConversationKey) -> Unit,
     onCancelDelegation: () -> Unit,
@@ -243,6 +244,7 @@ fun LazyListScope.turnBlockItems(
                 activeTurnStartedAt = activeTurnStartedAt,
                 expandByDefault = expandByDefault,
                 cwd = cwd,
+                focusText = if (block.inProgress) focusText else null,
                 onOpenConversation = onOpenConversation,
                 onCancelDelegation = onCancelDelegation,
                 onOpenArtifact = onOpenArtifact,
@@ -508,6 +510,7 @@ private fun CodexTurnTrace(
     activeTurnStartedAt: Long?,
     expandByDefault: Boolean,
     cwd: String?,
+    focusText: String? = null,
     onOpenConversation: (ConversationKey) -> Unit,
     onCancelDelegation: () -> Unit,
     onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
@@ -520,25 +523,33 @@ private fun CodexTurnTrace(
     val cmdCount = block.traceItems.count { it is TimelineItem.CommandRun }
     val editCount = block.traceItems.count { it is TimelineItem.FileEdit }
     val toolCount = block.traceItems.count { it is TimelineItem.ToolCall }
-    val liveAction = remember(block.traceItems, block.inProgress) {
+    val liveAction = remember(block.traceItems, block.inProgress, focusText) {
         if (!block.inProgress) null
-        else when (val latest = block.traceItems.lastOrNull()) {
-            is TimelineItem.CommandRun -> if (latest.status == ItemStatus.RUNNING) {
-                when (classifyCommandRun(latest)) {
-                    ToolCallKind.READ_FILE -> "正在读取文件"
-                    ToolCallKind.LIST_DIR -> "正在浏览目录"
-                    ToolCallKind.SEARCH_CODE -> "正在搜索代码"
-                    ToolCallKind.FIND_FILES -> "正在查找文件"
-                    else -> "正在运行命令"
-                }
-            } else "正在执行"
-            is TimelineItem.FileEdit -> if (latest.status == ItemStatus.RUNNING) "正在编辑文件" else "正在执行"
-            is TimelineItem.ToolCall -> if (latest.status == ItemStatus.RUNNING) "正在${describeToolCall(latest.name, latest.input).badge}" else "正在执行"
-            is TimelineItem.Reasoning -> if (latest.streaming) {
-                val hint = reasoningPreview(latest.summaryText, true).title?.take(16)
-                if (!hint.isNullOrBlank()) "正在思考 · $hint" else "正在思考"
-            } else "正在执行"
-            else -> "正在执行"
+        else {
+            val cleanFocus = focusText?.trim()?.takeIf { it.isNotEmpty() }?.take(34)
+            when (val latest = block.traceItems.lastOrNull()) {
+                is TimelineItem.CommandRun -> if (latest.status == ItemStatus.RUNNING) {
+                    cleanFocus ?: when (classifyCommandRun(latest)) {
+                        ToolCallKind.READ_FILE -> "正在读取文件"
+                        ToolCallKind.LIST_DIR -> "正在浏览目录"
+                        ToolCallKind.SEARCH_CODE -> "正在搜索代码"
+                        ToolCallKind.FIND_FILES -> "正在查找文件"
+                        else -> "正在运行命令"
+                    }
+                } else cleanFocus ?: "正在执行"
+                is TimelineItem.FileEdit -> if (latest.status == ItemStatus.RUNNING) cleanFocus ?: "正在编辑文件" else cleanFocus ?: "正在执行"
+                is TimelineItem.ToolCall -> if (latest.status == ItemStatus.RUNNING) {
+                    cleanFocus ?: "正在${describeToolCall(latest.name, latest.input, latest.kind).badge}"
+                } else cleanFocus ?: "正在执行"
+                is TimelineItem.Reasoning -> if (latest.streaming) {
+                    if (cleanFocus != null) cleanFocus
+                    else {
+                        val hint = reasoningPreview(latest.summaryText, true).title?.take(16)
+                        if (!hint.isNullOrBlank()) "正在思考 · $hint" else "正在思考"
+                    }
+                } else cleanFocus ?: "正在执行"
+                else -> cleanFocus ?: "正在执行"
+            }
         }
     }
     val durationMs = block.durationMs
@@ -645,7 +656,7 @@ private fun FramelessActivityCluster(
             when (item) {
                 is TimelineItem.FileEdit -> ToolCallKind.EDIT_FILE
                 is TimelineItem.CommandRun -> classifyCommandRun(item)
-                is TimelineItem.ToolCall -> describeToolCall(item.name, item.input).kind
+                is TimelineItem.ToolCall -> describeToolCall(item.name, item.input, item.kind).kind
                 else -> ToolCallKind.GENERIC
             }
         }.distinct()
@@ -965,7 +976,7 @@ private fun CompactFileEditRow(item: TimelineItem.FileEdit, cwd: String?) {
 @Composable
 private fun CompactToolRow(item: TimelineItem.ToolCall, cwd: String?, onOpenArtifact: ((ChatArtifact) -> Unit)? = null) {
     var open by remember { mutableStateOf(false) }
-    val meta = remember(item.name, item.input) { describeToolCall(item.name, item.input) }
+    val meta = remember(item.name, item.input, item.kind) { describeToolCall(item.name, item.input, item.kind) }
     val widgetArtifact = remember(item.id, item.name, item.input) { extractArtifactsFromItems(listOf(item)).firstOrNull() }
     val summary = remember(meta.summary, cwd) { stripCwdPrefix(meta.summary, cwd) }
     Column(Modifier.fillMaxWidth()) {
