@@ -227,7 +227,7 @@ fun PluginGlobalOverlayLayer(
                             ) {
                                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        Box(Modifier.size(7.dp).clip(CircleShape).background(G.accent))
+                                        Icon(GaliaisIcons.Sparkles, contentDescription = null, tint = G.accent, modifier = Modifier.size(13.dp))
                                         Text(
                                             liveCard.title.ifBlank { slot.label },
                                             style = MaterialTheme.typography.labelMedium,
@@ -300,7 +300,7 @@ fun PluginGlobalOverlayLayer(
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                                 ) {
-                                    Box(Modifier.size(7.dp).clip(CircleShape).background(G.accent))
+                                    Icon(GaliaisIcons.Sparkles, contentDescription = null, tint = G.accent, modifier = Modifier.size(13.dp))
                                     Text(
                                         slot.badge.ifBlank { slot.label.ifBlank { "插件" } },
                                         style = MaterialTheme.typography.labelMedium,

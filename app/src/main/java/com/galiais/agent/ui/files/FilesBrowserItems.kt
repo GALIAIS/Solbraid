@@ -76,6 +76,8 @@ import com.galiais.agent.ui.GaliaisMenuRow
 import com.galiais.agent.ui.Mono
 import com.galiais.agent.ui.SegmentedPillBar
 import com.galiais.agent.ui.SelectableChip
+import com.galiais.agent.ui.StatusGlyph
+import com.galiais.agent.ui.StatusVisual
 import com.galiais.agent.ui.TagPill
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -396,7 +398,11 @@ internal fun CompactRootStatusBar(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Box(Modifier.size(6.dp).background(accent, CircleShape))
+        StatusGlyph(
+            visual = if (writeUnlocked) StatusVisual.WARNING else StatusVisual.SUCCESS,
+            color = accent,
+            size = 13.5.dp,
+        )
         Text(
             summary,
             fontFamily = Mono,

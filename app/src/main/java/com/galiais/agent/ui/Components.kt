@@ -1,6 +1,7 @@
 package com.galiais.agent.ui
 
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloat
@@ -10,6 +11,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -97,6 +99,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -308,16 +312,132 @@ fun HeaderProgressSlot(loading: Boolean, modifier: Modifier = Modifier) {
     }
 }
 
+/** 统一语义状态枚举（方案 A：FA7 Pro+ / Pro 双层 Duotone 极简微章，形状 + 语义图标 + 柔和色阶协同表达）。 */
+enum class StatusVisual {
+    RUNNING,
+    SUCCESS,
+    WARNING,
+    DANGER,
+    STOPPED,
+    SKIPPED,
+    PENDING,
+}
+
+/** Duotone 轨道微弧旋转 / 真实进度环：progress 非空时按真实比例绘制，为空时 60/120fps 平滑旋转。 */
+@Composable
+fun StatusProgressArc(
+    color: Color,
+    size: Dp = 14.dp,
+    progress: Float? = null,
+    strokeWidth: Dp = 1.9.dp,
+    modifier: Modifier = Modifier,
+) {
+    if (progress != null) {
+        val animatedProgress by animateFloatAsState(
+            targetValue = progress.coerceIn(0.06f, 1f),
+            animationSpec = tween(260),
+            label = "statusArcProgress",
+        )
+        Canvas(modifier = modifier.size(size)) {
+            val stroke = Stroke(width = strokeWidth.toPx(), cap = StrokeCap.Round)
+            val pad = stroke.width / 2f
+            val arcSize = androidx.compose.ui.geometry.Size(this.size.width - stroke.width, this.size.height - stroke.width)
+            val topLeft = Offset(pad, pad)
+            drawArc(color = color.copy(alpha = 0.24f), startAngle = 0f, sweepAngle = 360f, useCenter = false, topLeft = topLeft, size = arcSize, style = stroke)
+            drawArc(color = color, startAngle = -90f, sweepAngle = animatedProgress * 360f, useCenter = false, topLeft = topLeft, size = arcSize, style = stroke)
+        }
+    } else {
+        val transition = rememberInfiniteTransition(label = "statusSpin")
+        val angle by transition.animateFloat(
+            initialValue = 0f,
+            targetValue = 360f,
+            animationSpec = infiniteRepeatable(tween(950, easing = LinearEasing), RepeatMode.Restart),
+            label = "statusSpinAngle",
+        )
+        Canvas(modifier = modifier.size(size)) {
+            val stroke = Stroke(width = strokeWidth.toPx(), cap = StrokeCap.Round)
+            val pad = stroke.width / 2f
+            val arcSize = androidx.compose.ui.geometry.Size(this.size.width - stroke.width, this.size.height - stroke.width)
+            val topLeft = Offset(pad, pad)
+            drawArc(color = color.copy(alpha = 0.24f), startAngle = 0f, sweepAngle = 360f, useCenter = false, topLeft = topLeft, size = arcSize, style = stroke)
+            drawArc(color = color, startAngle = angle - 90f, sweepAngle = 115f, useCenter = false, topLeft = topLeft, size = arcSize, style = stroke)
+        }
+    }
+}
+
+/** 统一 Duotone 语义状态微章（无边框轻盈嵌入行内、列表与胶囊）。 */
+@Composable
+fun StatusGlyph(
+    visual: StatusVisual,
+    color: Color,
+    size: Dp = 15.dp,
+    progress: Float? = null,
+    modifier: Modifier = Modifier,
+) {
+    when (visual) {
+        StatusVisual.RUNNING -> StatusProgressArc(
+            color = color,
+            size = (size - 1.dp).coerceAtLeast(10.dp),
+            progress = progress,
+            strokeWidth = if (size <= 13.dp) 1.7.dp else 1.9.dp,
+            modifier = modifier,
+        )
+        StatusVisual.SUCCESS -> Icon(GaliaisIcons.CheckCircle, contentDescription = null, tint = color, modifier = modifier.size(size))
+        StatusVisual.WARNING -> Icon(GaliaisIcons.AlertTriangle, contentDescription = null, tint = color, modifier = modifier.size(size))
+        StatusVisual.DANGER -> Icon(GaliaisIcons.XCircle, contentDescription = null, tint = color, modifier = modifier.size(size))
+        StatusVisual.STOPPED -> Icon(GaliaisIcons.PowerOff, contentDescription = null, tint = color, modifier = modifier.size(size))
+        StatusVisual.SKIPPED -> Icon(GaliaisIcons.MinusCircle, contentDescription = null, tint = color, modifier = modifier.size(size))
+        StatusVisual.PENDING -> Icon(GaliaisIcons.CirclePending, contentDescription = null, tint = color, modifier = modifier.size(size))
+    }
+}
+
+/** 方案 A 语义状态胶囊：柔和浅底 + 0.75dp 语义微边 + FA7 Duotone 微章或真实进度环 + 文本。 */
+@Composable
+fun StatusBadge(
+    label: String,
+    visual: StatusVisual,
+    color: Color,
+    background: Color,
+    progress: Float? = null,
+    textColor: Color = color,
+    borderAlpha: Float = 0.24f,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier = modifier
+            .clip(D.shape(999.dp))
+            .background(background)
+            .border(0.75.dp, color.copy(alpha = borderAlpha), D.shape(999.dp))
+            .padding(horizontal = 9.5.dp, vertical = 4.5.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.5.dp),
+    ) {
+        StatusGlyph(visual = visual, color = color, size = 14.dp, progress = progress)
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = textColor,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            softWrap = false,
+        )
+    }
+}
+
+/** 图表图例专用圆角色条（替代孤立小圆点，与分段进度条语言呼应）。 */
+@Composable
+fun ColorSwatchPill(color: Color, modifier: Modifier = Modifier) {
+    Box(modifier.width(10.dp).height(5.dp).clip(RoundedCornerShape(999.dp)).background(color))
+}
+
+/** 兼容旧调用的运行态微弧指示器（已升级为 Duotone 细轨道旋转环，不再是闪烁圆点）。 */
 @Composable
 fun PulsingDot(color: Color, size: Dp = 7.dp) {
-    val transition = rememberInfiniteTransition(label = "pulse")
-    val alpha = transition.animateFloat(
-        initialValue = 1f,
-        targetValue = 0.25f,
-        animationSpec = infiniteRepeatable(tween(900), RepeatMode.Reverse),
-        label = "pulseAlpha",
+    StatusProgressArc(
+        color = color,
+        size = (size + 5.dp).coerceIn(11.dp, 15.dp),
+        strokeWidth = 1.75.dp,
     )
-    Box(Modifier.size(size).graphicsLayer { this.alpha = alpha.value }.background(color, CircleShape))
 }
 
 @Composable

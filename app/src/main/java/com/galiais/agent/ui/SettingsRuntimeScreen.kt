@@ -1,6 +1,7 @@
 package com.galiais.agent.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -129,12 +130,21 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
                         false -> Triple(rootAccess?.status?.label ?: "Root 启动未确认", G.inkMuted, G.surfaceSubtle)
                     }
                     Row(
-                        modifier = Modifier.weight(1f).clip(D.chipShape).background(rootBg).padding(horizontal = 10.dp, vertical = 6.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(D.chipShape)
+                            .background(rootBg)
+                            .border(0.75.dp, rootColor.copy(alpha = 0.24f), D.chipShape)
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        if (rootAvailable == null) PulsingDot(rootColor, size = 6.dp)
-                        else Box(Modifier.size(6.dp).background(rootColor, CircleShape))
+                        val rootVisual = when (rootAvailable) {
+                            null -> StatusVisual.RUNNING
+                            true -> StatusVisual.SUCCESS
+                            false -> StatusVisual.WARNING
+                        }
+                        StatusGlyph(visual = rootVisual, color = rootColor, size = 14.dp)
                         Text(rootText, style = MaterialTheme.typography.labelSmall, color = G.ink, fontWeight = FontWeight.Medium)
                     }
                     TagPill(
@@ -516,8 +526,13 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
                                 TagPill("收起", fg = G.inkMuted, bg = G.surface, onClick = { diagnosticItems = emptyList() })
                             }
                             diagnosticItems.forEach { (title, ok, msg) ->
-                                Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    Box(Modifier.padding(top = 5.dp).size(6.dp).background(if (ok) G.success else G.warning, CircleShape))
+                                Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    StatusGlyph(
+                                        visual = if (ok) StatusVisual.SUCCESS else StatusVisual.WARNING,
+                                        color = if (ok) G.success else G.warning,
+                                        size = 15.dp,
+                                        modifier = Modifier.padding(top = 1.dp),
+                                    )
                                     Column(Modifier.weight(1f)) {
                                         Text(title, style = MaterialTheme.typography.labelSmall, color = G.ink, fontWeight = FontWeight.Medium)
                                         Text(msg, style = MaterialTheme.typography.labelSmall, color = G.inkMuted)
@@ -719,12 +734,21 @@ private fun ArchitectureCard(env: EnvironmentStatus) {
 private fun ComponentPill(label: String, ok: Boolean, loading: Boolean) {
     val fg = when { ok -> G.success; loading -> G.inkSubtle; else -> G.inkMuted }
     val bg = when { ok -> G.successTint; else -> G.surfaceSubtle }
+    val visual = when {
+        loading -> StatusVisual.RUNNING
+        ok -> StatusVisual.SUCCESS
+        else -> StatusVisual.STOPPED
+    }
     Row(
-        modifier = Modifier.clip(D.chipShape).background(bg).padding(horizontal = 10.dp, vertical = 6.dp),
+        modifier = Modifier
+            .clip(D.chipShape)
+            .background(bg)
+            .border(0.75.dp, fg.copy(alpha = if (ok) 0.24f else 0.16f), D.chipShape)
+            .padding(horizontal = 9.dp, vertical = 5.5.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(5.5.dp),
     ) {
-        Box(Modifier.size(6.5.dp).background(fg, CircleShape))
+        StatusGlyph(visual = visual, color = fg, size = 13.5.dp)
         Text(label, style = MaterialTheme.typography.labelSmall, color = if (ok) G.ink else G.inkMuted, fontWeight = FontWeight.Medium)
     }
 }
@@ -762,7 +786,7 @@ private fun StorageCard(
             }
             segments.forEach { (label, bytes, color) ->
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Box(Modifier.size(8.dp).background(color, CircleShape))
+                    ColorSwatchPill(color)
                     Text(label, style = MaterialTheme.typography.bodySmall, color = G.ink, modifier = Modifier.weight(1f))
                     Text(formatBytes(bytes), fontFamily = Mono, fontSize = 12.sp, color = G.inkMuted)
                 }
@@ -856,8 +880,13 @@ private fun ChannelStatusRow(title: String, ok: Boolean, detail: String, warning
         ok -> G.success
         else -> G.inkSubtle
     }
+    val visual = when {
+        warning -> StatusVisual.WARNING
+        ok -> StatusVisual.SUCCESS
+        else -> StatusVisual.STOPPED
+    }
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Box(Modifier.padding(top = 5.dp).size(7.dp).background(dot, CircleShape))
+        StatusGlyph(visual = visual, color = dot, size = 15.dp, modifier = Modifier.padding(top = 1.dp))
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(title, style = MaterialTheme.typography.labelMedium, color = G.ink, fontWeight = FontWeight.Medium)
             Text(detail, fontFamily = Mono, fontSize = 11.5.sp, color = if (warning) G.warning else G.inkMuted)

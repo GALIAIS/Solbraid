@@ -134,12 +134,17 @@ fun ModeSelectionScreen(app: GaliaisApplication) {
                         .fillMaxWidth()
                         .clip(D.shape(12.dp))
                         .background(probeBg)
+                        .border(0.75.dp, probeDot.copy(alpha = 0.24f), D.shape(12.dp))
                         .padding(horizontal = 12.dp, vertical = 10.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    if (rootAvailable == null || requestingRoot) PulsingDot(probeDot, size = 7.dp)
-                    else Box(Modifier.size(7.dp).background(probeDot, CircleShape))
+                    val probeVisual = when {
+                        rootAvailable == null || requestingRoot -> StatusVisual.RUNNING
+                        rootAvailable == true -> StatusVisual.SUCCESS
+                        else -> StatusVisual.WARNING
+                    }
+                    StatusGlyph(visual = probeVisual, color = probeDot, size = 15.dp)
                     Text(
                         probeText,
                         style = MaterialTheme.typography.labelLarge,

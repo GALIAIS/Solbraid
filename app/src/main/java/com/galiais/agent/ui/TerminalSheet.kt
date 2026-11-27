@@ -643,7 +643,12 @@ fun TerminalSheet(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(5.dp),
                             ) {
-                                Box(Modifier.size(6.dp).clip(CircleShape).background(dotColor))
+                                val tabVisual = when (sStatus) {
+                                    TermSessionStatus.CONNECTING -> StatusVisual.RUNNING
+                                    TermSessionStatus.RUNNING -> StatusVisual.SUCCESS
+                                    else -> StatusVisual.DANGER
+                                }
+                                StatusGlyph(visual = tabVisual, color = dotColor, size = 12.dp)
                                 if (session.isSsh) {
                                     Text("SSH", fontFamily = Mono, fontSize = 8.5.sp, fontWeight = FontWeight.Bold, color = scheme.accentColor)
                                 }

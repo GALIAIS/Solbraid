@@ -536,4 +536,55 @@ object GaliaisIcons {
             stroke = "M4.5,12 A7.5,7.5 0 1 0 6.8,6.6 L4.5,8.8 M4.5,4.8 V8.8 H8.5 M12,8.2 V12.2 L14.8,13.8",
         )
     }
+
+    // ── FA7 Pro+ / Pro 双层 Duotone 语义状态图标（取代纯色圆点） ──────────────
+    /** 就绪 / 成功（双层对勾圆章） */
+    val CheckCircle: ImageVector by lazy {
+        duo(
+            name = "CheckCircle",
+            secondary = "M12,3.25 A8.75,8.75 0 1 0 12,20.75 A8.75,8.75 0 1 0 12,3.25 Z",
+            stroke = "M12,3.25 A8.75,8.75 0 1 0 12,20.75 A8.75,8.75 0 1 0 12,3.25 Z M8.3,12.2 L10.8,14.7 L15.8,9.6",
+        )
+    }
+    /** 异常 / 失败（双层叉号圆章） */
+    val XCircle: ImageVector by lazy {
+        duo(
+            name = "XCircle",
+            secondary = "M12,3.25 A8.75,8.75 0 1 0 12,20.75 A8.75,8.75 0 1 0 12,3.25 Z",
+            stroke = "M12,3.25 A8.75,8.75 0 1 0 12,20.75 A8.75,8.75 0 1 0 12,3.25 Z M9.2,9.2 L14.8,14.8 M14.8,9.2 L9.2,14.8",
+        )
+    }
+    /** 已跳过 / 已拒绝（双层减号圆章） */
+    val MinusCircle: ImageVector by lazy {
+        duo(
+            name = "MinusCircle",
+            secondary = "M12,3.25 A8.75,8.75 0 1 0 12,20.75 A8.75,8.75 0 1 0 12,3.25 Z",
+            stroke = "M12,3.25 A8.75,8.75 0 1 0 12,20.75 A8.75,8.75 0 1 0 12,3.25 Z M8.5,12 H15.5",
+        )
+    }
+    /** 已停止 / 离线（双层电源态） */
+    val PowerOff: ImageVector by lazy {
+        duo(
+            name = "PowerOff",
+            secondary = "M12,4 A8,8 0 1 0 12,20 A8,8 0 1 0 12,4 Z",
+            stroke = "M12,4.2 V11.2 M7.5,6.9 A7.2,7.2 0 1 0 16.5,6.9",
+        )
+    }
+    /** 等待中 / 待执行（双层空心环心） */
+    val CirclePending: ImageVector by lazy {
+        duo(
+            name = "CirclePending",
+            secondary = "M12,5.5 A6.5,6.5 0 1 0 12,18.5 A6.5,6.5 0 1 0 12,5.5 Z",
+            stroke = "M12,3.25 A8.75,8.75 0 1 0 12,20.75 A8.75,8.75 0 1 0 12,3.25 Z",
+            primaryFill = "M12,12 m-1.7,0 a1.7,1.7 0 1,0 3.4,0 a1.7,1.7 0 1,0 -3.4,0",
+        )
+    }
+    /** 端口转发 / 活跃链路（双层对向链环） */
+    val TunnelLink: ImageVector by lazy {
+        duo(
+            name = "TunnelLink",
+            secondary = "M3.5,9.8 A2.8,2.8 0 0 1 6.3,7 H10.5 V17 H6.3 A2.8,2.8 0 0 1 3.5,14.2 Z M13.5,7 H17.7 A2.8,2.8 0 0 1 20.5,9.8 V14.2 A2.8,2.8 0 0 1 17.7,17 H13.5 Z",
+            stroke = "M9.5,12 H14.5 M10.5,7.4 H7.2 A4.6,4.6 0 0 0 7.2,16.6 H10.5 M13.5,7.4 H16.8 A4.6,4.6 0 0 1 16.8,16.6 H13.5",
+        )
+    }
 }

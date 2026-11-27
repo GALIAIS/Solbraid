@@ -201,8 +201,13 @@ fun MobileUseSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                 Surface(Modifier.fillMaxWidth(), shape = D.shape(10.dp), color = G.surfaceSubtle) {
                     Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
                         items.forEach { (title, ok, detail) ->
-                            Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                                Box(Modifier.padding(top = 5.dp).size(7.dp).background(if (ok) G.success else G.warning, CircleShape))
+                            Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                StatusGlyph(
+                                    visual = if (ok) StatusVisual.SUCCESS else StatusVisual.WARNING,
+                                    color = if (ok) G.success else G.warning,
+                                    size = 15.5.dp,
+                                    modifier = Modifier.padding(top = 1.dp),
+                                )
                                 Column(Modifier.weight(1f)) {
                                     Text(title, style = MaterialTheme.typography.labelMedium, color = G.ink, fontWeight = FontWeight.Medium)
                                     Text(detail, style = MaterialTheme.typography.labelSmall, color = G.inkMuted)

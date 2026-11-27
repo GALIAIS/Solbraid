@@ -133,8 +133,8 @@ fun ProjectGroupHeader(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f, fill = false),
                     )
-                    if (hasRunning) PulsingDot(G.warning, size = 6.dp)
-                    else if (hasPending) Box(Modifier.size(6.dp).background(G.warning, CircleShape))
+                    if (hasRunning) StatusProgressArc(G.warning, size = 12.5.dp, strokeWidth = 1.7.dp)
+                    else if (hasPending) StatusGlyph(StatusVisual.WARNING, G.warning, size = 13.5.dp)
                 }
                 Text(
                     projectShortPath(path),

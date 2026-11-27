@@ -713,28 +713,25 @@ private fun QuickEngineCard(engine: EngineKind, title: String, subtitle: String,
 @Composable
 fun RuntimeBadge(runtime: RuntimeSnapshot) {
     val pct = runtime.progress?.let { (it.coerceIn(0f, 1f) * 100).toInt() }
-    val (label, dotColor, bgColor) = when {
-        runtime.ready -> Triple("运行中", G.success, G.successTint)
-        runtime.state == "error" -> Triple("运行异常", G.danger, G.dangerTint)
-        runtime.maintenance -> Triple("维护中", G.warning, G.warningTint)
-        runtime.state == "stopping" -> Triple("停止中", G.warning, G.warningTint)
-        runtime.busy && runtime.firstTimeSetup && pct != null -> Triple("配置 $pct%", G.accent, G.accentContainer)
-        runtime.busy && pct != null -> Triple("启动 $pct%", G.warning, G.warningTint)
-        runtime.busy -> Triple("启动中", G.warning, G.warningTint)
-        else -> Triple("已停止", G.inkSubtle, G.surfaceSubtle)
+    val (label, visual, color, bg) = when {
+        runtime.ready -> listOf("运行中", StatusVisual.SUCCESS, G.success, G.successTint)
+        runtime.state == "error" -> listOf("运行异常", StatusVisual.DANGER, G.danger, G.dangerTint)
+        runtime.maintenance -> listOf("维护中", StatusVisual.WARNING, G.warning, G.warningTint)
+        runtime.state == "stopping" -> listOf("停止中", StatusVisual.RUNNING, G.warning, G.warningTint)
+        runtime.busy && runtime.firstTimeSetup && pct != null -> listOf("配置 $pct%", StatusVisual.RUNNING, G.accent, G.accentContainer)
+        runtime.busy && pct != null -> listOf("启动 $pct%", StatusVisual.RUNNING, G.warning, G.warningTint)
+        runtime.busy -> listOf("启动中", StatusVisual.RUNNING, G.warning, G.warningTint)
+        else -> listOf("已停止", StatusVisual.STOPPED, G.inkSubtle, G.surfaceSubtle)
     }
-    Row(
-        modifier = Modifier
-            .clip(D.shape(999.dp))
-            .background(bgColor)
-            .padding(horizontal = 10.dp, vertical = 5.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        if (runtime.busy) PulsingDot(dotColor, size = 6.5.dp)
-        else Box(Modifier.size(6.5.dp).background(dotColor, CircleShape))
-        Text(label, style = MaterialTheme.typography.labelSmall, color = if (runtime.ready || runtime.busy || runtime.state == "error") dotColor else G.inkMuted, fontWeight = FontWeight.SemiBold)
-    }
+    val badgeColor = color as Color
+    StatusBadge(
+        label = label as String,
+        visual = visual as StatusVisual,
+        color = badgeColor,
+        background = bg as Color,
+        progress = if (runtime.busy && !runtime.maintenance && runtime.state != "stopping") runtime.progress else null,
+        textColor = if (runtime.ready || runtime.busy || runtime.state == "error" || runtime.maintenance) badgeColor else G.inkMuted,
+    )
 }
 
 private val FIRST_SETUP_STEPS = listOf("安装系统", "准备组件", "连接引擎")
@@ -809,9 +806,13 @@ fun RuntimeCard(
                             active -> G.ink
                             else -> G.inkSubtle
                         }
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                            if (active) PulsingDot(dotColor, size = 6.dp)
-                            else Box(Modifier.size(6.dp).background(dotColor, CircleShape))
+                        val visual = when {
+                            done -> StatusVisual.SUCCESS
+                            active -> StatusVisual.RUNNING
+                            else -> StatusVisual.PENDING
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                            StatusGlyph(visual = visual, color = dotColor, size = 13.5.dp)
                             Text(
                                 name,
                                 style = MaterialTheme.typography.labelSmall,

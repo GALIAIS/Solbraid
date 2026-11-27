@@ -378,7 +378,7 @@ fun ContextBreakdownSheet(
                                     val frac = if (d.maxTokens > 0) (row.tokens * 100.0 / d.maxTokens) else 0.0
                                     val dotColor = resolveCategoryColor(row.id, row.kind, row.colorHex)
                                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        Box(Modifier.size(8.dp).clip(CircleShape).background(dotColor))
+                                        ColorSwatchPill(dotColor)
                                         Text(row.name, style = MaterialTheme.typography.bodySmall, color = G.ink, modifier = Modifier.weight(1f))
                                         Text(
                                             "${formatTokenCount(row.tokens)} (${String.format(Locale.ROOT, "%.1f%%", frac)})",

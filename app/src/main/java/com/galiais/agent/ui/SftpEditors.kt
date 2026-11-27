@@ -258,7 +258,7 @@ fun SftpTextEditor(app: GaliaisApplication, host: SshHostConfig, path: String, o
                 }
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                        if (dirty) Box(Modifier.size(7.dp).clip(CircleShape).background(G.warning))
+                        if (dirty) Icon(GaliaisIcons.Edit, contentDescription = "未保存", tint = G.warning, modifier = Modifier.size(13.dp))
                         Text(
                             path.substringAfterLast('/').ifBlank { path },
                             style = MaterialTheme.typography.titleSmall,

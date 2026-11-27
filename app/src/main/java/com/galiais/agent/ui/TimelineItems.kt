@@ -765,10 +765,10 @@ fun PlanArtifactCard(
                 horizontalArrangement = Arrangement.spacedBy(7.dp),
             ) {
                 if (item.streaming) {
-                    PulsingDot(G.accent, size = 7.dp)
+                    StatusProgressArc(G.accent, size = 14.dp, strokeWidth = 1.9.dp)
                 } else {
                     Icon(
-                        if (isWalkthrough) GaliaisIcons.Check else GaliaisIcons.ListCheck,
+                        if (isWalkthrough) GaliaisIcons.CheckCircle else GaliaisIcons.ListCheck,
                         contentDescription = null,
                         tint = if (isWalkthrough) G.success else if (needsReview) G.warning else G.accent,
                         modifier = Modifier.size(15.dp),
@@ -998,12 +998,12 @@ fun PlanChecklistCard(
                 horizontalArrangement = Arrangement.spacedBy(7.dp),
             ) {
                 if (activeStep != null) {
-                    PulsingDot(G.accent, size = 7.dp)
+                    StatusProgressArc(G.accent, size = 14.dp, strokeWidth = 1.9.dp)
                 } else {
                     Icon(
                         when {
                             stats.failed > 0 -> GaliaisIcons.AlertTriangle
-                            stats.allSettled -> GaliaisIcons.Check
+                            stats.allSettled -> GaliaisIcons.CheckCircle
                             else -> GaliaisIcons.ListCheck
                         },
                         contentDescription = null,
@@ -1095,13 +1095,13 @@ fun PlanChecklistCard(
                             verticalAlignment = Alignment.Top,
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            Box(Modifier.padding(top = 3.dp).size(14.dp), contentAlignment = Alignment.Center) {
+                            Box(Modifier.padding(top = 2.dp).size(15.dp), contentAlignment = Alignment.Center) {
                                 when {
-                                    isDone -> Icon(GaliaisIcons.Check, contentDescription = null, tint = G.success, modifier = Modifier.size(12.5.dp))
-                                    isActive -> PulsingDot(G.accent, size = 8.dp)
-                                    isFailed -> Icon(GaliaisIcons.Close, contentDescription = null, tint = G.danger, modifier = Modifier.size(12.dp))
-                                    isSkipped -> Box(Modifier.width(7.dp).height(1.5.dp).background(G.inkSubtle, CircleShape))
-                                    else -> Box(Modifier.size(7.dp).border(1.25.dp, G.borderStrong, CircleShape))
+                                    isDone -> StatusGlyph(StatusVisual.SUCCESS, G.success, size = 14.5.dp)
+                                    isActive -> StatusGlyph(StatusVisual.RUNNING, G.accent, size = 14.5.dp)
+                                    isFailed -> StatusGlyph(StatusVisual.DANGER, G.danger, size = 14.5.dp)
+                                    isSkipped -> StatusGlyph(StatusVisual.SKIPPED, G.inkSubtle, size = 14.5.dp)
+                                    else -> StatusGlyph(StatusVisual.PENDING, G.borderStrong, size = 14.5.dp)
                                 }
                             }
                             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
@@ -1572,10 +1572,10 @@ private fun TerminalOutput(text: String, language: String? = null) {
 @Composable
 fun StatusMark(status: ItemStatus) {
     when (status) {
-        ItemStatus.RUNNING -> PulsingDot(G.warning, size = 7.dp)
-        ItemStatus.COMPLETED -> Box(Modifier.size(7.dp).background(G.success, CircleShape))
-        ItemStatus.FAILED -> Box(Modifier.size(7.dp).background(G.danger, CircleShape))
-        ItemStatus.DECLINED -> Box(Modifier.size(7.dp).background(G.inkSubtle, CircleShape))
+        ItemStatus.RUNNING -> StatusGlyph(StatusVisual.RUNNING, G.warning, size = 15.dp)
+        ItemStatus.COMPLETED -> StatusGlyph(StatusVisual.SUCCESS, G.success, size = 15.dp)
+        ItemStatus.FAILED -> StatusGlyph(StatusVisual.DANGER, G.danger, size = 15.dp)
+        ItemStatus.DECLINED -> StatusGlyph(StatusVisual.SKIPPED, G.inkSubtle, size = 15.dp)
     }
 }
 

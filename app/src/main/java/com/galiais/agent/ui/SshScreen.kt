@@ -206,6 +206,11 @@ fun SshScreen(
                                 TermSessionStatus.RUNNING -> G.success
                                 else -> G.danger
                             }
+                            val statusVisual = when (st) {
+                                TermSessionStatus.CONNECTING -> StatusVisual.RUNNING
+                                TermSessionStatus.RUNNING -> StatusVisual.SUCCESS
+                                else -> StatusVisual.DANGER
+                            }
                             Row(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(8.dp))
@@ -216,7 +221,7 @@ fun SshScreen(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(5.dp),
                             ) {
-                                Box(Modifier.size(6.dp).clip(CircleShape).background(dotColor))
+                                StatusGlyph(visual = statusVisual, color = dotColor, size = 12.5.dp)
                                 Text(if (sess.isSsh) "SSH" else "LOCAL", fontFamily = Mono, fontSize = 8.5.sp, fontWeight = FontWeight.Bold, color = if (sess.isSsh) G.accent else G.success)
                                 Text(sess.title, fontFamily = Mono, fontSize = 11.sp, color = G.ink, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 110.dp))
                                 Box(
@@ -386,16 +391,17 @@ fun SshScreen(
                                                     else -> null
                                                 }
                                                 if (statusDotColor != null) {
+                                                    val badgeVisual = if (liveHostSession != null || test?.ok == true) StatusVisual.SUCCESS else StatusVisual.DANGER
                                                     Box(
                                                         Modifier
                                                             .align(Alignment.TopEnd)
-                                                            .size(8.dp)
+                                                            .size(14.dp)
                                                             .clip(CircleShape)
-                                                            .background(G.surface)
-                                                            .padding(1.5.dp)
-                                                            .clip(CircleShape)
-                                                            .background(statusDotColor),
-                                                    )
+                                                            .background(G.surface),
+                                                        contentAlignment = Alignment.Center,
+                                                    ) {
+                                                        StatusGlyph(visual = badgeVisual, color = statusDotColor, size = 12.dp)
+                                                    }
                                                 }
                                             }
 
@@ -589,15 +595,26 @@ fun SshScreen(
                             val busy = busyTunnelIds[preset.id] == true || active?.status in listOf("starting", "stopping")
                             CrispCard(padding = PaddingValues(horizontal = 12.dp, vertical = 10.dp)) {
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                    val tunnelTint = when {
+                                        busy -> G.warning
+                                        running -> G.success
+                                        else -> G.inkSubtle
+                                    }
+                                    val tunnelBg = when {
+                                        busy -> G.warningTint
+                                        running -> G.successTint
+                                        else -> G.surfaceSubtle
+                                    }
                                     Box(
                                         modifier = Modifier
-                                            .size(34.dp)
-                                            .clip(RoundedCornerShape(9.dp))
-                                            .background(if (running) G.successTint else G.surfaceSubtle),
+                                            .size(36.dp)
+                                            .clip(RoundedCornerShape(10.dp))
+                                            .background(tunnelBg)
+                                            .border(0.75.dp, tunnelTint.copy(alpha = if (running || busy) 0.28f else 0.16f), RoundedCornerShape(10.dp)),
                                         contentAlignment = Alignment.Center,
                                     ) {
-                                        if (running) PulsingDot(G.success, size = 8.dp)
-                                        else Box(Modifier.size(7.dp).clip(CircleShape).background(G.borderStrong))
+                                        if (busy) StatusProgressArc(G.warning, size = 17.dp, strokeWidth = 2.dp)
+                                        else Icon(GaliaisIcons.TunnelLink, contentDescription = null, tint = tunnelTint, modifier = Modifier.size(18.dp))
                                     }
                                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
