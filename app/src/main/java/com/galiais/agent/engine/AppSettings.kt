@@ -78,6 +78,10 @@ data class SettingsState(
     val assistantRichRender: Boolean = true,
     val inlineVisualArtifacts: Boolean = true,
     val renderMathFormulas: Boolean = true,
+    /** 会话流式输出动效：smooth_fade / typewriter / luminous_sweep / ink_bloom / blur_slide / instant。 */
+    val streamAnimationStyle: String = STREAM_ANIM_SMOOTH_FADE,
+    /** 会话流式输出流速档位：gentle / balanced / fast。 */
+    val streamSpeed: String = STREAM_SPEED_BALANCED,
     val keepUnsentDrafts: Boolean = true,
     val fileEditorWordWrap: Boolean = true,
     /** 缩进宽度：2 / 4 空格，0 表示真实 Tab 字符。 */
@@ -158,6 +162,26 @@ const val USER_RENDER_ALWAYS_PLAIN = "always_plain"
 val USER_RENDER_MODES = setOf(USER_RENDER_FOLLOW_EDITOR, USER_RENDER_ALWAYS_RICH, USER_RENDER_ALWAYS_PLAIN)
 val EDITOR_FALLBACK_THRESHOLDS = setOf(0, 4000, 8000, 20000)
 val EDITOR_TAB_SIZES = setOf(0, 2, 4)
+
+const val STREAM_ANIM_SMOOTH_FADE = "smooth_fade"
+const val STREAM_ANIM_TYPEWRITER = "typewriter"
+const val STREAM_ANIM_LUMINOUS_SWEEP = "luminous_sweep"
+const val STREAM_ANIM_INK_BLOOM = "ink_bloom"
+const val STREAM_ANIM_BLUR_SLIDE = "blur_slide"
+const val STREAM_ANIM_INSTANT = "instant"
+val STREAM_ANIMATION_STYLES = setOf(
+    STREAM_ANIM_SMOOTH_FADE,
+    STREAM_ANIM_TYPEWRITER,
+    STREAM_ANIM_LUMINOUS_SWEEP,
+    STREAM_ANIM_INK_BLOOM,
+    STREAM_ANIM_BLUR_SLIDE,
+    STREAM_ANIM_INSTANT,
+)
+
+const val STREAM_SPEED_GENTLE = "gentle"
+const val STREAM_SPEED_BALANCED = "balanced"
+const val STREAM_SPEED_FAST = "fast"
+val STREAM_SPEEDS = setOf(STREAM_SPEED_GENTLE, STREAM_SPEED_BALANCED, STREAM_SPEED_FAST)
 
 const val DEFAULT_WORKSPACE = "/home/agent/workspace"
 const val RUNTIME_MODE_ROOT = "root"
@@ -553,6 +577,8 @@ class AppSettings(context: Context) {
             assistantRichRender = prefs.getBoolean("general.assistantRichRender", true),
             inlineVisualArtifacts = prefs.getBoolean("general.inlineVisualArtifacts", true),
             renderMathFormulas = prefs.getBoolean("general.renderMathFormulas", true),
+            streamAnimationStyle = prefs.getString("general.streamAnimationStyle", STREAM_ANIM_SMOOTH_FADE)?.takeIf { it in STREAM_ANIMATION_STYLES } ?: STREAM_ANIM_SMOOTH_FADE,
+            streamSpeed = prefs.getString("general.streamSpeed", STREAM_SPEED_BALANCED)?.takeIf { it in STREAM_SPEEDS } ?: STREAM_SPEED_BALANCED,
             keepUnsentDrafts = prefs.getBoolean("general.keepUnsentDrafts", true),
             fileEditorWordWrap = prefs.getBoolean("general.fileEditorWordWrap", true),
             editorTabSize = prefs.getInt("general.editorTabSize", 2).takeIf { it in EDITOR_TAB_SIZES } ?: 2,
@@ -744,6 +770,14 @@ class AppSettings(context: Context) {
     fun setAssistantRichRender(value: Boolean) = edit { putBoolean("general.assistantRichRender", value) }
     fun setInlineVisualArtifacts(value: Boolean) = edit { putBoolean("general.inlineVisualArtifacts", value) }
     fun setRenderMathFormulas(value: Boolean) = edit { putBoolean("general.renderMathFormulas", value) }
+    fun setStreamAnimationStyle(style: String) {
+        require(style in STREAM_ANIMATION_STYLES) { "不支持的流式输出动效：$style" }
+        edit { putString("general.streamAnimationStyle", style) }
+    }
+    fun setStreamSpeed(speed: String) {
+        require(speed in STREAM_SPEEDS) { "不支持的流式输出流速：$speed" }
+        edit { putString("general.streamSpeed", speed) }
+    }
     fun setKeepUnsentDrafts(value: Boolean) = edit {
         putBoolean("general.keepUnsentDrafts", value)
         if (!value) {
@@ -770,6 +804,8 @@ class AppSettings(context: Context) {
             "general.assistantRichRender",
             "general.inlineVisualArtifacts",
             "general.renderMathFormulas",
+            "general.streamAnimationStyle",
+            "general.streamSpeed",
             "general.keepUnsentDrafts",
             "general.fileEditorWordWrap",
             "general.editorTabSize",

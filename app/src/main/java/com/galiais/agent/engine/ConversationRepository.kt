@@ -397,11 +397,13 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
     )
     private val pendingDeltas = linkedMapOf<ConversationKey, LinkedHashMap<String, StreamDeltaBucket>>()
     private var deltaFlushJob: Job? = null
+    private val lastFlushAtMs = hashMapOf<ConversationKey, Long>()
 
     /**
-     * 流式增量合帧缓冲（48ms / ~20fps）：
-     * 避免每个 Token 都复制整个 Conversation Map 与 Timeline List 触发全页重排和 Markdown 重解析；
-     * 任意结构化事件（tool_call / completed / update / upsert）到来前会自动同步 flush，保证 100% 顺序一致。
+     * 流式增量合帧缓冲（首包 0ms 直通 + 稳态 24ms / ~42Hz 合帧）：
+     * - 新消息首包或静默超过 64ms 后的首个增量立即提交，消除首字等待感；
+     * - 稳态每 24ms 合并高频 SSE 碎片，减少 Conversation Map / Timeline List 复制，并配合展示层 VSync 流速缓动实现 120Hz 顺滑输出；
+     * - 任意结构化事件（tool_call / completed / update / upsert）到来前会自动同步 flush，保证 100% 顺序一致。
      */
     fun appendStreamingDelta(
         key: ConversationKey,
@@ -422,16 +424,19 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
         }
         val byItem = pendingDeltas.getOrPut(key) { linkedMapOf() }
         val bucketKey = if (mappedKind == StreamDeltaKind.REASONING_PART) "$itemId#$summaryIndex" else "$itemId:${mappedKind.ordinal}"
+        val isNewBucket = !byItem.containsKey(bucketKey)
         val bucket = byItem.getOrPut(bucketKey) { StreamDeltaBucket(itemId, mappedKind, summaryIndex, StringBuilder(), create) }
         bucket.buffer.append(delta)
-        // 单次缓冲超过 2KB 时立即提交，防止巨量命令输出堆积内存
-        if (bucket.buffer.length >= 2048) {
+        val now = System.currentTimeMillis()
+        val lastFlush = lastFlushAtMs[key] ?: 0L
+        // 首字直通（静默超过 64ms 且刚开启新缓冲）或单次缓冲超过 2KB 时立即提交，兼顾极速首字与内存上限
+        if (bucket.buffer.length >= 2048 || (isNewBucket && (now - lastFlush) >= 64L)) {
             flushStreamingDeltas(key)
             return
         }
         if (deltaFlushJob?.isActive != true) {
             deltaFlushJob = scope.launch {
-                delay(48L)
+                delay(24L)
                 flushAllStreamingDeltas()
             }
         }
@@ -446,6 +451,7 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
     fun flushStreamingDeltas(key: ConversationKey) {
         val buckets = pendingDeltas.remove(key) ?: return
         if (buckets.isEmpty()) return
+        lastFlushAtMs[key] = System.currentTimeMillis()
         val current = conversationsFlow.value
         val existing = current[key] ?: initialState(ConversationSummary(key, "新会话", "", null, System.currentTimeMillis()))
         val items = existing.items.toMutableList()
@@ -453,7 +459,8 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
         for (b in buckets.values) {
             val chunk = b.buffer.toString()
             if (chunk.isEmpty()) continue
-            val idx = items.indexOfFirst { it.id == b.itemId }
+            // 活跃流式条目几乎总是位于列表尾部，逆序查找将长会话 O(N) 扫描降为 O(1)
+            val idx = items.indexOfLast { it.id == b.itemId }
             val base = if (idx >= 0) items[idx] else (b.create() ?: continue)
             val next = when (b.kind) {
                 StreamDeltaKind.AGENT_TEXT -> if (base is TimelineItem.AgentMessage) base.copy(text = base.text + chunk, streaming = true) else base
@@ -476,7 +483,7 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
             changed = true
         }
         if (changed) {
-            // 流式增量绝不触碰 summariesFlow，杜绝 20fps 后台会话列表重排与重组
+            // 流式增量绝不触碰 summariesFlow，杜绝后台会话列表重排与重组
             publishConversations(current + (key to existing.copy(items = items)), syncSummaryList = false)
         }
     }
@@ -503,6 +510,7 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
 
     fun remove(key: ConversationKey) {
         pendingDeltas.remove(key)
+        lastFlushAtMs.remove(key)
         loadingJobs.remove(key)?.cancel()
         loadedOrder.remove(key)
         publishConversations(conversationsFlow.value - key)
@@ -510,9 +518,9 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
         arenaGroupsFlow.value = arenaGroupsFlow.value.mapValues { it.value - key }.filterValues { it.size > 1 }
     }
 
-    /** 新增或替换时间线条目（按 id）。 */
+    /** 新增或替换时间线条目（按 id，优先从尾部匹配降低长会话查找开销）。 */
     fun upsertItem(key: ConversationKey, item: TimelineItem) = update(key) { state ->
-        val index = state.items.indexOfFirst { it.id == item.id }
+        val index = state.items.indexOfLast { it.id == item.id }
         val items = if (index >= 0) state.items.toMutableList().also { it[index] = item } else state.items + item
         state.copy(items = items, summary = state.summary.copy(updatedAt = System.currentTimeMillis()))
     }
@@ -520,14 +528,14 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
     /** 修改已有条目；条目不存在时用 [create] 生成。 */
     fun <T : TimelineItem> mutateItem(key: ConversationKey, id: String, create: () -> T?, transform: (TimelineItem) -> TimelineItem) {
         flushStreamingDeltas(key)
-        val item = state(key)?.items?.firstOrNull { it.id == id }
+        val item = state(key)?.items?.lastOrNull { it.id == id }
         val next = if (item != null) transform(item) else create()?.let(transform) ?: return
         upsertItem(key, next)
     }
 
     fun findItem(key: ConversationKey, id: String): TimelineItem? {
         flushStreamingDeltas(key)
-        return state(key)?.items?.firstOrNull { it.id == id }
+        return state(key)?.items?.lastOrNull { it.id == id }
     }
 
     fun addRequest(request: PendingRequest) {

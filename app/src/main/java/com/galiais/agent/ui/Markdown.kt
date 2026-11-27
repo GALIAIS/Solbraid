@@ -27,11 +27,13 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
+import com.galiais.agent.engine.STREAM_ANIM_SMOOTH_FADE
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -145,54 +147,16 @@ private fun parseMarkdownCached(markdown: String, streaming: Boolean): Node {
     return doc
 }
 
-/**
- * 流式长回复增量切分：把已完整闭合的前置段落与正在逐字增长的尾部段落分离，
- * 使前置段落（含已闭合代码块、公式、图表）完全命中 `remember` 缓存，流式期间只重解析尾部小段文本。
- */
-private fun splitStableMarkdownPrefix(text: String): Pair<String, String> {
-    if (text.length < 240) return "" to text
-    var inFence = false
-    var inMath = false
-    var inArtifact = false
-    var lastSafeIdx = 0
-    var pos = 0
-    val len = text.length
-    while (pos < len) {
-        val nl = text.indexOf('\n', pos)
-        val end = if (nl < 0) len else nl
-        val line = text.substring(pos, end)
-        val trimmed = line.trim()
-        if (trimmed.startsWith("```") || trimmed.startsWith("~~~")) {
-            inFence = !inFence
-        } else if (!inFence) {
-            if (trimmed == "$$" || (trimmed.startsWith("$$") && !trimmed.drop(2).contains("$$"))) {
-                inMath = !inMath
-            } else if (trimmed.startsWith("\\[") && !trimmed.contains("\\]")) {
-                inMath = true
-            } else if (inMath && trimmed.contains("\\]")) {
-                inMath = false
-            }
-            if (line.contains("<antArtifact", ignoreCase = true) && !line.contains("</antArtifact>", ignoreCase = true)) {
-                inArtifact = true
-            } else if (inArtifact && line.contains("</antArtifact>", ignoreCase = true)) {
-                inArtifact = false
-            }
-        }
-        val nextPos = if (nl < 0) len else nl + 1
-        if (trimmed.isEmpty() && !inFence && !inMath && !inArtifact && nextPos < len) {
-            val peekEnd = text.indexOf('\n', nextPos).let { if (it < 0) len else it }
-            val nextTrim = text.substring(nextPos, peekEnd).trim()
-            if (nextTrim.isNotEmpty() && !nextTrim.startsWith("|")) {
-                lastSafeIdx = nextPos
-            }
-        }
-        pos = nextPos
-    }
-    if (lastSafeIdx <= 0 || lastSafeIdx >= len) return "" to text
-    return text.substring(0, lastSafeIdx) to text.substring(lastSafeIdx)
+@Composable
+private fun OptionalSelectionContainer(
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
+    if (enabled) SelectionContainer(modifier = modifier, content = content) else content()
 }
 
-/** Compose 原生 Markdown 渲染：支持流式增量冻结、标题、列表、Callout 引用、语法高亮代码块、表格、Diff、可排序 CSV、行内/块级数学公式及离线交互可视化组件。 */
+/** Compose 原生 Markdown 渲染：支持块级增量冻结、流式未闭合语法修复、6 种流式输出动效、标题、列表、Callout 引用、语法高亮代码块、表格、Diff、可排序 CSV、行内/块级数学公式及离线交互可视化组件。 */
 @Composable
 fun Markdown(
     text: String,
@@ -202,41 +166,64 @@ fun Markdown(
     streaming: Boolean = false,
     overrideTextColor: Color? = null,
     onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
+    streamStyleOverride: String? = null,
 ) {
-    if (streaming && text.length >= 240) {
-        val (stablePrefix, liveTail) = remember(text) { splitStableMarkdownPrefix(text) }
-        if (stablePrefix.isNotEmpty()) {
+    val effectiveStreamStyle = streamStyleOverride ?: RPrefs.streamAnimationStyle
+    if (streaming) {
+        val split = remember(text) { splitStreamingMarkdownBlocks(text) }
+        val repairedTail = remember(split.liveTail) { repairStreamingMarkdownTail(split.liveTail) }
+        if (split.frozenBlocks.isNotEmpty()) {
             Column(modifier, verticalArrangement = Arrangement.spacedBy(if (compact) 5.dp else 9.dp)) {
-                MarkdownBody(
-                    text = stablePrefix,
-                    compact = compact,
-                    sourceItemId = sourceItemId,
-                    streaming = false,
-                    overrideTextColor = overrideTextColor,
-                    onOpenArtifact = onOpenArtifact,
-                )
-                if (liveTail.isNotEmpty()) {
+                split.frozenBlocks.forEachIndexed { blockIdx, blockText ->
+                    key(blockIdx) {
+                        MarkdownBody(
+                            text = blockText,
+                            compact = compact,
+                            sourceItemId = "$sourceItemId:fb$blockIdx",
+                            streaming = false,
+                            overrideTextColor = overrideTextColor,
+                            onOpenArtifact = onOpenArtifact,
+                            streamStyle = effectiveStreamStyle,
+                        )
+                    }
+                }
+                if (repairedTail.isNotEmpty()) {
                     MarkdownBody(
-                        text = liveTail,
+                        text = repairedTail,
                         compact = compact,
-                        sourceItemId = sourceItemId,
+                        sourceItemId = "$sourceItemId:tail",
                         streaming = true,
                         overrideTextColor = overrideTextColor,
                         onOpenArtifact = onOpenArtifact,
+                        streamStyle = effectiveStreamStyle,
+                        tailEffectKey = "$sourceItemId:tb${split.frozenBlocks.size}",
                     )
                 }
             }
             return
         }
+        MarkdownBody(
+            text = repairedTail,
+            modifier = modifier,
+            compact = compact,
+            sourceItemId = sourceItemId,
+            streaming = true,
+            overrideTextColor = overrideTextColor,
+            onOpenArtifact = onOpenArtifact,
+            streamStyle = effectiveStreamStyle,
+            tailEffectKey = "$sourceItemId:tb0",
+        )
+        return
     }
     MarkdownBody(
         text = text,
         modifier = modifier,
         compact = compact,
         sourceItemId = sourceItemId,
-        streaming = streaming,
+        streaming = false,
         overrideTextColor = overrideTextColor,
         onOpenArtifact = onOpenArtifact,
+        streamStyle = effectiveStreamStyle,
     )
 }
 
@@ -249,11 +236,14 @@ private fun MarkdownBody(
     streaming: Boolean = false,
     overrideTextColor: Color? = null,
     onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
+    streamStyle: String = STREAM_ANIM_SMOOTH_FADE,
+    tailEffectKey: String = sourceItemId,
 ) {
     val prefs = RPrefs
     val segments = remember(text, sourceItemId, streaming) { splitMessageSegments(sourceItemId, text, streaming) }
     Column(modifier, verticalArrangement = Arrangement.spacedBy(if (compact) 5.dp else 9.dp)) {
-        segments.forEach { seg ->
+        segments.forEachIndexed { segIdx, seg ->
+            val isLastSegment = segIdx == segments.lastIndex
             when (seg) {
                 is MessageSegment.Artifact -> {
                     if (!compact && prefs.inlineVisualArtifacts && seg.artifact.kind == ArtifactKind.CSV && !seg.artifact.streaming) {
@@ -266,13 +256,32 @@ private fun MarkdownBody(
                     } else if (onOpenArtifact != null) {
                         InlineArtifactCard(artifact = seg.artifact, onOpen = onOpenArtifact)
                     } else {
-                        CodeBlock(seg.artifact.content, seg.artifact.language)
+                        CodeBlock(
+                            code = seg.artifact.content,
+                            language = seg.artifact.language,
+                            streaming = streaming && isLastSegment,
+                            streamStyle = streamStyle,
+                        )
                     }
                 }
                 is MessageSegment.Text -> {
                     val document = remember(seg.markdown, streaming) { parseMarkdownCached(seg.markdown, streaming) }
+                    val blocks = remember(document) { document.children() }
                     Column(verticalArrangement = Arrangement.spacedBy(if (compact) 5.dp else 9.dp)) {
-                        document.children().forEach { Block(it, compact, sourceItemId, streaming, overrideTextColor, onOpenArtifact) }
+                        blocks.forEachIndexed { blockIdx, child ->
+                            val isActiveTail = streaming && isLastSegment && blockIdx == blocks.lastIndex
+                            Block(
+                                node = child,
+                                compact = compact,
+                                sourceItemId = sourceItemId,
+                                streaming = streaming,
+                                overrideTextColor = overrideTextColor,
+                                onOpenArtifact = onOpenArtifact,
+                                isActiveStreamTail = isActiveTail,
+                                streamStyle = streamStyle,
+                                tailEffectKey = "$tailEffectKey:s$segIdx:b$blockIdx",
+                            )
+                        }
                     }
                 }
             }
@@ -303,6 +312,9 @@ private fun Block(
     streaming: Boolean = false,
     overrideTextColor: Color? = null,
     onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
+    isActiveStreamTail: Boolean = false,
+    streamStyle: String = STREAM_ANIM_SMOOTH_FADE,
+    tailEffectKey: String = "",
 ) {
     val prefs = RPrefs
     val bodyStyle = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodyLarge
@@ -321,7 +333,12 @@ private fun Block(
                     }
                     val nonImgText = node.children().filterNot { it is MdImage }
                     if (nonImgText.isNotEmpty()) {
-                        SelectionContainer { Text(inline(node, overrideTextColor), style = bodyStyle, color = textColor) }
+                        val content = inline(node, overrideTextColor)
+                        if (isActiveStreamTail) {
+                            StreamingTailText(content, streamStyle, textColor, bodyStyle, streaming = true, effectKey = "$tailEffectKey:imgp")
+                        } else {
+                            OptionalSelectionContainer(!streaming) { Text(content, style = bodyStyle, color = textColor) }
+                        }
                     }
                 }
             } else if (mathMatches.isNotEmpty()) {
@@ -332,7 +349,7 @@ private fun Block(
                             val before = raw.substring(cursor, m.range.first).trim()
                             if (before.isNotEmpty()) {
                                 val subDoc = remember(before) { parser.parse(before) }
-                                SelectionContainer {
+                                OptionalSelectionContainer(!streaming) {
                                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                         subDoc.children().forEach { child ->
                                             if (child is Paragraph) Text(inline(child, overrideTextColor), style = bodyStyle, color = textColor)
@@ -367,7 +384,7 @@ private fun Block(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
-                                SelectionContainer(modifier = Modifier.weight(1f)) {
+                                OptionalSelectionContainer(!streaming, modifier = Modifier.weight(1f)) {
                                     Text(
                                         prettyMath,
                                         style = bodyStyle,
@@ -390,10 +407,16 @@ private fun Block(
                         val after = raw.substring(cursor).trim()
                         if (after.isNotEmpty()) {
                             val subDoc = remember(after) { parser.parse(after) }
-                            SelectionContainer {
+                            val subChildren = remember(subDoc) { subDoc.children().filterIsInstance<Paragraph>() }
+                            OptionalSelectionContainer(!streaming) {
                                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    subDoc.children().forEach { child ->
-                                        if (child is Paragraph) Text(inline(child, overrideTextColor), style = bodyStyle, color = textColor)
+                                    subChildren.forEachIndexed { sIdx, child ->
+                                        val content = inline(child, overrideTextColor)
+                                        if (isActiveStreamTail && sIdx == subChildren.lastIndex) {
+                                            StreamingTailText(content, streamStyle, textColor, bodyStyle, streaming = true, effectKey = "$tailEffectKey:ma$sIdx")
+                                        } else {
+                                            Text(content, style = bodyStyle, color = textColor)
+                                        }
                                     }
                                 }
                             }
@@ -401,10 +424,15 @@ private fun Block(
                     }
                 }
             } else {
-                SelectionContainer { Text(inline(node, overrideTextColor), style = bodyStyle, color = textColor) }
+                val content = inline(node, overrideTextColor)
+                if (isActiveStreamTail) {
+                    StreamingTailText(content, streamStyle, textColor, bodyStyle, streaming = true, effectKey = "$tailEffectKey:p")
+                } else {
+                    OptionalSelectionContainer(!streaming) { Text(content, style = bodyStyle, color = textColor) }
+                }
             }
         }
-        is Heading -> SelectionContainer {
+        is Heading -> {
             val headingStyle = if (compact) {
                 when (node.level) {
                     1 -> MaterialTheme.typography.titleSmall
@@ -420,13 +448,31 @@ private fun Block(
                 }
             }
             val headingColor = overrideTextColor ?: if (node.level >= 4) G.inkMuted else G.ink
-            Text(
-                inline(node, overrideTextColor),
-                style = headingStyle,
-                color = headingColor,
-                fontWeight = if (node.level <= 2) FontWeight.Bold else FontWeight.SemiBold,
-                modifier = Modifier.padding(top = if (node.level <= 2) 6.dp else 3.dp, bottom = 1.dp),
-            )
+            val headingWeight = if (node.level <= 2) FontWeight.Bold else FontWeight.SemiBold
+            val content = inline(node, overrideTextColor)
+            val headingMod = Modifier.padding(top = if (node.level <= 2) 6.dp else 3.dp, bottom = 1.dp)
+            if (isActiveStreamTail) {
+                StreamingTailText(
+                    annotated = content,
+                    style = streamStyle,
+                    baseColor = headingColor,
+                    textStyle = headingStyle,
+                    fontWeight = headingWeight,
+                    streaming = true,
+                    effectKey = "$tailEffectKey:h${node.level}",
+                    modifier = headingMod,
+                )
+            } else {
+                OptionalSelectionContainer(!streaming) {
+                    Text(
+                        content,
+                        style = headingStyle,
+                        color = headingColor,
+                        fontWeight = headingWeight,
+                        modifier = headingMod,
+                    )
+                }
+            }
         }
         is FencedCodeBlock -> {
             val code = node.literal.removeSuffix("\n")
@@ -493,14 +539,21 @@ private fun Block(
                             )
                         }
                     } else null
-                    CodeBlock(code, lang, onPreview = onPreview, previewLabel = if (previewKind == ArtifactKind.LATEX) "编译预览" else "预览")
+                    CodeBlock(
+                        code = code,
+                        language = lang,
+                        onPreview = onPreview,
+                        previewLabel = if (previewKind == ArtifactKind.LATEX) "编译预览" else "预览",
+                        streaming = isActiveStreamTail,
+                        streamStyle = streamStyle,
+                    )
                 }
             }
         }
-        is IndentedCodeBlock -> CodeBlock(node.literal.removeSuffix("\n"), null)
-        is HtmlBlock -> CodeBlock(node.literal.removeSuffix("\n"), "html")
-        is BulletList -> ListBlock(node, ordered = false, start = 1, compact = compact, sourceItemId = sourceItemId, streaming = streaming, overrideTextColor = overrideTextColor, onOpenArtifact = onOpenArtifact)
-        is OrderedList -> ListBlock(node, ordered = true, start = node.markerStartNumber ?: 1, compact = compact, sourceItemId = sourceItemId, streaming = streaming, overrideTextColor = overrideTextColor, onOpenArtifact = onOpenArtifact)
+        is IndentedCodeBlock -> CodeBlock(node.literal.removeSuffix("\n"), null, streaming = isActiveStreamTail, streamStyle = streamStyle)
+        is HtmlBlock -> CodeBlock(node.literal.removeSuffix("\n"), "html", streaming = isActiveStreamTail, streamStyle = streamStyle)
+        is BulletList -> ListBlock(node, ordered = false, start = 1, compact = compact, sourceItemId = sourceItemId, streaming = streaming, overrideTextColor = overrideTextColor, onOpenArtifact = onOpenArtifact, isActiveStreamTail = isActiveStreamTail, streamStyle = streamStyle, tailEffectKey = tailEffectKey)
+        is OrderedList -> ListBlock(node, ordered = true, start = node.markerStartNumber ?: 1, compact = compact, sourceItemId = sourceItemId, streaming = streaming, overrideTextColor = overrideTextColor, onOpenArtifact = onOpenArtifact, isActiveStreamTail = isActiveStreamTail, streamStyle = streamStyle, tailEffectKey = tailEffectKey)
         is BlockQuote -> {
             val firstParaText = remember(node) { (node.firstChild as? Paragraph)?.let(::rawParagraphText).orEmpty() }
             val callout = remember(firstParaText) { calloutHeaderRe.find(firstParaText.lineSequence().firstOrNull().orEmpty()) }
@@ -556,11 +609,37 @@ private fun Block(
                             Text(label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, color = accent)
                         }
                         val firstClean = listOf(extraLine, rest).filter { it.isNotBlank() }.joinToString("\n")
+                        val restChildren = node.children().drop(1)
                         if (firstClean.isNotBlank()) {
                             val subDoc = remember(firstClean) { parser.parse(firstClean) }
-                            subDoc.children().forEach { Block(it, compact, sourceItemId, streaming, null, onOpenArtifact) }
+                            val subKids = remember(subDoc) { subDoc.children() }
+                            subKids.forEachIndexed { idx, child ->
+                                Block(
+                                    node = child,
+                                    compact = compact,
+                                    sourceItemId = sourceItemId,
+                                    streaming = streaming,
+                                    overrideTextColor = null,
+                                    onOpenArtifact = onOpenArtifact,
+                                    isActiveStreamTail = isActiveStreamTail && restChildren.isEmpty() && idx == subKids.lastIndex,
+                                    streamStyle = streamStyle,
+                                    tailEffectKey = "$tailEffectKey:co0:$idx",
+                                )
+                            }
                         }
-                        node.children().drop(1).forEach { Block(it, compact, sourceItemId, streaming, null, onOpenArtifact) }
+                        restChildren.forEachIndexed { idx, child ->
+                            Block(
+                                node = child,
+                                compact = compact,
+                                sourceItemId = sourceItemId,
+                                streaming = streaming,
+                                overrideTextColor = null,
+                                onOpenArtifact = onOpenArtifact,
+                                isActiveStreamTail = isActiveStreamTail && idx == restChildren.lastIndex,
+                                streamStyle = streamStyle,
+                                tailEffectKey = "$tailEffectKey:co1:$idx",
+                            )
+                        }
                     }
                 }
             } else {
@@ -576,8 +655,19 @@ private fun Block(
                             .padding(horizontal = 13.dp, vertical = 9.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        node.children().forEach {
-                            Block(it, compact, sourceItemId, streaming, overrideTextColor ?: G.inkMuted, onOpenArtifact)
+                        val quoteKids = node.children()
+                        quoteKids.forEachIndexed { idx, child ->
+                            Block(
+                                node = child,
+                                compact = compact,
+                                sourceItemId = sourceItemId,
+                                streaming = streaming,
+                                overrideTextColor = overrideTextColor ?: G.inkMuted,
+                                onOpenArtifact = onOpenArtifact,
+                                isActiveStreamTail = isActiveStreamTail && idx == quoteKids.lastIndex,
+                                streamStyle = streamStyle,
+                                tailEffectKey = "$tailEffectKey:bq:$idx",
+                            )
                         }
                     }
                 }
@@ -585,7 +675,22 @@ private fun Block(
         }
         is ThematicBreak -> Hairline(Modifier.padding(vertical = 6.dp))
         is TableBlock -> TableView(node)
-        else -> node.children().forEach { Block(it, compact, sourceItemId, streaming, overrideTextColor, onOpenArtifact) }
+        else -> {
+            val kids = node.children()
+            kids.forEachIndexed { idx, child ->
+                Block(
+                    node = child,
+                    compact = compact,
+                    sourceItemId = sourceItemId,
+                    streaming = streaming,
+                    overrideTextColor = overrideTextColor,
+                    onOpenArtifact = onOpenArtifact,
+                    isActiveStreamTail = isActiveStreamTail && idx == kids.lastIndex,
+                    streamStyle = streamStyle,
+                    tailEffectKey = "$tailEffectKey:e:$idx",
+                )
+            }
+        }
     }
 }
 
@@ -599,9 +704,14 @@ private fun ListBlock(
     streaming: Boolean = false,
     overrideTextColor: Color? = null,
     onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
+    isActiveStreamTail: Boolean = false,
+    streamStyle: String = STREAM_ANIM_SMOOTH_FADE,
+    tailEffectKey: String = "",
 ) {
+    val listItems = remember(node) { node.children().filterIsInstance<ListItem>() }
     Column(verticalArrangement = Arrangement.spacedBy(if (compact) 4.dp else 5.dp)) {
-        node.children().filterIsInstance<ListItem>().forEachIndexed { index, item ->
+        listItems.forEachIndexed { index, item ->
+            val isLastListItem = index == listItems.lastIndex
             val taskMarker = if (!ordered) extractTaskListMarker(item) else null
             Row(Modifier.fillMaxWidth()) {
                 if (taskMarker != null) {
@@ -644,22 +754,36 @@ private fun ListBlock(
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     val itemChildren = item.children()
                     itemChildren.forEachIndexed { childIdx, child ->
+                        val childIsTail = isActiveStreamTail && isLastListItem && childIdx == itemChildren.lastIndex
                         if (childIdx == 0 && taskMarker != null && child is Paragraph) {
                             val checked = taskMarker.first
-                            SelectionContainer {
-                                Text(
-                                    text = inline(
-                                        node = child,
-                                        overrideTextColor = if (checked) (overrideTextColor?.copy(alpha = 0.65f) ?: G.inkMuted) else overrideTextColor,
-                                        stripLeadingChars = taskMarker.second,
-                                        strikethrough = checked,
-                                    ),
-                                    style = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodyLarge,
-                                    color = if (checked) (overrideTextColor?.copy(alpha = 0.65f) ?: G.inkMuted) else (overrideTextColor ?: G.ink),
-                                )
+                            val taskColor = if (checked) (overrideTextColor?.copy(alpha = 0.65f) ?: G.inkMuted) else (overrideTextColor ?: G.ink)
+                            val taskStyle = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodyLarge
+                            val taskText = inline(
+                                node = child,
+                                overrideTextColor = if (checked) (overrideTextColor?.copy(alpha = 0.65f) ?: G.inkMuted) else overrideTextColor,
+                                stripLeadingChars = taskMarker.second,
+                                strikethrough = checked,
+                            )
+                            if (childIsTail) {
+                                StreamingTailText(taskText, streamStyle, taskColor, taskStyle, streaming = true, effectKey = "$tailEffectKey:li$index:t")
+                            } else {
+                                OptionalSelectionContainer(!streaming) {
+                                    Text(text = taskText, style = taskStyle, color = taskColor)
+                                }
                             }
                         } else {
-                            Block(child, compact, sourceItemId, streaming, overrideTextColor, onOpenArtifact)
+                            Block(
+                                node = child,
+                                compact = compact,
+                                sourceItemId = sourceItemId,
+                                streaming = streaming,
+                                overrideTextColor = overrideTextColor,
+                                onOpenArtifact = onOpenArtifact,
+                                isActiveStreamTail = childIsTail,
+                                streamStyle = streamStyle,
+                                tailEffectKey = "$tailEffectKey:li$index:c$childIdx",
+                            )
                         }
                     }
                 }
@@ -774,6 +898,8 @@ fun CodeBlock(
     modifier: Modifier = Modifier,
     onPreview: (() -> Unit)? = null,
     previewLabel: String = "预览",
+    streaming: Boolean = false,
+    streamStyle: String = STREAM_ANIM_SMOOTH_FADE,
 ) {
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
@@ -785,7 +911,7 @@ fun CodeBlock(
         modifier = modifier.fillMaxWidth(),
         shape = D.codeShape,
         color = G.codeBg,
-        border = BorderStroke(1.dp, G.codeBorder),
+        border = BorderStroke(1.dp, if (streaming) G.accent.copy(alpha = 0.45f) else G.codeBorder),
     ) {
         Column {
             Row(
@@ -801,6 +927,11 @@ fun CodeBlock(
                     color = G.codeMuted,
                     modifier = Modifier.weight(1f),
                 )
+                if (streaming) {
+                    Box(Modifier.size(width = 18.dp, height = 14.dp), contentAlignment = Alignment.Center) {
+                        StreamingInlineCursor(style = streamStyle, inkColor = G.codeInk, accentColor = G.accent)
+                    }
+                }
                 if (onPreview != null) {
                     Row(
                         modifier = Modifier

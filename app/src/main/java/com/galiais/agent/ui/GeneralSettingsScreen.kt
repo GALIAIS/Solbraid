@@ -1,6 +1,7 @@
 package com.galiais.agent.ui
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -22,8 +23,15 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.galiais.agent.GaliaisApplication
+import com.galiais.agent.engine.STREAM_ANIM_INSTANT
+import com.galiais.agent.engine.STREAM_SPEED_BALANCED
+import com.galiais.agent.engine.STREAM_SPEED_FAST
+import com.galiais.agent.engine.STREAM_SPEED_GENTLE
 import com.galiais.agent.engine.USER_RENDER_ALWAYS_PLAIN
 import com.galiais.agent.engine.USER_RENDER_ALWAYS_RICH
 import com.galiais.agent.engine.USER_RENDER_FOLLOW_EDITOR
@@ -195,7 +203,136 @@ fun GeneralSettingsScreen(
             }
         }
 
-        // 3. 文件编辑器与对话显示
+        // 3. 流式输出动效与流速
+        SectionLabel("流式输出动效")
+        CrispCard {
+            val activeStreamOpt = remember(settings.streamAnimationStyle) {
+                STREAM_ANIMATION_OPTIONS.firstOrNull { it.id == settings.streamAnimationStyle } ?: STREAM_ANIMATION_OPTIONS.first()
+            }
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("输出动画效果", style = MaterialTheme.typography.titleSmall, color = G.ink)
+                    Text(
+                        activeStreamOpt.subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = G.inkMuted,
+                    )
+                }
+
+                StreamingAnimationPreviewCard(
+                    style = settings.streamAnimationStyle,
+                    speed = settings.streamSpeed,
+                )
+
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    STREAM_ANIMATION_OPTIONS.chunked(2).forEach { rowItems ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            rowItems.forEach { opt ->
+                                val selected = opt.id == settings.streamAnimationStyle
+                                val cardShape = D.shape(11.dp)
+                                Surface(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clip(cardShape)
+                                        .clickable { app.settings.setStreamAnimationStyle(opt.id) },
+                                    shape = cardShape,
+                                    color = if (selected) {
+                                        G.accentContainer.copy(alpha = if (G.dark) 0.42f else 0.72f)
+                                    } else {
+                                        G.surfaceSubtle.copy(alpha = if (G.dark) 0.45f else 0.62f)
+                                    },
+                                    border = BorderStroke(
+                                        width = if (selected) 1.25.dp else 0.75.dp,
+                                        color = if (selected) G.accent else G.border,
+                                    ),
+                                ) {
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 10.dp, vertical = 9.dp),
+                                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        ) {
+                                            Text(
+                                                opt.title,
+                                                style = MaterialTheme.typography.labelLarge,
+                                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                                                color = if (selected) G.accent else G.ink,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.weight(1f),
+                                            )
+                                            if (selected) {
+                                                Icon(
+                                                    GaliaisIcons.Check,
+                                                    contentDescription = "已选中",
+                                                    tint = G.accent,
+                                                    modifier = Modifier.size(13.dp),
+                                                )
+                                            } else {
+                                                Text(
+                                                    opt.badge,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = G.inkSubtle,
+                                                    maxLines = 1,
+                                                )
+                                            }
+                                        }
+                                        Text(
+                                            opt.subtitle,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (selected) G.ink.copy(alpha = 0.78f) else G.inkMuted,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Column(Modifier.fillMaxWidth()) {
+                    AnimatedExpandable(expanded = settings.streamAnimationStyle != STREAM_ANIM_INSTANT) {
+                        Column(
+                            modifier = Modifier.padding(top = 4.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Hairline()
+                            Spacer(Modifier.height(2.dp))
+                            Text("流式推进流速", style = MaterialTheme.typography.titleSmall, color = G.ink)
+                            Text(
+                                when (settings.streamSpeed) {
+                                    STREAM_SPEED_GENTLE -> "舒缓节奏：更适合从容阅读长篇思考与逐段解析。"
+                                    STREAM_SPEED_FAST -> "迅捷节奏：低延迟紧跟高吞吐推理模型，同时保持平滑不抖动。"
+                                    else -> "均衡节奏：按屏幕刷新率平滑释放，高速模型下自动动态提速不掉队。"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = G.inkMuted,
+                            )
+                            SegmentedPillBar(
+                                options = listOf(
+                                    STREAM_SPEED_GENTLE to "舒缓",
+                                    STREAM_SPEED_BALANCED to "均衡",
+                                    STREAM_SPEED_FAST to "迅捷",
+                                ),
+                                selected = settings.streamSpeed,
+                                onSelect = app.settings::setStreamSpeed,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. 文件编辑器与对话显示
         SectionLabel("文件编辑器与对话体验")
         CrispCard {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -252,7 +389,7 @@ fun GeneralSettingsScreen(
     if (confirmReset) {
         GaliaisConfirmDialog(
             title = "恢复常规默认设置？",
-            message = "将重置编辑器模式、消息渲染偏好、自动滚动与输入快捷键为默认值，不影响服务商与工作区数据。",
+            message = "将重置编辑器模式、消息渲染偏好、流式输出动效、自动滚动与输入快捷键为默认值，不影响服务商与工作区数据。",
             confirmText = "确认恢复",
             danger = true,
             onConfirm = {

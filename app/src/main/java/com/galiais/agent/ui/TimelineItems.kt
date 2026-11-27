@@ -611,28 +611,56 @@ internal fun AgentMessageView(
     onQuote: ((String) -> Unit)?,
     showFooterActions: Boolean = true,
     onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
+    globalOffset: Int = 0,
 ) {
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
     var copied by remember { mutableStateOf(false) }
     LaunchedEffect(copied) { if (copied) { delay(1500); copied = false } }
+    val streamStyle = RPrefs.streamAnimationStyle
+    val streamSpeed = RPrefs.streamSpeed
+    val paced = rememberPacedStreamingText(
+        sourceId = item.id,
+        fullText = item.text,
+        streaming = item.streaming,
+        style = streamStyle,
+        speed = streamSpeed,
+        globalOffset = globalOffset,
+    )
 
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        if (item.text.isNotEmpty()) {
+        if (paced.visibleText.isNotEmpty()) {
             if (RPrefs.assistantRichRender) {
-                Markdown(item.text, sourceItemId = item.id, streaming = item.streaming, onOpenArtifact = onOpenArtifact)
+                Markdown(
+                    text = paced.visibleText,
+                    sourceItemId = "${item.id}:$globalOffset",
+                    streaming = paced.visualStreaming,
+                    onOpenArtifact = onOpenArtifact,
+                )
+            } else if (paced.visualStreaming) {
+                val plainAnnotated = remember(paced.visibleText) {
+                    androidx.compose.ui.text.AnnotatedString(paced.visibleText)
+                }
+                StreamingTailText(
+                    annotated = plainAnnotated,
+                    style = streamStyle,
+                    baseColor = G.ink,
+                    textStyle = MaterialTheme.typography.bodyLarge,
+                    streaming = true,
+                    effectKey = "${item.id}:plain:$globalOffset",
+                )
             } else {
                 SelectionContainer {
-                    Text(item.text, style = MaterialTheme.typography.bodyLarge, color = G.ink)
+                    Text(paced.visibleText, style = MaterialTheme.typography.bodyLarge, color = G.ink)
                 }
             }
         }
-        if (item.streaming) {
+        if (paced.visualStreaming && paced.visibleText.isEmpty()) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 TypingWaveDots(G.accent, dotSize = 5.5.dp)
-                if (item.text.isEmpty()) Text("正在生成…", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                Text("正在生成…", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
             }
-        } else if (showFooterActions && item.text.isNotBlank()) {
+        } else if (!paced.visualStreaming && showFooterActions && item.text.isNotBlank()) {
             Row(
                 modifier = Modifier.padding(top = 2.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -841,7 +869,7 @@ fun PlanArtifactCard(
                                     .heightIn(max = 280.dp)
                                     .verticalScroll(rememberScrollState()),
                             ) {
-                                Markdown(item.text, compact = true, streaming = item.streaming, onOpenArtifact = onOpenArtifact)
+                                Markdown(item.text, compact = true, sourceItemId = item.id, streaming = item.streaming, onOpenArtifact = onOpenArtifact)
                             }
                         } else if (item.streaming) {
                             Text("正在生成执行方案…", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
@@ -1355,7 +1383,7 @@ internal fun ThinkingBlock(item: TimelineItem.Reasoning, initiallyOpen: Boolean)
                                 else mod.heightIn(max = 320.dp).verticalScroll(scroll)
                             },
                     ) {
-                        Markdown(effectiveBody, compact = true, streaming = item.streaming)
+                        Markdown(effectiveBody, compact = true, sourceItemId = item.id, streaming = item.streaming)
                     }
                     if (!item.streaming && hasBody) {
                         Row(

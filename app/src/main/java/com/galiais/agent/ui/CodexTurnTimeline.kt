@@ -270,12 +270,12 @@ fun formatTurnDuration(ms: Long): String {
 }
 
 /**
- * 将长篇已定稿 Markdown 文本按安全块边界（不截断围栏代码块、数学块、表格与 `<antArtifact>`）切分为 ~1.2KB 虚拟化块，
- * 供 `LazyColumn` 按屏懒加载与回收，彻底消除长回复单 item 全量排版卡顿。
+ * 将长篇 Markdown 文本按安全块边界（不截断围栏代码块、数学块、表格与 `<antArtifact>`）切分为 ~1.2KB 虚拟化块，
+ * 并附带每块在原文中的精确字符起始偏移，供流式与已定稿共享稳定的 LazyColumn 键值且绝不重播。
  */
-internal fun splitMarkdownVirtualChunks(text: String, targetChunkChars: Int = 1200): List<String> {
-    if (text.length <= targetChunkChars + 600) return listOf(text)
-    val chunks = ArrayList<String>()
+internal fun splitMarkdownVirtualChunksIndexed(text: String, targetChunkChars: Int = 1200): List<Pair<Int, String>> {
+    if (text.length <= targetChunkChars + 600) return listOf(0 to text)
+    val chunks = ArrayList<Pair<Int, String>>()
     var chunkStart = 0
     var pos = 0
     var inFence = false
@@ -309,7 +309,7 @@ internal fun splitMarkdownVirtualChunks(text: String, targetChunkChars: Int = 12
             val nextTrim = text.substring(nextPos, peekEnd).trim()
             if (nextTrim.isNotEmpty() && !nextTrim.startsWith("|")) {
                 val slice = text.substring(chunkStart, nextPos).trimEnd()
-                if (slice.isNotEmpty()) chunks += slice
+                if (slice.isNotEmpty()) chunks += (chunkStart to slice)
                 chunkStart = nextPos
             }
         }
@@ -317,10 +317,13 @@ internal fun splitMarkdownVirtualChunks(text: String, targetChunkChars: Int = 12
     }
     if (chunkStart < len) {
         val tail = text.substring(chunkStart).trimEnd()
-        if (tail.isNotEmpty()) chunks += tail
+        if (tail.isNotEmpty()) chunks += (chunkStart to tail)
     }
-    return if (chunks.isEmpty()) listOf(text) else chunks
+    return if (chunks.isEmpty()) listOf(0 to text) else chunks
 }
+
+internal fun splitMarkdownVirtualChunks(text: String, targetChunkChars: Int = 1200): List<String> =
+    splitMarkdownVirtualChunksIndexed(text, targetChunkChars).map { it.second }
 
 /**
  * 细粒度铺平单轮 LazyColumn 项：
@@ -412,19 +415,37 @@ fun LazyListScope.turnBlockItems(
     }
 
     block.finalMessage?.let { msg ->
-        if (!msg.streaming && msg.text.length > 1800) {
-            val chunks = splitMarkdownVirtualChunks(msg.text)
-            chunks.forEachIndexed { cIdx, chunk ->
-                val isLastChunk = cIdx == chunks.lastIndex
-                item(key = "m-${block.id}-${msg.id}-c$cIdx", contentType = "agent_msg_chunk") {
+        // 流式与已定稿统一使用稳定切片键 `m-${block.id}-${msg.id}-c$cIdx`，彻底消除超过 1800 字结束时的销毁重建闪烁
+        val chunks = if (msg.text.length > 1800) splitMarkdownVirtualChunksIndexed(msg.text) else listOf(0 to msg.text)
+        chunks.forEachIndexed { cIdx, (chunkOffset, chunk) ->
+            val isLastChunk = cIdx == chunks.lastIndex
+            item(key = "m-${block.id}-${msg.id}-c$cIdx", contentType = "agent_msg_chunk") {
+                if (!isLastChunk) {
                     Column(Modifier.fillMaxWidth().padding(vertical = 1.dp)) {
-                        Markdown(
-                            text = chunk,
-                            sourceItemId = "${msg.id}:c$cIdx",
-                            streaming = false,
+                        if (RPrefs.assistantRichRender) {
+                            Markdown(
+                                text = chunk,
+                                sourceItemId = "${msg.id}:c$cIdx",
+                                streaming = false,
+                                onOpenArtifact = actions.onOpenArtifact,
+                            )
+                        } else {
+                            SelectionContainer {
+                                Text(chunk, style = MaterialTheme.typography.bodyLarge, color = G.ink)
+                            }
+                        }
+                    }
+                } else {
+                    Column(Modifier.fillMaxWidth().padding(vertical = 1.dp)) {
+                        val tailItem = if (chunks.size == 1) msg else msg.copy(text = chunk)
+                        AgentMessageView(
+                            item = tailItem,
+                            onQuote = actions.onQuote,
+                            showFooterActions = false,
                             onOpenArtifact = actions.onOpenArtifact,
+                            globalOffset = chunkOffset,
                         )
-                        if (isLastChunk) {
+                        if (!msg.streaming) {
                             val pluginFooter = LocalPluginMessageFooter.current
                             if (pluginFooter != null && pluginFooter.first.isNotEmpty() && msg.text.isNotBlank()) {
                                 Row(
@@ -445,10 +466,6 @@ fun LazyListScope.turnBlockItems(
                         }
                     }
                 }
-            }
-        } else {
-            item(key = "m-${block.id}-${msg.id}", contentType = "agent_msg") {
-                AgentMessageView(item = msg, onQuote = actions.onQuote, showFooterActions = false, onOpenArtifact = actions.onOpenArtifact)
             }
         }
     }
