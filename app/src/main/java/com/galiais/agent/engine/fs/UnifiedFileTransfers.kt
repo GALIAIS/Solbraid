@@ -320,16 +320,39 @@ private suspend fun UnifiedFileRepository.commitLocalTreeToScope(
     onFile: (String, Long) -> Unit,
 ) {
     val base = localDir.canonicalFile
-    fun walk(dir: File, relPrefix: String): List<Pair<String, File>> {
+    val visitedInodes = HashSet<Pair<Long, Long>>()
+    val visitedPaths = HashSet<String>()
+    fun walk(dir: File, relPrefix: String, depth: Int): List<Pair<String, File>> {
+        if (depth > 96) return emptyList()
+        val (dirIsLink, dirInode) = LocalFsHelper.lstatIdentity(dir)
+        if (dirIsLink) return emptyList()
+        if (dirInode != null && !visitedInodes.add(dirInode)) return emptyList()
+        if (dirInode == null) {
+            val canon = runCatching { dir.canonicalPath }.getOrDefault(dir.absolutePath)
+            if (!visitedPaths.add(canon)) return emptyList()
+        }
         val out = mutableListOf<Pair<String, File>>()
         for (c in dir.listFiles().orEmpty()) {
+            val (cIsLink, _) = LocalFsHelper.lstatIdentity(c)
+            if (cIsLink) continue
             val rel = if (relPrefix.isEmpty()) c.name else "$relPrefix/${c.name}"
-            if (c.isDirectory) out += walk(c, rel) else if (c.isFile) out += rel to c
+            if (c.isDirectory) out += walk(c, rel, depth + 1) else if (c.isFile) out += rel to c
         }
         return out
     }
-    for ((rel, file) in walk(base, "")) {
+    val safTarget = isSafPath(targetScope, targetDir)
+    for ((rel, file) in walk(base, "", 0)) {
         if (cancelled.get()) throw InterruptedException("已取消")
+        if (safTarget) {
+            val segments = splitValidatedRelativePath(rel)
+            val parentRef = if (segments.size == 1) FileRef(targetScope, targetDir)
+            else createDirectoryIn(targetScope, targetDir, segments.dropLast(1).joinToString("/"))
+            val dstRef = prepareTransferTarget(targetScope, parentRef.path, segments.last(), directory = false, policy = conflictPolicy)
+                ?: continue
+            writeLocalFileTo(dstRef, file)
+            onFile(rel, file.length())
+            continue
+        }
         val fullTarget = normalizeVfsPath("$targetDir/$rel")
         val parent = fullTarget.substringBeforeLast('/').ifEmpty { "/" }
         mkdir(targetScope, parent)
@@ -422,30 +445,70 @@ suspend fun UnifiedFileRepository.compressInPlace(refs: List<FileRef>, targetSco
         }
     }
 
-/** 解压压缩包到指定目录（支持 `.zip` 原生流式解压及 `.tar.*`/`.7z` 系统命令解压）。 */
+/** 解压压缩包到指定目录（支持 `.zip` 原生流式解压及 `.tar.*` 安全预检解压）。 */
 suspend fun UnifiedFileRepository.extractArchive(ref: FileRef, targetScope: FileScope, targetDir: String): Int =
     withContext(Dispatchers.IO) {
         val ext = ref.name.lowercase()
         val staged = stageReadableFile(ref)
         val tmpOut = File(app.cacheDir, "extract-${UUID.randomUUID().toString().take(8)}").apply { mkdirs() }
         try {
-            val count = runTrackedTransfer(title = "解压 ${ref.name}") { cancelled, report ->
-                if (ext.endsWith(".zip") || ext.endsWith(".jar") || ext.endsWith(".apk") || ext.endsWith(".aar")) {
+            runTrackedTransfer(title = "解压 ${ref.name}") { cancelled, report ->
+                val count = if (ext.endsWith(".zip") || ext.endsWith(".jar") || ext.endsWith(".apk") || ext.endsWith(".aar")) {
                     staged.inputStream().use { input ->
                         ArchiveEngine.extractZipStream(input, tmpOut, cancelled = cancelled) { name, done, bytes ->
                             report(name, done, bytes)
                         }
                     }
                 } else {
-                    // 使用 tar 解压 .tar / .tar.gz / .tgz / .tar.xz / .tar.bz2
+                    // 安全预检 tar 列表：拦截路径穿越（../、绝对路径）、符号链接/硬链接/设备文件及超量条目
+                    val listProc = ProcessBuilder("tar", "-tf", staged.absolutePath).redirectErrorStream(true).start()
+                    var entryCount = 0
+                    listProc.inputStream.bufferedReader(Charsets.UTF_8).useLines { lines ->
+                        for (rawLine in lines) {
+                            if (cancelled.get()) {
+                                listProc.destroyForcibly()
+                                throw InterruptedException("已取消解压")
+                            }
+                            val line = rawLine.trimEnd('\r')
+                            if (line.isBlank()) continue
+                            entryCount++
+                            check(entryCount <= 50_000) { "归档条目数超过安全上限（50,000），已中止解压" }
+                            val cleaned = line.removePrefix("./")
+                            if (cleaned.isEmpty() || cleaned == ".") continue
+                            check(ArchiveEngine.normalizeEntryPath(cleaned) != null) {
+                                "检测到归档路径穿越条目，已拦截：${line.take(120)}"
+                            }
+                        }
+                    }
+                    check(listProc.waitFor() == 0) { "无法校验归档内容，文件可能已损坏或格式不支持" }
+
+                    val verboseProc = ProcessBuilder("tar", "-tvf", staged.absolutePath).redirectErrorStream(true).start()
+                    verboseProc.inputStream.bufferedReader(Charsets.UTF_8).useLines { lines ->
+                        for (rawLine in lines) {
+                            if (cancelled.get()) {
+                                verboseProc.destroyForcibly()
+                                throw InterruptedException("已取消解压")
+                            }
+                            val typeChar = rawLine.firstOrNull() ?: continue
+                            check(typeChar !in setOf('l', 'h', 'b', 'c', 'p')) {
+                                "检测到归档包含符号链接/硬链接或设备节点，已安全拦截：${rawLine.take(120)}"
+                            }
+                        }
+                    }
+                    check(verboseProc.waitFor() == 0) { "归档条目安全预检失败" }
+
                     val pb = ProcessBuilder("tar", "-xf", staged.absolutePath, "-C", tmpOut.absolutePath).redirectErrorStream(true).start()
-                    val output = pb.inputStream.bufferedReader().readText()
-                    check(pb.waitFor() == 0) { "解压失败：${output.take(400)}" }
-                    tmpOut.walkTopDown().count { it.isFile }
+                    val output = pb.inputStream.bufferedReader().readText().take(400)
+                    check(pb.waitFor() == 0) { "解压失败：$output" }
+                    tmpOut.walkTopDown().count { !LocalFsHelper.lstatIdentity(it).first && it.isFile }
                 }
+                var committedBytes = 0L
+                commitLocalTreeToScope(tmpOut, targetScope, targetDir, ConflictPolicy.RENAME, cancelled) { name, b ->
+                    committedBytes += b
+                    report(name, count, committedBytes)
+                }
+                count
             }
-            commitLocalTreeToScope(tmpOut, targetScope, targetDir, ConflictPolicy.OVERWRITE, AtomicBoolean(false)) { _, _ -> }
-            count
         } finally {
             tmpOut.deleteRecursively()
         }
@@ -512,12 +575,23 @@ suspend fun UnifiedFileRepository.search(
     val hits = ArrayList<SearchHit>()
     val skipDirs = setOf(".git", "node_modules", ".gradle", "build", "__pycache__", ".venv")
     val baseCanon = rootFile.canonicalPath.trimEnd('/')
+    val visitedInodes = HashSet<Pair<Long, Long>>()
+    val visitedPaths = HashSet<String>()
 
     fun walk(dir: File, depth: Int) {
         if (depth > 16 || hits.size >= maxResults) return
+        val (dirLink, dirInode) = LocalFsHelper.lstatIdentity(dir)
+        if (depth > 0 && dirLink) return
+        if (dirInode != null && !visitedInodes.add(dirInode)) return
+        if (dirInode == null) {
+            val canon = runCatching { dir.canonicalPath }.getOrDefault(dir.absolutePath)
+            if (!visitedPaths.add(canon)) return
+        }
         val children = dir.listFiles() ?: return
         for (f in children) {
             if (hits.size >= maxResults) return
+            val (fIsLink, _) = LocalFsHelper.lstatIdentity(f)
+            if (fIsLink) continue
             val rel = f.canonicalPath.removePrefix(baseCanon).trimStart('/')
             val vPath = if (normRoot == "/") "/$rel" else "$normRoot/$rel"
             if (f.isDirectory) {
@@ -556,7 +630,7 @@ suspend fun UnifiedFileRepository.search(
     hits
 }
 
-/** 分析当前目录各子项的磁盘空间占用排行。 */
+/** 分析当前目录各子项的磁盘空间占用排行（自动跳过符号链接以防循环遍历）。 */
 suspend fun UnifiedFileRepository.analyzeDiskUsage(scope: FileScope, path: String): List<DiskUsageEntry> = withContext(Dispatchers.IO) {
     val phys = physicalPathFor(scope, path)
     if (usesRootBackend(scope) || !File(phys).canRead()) {
@@ -567,14 +641,31 @@ suspend fun UnifiedFileRepository.analyzeDiskUsage(scope: FileScope, path: Strin
     dir.listFiles().orEmpty().map { child ->
         var bytes = 0L
         var count = 0
-        if (child.isDirectory) {
-            child.walkTopDown().maxDepth(32).forEach { f ->
-                if (f.isFile) { bytes += f.length(); count++ }
+        val (childLink, _) = LocalFsHelper.lstatIdentity(child)
+        if (!childLink && child.isDirectory) {
+            val visitedInodes = HashSet<Pair<Long, Long>>()
+            val visitedPaths = HashSet<String>()
+            fun walkSize(d: File, depth: Int) {
+                if (depth > 32) return
+                val (dLink, dInode) = LocalFsHelper.lstatIdentity(d)
+                if (dLink) return
+                if (dInode != null && !visitedInodes.add(dInode)) return
+                if (dInode == null) {
+                    val canon = runCatching { d.canonicalPath }.getOrDefault(d.absolutePath)
+                    if (!visitedPaths.add(canon)) return
+                }
+                for (f in d.listFiles().orEmpty()) {
+                    val (fLink, _) = LocalFsHelper.lstatIdentity(f)
+                    if (fLink) continue
+                    if (f.isDirectory) walkSize(f, depth + 1)
+                    else if (f.isFile) { bytes += f.length(); count++ }
+                }
             }
-        } else if (child.isFile) {
+            walkSize(child, 0)
+        } else if (!childLink && child.isFile) {
             bytes = child.length(); count = 1
         }
         val vPath = if (norm == "/") "/${child.name}" else "$norm/${child.name}"
-        DiskUsageEntry(child.name, vPath, child.isDirectory, bytes, count)
+        DiskUsageEntry(child.name, vPath, !childLink && child.isDirectory, bytes, count)
     }.sortedByDescending { it.bytes }
 }

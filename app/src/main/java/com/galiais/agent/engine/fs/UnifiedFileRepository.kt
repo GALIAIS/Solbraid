@@ -18,6 +18,13 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
+import java.nio.file.FileVisitResult
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Path
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -33,7 +40,10 @@ class UnifiedFileRepository(
     val runtime: RuntimeClient,
     val settings: AppSettings,
 ) {
-    internal val rootDaemon = RootFsDaemon(app)
+    private val rootWriteUnlockedFlow = MutableStateFlow(false)
+    val rootWriteUnlocked: StateFlow<Boolean> = rootWriteUnlockedFlow.asStateFlow()
+
+    internal val rootDaemon = RootFsDaemon(app) { rootWriteUnlockedFlow.value }
     private val prefs = app.getSharedPreferences("solbraid-files-v2", Context.MODE_PRIVATE)
     private val cancelFlags = ConcurrentHashMap<String, AtomicBoolean>()
 
@@ -81,9 +91,6 @@ class UnifiedFileRepository(
 
     private val showHiddenFlow = MutableStateFlow(prefs.getBoolean("show.hidden", true))
     val showHidden: StateFlow<Boolean> = showHiddenFlow.asStateFlow()
-
-    private val rootWriteUnlockedFlow = MutableStateFlow(false)
-    val rootWriteUnlocked: StateFlow<Boolean> = rootWriteUnlockedFlow.asStateFlow()
 
     private val backupOnRootEditFlow = MutableStateFlow(prefs.getBoolean("root.backup", true))
     val backupOnRootEdit: StateFlow<Boolean> = backupOnRootEditFlow.asStateFlow()
@@ -271,6 +278,15 @@ class UnifiedFileRepository(
         if (scope == FileScope.HOST_ROOT && rootDaemon.isProtectedSystemPath(norm) && !rootWriteUnlockedFlow.value) {
             throw IllegalStateException("系统保护分区（$norm）当前处于只读保护状态，请先在顶部保护条解锁「允许写入系统区」后再操作")
         }
+        if (!isSafPath(scope, norm)) {
+            val phys = File(physicalPathFor(scope, norm))
+            val canon = runCatching { phys.canonicalPath }.getOrNull()
+            if (canon != null && rootDaemon.isProtectedSystemPath(canon) &&
+                !(scope == FileScope.HOST_ROOT && rootWriteUnlockedFlow.value)
+            ) {
+                throw IllegalStateException("目标规范路径落入系统保护分区（$canon），已拦截写入")
+            }
+        }
     }
 
     private fun builtInBookmarks(): List<FileBookmark> {
@@ -312,7 +328,7 @@ class UnifiedFileRepository(
         val raw = prefs.getString("trash.entries", null) ?: return@runCatching emptyList()
         val arr = JSONArray(raw)
         (0 until arr.length()).mapNotNull { TrashEntry.fromJson(arr.getJSONObject(it)) }
-            .filter { File(it.trashFilePath).exists() }
+            .filterNot { Files.notExists(File(it.trashFilePath).toPath(), LinkOption.NOFOLLOW_LINKS) }
     }.getOrDefault(emptyList())
 
     internal fun saveTrash(entries: List<TrashEntry>) {
@@ -508,10 +524,21 @@ class UnifiedFileRepository(
             rootDaemon.computeDirStats(phys)
         } else {
             var bytes = 0L; var files = 0; var dirs = 0
+            val visitedInodes = HashSet<Pair<Long, Long>>()
+            val visitedPaths = HashSet<String>()
             fun walk(f: File, depth: Int) {
                 if (depth > 64) return
+                val (fLink, fInode) = LocalFsHelper.lstatIdentity(f)
+                if (depth > 0 && fLink) return
+                if (fInode != null && !visitedInodes.add(fInode)) return
+                if (fInode == null) {
+                    val canon = runCatching { f.canonicalPath }.getOrDefault(f.absolutePath)
+                    if (!visitedPaths.add(canon)) return
+                }
                 val list = f.listFiles() ?: return
                 for (c in list) {
+                    val (cLink, _) = LocalFsHelper.lstatIdentity(c)
+                    if (cLink) continue
                     if (c.isDirectory) { dirs++; walk(c, depth + 1) }
                     else if (c.isFile) { files++; bytes += c.length() }
                 }
@@ -655,10 +682,24 @@ class UnifiedFileRepository(
             if (node?.isSpecialFile == true) {
                 throw IllegalStateException("不支持以文本方式打开特殊设备或管道文件：${ref.name}")
             }
+            val safeCap = maxBytes.coerceAtLeast(1L)
             val totalSize = node?.size ?: -1L
-            val truncated = totalSize > maxBytes
-            val staged = stageReadableFile(ref, maxBytes = if (truncated) maxBytes else -1L)
-            val bytes = staged.readBytes()
+            val staged = stageReadableFile(ref, maxBytes = safeCap + 1L)
+            val rawBytes = staged.inputStream().use { input ->
+                val limit = (safeCap + 1L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                val out = java.io.ByteArrayOutputStream(minOf(limit, 65_536))
+                val buf = ByteArray(32_768)
+                var readTotal = 0
+                while (readTotal < limit) {
+                    val n = input.read(buf, 0, minOf(buf.size, limit - readTotal))
+                    if (n <= 0) break
+                    out.write(buf, 0, n)
+                    readTotal += n
+                }
+                out.toByteArray()
+            }
+            val truncated = rawBytes.size > safeCap || totalSize > safeCap
+            val bytes = if (rawBytes.size > safeCap) rawBytes.copyOf(safeCap.toInt()) else rawBytes
             val sha = TextCodec.sha256Hex(bytes)
             val effectiveSize = if (totalSize > 0L) totalSize else bytes.size.toLong()
             val revision = FileRevision(
@@ -980,6 +1021,10 @@ class UnifiedFileRepository(
         assertWriteAllowed(ref.scope, dstPath)
         require(!rootDaemon.isUnremovablePath(ref.scope, norm)) { "不允许重命名受保护的系统或工作区根目录" }
         val srcFile = File(physicalPathFor(ref.scope, norm))
+        val srcCanon = runCatching { srcFile.canonicalPath }.getOrNull()
+        if (srcCanon != null && ref.scope == FileScope.HOST_ROOT) {
+            require(!rootDaemon.isUnremovablePath(FileScope.HOST_ROOT, srcCanon)) { "不允许重命名受保护的系统或工作区根目录" }
+        }
         val dstFile = File(physicalPathFor(ref.scope, dstPath))
         if (usesRootBackend(ref.scope) || !srcFile.renameTo(dstFile)) {
             if (hasRoot) rootDaemon.rename(srcFile.absolutePath, dstFile.absolutePath)
@@ -1015,6 +1060,7 @@ class UnifiedFileRepository(
 
     suspend fun delete(ref: FileRef, moveToTrash: Boolean = false) = withContext(Dispatchers.IO) {
         val norm = ref.normalizedPath
+        require(!moveToTrash || supportsTrash(ref)) { "此位置不支持回收站" }
         if (isSafPath(ref.scope, norm)) {
             val (_, treeUri, docId) = parseSafRef(norm)
             check(LocalFsHelper.deleteSafDocument(app, treeUri, docId)) { "删除外部 SAF 文档失败" }
@@ -1023,41 +1069,74 @@ class UnifiedFileRepository(
         assertWriteAllowed(ref.scope, norm)
         require(!rootDaemon.isUnremovablePath(ref.scope, norm)) { "不允许删除系统核心目录或默认工作区根目录：$norm" }
         val phys = File(physicalPathFor(ref.scope, norm))
-        if (moveToTrash && !ref.scope.isRootElevated && phys.exists() && phys.canWrite()) {
-            val trashDir = File(app.filesDir, "file-trash").apply { mkdirs() }
-            val id = UUID.randomUUID().toString().take(10)
+        val physCanon = runCatching { phys.canonicalPath }.getOrNull()
+        if (physCanon != null && ref.scope == FileScope.HOST_ROOT) {
+            require(!rootDaemon.isUnremovablePath(FileScope.HOST_ROOT, physCanon)) { "不允许删除系统核心目录或默认工作区根目录：$norm" }
+        }
+        if (moveToTrash) {
+            val base = if (ref.scope == FileScope.ANDROID_STORAGE) {
+                app.getExternalFilesDir(null) ?: error("外部存储不可用")
+            } else app.filesDir
+            val trashDir = File(base, "file-trash").apply { check(isDirectory || mkdirs()) { "无法创建回收站目录" } }
+            val id = UUID.randomUUID().toString()
             val trashTarget = File(trashDir, "${id}_${ExternalStorageBridge.sanitizeFilename(ref.name)}")
             val isDir = phys.isDirectory
             val size = if (isDir) 0L else phys.length()
-            if (phys.renameTo(trashTarget)) {
-                val entry = TrashEntry(id, ref.scope, norm, ref.name, isDir, size, System.currentTimeMillis(), trashTarget.absolutePath)
-                saveTrash(listOf(entry) + trashFlow.value)
-                return@withContext
+            check(phys.renameTo(trashTarget)) { "无法移入回收站，文件已保留" }
+            val entry = TrashEntry(id, ref.scope, norm, ref.name, isDir, size, System.currentTimeMillis(), trashTarget.absolutePath)
+            saveTrash(listOf(entry) + trashFlow.value)
+            return@withContext
+        }
+        if (usesRootBackend(ref.scope)) {
+            rootDaemon.remove(phys.absolutePath)
+        } else {
+            try {
+                deleteLocalTree(phys)
+            } catch (error: IOException) {
+                if (hasRoot) rootDaemon.remove(phys.absolutePath) else throw error
             }
         }
-        if (usesRootBackend(ref.scope) || !phys.deleteRecursively()) {
-            if (phys.exists()) {
-                if (hasRoot) rootDaemon.remove(phys.absolutePath) else error("删除失败：$norm")
+    }
+
+    internal fun supportsTrash(ref: FileRef): Boolean = !ref.scope.isRootElevated && !isSafPath(ref.scope, ref.normalizedPath)
+
+    private fun deleteLocalTree(file: File) {
+        val target = file.toPath()
+        if (Files.notExists(target, LinkOption.NOFOLLOW_LINKS)) return
+        // 不跟随软链接，避免删除目录时进入其他项目或存储位置。
+        Files.walkFileTree(target, object : SimpleFileVisitor<Path>() {
+            override fun visitFile(path: Path, attrs: BasicFileAttributes): FileVisitResult {
+                Files.delete(path)
+                return FileVisitResult.CONTINUE
             }
-        }
+
+            override fun postVisitDirectory(path: Path, error: IOException?): FileVisitResult {
+                if (error != null) throw error
+                Files.delete(path)
+                return FileVisitResult.CONTINUE
+            }
+        })
     }
 
     suspend fun restoreTrash(entry: TrashEntry) = withContext(Dispatchers.IO) {
         val src = File(entry.trashFilePath)
-        check(src.exists()) { "回收站文件已不存在" }
+        check(Files.exists(src.toPath(), LinkOption.NOFOLLOW_LINKS)) { "回收站文件已不存在" }
         val dst = File(physicalPathFor(entry.originalScope, entry.originalPath))
         dst.parentFile?.mkdirs()
         val finalDst = if (dst.exists()) ExternalStorageBridge.uniqueFile(dst.parentFile!!, dst.name) else dst
-        if (!src.renameTo(finalDst)) {
-            if (src.isDirectory) { src.copyRecursively(finalDst, overwrite = false); src.deleteRecursively() }
-            else { src.copyTo(finalDst, overwrite = false); src.delete() }
-        }
+        Files.move(src.toPath(), finalDst.toPath())
         saveTrash(trashFlow.value.filterNot { it.id == entry.id })
     }
 
     suspend fun emptyTrash() = withContext(Dispatchers.IO) {
-        trashFlow.value.forEach { runCatching { File(it.trashFilePath).deleteRecursively() } }
-        saveTrash(emptyList())
+        val failed = mutableListOf<TrashEntry>()
+        var failure: IOException? = null
+        trashFlow.value.forEach { entry ->
+            try { deleteLocalTree(File(entry.trashFilePath)) }
+            catch (error: IOException) { failed += entry; failure = error }
+        }
+        saveTrash(failed)
+        failure?.let { throw it }
     }
 
     suspend fun chmod(ref: FileRef, octal: String, recursive: Boolean) = withContext(Dispatchers.IO) {

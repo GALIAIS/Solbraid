@@ -9,6 +9,9 @@ import java.io.File
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 常驻 Root 文件引擎守护进程（基于 `su --mount-master -s /system/bin/sh` 单长连接）：
@@ -17,11 +20,17 @@ import java.util.UUID
  * - 支持大文件零 Base64 膨胀的分片/暂存流式读写，写回自动保留原 mode / uid:gid / SELinux 上下文并原子替换；
  * - 即使 Linux 运行环境未启动，也能独立访问手机宿主 `/`、`/data`、`/data/adb`、`/system`、`/sdcard` 及容器内 root 目录。
  */
-internal class RootFsDaemon(private val context: Context) {
+internal class RootFsDaemon(
+    private val context: Context,
+    private val isProtectedWriteUnlocked: () -> Boolean = { false },
+) {
     private val lock = Any()
     private var process: java.lang.Process? = null
     private var writer: BufferedWriter? = null
     private var reader: BufferedReader? = null
+    private val watchdog = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "RootFsDaemon-Watchdog").apply { isDaemon = true }
+    }
 
     private val stageRoot: File get() = File(context.cacheDir, "root-fs-stage").apply { mkdirs() }
     private val appUid: Int get() = Process.myUid()
@@ -93,37 +102,64 @@ internal class RootFsDaemon(private val context: Context) {
 
     fun close() = synchronized(lock) { closeLocked() }
 
-    /** 在常驻 su 会话中同步执行一条命令并返回完整 stdout 与退出码；断连自动重连一次。 */
-    fun exec(script: String, retryOnDisconnect: Boolean = true, beforeExecute: () -> Unit = {}): ExecOutput = synchronized(lock) {
+    /** 在常驻 su 会话中同步执行一条命令并返回完整 stdout 与退出码；支持超时强杀自愈、输出上限保护与断连重连。 */
+    fun exec(
+        script: String,
+        retryOnDisconnect: Boolean = true,
+        timeoutMs: Long = DEFAULT_CMD_TIMEOUT_MS,
+        beforeExecute: () -> Unit = {},
+    ): ExecOutput = synchronized(lock) {
         val lastAttempt = if (retryOnDisconnect) 1 else 0
         for (attempt in 0..lastAttempt) {
+            var timer: java.util.concurrent.ScheduledFuture<*>? = null
+            val timedOut = AtomicBoolean(false)
             try {
                 beforeExecute()
                 ensureConnectedLocked()
+                val curProc = process!!
                 val w = writer!!
                 val r = reader!!
                 val sentinel = "__GALIAIS_RFS_${UUID.randomUUID().toString().replace("-", "")}__"
                 beforeExecute()
+                if (timeoutMs > 0L) {
+                    timer = watchdog.schedule({
+                        timedOut.set(true)
+                        runCatching { curProc.destroyForcibly() }
+                    }, timeoutMs, TimeUnit.MILLISECONDS)
+                }
                 w.write("{\n")
                 w.write(script)
                 w.write("\n} 2>&1\n")
                 w.write("__rfs_rc=\$?\nprintf '\\n%s:%s\\n' '$sentinel' \"\$__rfs_rc\"\n")
                 w.flush()
                 val sb = StringBuilder()
+                var truncated = false
                 var rc = -1
                 while (true) {
-                    val line = r.readLine() ?: throw IllegalStateException("Root 文件服务连接意外断开")
+                    val line = r.readLine() ?: throw IllegalStateException(
+                        if (timedOut.get()) "Root 文件命令执行超时（${timeoutMs / 1000}s），已自动重置连接"
+                        else "Root 文件服务连接意外断开",
+                    )
                     if (line.startsWith("$sentinel:")) {
                         rc = line.substringAfter(':').trim().toIntOrNull() ?: 1
                         break
                     }
-                    if (sb.isNotEmpty()) sb.append('\n')
-                    sb.append(line)
+                    if (!truncated) {
+                        if (sb.length + line.length + 1 <= MAX_OUTPUT_CHARS) {
+                            if (sb.isNotEmpty()) sb.append('\n')
+                            sb.append(line)
+                        } else {
+                            truncated = true
+                        }
+                    }
                 }
                 return ExecOutput(rc, sb.toString())
             } catch (e: Exception) {
                 closeLocked()
+                if (timedOut.get()) throw IllegalStateException("Root 文件命令执行超时（${timeoutMs / 1000}s），已自动重置连接", e)
                 if (attempt == lastAttempt) throw e
+            } finally {
+                timer?.cancel(false)
             }
         }
         error("Root 命令执行失败")
@@ -133,11 +169,12 @@ internal class RootFsDaemon(private val context: Context) {
     fun listDirectory(physicalDir: String, scope: FileScope, virtualDir: String): List<FileNode> {
         val qDir = shQuote(physicalDir)
         val sep = "\u001F"
+        val marker = "__RFS_LINKS_${UUID.randomUUID().toString().replace("-", "")}__"
         val script = """
             if [ ! -d $qDir ]; then echo "NOT_A_DIRECTORY"; exit 2; fi
             cd -- $qDir || exit 1
             find . -maxdepth 1 -mindepth 1 -exec stat -c '%A$sep%a$sep%U$sep%G$sep%s$sep%Y$sep%C$sep%n' {} + 2>/dev/null
-            printf '__RFS_LINKS__\n'
+            printf '%s\n' '$marker'
             for __f in .* *; do
               case "${'$'}__f" in .|..) continue ;; esac
               [ -L "${'$'}__f" ] || continue
@@ -151,7 +188,6 @@ internal class RootFsDaemon(private val context: Context) {
         if (out.exitCode != 0) {
             throw IllegalStateException(out.stdout.ifBlank { "无法读取目录：$virtualDir" })
         }
-        val marker = "__RFS_LINKS__"
         val markerIdx = out.stdout.indexOf(marker)
         val statSection = if (markerIdx >= 0) out.stdout.substring(0, markerIdx) else out.stdout
         val linkSection = if (markerIdx >= 0) out.stdout.substring(markerIdx + marker.length) else ""
@@ -256,12 +292,13 @@ internal class RootFsDaemon(private val context: Context) {
         )
     }
 
-    /** 将任意 Root 权限文件高速拷贝到应用私有缓存文件（自动赋权为应用可读，兼容 /proc /sys 伪文件并拦截特殊设备）。 */
+    /** 将任意 Root 权限文件高速拷贝到应用私有缓存文件（自动赋权为应用可读，兼容 /proc /sys 与容器内 proc/sys 伪文件并拦截特殊设备）。 */
     fun stageFileToReadable(physicalSrc: String, destFile: File, maxBytes: Long = -1L) {
         destFile.parentFile?.mkdirs()
         val qSrc = shQuote(physicalSrc)
         val qDst = shQuote(destFile.absolutePath)
-        val isPseudoFs = physicalSrc.startsWith("/proc/") || physicalSrc.startsWith("/sys/")
+        val isPseudoFs = physicalSrc.startsWith("/proc/") || physicalSrc.startsWith("/sys/") ||
+            physicalSrc.contains("/proc/") || physicalSrc.contains("/sys/")
         val effectiveLimit = when {
             maxBytes > 0L -> maxBytes
             isPseudoFs -> 1_048_576L // /proc 与 /sys 伪文件默认封顶 1 MB，避免无限流或 cp 读空
@@ -325,13 +362,20 @@ internal class RootFsDaemon(private val context: Context) {
         val backupPart = if (createBackup) {
             "if [ -f \"\$__target\" ]; then cp -p -- \"\$__target\" \"\$__target.bak\" 2>/dev/null || true; fi"
         } else ""
+        val protectedGuard = protectedShellGuard("__target")
         val script = """
             $failGuard
             __target=$qDst
             if [ -L $qDst ]; then
               [ -e $qDst ] || { echo "DANGLING_SYMLINK"; exit 22; }
               __target=${'$'}(readlink -f -- $qDst 2>/dev/null) || { echo "无法解析符号链接目标"; exit 22; }
+            else
+              __parent_raw=${'$'}(dirname -- $qDst)
+              __parent_real=${'$'}(readlink -f -- "${'$'}__parent_raw" 2>/dev/null || printf '%s' "${'$'}__parent_raw")
+              __leaf=${'$'}(basename -- $qDst)
+              if [ "${'$'}__parent_real" = "/" ]; then __target="/${'$'}__leaf"; else __target="${'$'}__parent_real/${'$'}__leaf"; fi
             fi
+            $protectedGuard
             if [ -d "${'$'}__target" ]; then echo "EISDIR"; exit 21; fi
             __parent=${'$'}(dirname -- "${'$'}__target")
             mkdir -p -- "${'$'}__parent" || exit 1
@@ -359,6 +403,9 @@ internal class RootFsDaemon(private val context: Context) {
         val out = exec(script)
         if (out.exitCode != 0) {
             val msg = out.stdout.trim()
+            if (out.exitCode == 13 || msg.startsWith("PROTECTED_SYSTEM_PATH")) {
+                throw IllegalStateException("系统保护分区当前处于只读保护状态，已拦截写入：$physicalDst")
+            }
             if (out.exitCode == 17 || msg == "EEXIST") throw IllegalStateException("EEXIST")
             if (out.exitCode == 22 || msg == "DANGLING_SYMLINK") throw IllegalStateException("目标为悬空符号链接，已拒绝覆盖：$physicalDst")
             if (msg.contains("Read-only file system", ignoreCase = true)) {
@@ -368,38 +415,166 @@ internal class RootFsDaemon(private val context: Context) {
         }
     }
 
-    fun mkdir(physicalPath: String) = requireOk("mkdir -p -- ${shQuote(physicalPath)}", "创建目录失败")
-    fun rename(oldPhysical: String, newPhysical: String) =
-        requireOk("mv -- ${shQuote(oldPhysical)} ${shQuote(newPhysical)}", "重命名/移动失败")
-    fun copyRecursive(srcPhysical: String, dstPhysical: String) =
-        requireOk("cp -a -- ${shQuote(srcPhysical)} ${shQuote(dstPhysical)}", "复制失败")
-    fun copyDirectoryContents(srcPhysical: String, dstPhysical: String) =
-        requireOk("cp -a -- ${shQuote(srcPhysical.trimEnd('/') + "/.")} ${shQuote(dstPhysical.trimEnd('/') + "/")}", "复制目录失败")
-    fun remove(physicalPath: String) = requireOk("rm -rf -- ${shQuote(physicalPath)}", "删除失败")
+    private fun protectedShellGuard(varName: String): String {
+        if (isProtectedWriteUnlocked()) return ""
+        return """
+            case "${'$'}$varName" in
+              /system|/system/*|/vendor|/vendor/*|/product|/product/*|/odm|/odm/*|/system_ext|/system_ext/*|/apex|/apex/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*)
+                echo "PROTECTED_SYSTEM_PATH:${'$'}$varName"; exit 13 ;;
+            esac
+        """.trimIndent()
+    }
+
+    private fun unremovableHostShellGuard(varName: String): String = """
+        case "${'$'}$varName" in
+          /|/data|/data/data|/data/user|/data/user/0|/data/system|/system|/vendor|/product|/odm|/apex|/proc|/sys|/dev|/storage|/storage/emulated|/storage/emulated/0)
+            echo "UNREMOVABLE_SYSTEM_PATH:${'$'}$varName"; exit 14 ;;
+        esac
+    """.trimIndent()
+
+    private fun resolveRealPathScript(varName: String, rawQuoted: String, followLeafSymlink: Boolean): String = if (followLeafSymlink) {
+        """$varName=${'$'}(readlink -f -- $rawQuoted 2>/dev/null || printf '%s' $rawQuoted)"""
+    } else {
+        """
+            __rp_dir=${'$'}(dirname -- $rawQuoted)
+            __rp_real=${'$'}(readlink -f -- "${'$'}__rp_dir" 2>/dev/null || printf '%s' "${'$'}__rp_dir")
+            __rp_leaf=${'$'}(basename -- $rawQuoted)
+            if [ "${'$'}__rp_leaf" = "/" ]; then $varName="/"; elif [ "${'$'}__rp_real" = "/" ]; then $varName="/${'$'}__rp_leaf"; else $varName="${'$'}__rp_real/${'$'}__rp_leaf"; fi
+        """.trimIndent()
+    }
+
+    fun mkdir(physicalPath: String) {
+        val q = shQuote(physicalPath)
+        requireOk(
+            """
+                ${resolveRealPathScript("__p", q, followLeafSymlink = false)}
+                ${protectedShellGuard("__p")}
+                mkdir -p -- $q
+            """.trimIndent(),
+            "创建目录失败",
+        )
+    }
+
+    fun rename(oldPhysical: String, newPhysical: String) {
+        val qOld = shQuote(oldPhysical)
+        val qNew = shQuote(newPhysical)
+        requireOk(
+            """
+                ${resolveRealPathScript("__old", qOld, followLeafSymlink = false)}
+                ${resolveRealPathScript("__new", qNew, followLeafSymlink = false)}
+                ${unremovableHostShellGuard("__old")}
+                ${protectedShellGuard("__old")}
+                ${protectedShellGuard("__new")}
+                mv -- $qOld $qNew
+            """.trimIndent(),
+            "重命名/移动失败",
+        )
+    }
+
+    fun copyRecursive(srcPhysical: String, dstPhysical: String) {
+        val qSrc = shQuote(srcPhysical)
+        val qDst = shQuote(dstPhysical)
+        requireOk(
+            """
+                ${resolveRealPathScript("__dst", qDst, followLeafSymlink = false)}
+                ${protectedShellGuard("__dst")}
+                cp -a -- $qSrc $qDst
+            """.trimIndent(),
+            "复制失败",
+        )
+    }
+
+    fun copyDirectoryContents(srcPhysical: String, dstPhysical: String) {
+        val qSrc = shQuote(srcPhysical.trimEnd('/') + "/.")
+        val qDst = shQuote(dstPhysical.trimEnd('/') + "/")
+        requireOk(
+            """
+                ${resolveRealPathScript("__dst", shQuote(dstPhysical), followLeafSymlink = true)}
+                ${protectedShellGuard("__dst")}
+                cp -a -- $qSrc $qDst
+            """.trimIndent(),
+            "复制目录失败",
+        )
+    }
+
+    fun remove(physicalPath: String) {
+        val q = shQuote(physicalPath)
+        requireOk(
+            """
+                ${resolveRealPathScript("__p", q, followLeafSymlink = false)}
+                ${unremovableHostShellGuard("__p")}
+                ${protectedShellGuard("__p")}
+                rm -rf -- $q
+            """.trimIndent(),
+            "删除失败",
+        )
+    }
+
     fun chmod(physicalPath: String, octal: String, recursive: Boolean) {
         require(Regex("^[0-7]{3,4}$").matches(octal.trim())) { "权限格式无效（需 3-4 位八进制，例如 755 或 0644）" }
+        val q = shQuote(physicalPath)
         val flag = if (recursive) "-R " else ""
-        requireOk("chmod $flag${octal.trim()} -- ${shQuote(physicalPath)}", "修改权限失败")
+        requireOk(
+            """
+                ${resolveRealPathScript("__p", q, followLeafSymlink = true)}
+                ${protectedShellGuard("__p")}
+                chmod $flag${octal.trim()} -- $q
+            """.trimIndent(),
+            "修改权限失败",
+        )
     }
+
     fun chown(physicalPath: String, ownerSpec: String, recursive: Boolean) {
         require(Regex("^[a-zA-Z0-9_.-]+(:[a-zA-Z0-9_.-]+)?$").matches(ownerSpec.trim())) { "属主格式无效（例如 root:root 或 1000:1000）" }
+        val q = shQuote(physicalPath)
         val flag = if (recursive) "-R " else ""
-        requireOk("chown $flag${shQuote(ownerSpec.trim())} -- ${shQuote(physicalPath)}", "修改属主失败")
+        requireOk(
+            """
+                ${resolveRealPathScript("__p", q, followLeafSymlink = true)}
+                ${protectedShellGuard("__p")}
+                chown $flag${shQuote(ownerSpec.trim())} -- $q
+            """.trimIndent(),
+            "修改属主失败",
+        )
     }
+
     fun chcon(physicalPath: String, contextSpec: String, recursive: Boolean) {
         require(Regex("^[a-zA-Z0-9_.:-]+$").matches(contextSpec.trim())) { "SELinux 上下文格式无效" }
+        val q = shQuote(physicalPath)
         val flag = if (recursive) "-R " else ""
-        requireOk("chcon $flag${shQuote(contextSpec.trim())} -- ${shQuote(physicalPath)}", "修改 SELinux 上下文失败")
+        requireOk(
+            """
+                ${resolveRealPathScript("__p", q, followLeafSymlink = true)}
+                ${protectedShellGuard("__p")}
+                chcon $flag${shQuote(contextSpec.trim())} -- $q
+            """.trimIndent(),
+            "修改 SELinux 上下文失败",
+        )
     }
-    fun createSymlink(target: String, linkPhysical: String) =
-        requireOk("ln -s -- ${shQuote(target)} ${shQuote(linkPhysical)}", "创建符号链接失败")
+
+    fun createSymlink(target: String, linkPhysical: String) {
+        val qLink = shQuote(linkPhysical)
+        requireOk(
+            """
+                ${resolveRealPathScript("__p", qLink, followLeafSymlink = false)}
+                ${protectedShellGuard("__p")}
+                ln -s -- ${shQuote(target)} $qLink
+            """.trimIndent(),
+            "创建符号链接失败",
+        )
+    }
 
     fun queryMountInfo(physicalPath: String): MountInfo? {
         val q = shQuote(physicalPath)
         val out = exec("""
             __mp=${'$'}(stat -c '%m' -- $q 2>/dev/null || true)
             __fs=${'$'}(stat -f -c '%T' -- $q 2>/dev/null || true)
-            __line=${'$'}(awk -v mp="${'$'}__mp" '${'$'}2 == mp { print ${'$'}1 "|" ${'$'}3 "|" ${'$'}4 }' /proc/mounts 2>/dev/null | tail -n 1)
+            __line=""
+            if [ -r /proc/mounts ] && [ -n "${'$'}__mp" ]; then
+              while IFS=' ' read -r __mdev __mmp __mfs __mopts __mrest; do
+                if [ "${'$'}__mmp" = "${'$'}__mp" ]; then __line="${'$'}__mdev|${'$'}__mfs|${'$'}__mopts"; fi
+              done < /proc/mounts
+            fi
             printf '%s|%s|%s\n' "${'$'}__mp" "${'$'}__fs" "${'$'}__line"
         """.trimIndent())
         if (out.exitCode != 0) return null
@@ -413,7 +588,9 @@ internal class RootFsDaemon(private val context: Context) {
     fun computeDirStats(physicalPath: String): DirStats {
         val q = shQuote(physicalPath)
         val out = exec("""
-            __kb=${'$'}(du -sk -- $q 2>/dev/null | awk '{print ${'$'}1}')
+            __du=${'$'}(du -sk -- $q 2>/dev/null || true)
+            set -- ${'$'}__du
+            __kb="${'$'}{1:-0}"
             __fc=${'$'}(find $q -type f 2>/dev/null | wc -l)
             __dc=${'$'}(find $q -type d 2>/dev/null | wc -l)
             printf '%s|%s|%s\n' "${'$'}__kb" "${'$'}__fc" "${'$'}__dc"
@@ -433,7 +610,9 @@ internal class RootFsDaemon(private val context: Context) {
             for __f in .* *; do
               case "${'$'}__f" in .|..) continue ;; esac
               [ -e "${'$'}__f" ] || continue
-              __kb=${'$'}(du -sk -- "${'$'}__f" 2>/dev/null | awk '{print ${'$'}1}')
+              __du=${'$'}(du -sk -- "${'$'}__f" 2>/dev/null || true)
+              set -- ${'$'}__du
+              __kb="${'$'}{1:-0}"
               __d=0; [ -d "${'$'}__f" ] && __d=1
               printf '%s\t%s\t%s\n' "${'$'}__kb" "${'$'}__d" "${'$'}__f"
             done | sort -rn | head -n 60
@@ -506,10 +685,21 @@ internal class RootFsDaemon(private val context: Context) {
 
     private fun requireOk(cmd: String, fallbackError: String) {
         val out = exec(cmd)
-        if (out.exitCode != 0) throw IllegalStateException(out.stdout.ifBlank { fallbackError })
+        if (out.exitCode != 0) {
+            val msg = out.stdout.trim()
+            if (out.exitCode == 13 || msg.startsWith("PROTECTED_SYSTEM_PATH")) {
+                throw IllegalStateException("系统保护分区当前处于只读保护状态，请先在顶部保护条解锁「允许写入系统区」后再操作")
+            }
+            if (out.exitCode == 14 || msg.startsWith("UNREMOVABLE_SYSTEM_PATH")) {
+                throw IllegalStateException("不允许删除或移动系统核心根目录")
+            }
+            throw IllegalStateException(msg.ifBlank { fallbackError })
+        }
     }
 
     companion object {
+        private const val DEFAULT_CMD_TIMEOUT_MS = 45_000L
+        private const val MAX_OUTPUT_CHARS = 4 * 1024 * 1024
         private val PROTECTED_PREFIXES = setOf("/system", "/vendor", "/product", "/odm", "/system_ext", "/apex", "/proc", "/sys", "/dev")
     }
 }

@@ -1058,7 +1058,7 @@ fun FilesScreen(
     }
 
     deleteTargets?.let { refs ->
-        val canTrash = !activeScope.isRootElevated
+        val canTrash = refs.all(fm::supportsTrash)
         var moveToTrash by remember(refs) { mutableStateOf(canTrash) }
         GaliaisAlertDialog(
             onDismissRequest = { deleteTargets = null },
@@ -1078,10 +1078,10 @@ fun FilesScreen(
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
                             GaliaisCheckbox(moveToTrash)
-                            Text("移入回收站（可在书签 → 回收站中一键还原）", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                            Text("移入回收站，可在书签中恢复", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
                         }
                     } else {
-                        Text("Root 域删除会直接从文件系统永久移除，请谨慎确认。", style = MaterialTheme.typography.labelSmall, color = G.danger)
+                        Text("此位置不支持回收站，删除后无法恢复。", style = MaterialTheme.typography.labelSmall, color = G.danger)
                     }
                 }
             },

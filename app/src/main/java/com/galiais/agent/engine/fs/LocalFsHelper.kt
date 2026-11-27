@@ -22,16 +22,45 @@ import java.io.OutputStream
 internal object LocalFsHelper {
     fun linuxRootDir(context: Context, runtimeMode: String): File = LinuxRuntime(context, runtimeMode).root
 
-    /** 将虚拟路径映射为宿主物理 File（仅适用于本地/容器存储域）。 */
+    /** 将虚拟路径映射为宿主物理 File（仅适用于本地/容器存储域），并阻止跨存储域路径逃逸。 */
     fun resolvePhysicalFile(context: Context, scope: FileScope, virtualPath: String, runtimeMode: String): File {
+        require(!virtualPath.contains('\u0000')) { "路径包含非法空字符" }
         val norm = normalizeVfsPath(virtualPath)
         return when (scope) {
             FileScope.LINUX_WORKSPACE, FileScope.LINUX_ROOT -> {
-                val root = linuxRootDir(context, runtimeMode)
-                if (norm == "/") root else File(root, norm.removePrefix("/"))
+                val root = linuxRootDir(context, runtimeMode).absoluteFile
+                val resolved = if (norm == "/") root else File(root, norm.removePrefix("/"))
+                val rootPrefix = root.absolutePath.trimEnd(File.separatorChar)
+                val absPath = resolved.absolutePath
+                check(absPath == rootPrefix || absPath.startsWith(rootPrefix + File.separatorChar)) {
+                    "路径越界，已拦截容器外访问：$virtualPath"
+                }
+                resolved
             }
             FileScope.HOST_ROOT -> File(norm)
-            FileScope.ANDROID_STORAGE -> File(norm)
+            FileScope.ANDROID_STORAGE -> {
+                val extRoot = Environment.getExternalStorageDirectory().absolutePath.trimEnd('/')
+                val allowed = norm == "/storage" || norm.startsWith("/storage/") ||
+                    norm == "/sdcard" || norm.startsWith("/sdcard/") ||
+                    norm == extRoot || norm.startsWith("$extRoot/")
+                check(allowed) { "外部存储域仅允许访问 /storage 或 /sdcard 目录：$norm" }
+                File(norm)
+            }
+        }
+    }
+
+    /** 判断文件本身是否为符号链接，并返回其 (st_dev, st_ino) 设备与节点标识以防循环遍历。 */
+    fun lstatIdentity(file: File): Pair<Boolean, Pair<Long, Long>?> {
+        return try {
+            val st = Os.lstat(file.absolutePath)
+            val isLink = (st.st_mode and OsConstants.S_IFMT) == OsConstants.S_IFLNK
+            isLink to (st.st_dev to st.st_ino)
+        } catch (_: UnsatisfiedLinkError) {
+            val canon = runCatching { file.canonicalFile }.getOrNull()
+            val isLink = canon != null && canon.absolutePath != file.absolutePath
+            isLink to null
+        } catch (_: Throwable) {
+            false to null
         }
     }
 

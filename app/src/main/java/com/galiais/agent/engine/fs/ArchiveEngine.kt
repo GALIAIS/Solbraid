@@ -3,6 +3,8 @@ package com.galiais.agent.engine.fs
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.system.Os
+import android.system.OsConstants
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
@@ -16,9 +18,11 @@ import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
-/** 流式压缩/解压/包内透视与 APK 静态分析引擎（无 4MB/64MB 人工上限，严格防 Zip-Slip）。 */
+/** 流式压缩/解压/包内透视与 APK 静态分析引擎（严格防 Zip-Slip、Zip Bomb 与符号链接循环）。 */
 object ArchiveEngine {
     private val DEFAULT_SKIP_DIRS = setOf(".git", "node_modules", ".gradle", "build", "target", "__pycache__", ".venv")
+    private const val MAX_EXTRACT_BYTES = 2L * 1024L * 1024L * 1024L // 2 GB 安全解压上限
+    private const val MAX_EXTRACT_ENTRIES = 50_000                   // 单包最多 50,000 条目
 
     fun normalizeEntryPath(raw: String): String? {
         val unified = raw.replace('\\', '/')
@@ -84,12 +88,17 @@ object ArchiveEngine {
         if (!destDir.exists()) check(destDir.mkdirs()) { "无法创建解压目标目录：${destDir.absolutePath}" }
         val canonicalRoot = destDir.canonicalFile
         var doneFiles = 0
+        var totalEntries = 0
         var totalBytes = 0L
         val buf = ByteArray(65_536)
         ZipInputStream(BufferedInputStream(input)).use { zis ->
             while (true) {
                 if (cancelled.get()) throw InterruptedException("已取消解压")
                 val entry = zis.nextEntry ?: break
+                totalEntries++
+                check(totalEntries <= MAX_EXTRACT_ENTRIES) {
+                    "压缩包条目数超过安全上限（$MAX_EXTRACT_ENTRIES），已中止解压"
+                }
                 val rel = normalizeEntryPath(entry.name) ?: error("压缩包包含非法路径：${entry.name.take(120)}")
                 if (rel.startsWith("__MACOSX/") || rel.substringAfterLast('/') == ".DS_Store") continue
                 if (selectedPrefixes != null && selectedPrefixes.none { rel == it || rel.startsWith("$it/") }) continue
@@ -108,8 +117,11 @@ object ArchiveEngine {
                             if (cancelled.get()) throw InterruptedException("已取消解压")
                             val n = zis.read(buf)
                             if (n <= 0) break
-                            out.write(buf, 0, n)
                             totalBytes += n
+                            check(totalBytes <= MAX_EXTRACT_BYTES) {
+                                "压缩包解压体积超过安全上限（2 GB），疑似压缩炸弹已拦截"
+                            }
+                            out.write(buf, 0, n)
                         }
                     }
                     doneFiles++
@@ -120,7 +132,7 @@ object ArchiveEngine {
         return doneFiles
     }
 
-    /** 流式打包任意文件/目录集合为 ZIP（支持大文件、进度回调与取消）。 */
+    /** 流式打包任意文件/目录集合为 ZIP（支持大文件、进度回调、取消与防符号链接循环）。 */
     fun createZipStream(
         sources: List<Pair<String, File>>,
         output: OutputStream,
@@ -131,11 +143,28 @@ object ArchiveEngine {
         var doneFiles = 0
         var totalBytes = 0L
         val buf = ByteArray(65_536)
+        val visitedInodes = HashSet<Pair<Long, Long>>()
+        val visitedPaths = HashSet<String>()
         ZipOutputStream(BufferedOutputStream(output)).use { zos ->
             fun addRec(baseName: String, file: File, depth: Int) {
                 if (cancelled.get()) throw InterruptedException("已取消打包")
                 if (depth > 96) return
+                val (isLink, inode) = try {
+                    val st = Os.lstat(file.absolutePath)
+                    ((st.st_mode and OsConstants.S_IFMT) == OsConstants.S_IFLNK) to (st.st_dev to st.st_ino)
+                } catch (_: UnsatisfiedLinkError) {
+                    val canon = runCatching { file.canonicalFile }.getOrNull()
+                    (canon != null && canon.absolutePath != file.absolutePath) to null
+                } catch (_: Throwable) {
+                    false to null
+                }
+                if (isLink) return
                 if (file.isDirectory) {
+                    if (inode != null && !visitedInodes.add(inode)) return
+                    if (inode == null) {
+                        val canonPath = runCatching { file.canonicalPath }.getOrDefault(file.absolutePath)
+                        if (!visitedPaths.add(canonPath)) return
+                    }
                     val children = file.listFiles().orEmpty().sortedBy { it.name.lowercase() }
                     if (children.isEmpty()) {
                         zos.putNextEntry(ZipEntry(baseName.trimEnd('/') + "/"))
