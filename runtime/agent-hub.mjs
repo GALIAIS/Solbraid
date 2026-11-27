@@ -36,6 +36,7 @@ import {createComputerUseHub} from "./computer-use-hub.mjs";
 import * as toolchainHub from "./toolchain-hub.mjs";
 import * as projectDeps from "./project-deps-hub.mjs";
 import * as usageLedger from "./usage-ledger.mjs";
+import {historyWindow, historyResponse, readHistoryChunk} from "./session-history.mjs";
 import {PluginKernel, startPluginControlServer} from "./plugin-kernel.mjs";
 import {registerBuiltinHostPlugins} from "./plugin-builtins.mjs";
 import {normalizeDownloadNetwork, saveDownloadNetwork, downloadEnvironment, githubDownloadUrl, redactNetworkText} from "./download-network.mjs";
@@ -2998,9 +2999,15 @@ async function dispatchRequest(method, params = {}) {
 
     case "sessions/load": {
       const agentId = validateAgentId(params.agentId);
+      const owner = `${agentId}:${params.sessionId}`;
+      if (params.transfer) return readHistoryChunk(owner, params.transfer, params.offset);
       const m = resolveManifestOrNull(agentId);
       const record = await loadStoredSession(agentId, params.sessionId);
       if (!record) throw new Error("会话不存在");
+      const page = params.turnLimit == null ? null : historyWindow(record.messages, params.cursor, params.turnLimit,
+        msg => msg.role === "user", msg => msg.id);
+      const messages = page ? record.messages.slice(page.start, page.end) : record.messages;
+      if (params.cursor != null && page) return historyResponse(owner, {session: {messages}, nextCursor: page.nextCursor});
       let brainPlans = [];
       if (agentId === "antigravity" && record.remoteSessionId) {
         const existingPaths = new Set(
@@ -3009,15 +3016,17 @@ async function dispatchRequest(method, params = {}) {
         const found = await collectSessionBrainPlans(record.remoteSessionId).catch(() => []);
         brainPlans = found.filter(p => !existingPaths.has(p.path));
       }
-      return {
+      const result = {
         session: {
           ...record,
+          messages,
           driverName: record.driverName || m?.name || null,
           driverAvailable: Boolean(m),
           running: activeTurns.has(`${agentId}:${record.id}`),
           brainPlans,
         },
       };
+      return page ? historyResponse(owner, {...result, nextCursor: page.nextCursor}) : result;
     }
 
     case "sessions/prompt": {
@@ -3685,7 +3694,8 @@ async function dispatchRequest(method, params = {}) {
         for (const notice of afterHook.notices) {
           notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "notice", text: `[插件:${notice.pluginId}] ${notice.message}`, error: false});
         }
-        return {stopReason, text: replyText, turnDiff, usage: normalizedUsage, contextUsage: finalContextUsage};
+        return {stopReason, text: replyText, turnDiff, usage: normalizedUsage, contextUsage: finalContextUsage,
+          remoteSessionId: record.remoteSessionId};
       } catch (error) {
         stopSessionDriver(key);
         if (bridgedDuringTurn && !replySaved) {
@@ -3785,26 +3795,28 @@ async function dispatchRequest(method, params = {}) {
         let seen = 0;
         for (let i = 0; i < msgs.length; i++) {
           if (msgs[i]?.role === "user") {
-            if (seen === userTurnIndex) { idx = i; break; }
+            if (seen === userTurnIndex) {
+              if (!targetId || !msgs[i].id) idx = i;
+              break;
+            }
             seen++;
           }
         }
       }
-      if (idx >= 0) {
-        record.messages = msgs.slice(0, idx);
-        stopSessionDriver(key);
-        record.remoteSessionId = null;
-        record.plan = [];
-        record.planExplanation = null;
-        record.lastContextUsed = null;
-        const hasPrior = record.messages.some(msg => (msg?.role === "user" || msg?.role === "agent") && typeof msg.text === "string" && msg.text.trim());
-        record.pendingContextBridge = hasPrior;
-        const lastTextMsg = [...record.messages].reverse().find(msg => (msg?.role === "user" || msg?.role === "agent") && typeof msg.text === "string" && msg.text.trim());
-        record.preview = lastTextMsg ? lastTextMsg.text.trim().slice(0, 120) : "";
-        if (record.messages.length === 0) record.title = "新会话";
-        record.updatedAt = Date.now();
-        await saveSession(record);
-      }
+      if (idx < 0) throw new Error("未找到待回退的消息，请重新打开会话");
+      record.messages = msgs.slice(0, idx);
+      stopSessionDriver(key);
+      record.remoteSessionId = null;
+      record.plan = [];
+      record.planExplanation = null;
+      record.lastContextUsed = null;
+      const hasPrior = record.messages.some(msg => (msg?.role === "user" || msg?.role === "agent") && typeof msg.text === "string" && msg.text.trim());
+      record.pendingContextBridge = hasPrior;
+      const lastTextMsg = [...record.messages].reverse().find(msg => (msg?.role === "user" || msg?.role === "agent") && typeof msg.text === "string" && msg.text.trim());
+      record.preview = lastTextMsg ? lastTextMsg.text.trim().slice(0, 120) : "";
+      if (record.messages.length === 0) record.title = "新会话";
+      record.updatedAt = Date.now();
+      await saveSession(record);
       return {
         ok: true,
         retainedCount: (record.messages || []).length,

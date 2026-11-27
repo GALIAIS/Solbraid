@@ -85,28 +85,59 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
         }
     }
 
+    private data class ClaudeHistory(
+        val page: ConversationHistoryPage,
+        val plan: List<PlanStep>,
+        val explanation: String?,
+        val planFile: Pair<String, String>?,
+        val model: String?,
+        val permissionMode: String?,
+        val usage: TokenUsage?,
+    )
+
     override suspend fun load(key: ConversationKey) {
-        val cwd = repo.state(key)?.summary?.cwd
-        val messages = mutableListOf<JSONObject>()
-        var offset = 0
-        // 分页读取完整记录（最多 2000 条），避免只显示开头。
-        while (offset < 2000) {
-            val page = call("session/read", jsonOf("sessionId" to key.id, "limit" to 100, "offset" to offset, "cwd" to cwd)).arr("messages").objects()
-            messages += page
-            if (page.size < 100) break
-            offset += page.size
-        }
+        val before = repo.state(key)
+        val history = readHistoryPage(key, null)
         val savedProvider = settings.claudeSessionProvider(key.id)
         val selectedOptions = settings.conversationOptions(key)
-        val defaultPermMode = settings.state.value.claudePermissionMode
-        val initModel = repo.state(key)?.model
-        val initPermMode = repo.state(key)?.permissionMode
+        val current = repo.state(key)
+        val livePlan = current?.plan !== before?.plan
+        if (!livePlan) {
+            claudeTasks[key.id] = history.plan.toMutableList()
+            if (history.planFile != null) latestPlanFile[key.id] = history.planFile else latestPlanFile.remove(key.id)
+        }
+        repo.update(key) { base ->
+            val updated = base.copy(
+                items = base.mergeHistoryItems(before, history.page.items),
+                historyCursor = history.page.nextCursor,
+                plan = if (livePlan) base.plan else history.plan,
+                planExplanation = if (livePlan) base.planExplanation else history.explanation,
+                loaded = true, running = base.running && key.id in connected,
+                providerId = base.providerId ?: savedProvider,
+                model = if (base.model != before?.model) base.model else history.model ?: base.model,
+                permissionMode = if (base.permissionMode != before?.permissionMode) base.permissionMode else history.permissionMode ?: base.permissionMode,
+                tokenUsage = if (base.tokenUsage !== before?.tokenUsage) base.tokenUsage else history.usage ?: base.tokenUsage,
+            )
+            selectedOptions?.applyTo(updated) ?: updated
+        }
+    }
 
-        // 在后台计算线程一次性 O(N) 批量重建时间线、Diff、计划与用量，彻底消灭主线程 O(N²) 回放风暴
-        val built = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+    override suspend fun loadEarlier(key: ConversationKey, cursor: String) = readHistoryPage(key, cursor).page
+
+    private suspend fun readHistoryPage(key: ConversationKey, cursor: String?): ClaudeHistory {
+        val current = repo.state(key)
+        val response = runtime.historyRequest(key, current?.summary?.cwd, cursor)
+        val defaultPermMode = settings.state.value.claudePermissionMode
+        val initModel = current?.model
+        val initPermMode = current?.permissionMode
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            val prior = response.arr("priorState").objects()
+            val messages = response.getJSONArray("messages").objects()
             val items = ArrayList<TimelineItem>(messages.size)
             val idToIdx = HashMap<String, Int>(messages.size * 2)
+            var showItem = false
             fun upsertLocal(item: TimelineItem) {
+                if (!showItem) return
                 val prevIdx = idToIdx[item.id]
                 if (prevIdx != null) items[prevIdx] = item
                 else {
@@ -123,7 +154,8 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
             var curTokenUsage: TokenUsage? = null
             val taskIdRe = Regex("""(?:Task\s*#|id["']?\s*[:=]\s*["']?)([A-Za-z0-9_-]+)""", RegexOption.IGNORE_CASE)
 
-            for (message in messages) {
+            for ((index, message) in (prior + messages).withIndex()) {
+                showItem = index >= prior.size
                 val isSubagentMsg = !message.isNull("parent_tool_use_id") && message.has("parent_tool_use_id")
                 if (isSubagentMsg) continue
                 when (message.optString("type")) {
@@ -291,13 +323,19 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                         val body = message.optJSONObject("message") ?: continue
                         val content = body.opt("content")
                         if (content is String) {
-                            upsertLocal(TimelineItem.UserMessage(message.optString("uuid", newId()), content))
+                            if (content.isNotBlank() && !message.optBoolean("isSynthetic") && !message.optBoolean("is_meta")) {
+                                upsertLocal(TimelineItem.UserMessage(message.optString("uuid", newId()), content))
+                            }
                             continue
                         }
                         val blocks = (content as? JSONArray)?.objects() ?: continue
                         val text = blocks.filter { it.optString("type") == "text" }.joinToString("\n") { it.optString("text") }
-                        if (text.isNotBlank() && message.optBoolean("isSynthetic").not()) {
-                            upsertLocal(TimelineItem.UserMessage(message.optString("uuid", newId()), text))
+                        val images = blocks.count { it.optString("type") == "image" }
+                        val documents = blocks.filter { it.optString("type") == "document" }
+                        if (!message.optBoolean("isSynthetic") && !message.optBoolean("is_meta") &&
+                            (text.isNotBlank() || images > 0 || documents.isNotEmpty())) {
+                            val label = text.ifBlank { documents.joinToString("\n") { it.str("title") ?: "[文档]" } }
+                            upsertLocal(TimelineItem.UserMessage(message.optString("uuid", newId()), label, imageCount = images))
                         }
                         for (result in blocks.filter { it.optString("type") == "tool_result" }) {
                             val output = blockText(result.opt("content"))
@@ -351,37 +389,10 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                     }
                 }
             }
-            arrayOf(items, tasks.toList(), planExplanation, localLatestPlan, curModel, curPermMode, curTokenUsage)
-        }
-        @Suppress("UNCHECKED_CAST")
-        val loadedItems = built[0] as List<TimelineItem>
-        @Suppress("UNCHECKED_CAST")
-        val loadedPlan = built[1] as List<PlanStep>
-        val loadedPlanExpl = built[2] as String?
-        @Suppress("UNCHECKED_CAST")
-        val loadedLatestPlan = built[3] as Pair<String, String>?
-        val loadedModel = built[4] as String?
-        val loadedPermMode = built[5] as String?
-        val loadedUsage = built[6] as TokenUsage?
-
-        claudeTasks[key.id] = loadedPlan.toMutableList()
-        if (loadedLatestPlan != null) latestPlanFile[key.id] = loadedLatestPlan else latestPlanFile.remove(key.id)
-        repo.update(key) { base ->
-            val updated = base.copy(
-                items = loadedItems,
-                plan = loadedPlan,
-                planExplanation = loadedPlanExpl,
-                loaded = true,
-                running = base.running && key.id in connected,
-                providerId = base.providerId ?: savedProvider,
-                model = loadedModel ?: base.model,
-                permissionMode = loadedPermMode ?: base.permissionMode,
-                tokenUsage = loadedUsage ?: base.tokenUsage,
-            )
-            selectedOptions?.applyTo(updated) ?: updated
+            ClaudeHistory(ConversationHistoryPage(items, response.str("nextCursor")), tasks,
+                planExplanation, localLatestPlan, curModel, curPermMode, curTokenUsage)
         }
     }
-
     private fun normalizeDir(path: String): String = path.trim().trimEnd('/').ifEmpty { "/" }
 
     private fun sessionOptions(
@@ -671,8 +682,9 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
         val current = repo.state(key) ?: error("会话不存在")
         val cwd = current.summary.cwd ?: settings.state.value.defaultCwd
         if (rewindFiles && key.id !in connected) {
-            runCatching { ensureOpen(key) }
+            ensureOpen(key)
         }
+        connected -= key.id
         val res = call(
             "session/revertBefore",
             jsonOf(
@@ -717,7 +729,7 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                             updatedAt = System.currentTimeMillis(),
                         ),
                         items = remappedItems,
-                        loaded = true,
+                        loaded = remappedUserUuids.size == retainedItems.count { it is TimelineItem.UserMessage },
                         running = false,
                         activeTurnId = null,
                         providerId = current.providerId,

@@ -131,8 +131,8 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
 
     private fun normalizeDir(path: String): String = path.trim().trimEnd('/').ifEmpty { "/" }
 
-    private suspend fun attach(key: ConversationKey) {
-        if (key.id in attached) return
+    private suspend fun attach(key: ConversationKey): JSONObject? {
+        if (key.id in attached) return null
         val saved = repo.settings.conversationOptions(key)
         val current = repo.state(key)
         if (current?.providerId != null) repo.syncProvidersNow()
@@ -178,21 +178,85 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                 collaborationMode = state.collaborationMode ?: resumed.obj("collaborationMode")?.str("mode"))
         }
         repo.persistOptions(key)
+        return resumed.getJSONObject("thread")
     }
 
     override suspend fun load(key: ConversationKey) {
-        // 并行执行 thread/read 与 attach，并将历史 JSON 映射下沉到 Dispatchers.Default，降低冷进会话延迟与主线程掉帧
-        val thread = coroutineScope {
-            val attachTask = async { attach(key) }
-            val readThread = call("thread/read", jsonOf("threadId" to key.id, "includeTurns" to true)).getJSONObject("thread")
-            attachTask.await()
-            readThread
+        val before = repo.state(key)
+        val (thread, page) = coroutineScope {
+            val metadata = async {
+                attach(key) ?: call("thread/read", jsonOf("threadId" to key.id, "includeTurns" to false)).getJSONObject("thread")
+            }
+            val history = async { readHistoryPage(key, null) }
+            metadata.await() to history.await()
         }
-        val (items, durations, activeTurn) = withContext(Dispatchers.Default) {
+        val providerId = CustomProvider.fromCodexProviderId(thread.str("modelProvider"))
+        if (providerId != null) threadProviderIds[key.id] = providerId else threadProviderIds.remove(key.id)
+        repo.update(key) { state ->
+            val turnChanged = state.activeTurnId != before?.activeTurnId || state.running != (before?.running == true)
+            state.copy(summary = summary(thread, state.summary.parent),
+                items = state.mergeHistoryItems(before, page.items), loaded = true, historyCursor = page.nextCursor,
+                running = if (turnChanged) state.running else page.activeTurnId != null,
+                activeTurnId = if (turnChanged) state.activeTurnId else page.activeTurnId,
+                turnDurations = page.durations + state.turnDurations, providerId = providerId)
+        }
+    }
+
+    override suspend fun loadEarlier(key: ConversationKey, cursor: String) = readHistoryPage(key, cursor)
+
+    private suspend fun readHistoryPage(key: ConversationKey, cursor: String?): ConversationHistoryPage {
+        val params = jsonOf("threadId" to key.id, "cursor" to cursor, "sortDirection" to "desc",
+            "limit" to if (cursor == null) INITIAL_HISTORY_TURNS else HISTORY_PAGE_TURNS)
+        val result = try {
+            call("thread/turns/list", params.put("itemsView", "notLoaded"))
+        } catch (error: EngineException) {
+            if (error.code != -32601 || cursor != null) throw error
+            val thread = call("thread/read", jsonOf("threadId" to key.id, "includeTurns" to true)).getJSONObject("thread")
+            return mapHistoryTurns(thread.arr("turns").objects(), null)
+        }
+        val turns = result.getJSONArray("data").objects().asReversed()
+        try {
+            for (batch in turns.chunked(4)) coroutineScope {
+                batch.map { turn -> async { loadTurnItems(key, turn) } }.forEach { it.await() }
+            }
+        } catch (error: EngineException) {
+            if (error.code != -32601) throw error
+            val full = call("thread/turns/list", params.put("itemsView", "full"))
+            return mapHistoryTurns(full.getJSONArray("data").objects().asReversed(), full.str("nextCursor"))
+        }
+        return mapHistoryTurns(turns, result.str("nextCursor"))
+    }
+
+    private suspend fun loadTurnItems(key: ConversationKey, turn: JSONObject) {
+        val turnId = turn.getString("id")
+        val items = JSONArray()
+        var cursor: String? = null
+        val seen = mutableSetOf<String>()
+        do {
+            val result = call("thread/items/list", jsonOf("threadId" to key.id, "turnId" to turnId,
+                "sortDirection" to "asc", "limit" to 16, "cursor" to cursor))
+            for (entry in result.getJSONArray("data").objects()) {
+                val item = entry.optJSONObject("item") ?: entry
+                if (item !== entry) {
+                    check(entry.str("turnId") == turnId) { "会话历史返回了其他轮次的消息" }
+                    for (field in listOf("startedAtMs", "completedAtMs")) {
+                        if (!entry.isNull(field)) item.put(field, entry.get(field))
+                    }
+                }
+                items.put(item)
+            }
+            cursor = result.str("nextCursor")
+            check(cursor == null || seen.add(cursor)) { "轮次消息分页标识重复" }
+        } while (cursor != null)
+        turn.put("items", items)
+    }
+
+    private suspend fun mapHistoryTurns(turns: List<JSONObject>, nextCursor: String?): ConversationHistoryPage =
+        withContext(Dispatchers.Default) {
             val list = ArrayList<TimelineItem>()
             val durs = LinkedHashMap<String, Long>()
             var runningTurn: String? = null
-            for (turn in thread.arr("turns").objects()) {
+            for (turn in turns) {
                 val tid = turn.str("id")
                 val durMs = if (turn.has("durationMs") && !turn.isNull("durationMs")) turn.optLong("durationMs", -1L).takeIf { it >= 0L } else null
                 if (tid != null && durMs != null) durs[tid] = durMs
@@ -214,18 +278,8 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                 turn.obj("error")?.let { list += TimelineItem.Notice("error-${turn.optString("id")}", it.optString("message"), error = true) }
                 if (turn.optString("status") == "inProgress") runningTurn = tid
             }
-            Triple(list, durs, runningTurn)
+            ConversationHistoryPage(list, nextCursor, durs, runningTurn)
         }
-        val providerId = CustomProvider.fromCodexProviderId(thread.str("modelProvider"))
-        if (providerId != null) threadProviderIds[key.id] = providerId else threadProviderIds.remove(key.id)
-        repo.update(key) { state ->
-            state.copy(summary = summary(thread, state.summary.parent), items = items, loaded = true,
-                running = activeTurn != null, activeTurnId = activeTurn,
-                turnDurations = state.turnDurations + durations,
-                providerId = providerId)
-        }
-    }
-
     override suspend fun create(cwd: String, options: CreateOptions): ConversationKey {
         val normCwd = normalizeDir(cwd)
         val selectedProviderId = when (options.providerId) {
@@ -409,11 +463,14 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         var turnId = repo.state(key)?.activeTurnId
         if (turnId == null) {
             // UI 重启/后台重连后可能尚未加载时间线，主动探测进行中的 turnId 再发起中断
-            turnId = runCatching {
-                val turns = call("thread/read", jsonOf("threadId" to key.id, "includeTurns" to true))
-                    .optJSONObject("thread")?.arr("turns")?.objects().orEmpty()
-                turns.lastOrNull { it.optString("status") == "inProgress" }?.str("id")
-            }.getOrNull()
+            turnId = try {
+                call("thread/turns/list", jsonOf("threadId" to key.id, "sortDirection" to "desc",
+                    "itemsView" to "notLoaded", "limit" to 1)).getJSONArray("data").optJSONObject(0)
+                    ?.takeIf { it.optString("status") == "inProgress" }?.str("id")
+            } catch (error: EngineException) {
+                if (error.code != -32601) throw error
+                readHistoryPage(key, null).activeTurnId
+            }
         }
         if (turnId == null) return
         call("turn/interrupt", jsonOf("threadId" to key.id, "turnId" to turnId))
@@ -453,6 +510,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         val environment = repo.envSsh.effectiveEnvironment(current?.summary?.cwd)
         val params = jsonOf(
             "threadId" to key.id,
+            "excludeTurns" to true,
             "modelProvider" to (provider?.codexProviderId ?: "openai"),
             "model" to current?.model,
             "sandbox" to "danger-full-access",
@@ -930,11 +988,12 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         val nextWin = inferModelContextWindow(resolvedModel)
 
         // 有历史记录的 Codex 线程通过原生 thread/fork(modelProvider) 完整保留上下文并切换服务商；空白线程直接重建。
-        val forkedResult = if (current.items.isNotEmpty()) {
+        val forkedResult = if (current.items.isNotEmpty() || current.historyCursor != null) {
             try {
                 attach(key)
                 val forkParams = jsonOf(
                     "threadId" to key.id,
+                    "excludeTurns" to true,
                     "modelProvider" to targetCodexProvider,
                     "model" to resolvedModel,
                     "sandbox" to "danger-full-access",
@@ -971,7 +1030,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                         updatedAt = System.currentTimeMillis(),
                     ),
                     items = current.items,
-                    loaded = true,
+                    loaded = current.historyCursor == null,
                     running = false,
                     providerId = actualProvId,
                     model = actualModel,

@@ -106,6 +106,8 @@ class LiveTerminalSession(
     private val onCommandRecorded: (String) -> Unit,
     private val onNotification: (title: String?, body: String) -> Unit,
     private val onStatusChanged: () -> Unit,
+    val initialCommand: String? = null,
+    val conversationRoute: String? = null,
 ) {
     val isSsh: Boolean get() = sshHost != null
     val status = MutableStateFlow(TermSessionStatus.CONNECTING)
@@ -158,6 +160,7 @@ class LiveTerminalSession(
             trackUserInputBytes(bytes)
             sendBytesAsync(bytes)
         },
+        onSendResponse = { bytes -> sendBytesAsync(bytes) },
         onResize = { cols, rows ->
             val c = cols.coerceIn(10, 500)
             val r = rows.coerceIn(2, 300)
@@ -601,7 +604,7 @@ class NativeTerminalManager(
             val wantRemote = sshHost.defaultPath.trim()
             list.lastOrNull { it.sshHost?.id == sshHost.id && it.remoteCwd == wantRemote && it.isActive }
         } else {
-            list.lastOrNull { !it.isSsh && it.cwd == cwd && it.isActive }
+            list.lastOrNull { !it.isSsh && it.initialCommand == null && it.cwd == cwd && it.isActive }
         }
     }
 
@@ -701,8 +704,16 @@ class NativeTerminalManager(
         job.invokeOnCompletion { refreshActiveFlag() }
     }
 
-    fun openLocal(cwd: String, cols: Int = 80, rows: Int = 24): LiveTerminalSession {
+    fun openLocal(
+        cwd: String, cols: Int = 80, rows: Int = 24,
+        initialCommand: String? = null, conversationRoute: String? = null,
+    ): LiveTerminalSession {
         check(runtime.hubAvailable) { "请先启动本地 Linux 运行环境（SSH 主机无需启动本地环境即可直连）" }
+        if (initialCommand != null && conversationRoute != null) {
+            sessionsFlow.value.lastOrNull {
+                it.conversationRoute == conversationRoute && it.initialCommand == initialCommand && it.cwd == cwd && it.isActive
+            }?.let { return it }
+        }
         check(sessionsFlow.value.size < MAX_SESSIONS) { "最多同时保持 $MAX_SESSIONS 个终端会话，请先关闭不用的标签" }
         val id = "loc-${UUID.randomUUID().toString().take(8)}"
         val shortTitle = cwd.trimEnd('/').substringAfterLast('/').ifBlank { "本地终端" }
@@ -712,6 +723,8 @@ class NativeTerminalManager(
             cwd = cwd,
             sshHost = null,
             remoteCwd = "",
+            initialCommand = initialCommand,
+            conversationRoute = conversationRoute,
             initialCols = cols,
             initialRows = rows,
             ioScope = scope,
@@ -767,6 +780,7 @@ class NativeTerminalManager(
                     return@launch
                 }
                 session.attachLocal(ptyId, sock, out, coroutineContext[Job]!!)
+                session.initialCommand?.let { session.sendBytesAsync(("$it\r").toByteArray(Charsets.UTF_8)) }
 
                 while (true) {
                     val frame = PtyStreamCodec.readFrame(input) ?: break
@@ -831,7 +845,8 @@ class NativeTerminalManager(
         }
         val cwd = old.cwd
         closeSession(id)
-        return if (host != null) openSsh(host, cwd, cols, rows) else openLocal(cwd, cols, rows)
+        return if (host != null) openSsh(host, cwd, cols, rows)
+        else openLocal(cwd, cols, rows, old.initialCommand, old.conversationRoute)
     }
 
     fun saveSnippet(snippet: TerminalSnippet) {

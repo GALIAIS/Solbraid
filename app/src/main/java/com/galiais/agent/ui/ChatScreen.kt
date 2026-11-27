@@ -7,17 +7,22 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.ui.geometry.Offset
@@ -54,6 +59,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -92,6 +98,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isShiftPressed
@@ -102,16 +109,20 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.toClipEntry
+import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.galiais.agent.GaliaisApplication
@@ -138,8 +149,11 @@ import com.galiais.agent.engine.jsonOf
 import com.galiais.agent.engine.selectedModel
 import com.galiais.agent.ui.files.CodeEditorDialog
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -335,7 +349,25 @@ fun ChatScreen(
             value = withContext(Dispatchers.Default) { extractArtifactsFromItems(snapshotItems) }
         }
     }
-    val hasDiffs = !state?.turnDiff.isNullOrBlank() || fileEdits.isNotEmpty()
+    val hasEarlierHistory = state?.historyCursor != null
+    val hasDiffs = hasEarlierHistory || !state?.turnDiff.isNullOrBlank() || fileEdits.isNotEmpty()
+    val inspectingHistory = showDiffs || showArtifactsDrawer
+    var inspectedHistoryEdits by remember(key, inspectingHistory) { mutableStateOf<List<FileDiff>?>(null) }
+    var inspectedArtifacts by remember(key, inspectingHistory) { mutableStateOf<List<ChatArtifact>?>(null) }
+    var inspectHistoryError by remember(key, inspectingHistory) { mutableStateOf<String?>(null) }
+    var inspectRetry by remember(key) { mutableIntStateOf(0) }
+    LaunchedEffect(key, showDiffs, showArtifactsDrawer, hasEarlierHistory, inspectRetry) {
+        if (!inspectingHistory || !hasEarlierHistory) return@LaunchedEffect
+        inspectHistoryError = null
+        try {
+            val history = app.conversations.completeHistory(state)
+            if (showDiffs) inspectedHistoryEdits = withContext(Dispatchers.Default) {
+                history.items.filterIsInstance<TimelineItem.FileEdit>().flatMap { it.changes }
+            }
+            if (showArtifactsDrawer) inspectedArtifacts = withContext(Dispatchers.Default) { extractArtifactsFromItems(history.items) }
+        } catch (cancel: CancellationException) { throw cancel }
+        catch (error: Exception) { inspectHistoryError = error.localizedMessage ?: "读取会话历史失败" }
+    }
     val cwd = state?.summary?.cwd
     val needsTrust = key.engine == EngineKind.CLAUDE && cwd != null && cwd !in settings.trustedProjects
 
@@ -405,31 +437,239 @@ fun ChatScreen(
     }
     val currentModelOption = effectiveModels.selectedModel(state?.model)
 
+    var visibleTurnLimit by remember(key) { mutableIntStateOf(com.galiais.agent.engine.HISTORY_PAGE_TURNS) }
+    val items = state?.items.orEmpty()
+    val firstVisible = remember(items, visibleTurnLimit) {
+        var remaining = visibleTurnLimit
+        items.indexOfLast { it is TimelineItem.UserMessage && --remaining == 0 }.coerceAtLeast(0)
+    }
     val turnBlockCache = remember(key) { TurnBlockIncrementalCache() }
-    val turnBlocks = remember(key, state?.items, state?.turnDurations, state?.running) {
-        turnBlockCache.group(state?.items.orEmpty(), state?.turnDurations.orEmpty(), state?.running == true)
+    val turnBlocks = remember(key, items, firstVisible, state?.turnDurations, state?.running) {
+        turnBlockCache.group(items.subList(firstVisible, items.size), state?.turnDurations.orEmpty(), state?.running == true)
     }
     val latestTurnBlocks by rememberUpdatedState(turnBlocks)
-    var visibleTurnLimit by remember(key) { mutableIntStateOf(25) }
+    val hasLocalHistory by rememberUpdatedState(firstVisible > 0)
+    val hasMoreHistory = hasLocalHistory || hasEarlierHistory
+    val latestHasMoreHistory by rememberUpdatedState(hasMoreHistory)
+    val isLoadingEarlier = state?.loadingEarlier == true
+    val latestLoadingEarlier by rememberUpdatedState(isLoadingEarlier)
+
+    val pullDensity = LocalDensity.current
+    val haptics = LocalHapticFeedback.current
+    val pullTriggerPx = with(pullDensity) { 46.dp.toPx() }
+    val pullMaxPx = with(pullDensity) { 78.dp.toPx() }
+    val pullHoldPx = with(pullDensity) { 46.dp.toPx() }
+    val pullPeekExtraPx = with(pullDensity) { 44.dp.toPx() }
+    val pullMinPeekPx = with(pullDensity) { 72.dp.toPx() }
+    val pullOffset = remember(key) { Animatable(0f) }
+    var pullArmed by remember(key) { mutableStateOf(false) }
+    var loadedEarlierOnce by remember(key) { mutableStateOf(false) }
+    var waitingAtTopForHistory by remember(key) { mutableStateOf(false) }
+    val scrollMotionHolder = remember(key) {
+        object {
+            var movingToHistory = false
+            var animatingPeek = false
+        }
+    }
+
+    val loadEarlier: (Boolean) -> Boolean = remember(key, list) {
+        load@{ fromPrefetch ->
+            val current = app.conversations.state(key) ?: return@load false
+            if (!initialPositioned || current.reverting || current.loadingEarlier) return@load false
+            val hadLocal = hasLocalHistory
+            if (!hadLocal && !app.conversations.loadEarlier(key)) return@load false
+            followLatest = false
+            loadedEarlierOnce = true
+            if (!fromPrefetch) waitingAtTopForHistory = true
+            visibleTurnLimit = minOf(visibleTurnLimit, latestTurnBlocks.size) + com.galiais.agent.engine.HISTORY_PAGE_TURNS
+            true
+        }
+    }
     // 只有用户主动脱离底部且下方确实还有内容时才显示回底按钮，流式增长期间不闪烁。
     val showScrollDown by remember(list) { derivedStateOf { !followLatest && list.canScrollForward } }
-    // 毫秒级识别用户上滑意图：手指一向上回看立刻解除自动跟随，彻底杜绝流式回跳。
-    val userScrollDetector = remember {
+    val userScrollDetector = remember(key, list, pullTriggerPx, pullMaxPx, pullHoldPx) {
         object : NestedScrollConnection {
+            private var rawPullPx = 0f
+            private var requestedDuringPull = false
+            private var crossedHaptic = false
+
+            private fun dampedPull(raw: Float): Float {
+                if (raw <= 0f) return 0f
+                return (pullMaxPx * (1.0 - kotlin.math.exp((-raw / (pullMaxPx * 1.35f)).toDouble()))).toFloat()
+            }
+
+            private fun updatePullVisual(newRaw: Float) {
+                rawPullPx = newRaw.coerceAtLeast(0f)
+                val visual = dampedPull(rawPullPx)
+                scope.launch(start = CoroutineStart.UNDISPATCHED) { pullOffset.snapTo(visual) }
+                val armedNow = visual >= pullTriggerPx
+                if (armedNow != pullArmed) {
+                    pullArmed = armedNow
+                    if (armedNow && !crossedHaptic) {
+                        crossedHaptic = true
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    }
+                }
+            }
+
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-                if (source == NestedScrollSource.UserInput && available.y > 0.5f) {
-                    followLatest = false
+                if (source == NestedScrollSource.UserInput && available.y != 0f) {
+                    val towardHistory = available.y > 0f
+                    scrollMotionHolder.movingToHistory = towardHistory
+                    if (towardHistory && list.canScrollBackward) followLatest = false
+                }
+                if (source == NestedScrollSource.UserInput && latestHasMoreHistory && !latestLoadingEarlier) {
+                    // 下拉弹性区内反向推回时 1:1 优先收回弹性位移，手感跟手不突兀
+                    if (rawPullPx > 0f && available.y < 0f) {
+                        val consumedY = maxOf(available.y, -rawPullPx)
+                        updatePullVisual(rawPullPx + consumedY)
+                        return Offset(0f, consumedY)
+                    }
+                    // 已到顶继续下拉：平滑弹性位移替代系统 Stretch 扭曲
+                    if (!list.canScrollBackward && available.y > 0f && initialPositioned) {
+                        followLatest = false
+                        updatePullVisual(rawPullPx + available.y)
+                        return Offset(0f, available.y)
+                    }
                 }
                 return Offset.Zero
+            }
+
+            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                if (source == NestedScrollSource.SideEffect &&
+                    scrollMotionHolder.movingToHistory &&
+                    !scrollMotionHolder.animatingPeek &&
+                    !requestedDuringPull &&
+                    !list.canScrollBackward &&
+                    (available.y > 0f || consumed.y > 0f)
+                ) {
+                    if (latestLoadingEarlier) {
+                        waitingAtTopForHistory = true
+                    } else if (loadEarlier(false)) {
+                        requestedDuringPull = true
+                    }
+                }
+                return Offset.Zero
+            }
+
+            override suspend fun onPreFling(available: Velocity): Velocity {
+                val pulled = rawPullPx > 0f
+                val shouldTrigger = pullArmed && !requestedDuringPull && latestHasMoreHistory && !latestLoadingEarlier
+                rawPullPx = 0f
+                pullArmed = false
+                crossedHaptic = false
+                if (shouldTrigger) {
+                    val started = loadEarlier(false)
+                    if (started) {
+                        requestedDuringPull = true
+                        if (app.conversations.state(key)?.loadingEarlier == true) {
+                            scope.launch {
+                                pullOffset.animateTo(pullHoldPx, spring(dampingRatio = 0.86f, stiffness = 460f))
+                            }
+                        }
+                    } else {
+                        scope.launch { pullOffset.animateTo(0f, spring(dampingRatio = 0.82f, stiffness = 420f)) }
+                    }
+                } else if (pulled) {
+                    scope.launch { pullOffset.animateTo(0f, spring(dampingRatio = 0.82f, stiffness = 420f)) }
+                }
+                return if (pulled) Velocity(0f, available.y.coerceAtLeast(0f)) else Velocity.Zero
+            }
+
+            override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+                scrollMotionHolder.movingToHistory = false
+                requestedDuringPull = false
+                if (rawPullPx > 0f) {
+                    rawPullPx = 0f
+                    pullArmed = false
+                    crossedHaptic = false
+                    if (!latestLoadingEarlier) {
+                        scope.launch { pullOffset.animateTo(0f, spring(dampingRatio = 0.82f, stiffness = 420f)) }
+                    }
+                }
+                return Velocity.Zero
             }
         }
     }
 
-    // 当用户手动滑回底部时自动恢复跟随
+    // 临近顶部静默预加载：向上翻到距离顶部 3 项以内时提前在后台拉取下一页，尽量做到不撞顶无缝衔接。
+    LaunchedEffect(key, list, hasMoreHistory, state?.historyError) {
+        if (!hasMoreHistory || state?.historyError != null) return@LaunchedEffect
+        snapshotFlow {
+            val info = list.layoutInfo
+            val firstIdx = info.visibleItemsInfo.firstOrNull()?.index ?: Int.MAX_VALUE
+            Triple(firstIdx, info.totalItemsCount, list.isScrollInProgress)
+        }.distinctUntilChanged().collect { (firstIdx, total, scrolling) ->
+            if (!initialPositioned || total <= 0) return@collect
+            if (scrolling && !followLatest && scrollMotionHolder.movingToHistory && firstIdx <= 3) {
+                loadEarlier(true)
+            }
+        }
+    }
+
+    // 若预加载尚未完成而用户已滑至最顶部，自动柔和展开顶部加载托架，杜绝卡在顶部的无响应感。
+    LaunchedEffect(key, isLoadingEarlier, list, pullHoldPx) {
+        if (!isLoadingEarlier) return@LaunchedEffect
+        snapshotFlow { !list.canScrollBackward && initialPositioned }
+            .distinctUntilChanged()
+            .collect { blockedAtTop ->
+                if (blockedAtTop) {
+                    waitingAtTopForHistory = true
+                    if (!pullArmed && pullOffset.value < pullHoldPx) {
+                        pullOffset.animateTo(pullHoldPx, spring(dampingRatio = 0.86f, stiffness = 440f))
+                    }
+                }
+            }
+    }
+
+    // 顶部历史页到达后的无跳动锚定与轻柔露头：若用户正停在顶部等待，同步收回弹性托架并温和露出新加载的上一条消息边缘。
+    val headTurnId = turnBlocks.firstOrNull()?.id
+    var prevHeadTurnId by remember(key) { mutableStateOf<String?>(null) }
+    var prevTurnCount by remember(key) { mutableIntStateOf(0) }
+    LaunchedEffect(key, headTurnId, turnBlocks.size, isLoadingEarlier) {
+        val count = turnBlocks.size
+        val prepended = prevHeadTurnId != null && headTurnId != null && headTurnId != prevHeadTurnId && count > prevTurnCount
+        val wasWaiting = waitingAtTopForHistory
+        prevHeadTurnId = headTurnId
+        prevTurnCount = count
+        if (prepended) {
+            waitingAtTopForHistory = false
+            if (wasWaiting) {
+                yield()
+                val currentPull = pullOffset.value
+                val canPeek = !list.isScrollInProgress && list.firstVisibleItemIndex > 0
+                if (canPeek) {
+                    val totalPeek = maxOf(currentPull + pullPeekExtraPx, pullMinPeekPx)
+                    scrollMotionHolder.animatingPeek = true
+                    try {
+                        coroutineScope {
+                            launch {
+                                pullOffset.animateTo(0f, tween(durationMillis = 260, easing = FastOutSlowInEasing))
+                            }
+                            launch {
+                                list.animateScrollBy(-totalPeek, tween(durationMillis = 260, easing = FastOutSlowInEasing))
+                            }
+                        }
+                    } finally {
+                        scrollMotionHolder.animatingPeek = false
+                    }
+                } else if (currentPull > 0f) {
+                    pullOffset.animateTo(0f, spring(dampingRatio = 0.85f, stiffness = 420f))
+                }
+            }
+        } else if (!isLoadingEarlier && !pullArmed) {
+            waitingAtTopForHistory = false
+            if (pullOffset.value > 0f) {
+                pullOffset.animateTo(0f, spring(dampingRatio = 0.85f, stiffness = 420f))
+            }
+        }
+    }
+
+    // 当用户手动滑回底部时自动恢复跟随（拉取历史期间不抢占，避免补页后误拉回底部）
     LaunchedEffect(key, list) {
-        snapshotFlow { list.isScrollInProgress to list.canScrollForward }
-            .collect { (scrolling, canScrollForward) ->
-                if (!scrolling && !canScrollForward) followLatest = true
+        snapshotFlow { !list.isScrollInProgress && !list.canScrollForward && list.canScrollBackward }
+            .collect { atBottom ->
+                if (atBottom && !latestLoadingEarlier) followLatest = true
             }
     }
 
@@ -461,10 +701,18 @@ fun ChatScreen(
         initialPositioned = true
     }
 
-    // 像素级无回跳平滑贴底：仅在运行流式输出或新增消息项时贴底，用户静默展开/折叠历史块或弹起 / @ 浮层时绝不抢占滚动。
-    val currentRunning by androidx.compose.runtime.rememberUpdatedState(state?.running == true)
+    // 帧率自适应平滑贴底：
+    // 1) 按末尾项 ID 识别真正的尾部新增（头部补历史绝不触发自动滚底）；
+    // 2) 流式期间换行增量采用指数阻尼滑移，消除逐行 70px 硬跳感，用户手指触碰立即让出控制权；
+    // 3) 轮次刚结束保留 480ms 收尾宽限窗，让最后几个缓动字符与底部操作栏完整滑入视野。
+    val currentRunning by rememberUpdatedState(state?.running == true)
+    val latestTailItemId by rememberUpdatedState(items.lastOrNull()?.id)
     LaunchedEffect(key, list, settings.autoScroll) {
         var lastTotalCount = 0
+        var lastTailId: String? = null
+        var wasRunning = false
+        var settleUntilMs = 0L
+        var lastStepNanos = 0L
         snapshotFlow {
             val info = list.layoutInfo
             val lastVisible = info.visibleItemsInfo.lastOrNull()
@@ -474,17 +722,40 @@ fun ChatScreen(
                 info.viewportEndOffset - info.afterContentPadding,
             )
         }.collect { (totalCount, lastVis, viewportEnd) ->
-            val addedNewItem = totalCount > lastTotalCount
+            val nowMs = android.os.SystemClock.uptimeMillis()
+            if (currentRunning) {
+                wasRunning = true
+                settleUntilMs = nowMs + 480L
+            } else if (wasRunning && nowMs > settleUntilMs) {
+                wasRunning = false
+            }
+            val inSettleWindow = nowMs <= settleUntilMs
+            val tailId = latestTailItemId
+            val addedAtTail = totalCount > lastTotalCount && tailId != null && tailId != lastTailId
             lastTotalCount = totalCount
+            lastTailId = tailId
             if (!initialPositioned || !settings.autoScroll || !followLatest || list.isScrollInProgress || totalCount <= 0) return@collect
-            if (!currentRunning && !addedNewItem) return@collect
+            if (!currentRunning && !addedAtTail && !inSettleWindow) return@collect
             val lastIdx = totalCount - 1
             if (lastVis == null || lastVis.first < lastIdx) {
                 list.scrollToItem(lastIdx)
+                lastStepNanos = 0L
             } else {
                 val overflow = (lastVis.second + lastVis.third) - viewportEnd
                 if (overflow > 1) {
-                    list.scrollBy(overflow.toFloat())
+                    val nowNanos = System.nanoTime()
+                    val dtSec = if (lastStepNanos == 0L) 0.016 else ((nowNanos - lastStepNanos) / 1_000_000_000.0).coerceIn(0.004, 0.05)
+                    lastStepNanos = nowNanos
+                    val step = when {
+                        overflow > 320 || overflow <= 4 -> overflow.toFloat()
+                        else -> {
+                            val factor = (1.0 - kotlin.math.exp(-dtSec * 22.0)).toFloat().coerceIn(0.22f, 0.55f)
+                            (overflow * factor).coerceIn(3f, overflow.toFloat())
+                        }
+                    }
+                    list.scrollBy(step)
+                } else {
+                    lastStepNanos = 0L
                 }
             }
         }
@@ -746,14 +1017,19 @@ fun ChatScreen(
     }
 
     fun copyMarkdownArchive() {
-        val md = app.conversations.exportMarkdown(key)
-        if (md.isBlank()) { app.conversations.notify("暂无可导出的会话内容"); return }
         scope.launch {
-            clipboard.setClipEntry(ClipData.newPlainText("conversation.md", md).toClipEntry())
-            app.conversations.notify("已复制会话 Markdown")
+            try {
+                val md = app.conversations.exportMarkdown(key)
+                if (md.isBlank()) { app.conversations.notify("暂无可导出的会话内容"); return@launch }
+                clipboard.setClipEntry(ClipData.newPlainText("conversation.md", md).toClipEntry())
+                app.conversations.notify("已复制会话 Markdown")
+            } catch (cancel: CancellationException) {
+                throw cancel
+            } catch (error: Exception) {
+                app.conversations.notify("导出失败：${error.message}")
+            }
         }
     }
-
     fun forkConversation(upToMessageId: String? = null) {
         scope.launch {
             try {
@@ -777,17 +1053,14 @@ fun ChatScreen(
     fun launchNativeTui() {
         val targetCwd = cwd ?: settings.defaultCwd
         val cmd = app.conversations.buildNativeTuiCommand(key)
+        if (cmd == null) {
+            app.conversations.notify("此会话还没有 Antigravity 原生会话 ID")
+            return
+        }
         onOpenNativeTui(targetCwd, cmd) {
-            scope.launch {
-                if (key.engine.id == "antigravity") {
-                    runCatching { app.conversations.hub.syncAgyNativeSessions(targetCwd) }
-                }
-                app.conversations.open(key)
-                app.conversations.refresh()
-            }
+            if (app.conversations.state(key) != null) app.conversations.open(key, reload = true)
         }
     }
-
     fun runSlashCommand(cmd: SlashCommand) {
         replaceDraft("")
         when (cmd.localAction) {
@@ -920,7 +1193,7 @@ fun ChatScreen(
                                 }
                             }
                         }
-                        if (conversationArtifacts.isNotEmpty()) {
+                        if (conversationArtifacts.isNotEmpty() || hasEarlierHistory) {
                             Row(
                                 modifier = Modifier
                                     .clip(D.chipShape)
@@ -931,12 +1204,12 @@ fun ChatScreen(
                                 horizontalArrangement = Arrangement.spacedBy(3.dp),
                             ) {
                                 Icon(GaliaisIcons.Layers, contentDescription = null, tint = G.artifact, modifier = Modifier.size(13.dp))
-                                Text("${conversationArtifacts.size}", style = MaterialTheme.typography.labelSmall, color = G.artifact, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                                Text(if (hasEarlierHistory) "产物" else "${conversationArtifacts.size}", style = MaterialTheme.typography.labelSmall, color = G.artifact, fontWeight = FontWeight.SemiBold, maxLines = 1)
                             }
                         }
                         if (hasDiffs) {
                             val editedFileCount = remember(fileEdits) { fileEdits.map { it.path }.distinct().size }
-                            val diffPillLabel = if (editedFileCount > 0) "$editedFileCount" else "改动"
+                            val diffPillLabel = if (editedFileCount > 0 && !hasEarlierHistory) "$editedFileCount" else "改动"
                             Row(
                                 modifier = Modifier
                                     .clip(D.chipShape)
@@ -962,7 +1235,9 @@ fun ChatScreen(
                             Icon(GaliaisIcons.MoreHoriz, contentDescription = "更多操作", tint = G.inkMuted, modifier = Modifier.size(20.dp))
                         }
                     }
-                    HeaderProgressSlot(runtime.ready && (state?.loaded != true || state.reverting || editSubmitting))
+                    val readingHistory = state == null || (!state.loaded && state.historyError == null)
+                    val prefetchingInBackground = state?.loadingEarlier == true && list.canScrollBackward
+                    HeaderProgressSlot(runtime.ready && (readingHistory || prefetchingInBackground || state.reverting || editSubmitting))
                     val arenaSiblings = state?.arenaGroupId?.let { arenaGroups[it] }.orEmpty()
                     if (arenaSiblings.size > 1) {
                         Row(
@@ -1255,7 +1530,6 @@ fun ChatScreen(
                 }
             }
             val stablePickStarter: (String) -> Unit = remember { { hint -> replaceDraft(hint) } }
-            val stableLoadEarlier: () -> Unit = remember(key) { { visibleTurnLimit += 25 } }
             // 单容器浮层架构：消息列表延伸至底部透明输入框后方，并通过 ChatTimelineViewport 隔离 draftValue，打字零重组消息列表。
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 CompositionLocalProvider(
@@ -1264,19 +1538,25 @@ fun ChatScreen(
                     LocalPluginMessageFooter provides rememberedPluginFooter,
                 ) {
                 if (!runtime.ready || state == null || state.loaded) {
+                    val showAllLoadedCap = state?.loaded == true && !hasMoreHistory &&
+                        (loadedEarlierOnce || turnBlocks.size >= com.galiais.agent.engine.INITIAL_HISTORY_TURNS)
+                    val triggerLoadAction = remember(loadEarlier) { { loadEarlier(false) } }
                     ChatTimelineViewport(
                         list = list,
                         listRevealAlpha = listRevealAlpha,
+                        pullOffsetProvider = { pullOffset.value },
                         userScrollDetector = userScrollDetector,
                         composerBottomPadDp = composerBottomPadDp,
-                        isEmptyConversation = state?.loaded == true && state.items.isEmpty() && requests.isEmpty(),
+                        isEmptyConversation = state?.loaded == true && state.historyCursor == null && state.items.isEmpty() && requests.isEmpty(),
+                        showAllLoadedCap = showAllLoadedCap,
                         engine = key.engine,
                         cwd = cwd,
                         starterPrompts = starterPrompts,
                         onPickStarter = stablePickStarter,
                         turnBlocks = turnBlocks,
-                        visibleTurnLimit = visibleTurnLimit,
-                        onLoadEarlierTurns = stableLoadEarlier,
+                        onLoadEarlierTurns = triggerLoadAction.takeIf {
+                            hasMoreHistory && !isLoadingEarlier && state?.reverting != true
+                        },
                         activeTurnStartedAt = state?.turnStartedAt,
                         expandByDefault = settings.expandThinking,
                         focusText = state?.focusText,
@@ -1286,6 +1566,38 @@ fun ChatScreen(
                     )
                 }
 
+                if (hasMoreHistory || isLoadingEarlier) {
+                    HistoryPullIndicator(
+                        pullOffsetProvider = { pullOffset.value },
+                        triggerPx = pullTriggerPx,
+                        holdPx = pullHoldPx,
+                        armed = pullArmed,
+                        loading = isLoadingEarlier,
+                        modifier = Modifier.align(Alignment.TopCenter).padding(top = 8.dp),
+                    )
+                }
+                val showTopHistoryError = state?.loaded == true && hasEarlierHistory &&
+                    state.historyError != null && !isLoadingEarlier && !list.canScrollBackward
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = showTopHistoryError,
+                    enter = fadeIn(tween(180)) + slideInVertically(tween(200)) { -it / 2 },
+                    exit = fadeOut(tween(140)) + slideOutVertically(tween(140)) { -it / 2 },
+                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 8.dp),
+                ) {
+                    TagPill(
+                        text = "历史加载失败，点此或下拉重试",
+                        fg = G.danger,
+                        bg = G.surface,
+                        border = G.danger.copy(alpha = 0.35f),
+                        onClick = { loadEarlier(false) },
+                    )
+                }
+                if (state?.loaded == false && state.historyError != null) {
+                    Column(Modifier.align(Alignment.Center).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(state.historyError, color = G.danger)
+                        CompactActionButton("重新加载", onClick = { app.conversations.open(key) })
+                    }
+                }
                 androidx.compose.animation.AnimatedVisibility(
                     visible = showScrollDown,
                     enter = GaliaisMotion.fabEnter,
@@ -1682,7 +1994,7 @@ fun ChatScreen(
                                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                                             ) {
                                                 Text(
-                                                    "编辑第 $turnNum 轮并重发",
+                                                    if (!hasEarlierHistory && !hasLocalHistory) "编辑第 $turnNum 轮并重发" else "编辑此轮并重发",
                                                     style = MaterialTheme.typography.labelMedium,
                                                     color = G.accent,
                                                     fontWeight = FontWeight.SemiBold,
@@ -1953,9 +2265,9 @@ fun ChatScreen(
                                                     )
                                                 }
                                             }
-                                            if (conversationArtifacts.isNotEmpty()) {
+                                            if (conversationArtifacts.isNotEmpty() || hasEarlierHistory) {
                                                 GaliaisMenuRow(
-                                                    title = "会话产物（${conversationArtifacts.size}）",
+                                                    title = if (hasEarlierHistory) "会话产物" else "会话产物（${conversationArtifacts.size}）",
                                                     subtitle = "打开离线产物工作台查看全部结果",
                                                     icon = GaliaisIcons.Layers,
                                                     onClick = { attachMenu = false; showArtifactsDrawer = true },
@@ -2486,14 +2798,15 @@ fun ChatScreen(
             onExportCopy = { copyMarkdownArchive() },
             onExportSave = {
                 val targetDir = cwd ?: return@SessionInfoSheet
-                val md = app.conversations.exportMarkdown(key)
-                if (md.isBlank()) { app.conversations.notify("暂无可导出内容"); return@SessionInfoSheet }
                 val fileName = "solbraid-${key.engine.id}-${key.id.take(8)}.md"
                 scope.launch {
                     try {
+                        val md = app.conversations.exportMarkdown(key)
+                        if (md.isBlank()) { app.conversations.notify("暂无可导出内容"); return@launch }
                         files.write(targetDir.trimEnd('/') + "/" + fileName, md)
                         app.conversations.notify("已导出到 $fileName")
-                    } catch (e: Exception) { app.conversations.notify("导出失败：${e.message}") }
+                    } catch (cancel: CancellationException) { throw cancel }
+                    catch (e: Exception) { app.conversations.notify("导出失败：${e.message}") }
                 }
             },
             onOpenDirectory = cwd?.let { dir -> { onOpenDirectory(dir) } },
@@ -2732,9 +3045,24 @@ fun ChatScreen(
             DiffOverviewSheet(null, diffs, cwd = cwd, onDismiss = { inspectedDiffs = null })
         }
     }
-    if (showDiffs) {
+    val waitingForHistory = hasEarlierHistory &&
+        ((showDiffs && inspectedHistoryEdits == null) || (showArtifactsDrawer && inspectedArtifacts == null))
+    if (waitingForHistory) {
+        GaliaisSheetScaffold(title = if (showDiffs) "文件改动" else "会话产物",
+            onDismiss = { showDiffs = false; showArtifactsDrawer = false }) {
+            val error = inspectHistoryError
+            if (error == null) {
+                Text("正在读取会话历史…", color = G.inkMuted)
+                androidx.compose.material3.LinearProgressIndicator(Modifier.fillMaxWidth())
+            } else {
+                Text(error, color = G.danger)
+                CompactActionButton("重试", onClick = { inspectRetry++ })
+            }
+        }
+    }
+    if (showDiffs && !waitingForHistory) {
         CompositionLocalProvider(LocalDiffActions provides sheetDiffActions) {
-            DiffOverviewSheet(state?.turnDiff, fileEdits, cwd = cwd, onDismiss = { showDiffs = false })
+            DiffOverviewSheet(state?.turnDiff, inspectedHistoryEdits ?: fileEdits, cwd = cwd, onDismiss = { showDiffs = false })
         }
     }
     diffEditorTarget?.let { (ref, lineNo) ->
@@ -2803,9 +3131,9 @@ fun ChatScreen(
             onDismiss = { showVisualTemplates = false },
         )
     }
-    if (showArtifactsDrawer) {
+    if (showArtifactsDrawer && !waitingForHistory) {
         ConversationArtifactsSheet(
-            artifacts = conversationArtifacts,
+            artifacts = inspectedArtifacts ?: conversationArtifacts,
             onOpenArtifact = { art -> studioArtifact = art },
             onOpenLatexScratchpad = { showLatexScratchpad = true },
             onDismiss = { showArtifactsDrawer = false },
@@ -3391,22 +3719,104 @@ private fun formatCompactTokens(n: Long): String = when {
     else -> n.toString()
 }
 
+/** 顶部弹性下拉 / 加载历史指示胶囊：拉动阶段在 graphicsLayer 与 Canvas 中直读位移，零重组 120Hz 跟手。 */
+@Composable
+private fun HistoryPullIndicator(
+    pullOffsetProvider: () -> Float,
+    triggerPx: Float,
+    holdPx: Float,
+    armed: Boolean,
+    loading: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val accent = G.accent
+    val track = G.border
+    val borderColor by animateColorAsState(
+        targetValue = if (armed && !loading) accent.copy(alpha = 0.55f) else G.border,
+        animationSpec = tween(150),
+        label = "pullBorder",
+    )
+    val labelColor by animateColorAsState(
+        targetValue = if (armed && !loading) accent else G.inkMuted,
+        animationSpec = tween(150),
+        label = "pullLabel",
+    )
+    val visible by remember {
+        derivedStateOf { pullOffsetProvider() > 1.5f }
+    }
+    if (!visible) return
+    Surface(
+        modifier = modifier.graphicsLayer {
+            val px = pullOffsetProvider()
+            val denom = (if (loading) holdPx else triggerPx).coerceAtLeast(1f)
+            val progress = (px / denom).coerceIn(0f, 1f)
+            alpha = (px / (denom * 0.65f)).coerceIn(0f, 1f)
+            val s = 0.88f + 0.12f * progress
+            scaleX = s
+            scaleY = s
+            translationY = ((px - holdPx) * 0.35f).coerceIn(-12f, 10f)
+        },
+        shape = D.chipShape,
+        color = G.surface,
+        border = BorderStroke(0.75.dp, borderColor),
+        shadowElevation = 2.dp,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+        ) {
+            if (loading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(13.dp),
+                    strokeWidth = 1.8.dp,
+                    color = accent,
+                )
+            } else {
+                Canvas(modifier = Modifier.size(13.dp)) {
+                    val progress = (pullOffsetProvider() / triggerPx.coerceAtLeast(1f)).coerceIn(0f, 1f)
+                    val stroke = Stroke(width = 1.8.dp.toPx(), cap = StrokeCap.Round)
+                    drawCircle(color = track, style = stroke)
+                    drawArc(
+                        color = accent,
+                        startAngle = -90f + 120f * progress,
+                        sweepAngle = (290f * progress).coerceAtLeast(24f),
+                        useCenter = false,
+                        style = stroke,
+                    )
+                }
+            }
+            Text(
+                text = when {
+                    loading -> "正在加载更早历史…"
+                    armed -> "松开加载更早历史"
+                    else -> "下拉加载更早历史"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = labelColor,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
 /** 独立隔离的聊天消息列表视口：不依赖 draftValue，打字时零重组消息气泡与代码块；支持大会话尾部 25 轮分窗加载。 */
 @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 private fun ChatTimelineViewport(
     list: androidx.compose.foundation.lazy.LazyListState,
     listRevealAlpha: Float,
+    pullOffsetProvider: () -> Float,
     userScrollDetector: NestedScrollConnection,
     composerBottomPadDp: androidx.compose.ui.unit.Dp,
     isEmptyConversation: Boolean,
+    showAllLoadedCap: Boolean,
     engine: EngineKind,
     cwd: String?,
     starterPrompts: List<String>,
     onPickStarter: (String) -> Unit,
     turnBlocks: List<TurnBlock>,
-    visibleTurnLimit: Int,
-    onLoadEarlierTurns: () -> Unit,
+    onLoadEarlierTurns: (() -> Boolean)?,
     activeTurnStartedAt: Long?,
     expandByDefault: Boolean,
     focusText: String?,
@@ -3414,12 +3824,21 @@ private fun ChatTimelineViewport(
     inPlanMode: Boolean,
     actions: ChatTimelineActions,
 ) {
-    val hiddenTurns = (turnBlocks.size - visibleTurnLimit).coerceAtLeast(0)
-    val displayedTurns = remember(turnBlocks, hiddenTurns) {
-        if (hiddenTurns > 0) turnBlocks.subList(hiddenTurns, turnBlocks.size) else turnBlocks
-    }
     LazyColumn(
-        modifier = Modifier.fillMaxSize().graphicsLayer { alpha = listRevealAlpha }.nestedScroll(userScrollDetector),
+        modifier = Modifier.fillMaxSize().graphicsLayer {
+            alpha = listRevealAlpha
+            translationY = pullOffsetProvider()
+        }
+            .nestedScroll(userScrollDetector)
+            .semantics {
+                if (onLoadEarlierTurns != null) {
+                    customActions = listOf(CustomAccessibilityAction("加载更早的对话", onLoadEarlierTurns))
+                }
+            }
+            .onPreviewKeyEvent { event ->
+                event.type == KeyEventType.KeyDown && event.key == Key.PageUp &&
+                    !list.canScrollBackward && onLoadEarlierTurns?.invoke() == true
+            },
         state = list,
         contentPadding = PaddingValues(
             start = 14.dp,
@@ -3429,15 +3848,16 @@ private fun ChatTimelineViewport(
         ),
         verticalArrangement = Arrangement.spacedBy(D.space(10.dp)),
     ) {
-        if (hiddenTurns > 0) {
-            item(key = "load-earlier-turns", contentType = "load_earlier") {
-                Box(Modifier.fillMaxWidth().padding(vertical = 4.dp), contentAlignment = Alignment.Center) {
-                    TagPill(
-                        text = "加载更早的 $hiddenTurns 轮历史对话（+25 轮）",
-                        fg = G.accent,
-                        bg = G.accentContainer,
-                        onClick = onLoadEarlierTurns,
-                    )
+        if (showAllLoadedCap && !isEmptyConversation) {
+            item(key = "history-reached-top", contentType = "history_cap") {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Hairline(Modifier.weight(1f))
+                    Text("已显示全部对话", style = MaterialTheme.typography.labelSmall, color = G.inkSubtle)
+                    Hairline(Modifier.weight(1f))
                 }
             }
         }
@@ -3467,8 +3887,8 @@ private fun ChatTimelineViewport(
                 }
             }
         }
-        displayedTurns.forEachIndexed { localIdx, block ->
-            val isLastTurn = localIdx == displayedTurns.lastIndex
+        turnBlocks.forEachIndexed { localIdx, block ->
+            val isLastTurn = localIdx == turnBlocks.lastIndex
             val hasPendingPlan = block.planItems.any { it.requestFeedback || it.status == com.galiais.agent.engine.ItemStatus.RUNNING }
             val enablePlanActions = (isLastTurn && (inPlanMode || hasPendingPlan)) || hasPendingPlan
             turnBlockItems(

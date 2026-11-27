@@ -26,6 +26,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 import org.json.JSONArray
 import org.json.JSONObject
@@ -44,6 +45,7 @@ interface EngineAdapter {
     val kind: EngineKind
     suspend fun list(): List<ConversationSummary>
     suspend fun load(key: ConversationKey)
+    suspend fun loadEarlier(key: ConversationKey, cursor: String): ConversationHistoryPage
     suspend fun create(cwd: String, options: CreateOptions): ConversationKey
     suspend fun send(key: ConversationKey, text: String, attachments: List<ImageAttachment> = emptyList())
     suspend fun interrupt(key: ConversationKey)
@@ -99,14 +101,17 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
         if (loadedOrder.size <= maxInRam) return
         val current = conversationsFlow.value
         val toEvict = loadedOrder.filter { k ->
-            k != key && k != activeConversationKey && current[k]?.loaded == true && current[k]?.running != true
+            val state = current[k]
+            k != key && k != activeConversationKey && state?.loaded == true && !state.running && !state.reverting
         }.take((loadedOrder.size - maxInRam).coerceAtLeast(0))
         if (toEvict.isEmpty()) return
         val next = current.toMutableMap()
         var evictedAny = false
         for (k in toEvict) {
             val st = next[k] ?: continue
-            next[k] = st.copy(items = emptyList(), loaded = false)
+            loadingJobs.remove(k)?.cancel()
+            next[k] = st.copy(items = emptyList(), turnDurations = emptyMap(), loaded = false,
+                historyCursor = null, loadingEarlier = false, historyError = null)
             loadedOrder.remove(k)
             evictedAny = true
         }
@@ -231,7 +236,10 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
                         arenaGroupsFlow.value = emptyMap()
                     } else {
                         loadingJobs.values.forEach { it.cancel() }; loadingJobs.clear(); loadedOrder.clear()
-                        publishConversations(conversationsFlow.value.mapValues { it.value.copy(running = false, activeTurnId = null, loaded = false) })
+                        publishConversations(conversationsFlow.value.mapValues {
+                            it.value.copy(running = false, activeTurnId = null, loaded = false,
+                                historyCursor = null, loadingEarlier = false, historyError = null)
+                        })
                     }
                 }
             }
@@ -679,23 +687,87 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
         return created
     }
 
-    fun open(key: ConversationKey) {
-        val state = state(key)
-        if (state?.loaded == true) {
+    fun open(key: ConversationKey, reload: Boolean = false) {
+        val current = state(key)
+        if (current?.reverting == true) return
+        if (current?.loaded == true && !reload) {
             recordLoadedAndEvictIfNeeded(key)
             return
         }
-        if (loadingJobs[key]?.isActive == true) return
+        if (reload) loadingJobs.remove(key)?.cancel()
+        else if (loadingJobs[key]?.isActive == true) return
         val job = launchOperation("打开会话失败") {
+            update(key) { it.copy(loadingEarlier = false, historyError = null) }
             try {
                 withEngineOperation(key.engine.id) { adapter(key.engine).load(key) }
-            } finally {
-                loadingJobs.remove(key)
+            } catch (cancel: CancellationException) {
+                throw cancel
+            } catch (error: Exception) {
+                if (state(key) != null) update(key) { it.copy(historyError = error.localizedMessage ?: "读取会话失败") }
+                throw error
             }
         }
-        loadingJobs[key] = job
+        trackLoad(key, job)
     }
 
+    private fun trackLoad(key: ConversationKey, job: Job) {
+        loadingJobs[key] = job
+        job.invokeOnCompletion { loadingJobs.remove(key, job) }
+    }
+
+    fun loadEarlier(key: ConversationKey): Boolean {
+        val current = state(key) ?: return false
+        val cursor = current.historyCursor ?: return false
+        if (!current.loaded || current.reverting || loadingJobs[key]?.isActive == true) return false
+        val job = launchOperation("读取历史失败") {
+            update(key) { it.copy(loadingEarlier = true, historyError = null) }
+            try {
+                val page = adapter(key.engine).loadEarlier(key, cursor)
+                check(page.nextCursor != cursor) { "历史分页标识重复" }
+                if (state(key)?.historyCursor == cursor) update(key) { latest ->
+                    val ids = latest.items.mapTo(hashSetOf()) { it.id }
+                    latest.copy(items = page.items.filter { ids.add(it.id) } + latest.items,
+                        turnDurations = page.durations + latest.turnDurations,
+                        historyCursor = page.nextCursor, loadingEarlier = false)
+                }
+            } catch (cancel: CancellationException) {
+                throw cancel
+            } catch (error: Exception) {
+                if (state(key)?.historyCursor == cursor) update(key) {
+                    it.copy(loadingEarlier = false, historyError = error.localizedMessage ?: "读取历史失败")
+                }
+                throw error
+            }
+        }
+        trackLoad(key, job)
+        return true
+    }
+
+    internal suspend fun completeHistory(snapshot: ConversationState): ConversationState {
+        check(snapshot.loaded) { "会话历史尚未加载" }
+        var cursor = snapshot.historyCursor ?: return snapshot
+        val key = snapshot.summary.key
+        val seen = mutableSetOf<String>()
+        val pages = mutableListOf<ConversationHistoryPage>()
+        while (true) {
+            check(seen.add(cursor)) { "历史分页标识重复" }
+            val page = adapter(key.engine).loadEarlier(key, cursor)
+            pages += page
+            cursor = page.nextCursor ?: break
+        }
+        return withContext(Dispatchers.Default) {
+            val ids = snapshot.items.mapTo(hashSetOf()) { it.id }
+            val earlier = pages.map { page -> page.items.filter { ids.add(it.id) } }
+            snapshot.copy(
+                items = earlier.asReversed().flatten() + snapshot.items,
+                turnDurations = buildMap {
+                    pages.asReversed().forEach { putAll(it.durations) }
+                    putAll(snapshot.turnDurations)
+                },
+                historyCursor = null, loadingEarlier = false,
+            )
+        }
+    }
     private val initialDrafts = mutableMapOf<ConversationKey, String>()
     fun putInitialDraft(key: ConversationKey, text: String) { initialDrafts[key] = text }
     fun consumeInitialDraft(key: ConversationKey): String? = initialDrafts.remove(key)
@@ -783,21 +855,24 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
         rewindClaudeFiles: Boolean,
         restoreToComposer: Boolean,
     ): Pair<ConversationKey, TimelineItem.UserMessage> {
-        val current = state(key) ?: error("会话不存在")
-        check(current.loaded && !current.running && !current.reverting && key !in sending) { "请等待当前操作完成后再继续" }
-        val turnStart = current.items.indexOfFirst { it.id == userMessageId }
-        val message = current.items.getOrNull(turnStart) as? TimelineItem.UserMessage
-            ?: error("此轮消息已变更，请重新选择")
-        require(isEditableUserMessage(message)) { "运行中插话不支持单独编辑重发，请编辑该轮主消息" }
-        val userTurnIndex = current.items.take(turnStart).count { it is TimelineItem.UserMessage && isEditableUserMessage(it) }
-        val retained = current.items.take(turnStart)
-        val retainedIds = retained.flatMap { item ->
-            listOfNotNull(item.id, (item as? TimelineItem.UserMessage)?.turnId)
-        }.toSet()
-        val retainedDurations = current.turnDurations.filterKeys { id -> id in retainedIds }
-        update(key) { it.copy(reverting = true) }
+        val snapshot = state(key) ?: error("会话不存在")
+        check(snapshot.loaded && !snapshot.running && !snapshot.reverting && key !in sending) { "请等待当前操作完成后再继续" }
+        loadingJobs.remove(key)?.cancel()
+        update(key) { it.copy(reverting = true, loadingEarlier = false) }
         var resolvedKey = key
         try {
+            val current = completeHistory(snapshot)
+            check(state(key)?.reverting == true && state(key)?.running == false) { "会话状态已变更，请重新选择" }
+            val turnStart = current.items.indexOfFirst { it.id == userMessageId }
+            val message = current.items.getOrNull(turnStart) as? TimelineItem.UserMessage
+                ?: error("此轮消息已变更，请重新选择")
+            require(isEditableUserMessage(message)) { "运行中插话不支持单独编辑重发，请编辑该轮主消息" }
+            val userTurnIndex = current.items.take(turnStart).count { it is TimelineItem.UserMessage && isEditableUserMessage(it) }
+            val retained = current.items.take(turnStart)
+            val retainedIds = retained.flatMap { item ->
+                listOfNotNull(item.id, (item as? TimelineItem.UserMessage)?.turnId)
+            }.toSet()
+            val retainedDurations = current.turnDurations.filterKeys { id -> id in retainedIds }
             when (key.engine) {
                 EngineKind.CODEX -> {
                     val targetTurnId = message.turnId ?: current.items.drop(turnStart + 1)
@@ -815,6 +890,7 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
                             it.copy(
                                 summary = if (retained.isEmpty()) updatedSummary.copy(title = "新会话") else updatedSummary,
                                 items = retained,
+                                historyCursor = null,
                                 running = false,
                                 activeTurnId = null,
                                 turnStartedAt = null,
@@ -854,6 +930,8 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
                                     it.summary.copy(updatedAt = System.currentTimeMillis())
                                 },
                                 items = retained,
+                                historyCursor = null,
+                                remoteSessionId = null,
                                 running = false,
                                 activeTurnId = null,
                                 turnStartedAt = null,
@@ -1048,20 +1126,19 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
     }
 
     /** 构建无缝切入原生 TUI 终端的命令（复用当前会话 ID）。 */
-    fun buildNativeTuiCommand(key: ConversationKey): String {
+    fun buildNativeTuiCommand(key: ConversationKey): String? {
         val st = state(key)
         val cwd = st?.summary?.cwd ?: settings.state.value.defaultCwd
         fun shQ(s: String) = "'" + s.replace("'", "'\\''") + "'"
-        val cdPrefix = "cd ${shQ(cwd)} 2>/dev/null; "
+        val cdPrefix = "cd ${shQ(cwd)} && exec "
         return when (key.engine.id) {
             "codex" -> "${cdPrefix}codex resume ${shQ(key.id)}"
             "claude" -> "${cdPrefix}claude --resume ${shQ(key.id)}"
             "antigravity" -> {
                 val remoteId = st?.remoteSessionId?.takeIf { it.isNotBlank() }
-                if (remoteId != null) "${cdPrefix}agy --conversation ${shQ(remoteId)}"
-                else "${cdPrefix}agy --continue"
+                remoteId?.let { "${cdPrefix}agy --conversation ${shQ(it)}" }
             }
-            else -> "${cdPrefix}${key.engine.id}"
+            else -> "${cdPrefix}${shQ(key.engine.id)}"
         }
     }
     fun setCodexApproval(key: ConversationKey, policy: String, reviewer: String = "user") {
@@ -1331,8 +1408,14 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
     }
 
     /** 将整个会话时间线导出为整洁的 Markdown 文档，方便复制或保存归档。 */
-    fun exportMarkdown(key: ConversationKey): String {
-        val state = state(key) ?: return ""
+    suspend fun exportMarkdown(key: ConversationKey): String {
+        val snapshot = state(key) ?: return ""
+        val state = completeHistory(snapshot)
+        return withContext(Dispatchers.Default) { formatMarkdown(state) }
+    }
+
+    private fun formatMarkdown(state: ConversationState): String {
+        val key = state.summary.key
         val sb = StringBuilder()
         sb.appendLine("# ${state.summary.title}")
         sb.appendLine()

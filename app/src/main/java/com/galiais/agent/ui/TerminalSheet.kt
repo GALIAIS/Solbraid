@@ -122,6 +122,7 @@ fun TerminalSheet(
     sshHost: SshHostConfig? = null,
     initialSessionId: String? = null,
     initialCommand: String? = null,
+    conversationRoute: String? = null,
     onDismiss: () -> Unit,
 ) {
     val manager = app.envSsh.nativeTerminals
@@ -188,7 +189,7 @@ fun TerminalSheet(
     var showMediaUrlDialog by remember { mutableStateOf(false) }
     var visualBellPulse by remember { mutableIntStateOf(0) }
     var errorBanner by remember { mutableStateOf<String?>(null) }
-    var autoBootDone by remember(cwd, sshHost?.id, initialSessionId) { mutableStateOf(false) }
+    var autoBootDone by remember(cwd, sshHost?.id, initialSessionId, initialCommand, conversationRoute) { mutableStateOf(false) }
     var openingPluginSurface by remember { mutableStateOf<Pair<String, String>?>(null) }
     var openingPluginPanel by remember { mutableStateOf<Pair<String, com.galiais.agent.engine.ChatArtifact>?>(null) }
     val stickyModifiers = remember { StickyModifierManager() }
@@ -210,7 +211,6 @@ fun TerminalSheet(
     val focusedLiveCwd by (focusedSession?.liveCwd ?: remember { MutableStateFlow(cwd) }).collectAsState()
     val focusedTranscriptPath by (focusedSession?.transcriptPath ?: remember { MutableStateFlow<String?>(null) }).collectAsState()
     val focusedMediaReq by (focusedSession?.pendingMediaRequest ?: remember { MutableStateFlow<Pair<Long, TerminalMediaRequest>?>(null) }).collectAsState()
-    val focusedFrameVer by (focusedSession?.engine?.frameVersion ?: remember { MutableStateFlow(0L) }).collectAsState()
     val usable = focusedSession != null && focusedStatus == TermSessionStatus.RUNNING
 
     val latestPrimary by rememberUpdatedState(primarySession)
@@ -232,30 +232,31 @@ fun TerminalSheet(
         PsReadLinePredictor.predict(src, history)
     }
 
-    // 异步防抖全文搜索（支持大小写/正则/全词，在 Dispatchers.Default 执行，绝不卡顿 UI 线程）
-    var lastJumpedKey by remember { mutableStateOf("") }
-    LaunchedEffect(showSearchBar, searchQuery, searchOptions, focusedSession?.id, focusedFrameVer) {
+    LaunchedEffect(showSearchBar, searchQuery, searchOptions, focusedSession) {
         val target = focusedSession
+        searchMatches = emptyList()
+        searchActiveIdx = 0
         if (!showSearchBar || searchQuery.isBlank() || target == null) {
-            searchMatches = emptyList()
-            searchActiveIdx = 0
-            lastJumpedKey = ""
             return@LaunchedEffect
         }
+        val query = searchQuery
+        val options = searchOptions
+        var positionAtLastMatch = true
         delay(90L)
-        val opts = searchOptions
-        val found = withContext(Dispatchers.Default) { target.engine.search(searchQuery, opts) }
-        searchMatches = found
-        val curKey = "$searchQuery|${opts.caseSensitive}|${opts.useRegex}|${opts.wholeWord}"
-        if (found.isEmpty()) {
-            searchActiveIdx = 0
-        } else if (curKey != lastJumpedKey || searchActiveIdx !in found.indices) {
-            lastJumpedKey = curKey
-            val idx = found.lastIndex
-            searchActiveIdx = idx
-            val match = found[idx]
-            val sb = target.engine.scrollbackSize
-            scrollOffsets[target.id] = (sb - match.absRow + target.engine.rows / 2).coerceIn(0, sb)
+        // StateFlow 合并搜索期间到达的帧，持续输出不会反复取消当前搜索。
+        target.engine.frameVersion.collect {
+            val found = withContext(Dispatchers.Default) { target.engine.search(query, options) }
+            searchMatches = found
+            if (found.isEmpty()) {
+                searchActiveIdx = 0
+                positionAtLastMatch = true
+            } else if (positionAtLastMatch || searchActiveIdx !in found.indices) {
+                positionAtLastMatch = false
+                searchActiveIdx = found.lastIndex
+                val sb = target.engine.scrollbackSize
+                scrollOffsets[target.id] = (sb - found.last().absRow + target.engine.rows / 2).coerceIn(0, sb)
+            }
+            delay(200L)
         }
     }
 
@@ -354,25 +355,16 @@ fun TerminalSheet(
         }
     }
 
-    LaunchedEffect(autoBootDone, runtime.ready, initialSessionId, sshHost?.id, initialCommand) {
+    LaunchedEffect(runtime.ready, cwd, initialSessionId, sshHost?.id, initialCommand, conversationRoute) {
         if (autoBootDone) return@LaunchedEffect
         val list = manager.sessions.value
-        if (!initialCommand.isNullOrBlank() && runtime.ready) {
-            val fresh = runCatching { manager.openLocal(cwd) }
+        if (!initialCommand.isNullOrBlank()) {
+            if (!runtime.ready) return@LaunchedEffect
+            val fresh = runCatching { manager.openLocal(cwd, initialCommand = initialCommand, conversationRoute = conversationRoute) }
                 .onFailure { errorBanner = it.message }.getOrNull()
             if (fresh != null) {
                 selectedId = fresh.id
                 autoBootDone = true
-                // 等待本地 shell PTY 准备就绪后自动注入原生 TUI 命令
-                var waited = 0
-                while (fresh.status.value != TermSessionStatus.RUNNING && waited < 3000) {
-                    delay(100L)
-                    waited += 100
-                }
-                delay(280L)
-                if (fresh.status.value == TermSessionStatus.RUNNING) {
-                    fresh.sendUserRaw("$initialCommand\r")
-                }
             }
             return@LaunchedEffect
         }

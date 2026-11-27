@@ -114,11 +114,11 @@ class ChatTimelineActions(
 )
 
 /**
- * 轮次增量分组缓存：已完成的历史轮次按 (user, body, durationMs) 复用不可变 [TurnBlock]，
- * 流式输出期间仅重算最后一轮，彻底消除每 48ms 扫描全历史 Diff 与工具调用的主线程开销。
+ * 复用内容和状态相同的轮次，只为变化的轮次保留新的条目快照。
  */
 class TurnBlockIncrementalCache {
     private data class CachedTurn(
+        val id: String,
         val user: TimelineItem.UserMessage?,
         val body: List<TimelineItem>,
         val durationMs: Long?,
@@ -126,7 +126,7 @@ class TurnBlockIncrementalCache {
         val block: TurnBlock,
     )
 
-    private var previous: List<CachedTurn> = emptyList()
+    private var previous: Map<String, CachedTurn> = emptyMap()
 
     fun group(
         items: List<TimelineItem>,
@@ -134,36 +134,38 @@ class TurnBlockIncrementalCache {
         running: Boolean,
     ): List<TurnBlock> {
         if (items.isEmpty()) {
-            previous = emptyList()
+            previous = emptyMap()
             return emptyList()
         }
-        val rawGroups = ArrayList<Pair<TimelineItem.UserMessage?, ArrayList<TimelineItem>>>()
-        for (item in items) {
-            if (item is TimelineItem.UserMessage) {
-                rawGroups += item to ArrayList()
-            } else {
-                if (rawGroups.isEmpty()) rawGroups += null to ArrayList()
-                rawGroups.last().second += item
-            }
-        }
-        val nextCache = ArrayList<CachedTurn>(rawGroups.size)
-        val out = ArrayList<TurnBlock>(rawGroups.size)
-        rawGroups.forEachIndexed { idx, (user, body) ->
-            val isLast = idx == rawGroups.lastIndex
-            val inProgress = running && isLast
+        val cap = maxOf(previous.size, 8)
+        val nextCache = HashMap<String, CachedTurn>(cap)
+        val out = ArrayList<TurnBlock>(cap)
+        var cursor = 0
+        while (cursor < items.size) {
+            val idx = out.size
+            val user = items[cursor] as? TimelineItem.UserMessage
+            if (user != null) cursor++
+            val start = cursor
+            while (cursor < items.size && items[cursor] !is TimelineItem.UserMessage) cursor++
+            val inProgress = running && cursor == items.size
             val durMs = user?.durationMs
                 ?: user?.turnId?.let { turnDurations[it] }
                 ?: user?.id?.let { turnDurations[it] }
-            val prev = previous.getOrNull(idx)
-            val reused = prev != null &&
-                !inProgress &&
-                !prev.inProgress &&
-                prev.user == user &&
-                prev.durationMs == durMs &&
-                prev.body == body
-            val block = if (reused) prev.block else buildSingleTurnBlock(idx, user, body, durMs, inProgress)
-            nextCache += CachedTurn(user, body, durMs, inProgress, block)
-            out += block
+            val stableId = user?.id
+                ?: items.getOrNull(start)?.id?.let { "turn-head-$it" }
+                ?: "turn-head-$idx"
+            val prev = previous[stableId]
+            val turn = if (prev != null && prev.user == user && prev.inProgress == inProgress &&
+                prev.durationMs == durMs && prev.body.size == cursor - start &&
+                prev.body.indices.all { prev.body[it] == items[start + it] }
+            ) {
+                prev
+            } else {
+                val body = items.subList(start, cursor).toList()
+                CachedTurn(stableId, user, body, durMs, inProgress, buildSingleTurnBlock(stableId, user, body, durMs, inProgress))
+            }
+            nextCache[stableId] = turn
+            out += turn.block
         }
         previous = nextCache
         return out
@@ -171,7 +173,7 @@ class TurnBlockIncrementalCache {
 }
 
 private fun buildSingleTurnBlock(
-    idx: Int,
+    stableId: String,
     user: TimelineItem.UserMessage?,
     body: List<TimelineItem>,
     durMs: Long?,
@@ -232,7 +234,7 @@ private fun buildSingleTurnBlock(
     }
 
     return TurnBlock(
-        id = user?.id ?: "turn-head-$idx",
+        id = stableId,
         userMessage = user,
         traceItems = traceItems,
         planItems = planItems,

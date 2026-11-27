@@ -35,6 +35,35 @@ class PerfAndFlickerTest {
     }
 
     @Test
+    fun turnBlockIncrementalCacheReusesExistingTurnsWhenPrependingHistory() {
+        val cache = TurnBlockIncrementalCache()
+        val u3 = TimelineItem.UserMessage("u3", "第三轮问题")
+        val a3 = TimelineItem.AgentMessage("a3", "第三轮回答", streaming = false)
+        val u4 = TimelineItem.UserMessage("u4", "第四轮问题")
+        val a4 = TimelineItem.AgentMessage("a4", "第四轮回答", streaming = false)
+
+        val initial = cache.group(listOf(u3, a3, u4, a4), emptyMap(), running = false)
+        assertEquals(2, initial.size)
+
+        val u1 = TimelineItem.UserMessage("u1", "第一轮问题")
+        val a1 = TimelineItem.AgentMessage("a1", "第一轮回答", streaming = false)
+        val u2 = TimelineItem.UserMessage("u2", "第二轮问题")
+        val a2 = TimelineItem.AgentMessage("a2", "第二轮回答", streaming = false)
+        val prepended = cache.group(listOf(u1, a1, u2, a2, u3, a3, u4, a4), emptyMap(), running = false)
+        assertEquals(4, prepended.size)
+        // 顶部插页后，原有轮次下标虽已右移，但仍必须 100% 命中缓存复用原对象，杜绝主线程重算
+        assertSame(initial[0], prepended[2])
+        assertSame(initial[1], prepended[3])
+
+        // 无头轮次（如系统提示在首条用户消息前）必须按首条子项 ID 生成稳定 key，避免插页后 key 漂移导致跳顶
+        val headNotice = TimelineItem.Notice("notice-boot", "会话恢复", error = false)
+        val withHead = cache.group(listOf(headNotice, u1, a1), emptyMap(), running = false)
+        assertEquals("turn-head-notice-boot", withHead[0].id)
+        val withHeadAgain = cache.group(listOf(headNotice, u1, a1, u2, a2), emptyMap(), running = false)
+        assertSame(withHead[0], withHeadAgain[0])
+    }
+
+    @Test
     fun splitMarkdownVirtualChunksKeepsFencesAndMathIntact() {
         val para = "这是一段用于测试超长回答块级虚拟化切分的中文自然段内容，确保切分长度达到阈值后仅在安全空行边界断开。\n".repeat(12)
         val fence = "```kotlin\n" + (1..25).joinToString("\n") { "val x$it = $it\n" } + "\n```"

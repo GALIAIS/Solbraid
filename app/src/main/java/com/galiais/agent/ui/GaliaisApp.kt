@@ -98,6 +98,7 @@ private data class TerminalLaunchRequest(
     val sshHost: SshHostConfig? = null,
     val initialSessionId: String? = null,
     val initialCommand: String? = null,
+    val conversation: ConversationKey? = null,
     val onClosed: (() -> Unit)? = null,
 )
 
@@ -492,6 +493,7 @@ fun GaliaisApp(app: GaliaisApplication) {
                         sshHost = req?.sshHost,
                         initialSessionId = req?.initialSessionId,
                         initialCommand = req?.initialCommand,
+                        conversationRoute = req?.conversation?.route,
                         onDismiss = {
                             req?.onClosed?.invoke()
                             safePopBack()
@@ -572,6 +574,7 @@ fun GaliaisApp(app: GaliaisApplication) {
                                 sshHost = null,
                                 initialSessionId = null,
                                 initialCommand = cmd,
+                                conversation = key,
                                 onClosed = onClosed,
                             )
                             safeNavigate("terminal")

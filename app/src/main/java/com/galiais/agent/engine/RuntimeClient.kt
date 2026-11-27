@@ -396,6 +396,31 @@ class RuntimeClient(val app: Application) {
     }
 
     fun hubRespond(id: Any, result: Any?) = connected().respond(id, result, "agent-hub")
+
+    internal suspend fun historyRequest(key: ConversationKey, cwd: String?, cursor: String?): JSONObject {
+        suspend fun fetch(params: JSONObject): JSONObject {
+            params.put("sessionId", key.id)
+            return if (key.engine == EngineKind.CLAUDE) requestObject(key.engine, "session/history", params)
+            else hubRequest("sessions/load", params.put("agentId", key.engine.id))
+        }
+        val first = fetch(jsonOf("cwd" to cwd, "cursor" to cursor,
+            "turnLimit" to if (cursor == null) INITIAL_HISTORY_TURNS else HISTORY_PAGE_TURNS))
+        val transfer = first.str("transfer") ?: return first
+        return withContext(Dispatchers.Default) {
+            val json = StringBuilder()
+            var part = first
+            while (true) {
+                val chunk = part.getString("chunk")
+                check(part.getString("transfer") == transfer && part.getInt("offset") == json.length && chunk.isNotEmpty()) {
+                    "会话历史分块不连续"
+                }
+                json.append(chunk)
+                if (part.getBoolean("done")) break
+                part = fetch(jsonOf("transfer" to transfer, "offset" to json.length))
+            }
+            JSONObject(json.toString())
+        }
+    }
     fun hubReject(id: Any, code: Int, message: String) = connected().reject(id, code, message, "agent-hub")
 
     val hubAvailable: Boolean

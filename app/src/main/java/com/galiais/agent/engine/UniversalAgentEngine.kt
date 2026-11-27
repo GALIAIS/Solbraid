@@ -1992,9 +1992,48 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
     }
 
     override suspend fun load(key: ConversationKey) {
-        val res = runtime.hubRequest("sessions/load", jsonOf("agentId" to kind.id, "sessionId" to key.id))
-        val session = res.optJSONObject("session") ?: return
-        val (items, restoredSteps) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+        val before = repo.state(key)
+        val res = runtime.historyRequest(key, null, null)
+        val session = res.getJSONObject("session")
+        val (items, restoredSteps) = mapHistory(session)
+        val restoredPlanExpl = session.str("planExplanation")
+        val rawModel = session.str("model") ?: settings.state.value.agentModels[kind.id]
+        val (model, splitEff) = if (kind.id == "antigravity") hub.splitAgyModelEffort(rawModel) else (rawModel to null)
+        val providerId = if (session.has("providerId")) session.str("providerId") else settings.state.value.agentProviders[kind.id]
+        val mode = session.str("mode") ?: if (kind.id == "antigravity") settings.state.value.antigravityPermissionMode else "default"
+        val effort = session.str("effort") ?: splitEff ?: hub.configOptionsOf(key).firstOrNull { it.id == "thought_level" }?.currentValue
+        hub.updateSessionMetadata(key, session)
+        val resolvedEffort = effort ?: hub.configOptionsOf(key).firstOrNull { it.id == "thought_level" }?.currentValue
+        repo.update(key) { state ->
+            state.copy(
+                summary = state.summary.copy(
+                    title = session.str("title") ?: state.summary.title,
+                    cwd = session.str("cwd") ?: state.summary.cwd,
+                ),
+                items = state.mergeHistoryItems(before, items),
+                historyCursor = res.str("nextCursor"),
+                plan = if (restoredSteps.isNotEmpty()) restoredSteps else state.plan,
+                planExplanation = restoredPlanExpl ?: state.planExplanation,
+                loaded = true,
+                running = if (before?.running != state.running) state.running else session.optBoolean("running"),
+                providerId = providerId,
+                model = model,
+                effort = resolvedEffort ?: state.effort,
+                permissionMode = mode,
+                remoteSessionId = session.str("remoteSessionId"),
+                additionalDirectories = session.arr("additionalDirectories").strings().ifEmpty { state.additionalDirectories },
+            )
+        }
+    }
+
+    override suspend fun loadEarlier(key: ConversationKey, cursor: String): ConversationHistoryPage {
+        val response = runtime.historyRequest(key, null, cursor)
+        val (items, _) = mapHistory(response.getJSONObject("session"))
+        return ConversationHistoryPage(items, response.str("nextCursor"))
+    }
+
+    private suspend fun mapHistory(session: JSONObject): Pair<List<TimelineItem>, List<PlanStep>> =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
             val builtItems = buildList {
                 session.arr("messages").objects().forEach { m ->
                     val id = m.str("id") ?: newId()
@@ -2118,35 +2157,6 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
             }
             builtItems to steps
         }
-        val restoredPlanExpl = session.str("planExplanation")
-        val rawModel = session.str("model") ?: settings.state.value.agentModels[kind.id]
-        val (model, splitEff) = if (kind.id == "antigravity") hub.splitAgyModelEffort(rawModel) else (rawModel to null)
-        val providerId = if (session.has("providerId")) session.str("providerId") else settings.state.value.agentProviders[kind.id]
-        val mode = session.str("mode") ?: if (kind.id == "antigravity") settings.state.value.antigravityPermissionMode else "default"
-        val effort = session.str("effort") ?: splitEff ?: hub.configOptionsOf(key).firstOrNull { it.id == "thought_level" }?.currentValue
-        hub.updateSessionMetadata(key, session)
-        val resolvedEffort = effort ?: hub.configOptionsOf(key).firstOrNull { it.id == "thought_level" }?.currentValue
-        repo.update(key) { state ->
-            state.copy(
-                summary = state.summary.copy(
-                    title = session.str("title") ?: state.summary.title,
-                    cwd = session.str("cwd") ?: state.summary.cwd,
-                ),
-                items = if (items.isNotEmpty() || state.items.isEmpty()) items else state.items,
-                plan = if (restoredSteps.isNotEmpty()) restoredSteps else state.plan,
-                planExplanation = restoredPlanExpl ?: state.planExplanation,
-                loaded = true,
-                running = session.optBoolean("running"),
-                providerId = providerId,
-                model = model,
-                effort = resolvedEffort ?: state.effort,
-                permissionMode = mode,
-                remoteSessionId = session.str("remoteSessionId") ?: state.remoteSessionId,
-                additionalDirectories = session.arr("additionalDirectories").strings().ifEmpty { state.additionalDirectories },
-            )
-        }
-    }
-
     override suspend fun create(cwd: String, options: CreateOptions): ConversationKey {
         check(runtime.hubAvailable) { "Agent 服务未就绪" }
         val normCwd = cwd.trim().trimEnd('/').ifEmpty { "/" }
@@ -2233,6 +2243,7 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
                 "provider" to hub.providerPayload(kind.id, current?.providerId, current?.model),
                 "apiKey" to directApiKey,
             ), timeoutMs = 1_500_000)
+            if (res.has("remoteSessionId")) repo.update(key) { it.copy(remoteSessionId = res.str("remoteSessionId")) }
             val finalText = res.optString("text")
             if (finalText.isNotBlank()) {
                 val hasAgentMsg = repo.state(key)?.items?.lastOrNull() is TimelineItem.AgentMessage

@@ -8,6 +8,7 @@ import {loadMcpServersForClaude} from "./extension-sync.mjs";
 import {loadEffectiveUserEnv} from "./env-ssh-hub.mjs";
 import {resolveCliInstallation, bundledCliInstallation} from "./cli-components.mjs";
 import {captureFileCheckpoint, resolveSafeHomePath} from "./safe-file-io.mjs";
+import {historyWindow, historyResponse, readHistoryChunk} from "./session-history.mjs";
 let installation = await resolveCliInstallation("claude");
 let sdkDirectory = installation.sdkDirectory;
 let executable = installation.binary;
@@ -492,6 +493,78 @@ async function verifyInstallationOrFallback() {
   }
 }
 
+function isRealUserPrompt(m) {
+  if (m?.type !== "user" || m.isSynthetic || m.is_meta || m.parent_tool_use_id) return false;
+  const content = m.message?.content;
+  if (typeof content === "string") return Boolean(content.trim());
+  return Array.isArray(content) && content.some(b => b?.type === "image" || b?.type === "document" ||
+    (b?.type === "text" && Boolean(b.text?.trim())));
+}
+
+function historyBlock(block) {
+  if ((block?.type === "image" || block?.type === "document") && block.source) {
+    return {type: block.type, title: block.title};
+  }
+  if (block?.type === "tool_result" && Array.isArray(block.content)) {
+    return {...block, content: block.content.map(historyBlock)};
+  }
+  return block;
+}
+
+// 首屏只重放前序的会话状态变更，避免把早期对话、命令输出和附件送到手机。
+function priorHistoryState(messages, end) {
+  const state = [], taskCreates = new Set();
+  const latest = new Map();
+  for (let i = 0; i < end; i++) {
+    const m = messages[i];
+    if (m.parent_tool_use_id) continue;
+    if (m.type === "system" && ["init", "status", "compact_boundary"].includes(m.subtype)) {
+      state.push({type: m.type, subtype: m.subtype, model: m.model, permissionMode: m.permissionMode, compact_metadata: m.compact_metadata});
+    } else if (m.type === "result" || (m.type === "assistant" && m.message?.usage)) {
+      latest.set(m.type, {index: i, position: state.length, message: m});
+    }
+    if (!Array.isArray(m.message?.content)) continue;
+    const blocks = m.message.content.filter(b => {
+      if (b?.type === "tool_result") return taskCreates.delete(b.tool_use_id);
+      if (b?.type !== "tool_use") return false;
+      if (b.name === "TaskCreate") taskCreates.add(b.id);
+      if (["TodoWrite", "TaskCreate", "TaskUpdate", "EnterPlanMode", "ExitPlanMode"].includes(b.name)) return true;
+      const path = String(b.input?.file_path || b.input?.path || "").toLowerCase().replaceAll("\\", "/");
+      return ["Write", "Edit"].includes(b.name) &&
+        (path.includes("/.claude/plans/") || /(?:^|\/)(?:plan|implementation_plan)\.md$/.test(path));
+    });
+    if (blocks.length) state.push({type: m.type, uuid: m.uuid, message: {id: m.message.id, content: blocks}});
+  }
+  for (const {position, message: m} of [...latest.values()].sort((a, b) => b.index - a.index)) {
+    state.splice(position, 0, m.type === "result" ? {type: "result", usage: m.usage, modelUsage: m.modelUsage} :
+      {type: "assistant", message: {usage: m.message.usage}});
+  }
+  return state;
+}
+
+let historySnapshot, historyExpiry;
+async function readHistory(params) {
+  const id = uuid(params.sessionId);
+  if (params.transfer) return readHistoryChunk(id, params.transfer, params.offset);
+  const opts = params.cwd == null ? {} : {dir: await directory(params.cwd)};
+  let messages = historySnapshot?.id === id && historySnapshot.dir === opts.dir && params.cursor ? historySnapshot.messages : null;
+  if (!messages) {
+    messages = await sdk.getSessionMessages(id, {...opts, includeSystemMessages: true});
+    for (const m of messages) {
+      if (Array.isArray(m.message?.content)) m.message.content = m.message.content.map(historyBlock);
+    }
+  }
+  const page = historyWindow(messages, params.cursor, params.turnLimit, isRealUserPrompt, m => m.uuid);
+  clearTimeout(historyExpiry);
+  historySnapshot = page.start > 0 ? {id, dir: opts.dir, messages} : null;
+  if (historySnapshot) {
+    historyExpiry = setTimeout(() => { historySnapshot = null; }, 60_000);
+    historyExpiry.unref();
+  }
+  return historyResponse(id, {messages: messages.slice(page.start, page.end), nextCursor: page.nextCursor,
+    priorState: params.cursor == null && page.start ? priorHistoryState(messages, page.start) : []});
+}
+
 async function dispatch(method, params) {
   if (method === "initialize") {
     if (initialized) throw new Error("Claude Code bridge has already initialized");
@@ -521,6 +594,7 @@ async function dispatch(method, params) {
         activeSessions: listActiveSessionsSnapshot(),
       };
     }
+    case "session/history": return readHistory(params);
     case "session/read": {
       const id=uuid(params.sessionId), limit=params.limit ?? 50, offset=params.offset ?? 0;
       if (!Number.isInteger(limit) || limit<1 || limit>100 || !Number.isInteger(offset) || offset<0) throw new Error("Invalid session history range");
@@ -568,24 +642,12 @@ async function dispatch(method, params) {
       if (existing && !existing.closed && existing.busy) {
         throw new Error("当前会话正在运行任务，请先停止后再编辑重发");
       }
-      if (params.rewindFiles === true && beforeMessageId && existing && !existing.closed && existing.query) {
-        await existing.query.rewindFiles(beforeMessageId, {dryRun: false});
-      }
-      if (existing && !existing.closed) closeSession(existing);
       const opts = {...(params.cwd === undefined ? {} : {dir: await directory(params.cwd)})};
       const info = await sdk.getSessionInfo(id, opts).catch(() => null);
-      const allMessages = await sdk.getSessionMessages(id, {...opts, includeSystemMessages: true}).catch(() => []);
-      const isRealUserPrompt = (m) => {
-        if (!m || m.type !== "user" || m.isSynthetic === true) return false;
-        const c = m.message?.content;
-        if (typeof c === "string") return c.trim().length > 0;
-        if (Array.isArray(c)) {
-          return c.some(b => b && (b.type === "text" || b.type === "image" || b.type === "document") && (b.type !== "text" || String(b.text || "").trim().length > 0));
-        }
-        return false;
-      };
-      let targetIdx = beforeMessageId ? allMessages.findIndex(m => m?.uuid === beforeMessageId) : -1;
-      if (targetIdx < 0 && userTurnIndex >= 0) {
+      const allMessages = await sdk.getSessionMessages(id, {...opts, includeSystemMessages: true});
+
+      let targetIdx = beforeMessageId ? allMessages.findIndex(m => m?.uuid === beforeMessageId && isRealUserPrompt(m)) : -1;
+      if (!beforeMessageId && userTurnIndex >= 0) {
         let seen = 0;
         for (let i = 0; i < allMessages.length; i++) {
           if (isRealUserPrompt(allMessages[i])) {
@@ -595,10 +657,13 @@ async function dispatch(method, params) {
         }
       }
       if (targetIdx < 0) {
-        // 目标消息尚未落盘（例如上次发送失败未写入 transcript），服务端历史已处于其之前
-        return {sessionId: id, mode: "noop", retainedCount: allMessages.length, userMessageUuids: []};
+        throw new Error("未找到待回退的消息，请重新加载会话后重试");
       }
-      if (targetIdx === 0) {
+      if (params.rewindFiles === true && beforeMessageId && existing && !existing.closed && existing.query) {
+        await existing.query.rewindFiles(beforeMessageId, {dryRun: false});
+      }
+      if (existing && !existing.closed) closeSession(existing);
+      if (!allMessages.slice(0, targetIdx).some(isRealUserPrompt)) {
         try { await sdk.deleteSession(id, opts); } catch (err) {
           if (err?.code !== "ENOENT" && !/not found/i.test(String(err?.message || err || ""))) throw err;
         }

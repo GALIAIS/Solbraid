@@ -733,12 +733,25 @@ sealed interface Decision {
     data class FormSubmit(val content: JSONObject) : Decision
 }
 
+internal const val INITIAL_HISTORY_TURNS = 5
+internal const val HISTORY_PAGE_TURNS = 25
+
+data class ConversationHistoryPage(
+    val items: List<TimelineItem>,
+    val nextCursor: String?,
+    val durations: Map<String, Long> = emptyMap(),
+    val activeTurnId: String? = null,
+)
+
 data class ConversationState(
     val summary: ConversationSummary,
     val items: List<TimelineItem> = emptyList(),
     val running: Boolean = false,
     val activeTurnId: String? = null,
     val loaded: Boolean = false,
+    val historyCursor: String? = null,
+    val loadingEarlier: Boolean = false,
+    val historyError: String? = null,
     /** null 表示使用官方内置服务商；非 null 指向 [CustomProvider.id]。 */
     val providerId: String? = null,
     val model: String? = null,
@@ -782,6 +795,17 @@ data class ConversationState(
     val fastModeDisabledReason: String? = null,
     val claudeCodeVersion: String? = null,
 )
+
+internal fun ConversationState.mergeHistoryItems(before: ConversationState?, page: List<TimelineItem>): List<TimelineItem> {
+    if (items.isEmpty() || (items === before?.items && !running)) return page
+    val old = before?.items.orEmpty().associateBy { it.id }
+    val activeStart = if (running) items.indexOfLast { it is TimelineItem.UserMessage } else -1
+    val changed = items.filterIndexed { index, item ->
+        (activeStart >= 0 && index >= activeStart) || old[item.id] !== item
+    }.associateByTo(LinkedHashMap()) { it.id }
+    if (changed.isEmpty()) return page
+    return page.map { changed.remove(it.id) ?: it } + changed.values
+}
 
 data class ModelOption(
     val id: String,
