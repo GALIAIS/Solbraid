@@ -55,6 +55,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.Role
@@ -856,11 +857,17 @@ private fun FloatingDockTrack(
 ) {
     val g = G
     Surface(
-        modifier = modifier,
+        modifier = modifier.shadow(
+            elevation = if (g.dark) 4.dp else 6.dp,
+            shape = CircleShape,
+            clip = false,
+            ambientColor = softShadowAmbient(g),
+            spotColor = softShadowSpot(g),
+        ),
         shape = CircleShape,
         color = g.surface.copy(alpha = if (g.dark) 0.78f else 0.84f),
         border = BorderStroke(1.dp, g.borderStrong.copy(alpha = if (g.dark) 0.72f else 0.85f)),
-        shadowElevation = if (g.dark) 6.dp else 8.dp,
+        shadowElevation = 0.dp,
     ) {
         BoxWithConstraints(modifier = Modifier.fillMaxWidth().padding(4.dp).height(50.dp)) {
             val slotW = maxWidth / tabItems.size

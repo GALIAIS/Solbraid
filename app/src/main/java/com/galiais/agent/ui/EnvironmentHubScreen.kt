@@ -857,6 +857,7 @@ private fun RuntimeEnvSnapshotSheet(
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = 160.dp, max = 440.dp),
+                    contentPadding = PaddingValues(vertical = 2.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     items(filtered, key = { it.key }) { item ->

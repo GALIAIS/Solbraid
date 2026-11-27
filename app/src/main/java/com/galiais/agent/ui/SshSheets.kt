@@ -691,6 +691,7 @@ fun SftpBrowserSheet(
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = 180.dp, max = 440.dp),
+                    contentPadding = PaddingValues(vertical = 2.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     items(entries, key = { it.path }) { entry ->

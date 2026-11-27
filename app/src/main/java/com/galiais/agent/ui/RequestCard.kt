@@ -37,6 +37,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -88,24 +89,36 @@ fun ApprovalCardContainer(
         "hazard_header" -> g.borderStrong
         else -> g.border
     }
-    val shadow = when (style) {
-        "soft_halo" -> if (g.dark) 3.dp else 6.dp
-        else -> if (d.cardStyle == "elevated" && !g.dark) 3.dp else 0.dp
+    val shadow = if (LocalFlatCardContext.current) {
+        0.dp
+    } else when (style) {
+        "soft_halo" -> if (g.dark) 2.dp else 4.dp
+        else -> if (d.cardStyle == "elevated" && !g.dark) 2.dp else 0.dp
     }
 
-    val haloMod = if (style == "soft_halo") {
+    val haloMod = (if (style == "soft_halo") {
         modifier
             .fillMaxWidth()
             .border(3.dp, g.warning.copy(alpha = 0.16f), RoundedCornerShape(d.cardRadius + 3.dp))
             .padding(2.dp)
-    } else modifier.fillMaxWidth()
+    } else modifier.fillMaxWidth()).let { base ->
+        if (shadow > 0.dp) {
+            base.shadow(
+                elevation = shadow,
+                shape = shape,
+                clip = false,
+                ambientColor = softShadowAmbient(g),
+                spotColor = softShadowSpot(g),
+            )
+        } else base
+    }
 
     Surface(
         modifier = haloMod,
         shape = shape,
         color = bg,
         border = BorderStroke(if (style == "hazard_header") 1.25.dp else 1.dp, borderColor),
-        shadowElevation = shadow,
+        shadowElevation = 0.dp,
     ) {
         val innerDrawMod = when (style) {
             "top_glow" -> Modifier.drawBehind {

@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -127,6 +128,7 @@ fun ThemeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, on
         onBack = onBack,
         snackbar = snackbar,
         scrollable = false,
+        contentPadding = PaddingValues(0.dp),
         actions = {
             TextButton(onClick = {
                 set { ThemePresetCatalog.randomHarmoniousMix(it) }
@@ -135,7 +137,7 @@ fun ThemeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, on
         },
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
@@ -157,25 +159,29 @@ fun ThemeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, on
             TagPill("收藏", fg = G.accent, bg = G.accentContainer, onClick = { savingCustom = true })
         }
         AnimatedExpandable(expanded = showPreview) {
-            ThemePreview()
+            Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+                ThemePreview()
+            }
         }
         SegmentedPillBar(
             options = listOf("presets" to "预设", "color" to "色彩", "style" to "外观", "typo" to "排版"),
             selected = activeTab,
             onSelect = { activeTab = it },
+            modifier = Modifier.padding(horizontal = 16.dp),
         )
         Column(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
-                .verticalScroll(rememberScrollState()),
+                .verticalScroll(rememberScrollState())
+                .padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(D.space(10.dp)),
         ) {
             Crossfade(targetState = activeTab, animationSpec = tween(120), label = "themeTab") { tab ->
                 Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(D.space(10.dp))) {
                     when (tab) {
                         "presets" -> {
-                            SectionLabel("一键主题预设（24 套${if (customThemes.isNotEmpty()) " + ${customThemes.size} 收藏" else ""}）")
+                            SectionLabel("主题预设（24 套${if (customThemes.isNotEmpty()) " + ${customThemes.size} 收藏" else ""}）")
                             GaliaisScrollableTabBar(
                                 options = categories.map { it to it },
                                 selected = selectedCategory,

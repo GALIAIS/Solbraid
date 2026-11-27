@@ -311,10 +311,10 @@ private fun neutrals(config: ThemeConfig, dark: Boolean): Neutrals = if (!dark) 
         Color(0xFFF3F4F8), Color(0xFF9298AC), Color(0xFF60667A), Color(0xFF0B0C10))
 }
 
-/** 按感知亮度阈值选择前景墨色：中高饱和度强调色（如暖陶/祖母绿/靛蓝）保持清晰纯白，高亮度浅色/霓虹色切深墨。 */
+/** 按感知亮度阈值选择前景墨色：中高饱和度强调色保持清晰纯白，较亮深色态强调色切深墨以满足 WCAG AA 对比度。 */
 internal fun readableOn(bg: Color): Color {
     val lum = ColorEngine.relativeLuminance(bg)
-    return if (lum > 0.38) Color(0xFF111114) else Color.White
+    return if (lum > 0.32) Color(0xFF111114) else Color.White
 }
 
 /** GALIAIS 编辑风：中性纸张/深色基调 + 可选强调色（默认墨色）。 */
@@ -417,8 +417,8 @@ private fun schemeFromGaliais(p: GaliaisColors): ColorScheme {
     return base.copy(
         primary = p.accent, onPrimary = p.onAccent,
         primaryContainer = p.accentContainer, onPrimaryContainer = p.onAccentContainer,
-        secondary = p.codex, onSecondary = Color.White, secondaryContainer = p.accentContainer, onSecondaryContainer = p.onAccentContainer,
-        tertiary = p.claude, onTertiary = Color.White, tertiaryContainer = p.claudeTint, onTertiaryContainer = p.claude,
+        secondary = p.codex, onSecondary = p.onCodex, secondaryContainer = p.accentContainer, onSecondaryContainer = p.onAccentContainer,
+        tertiary = p.claude, onTertiary = readableOn(p.claude), tertiaryContainer = p.claudeTint, onTertiaryContainer = p.claude,
         background = p.canvas, onBackground = p.ink,
         surface = p.surface, onSurface = p.ink, surfaceVariant = p.surfaceSubtle, onSurfaceVariant = p.inkMuted,
         surfaceTint = Color.Transparent,

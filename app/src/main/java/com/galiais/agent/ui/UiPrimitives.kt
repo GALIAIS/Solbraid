@@ -34,6 +34,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -279,11 +280,13 @@ fun GaliaisAlertDialog(
         shape = D.dialogShape,
         title = { Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = if (danger) G.danger else G.ink) },
         text = {
-            Column(
-                modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                content = content,
-            )
+            CompositionLocalProvider(LocalFlatCardContext provides true) {
+                Column(
+                    modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    content = content,
+                )
+            }
         },
         confirmButton = {
             TextButton(enabled = confirmEnabled, onClick = onConfirm) {
@@ -328,11 +331,13 @@ fun GaliaisAlertDialog(
             )
         },
         text = {
-            Column(
-                modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                text()
+            CompositionLocalProvider(LocalFlatCardContext provides true) {
+                Column(
+                    modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    text()
+                }
             }
         },
         confirmButton = confirmButton,

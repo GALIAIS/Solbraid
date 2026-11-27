@@ -47,6 +47,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalClipboard
@@ -210,11 +211,19 @@ fun PluginGlobalOverlayLayer(
                     when {
                         isCardMode && liveCard != null && !collapsed -> {
                             Surface(
-                                modifier = Modifier.widthIn(min = 180.dp, max = 280.dp),
+                                modifier = Modifier
+                                    .widthIn(min = 180.dp, max = 280.dp)
+                                    .shadow(
+                                        elevation = 6.dp,
+                                        shape = D.shape(16.dp),
+                                        clip = false,
+                                        ambientColor = softShadowAmbient(G),
+                                        spotColor = softShadowSpot(G),
+                                    ),
                                 shape = D.shape(16.dp),
                                 color = G.surface.copy(alpha = 0.96f),
                                 border = BorderStroke(1.dp, G.borderStrong),
-                                shadowElevation = 8.dp,
+                                shadowElevation = 0.dp,
                             ) {
                                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -247,11 +256,19 @@ fun PluginGlobalOverlayLayer(
                         slot.displayMode == "fab" -> {
                             Surface(
                                 onClick = { triggerOverlay() },
-                                modifier = Modifier.size(48.dp),
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .shadow(
+                                        elevation = 6.dp,
+                                        shape = D.fabShape,
+                                        clip = false,
+                                        ambientColor = softShadowAmbient(G),
+                                        spotColor = softShadowSpot(G),
+                                    ),
                                 shape = D.fabShape,
                                 color = G.accent,
                                 contentColor = G.onAccent,
-                                shadowElevation = 8.dp,
+                                shadowElevation = 0.dp,
                             ) {
                                 Box(contentAlignment = Alignment.Center) {
                                     val txt = slot.badge.ifBlank { slot.label.take(2) }
@@ -266,10 +283,17 @@ fun PluginGlobalOverlayLayer(
                         else -> {
                             Surface(
                                 onClick = { if (isCardMode && collapsed) collapsed = false else triggerOverlay() },
+                                modifier = Modifier.shadow(
+                                    elevation = 5.dp,
+                                    shape = CircleShape,
+                                    clip = false,
+                                    ambientColor = softShadowAmbient(G),
+                                    spotColor = softShadowSpot(G),
+                                ),
                                 shape = CircleShape,
                                 color = G.surface.copy(alpha = 0.96f),
                                 border = BorderStroke(1.dp, G.accent.copy(alpha = 0.45f)),
-                                shadowElevation = 6.dp,
+                                shadowElevation = 0.dp,
                             ) {
                                 Row(
                                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),

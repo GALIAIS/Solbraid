@@ -384,7 +384,13 @@ internal fun TerminalVideoPlayerOverlay(
                     .offset { IntOffset(pipOffsetX.roundToInt(), pipOffsetY.roundToInt()) }
                     .width(268.dp)
                     .height(216.dp)
-                    .shadow(12.dp, RoundedCornerShape(12.dp))
+                    .shadow(
+                        elevation = 8.dp,
+                        shape = RoundedCornerShape(12.dp),
+                        clip = false,
+                        ambientColor = softShadowAmbient(G),
+                        spotColor = softShadowSpot(G),
+                    )
                     .clip(RoundedCornerShape(12.dp))
                     .border(1.dp, scheme.accentColor.copy(alpha = 0.75f), RoundedCornerShape(12.dp)),
             )

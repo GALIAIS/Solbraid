@@ -80,7 +80,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextFieldColors
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -89,12 +91,14 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
@@ -119,13 +123,22 @@ import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.runtime.remember
 import com.galiais.agent.engine.AgentCatalog
 import com.galiais.agent.engine.EngineKind
 
+/** 标记当前处于浮层容器（底部抽屉、对话框、悬浮气泡或父卡片内部），子卡片自动降级为平面细框以杜绝“阴影叠阴影”和滚动边界硬裁切。 */
+val LocalFlatCardContext = compositionLocalOf { false }
+
+/** 柔和的语义化阴影色（替代 Android 默认纯黑重影）。 */
+internal fun softShadowAmbient(g: GaliaisColors): Color =
+    if (g.dark) Color.Black.copy(alpha = 0.55f) else g.ink.copy(alpha = 0.22f)
+
+internal fun softShadowSpot(g: GaliaisColors): Color =
+    if (g.dark) Color.Black.copy(alpha = 0.70f) else g.ink.copy(alpha = 0.36f)
+
 /**
  * 卡片：随「卡片材质」令牌切换 6 种风格（微光边 / 工业硬影 / 柔影浮卡 / M3 拼接 / 极细框 / 柔和填充）。
- * 显式传入 [background] 时视为语义着色卡片（警告、提示等）。
+ * 显式传入 [background] 时视为语义着色卡片（警告、提示等）；在抽屉/弹窗/父卡片内自动平面化去投影。
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -136,6 +149,7 @@ fun CrispCard(
     borderColor: Color = Color.Unspecified,
     padding: PaddingValues? = null,
     groupPosition: CardGroupPos = CardGroupPos.SINGLE,
+    flat: Boolean = LocalFlatCardContext.current,
     onClick: (() -> Unit)? = null,
     onLongClick: (() -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit,
@@ -157,6 +171,14 @@ fun CrispCard(
         bg = background
         border = borderColor.takeIf { it != Color.Unspecified }
         elevation = 0.dp
+    } else if (flat) {
+        bg = when (d.cardStyle) {
+            "filled", "grouped_expressive" -> g.surfaceFilled
+            else -> if (g.dark) lerp(g.surface, g.surfaceSubtle, 0.35f) else g.surface
+        }
+        border = borderColor.takeIf { it != Color.Unspecified }
+            ?: if (d.cardStyle == "hardware_tactile") g.borderStrong else g.border
+        elevation = 0.dp
     } else when (d.cardStyle) {
         "filled", "grouped_expressive" -> {
             bg = g.surfaceFilled
@@ -165,13 +187,13 @@ fun CrispCard(
         }
         "elevated" -> {
             bg = g.surfaceElevated
-            border = borderColor.takeIf { it != Color.Unspecified } ?: if (g.dark) g.border.copy(alpha = 0.65f) else g.border.copy(alpha = 0.35f)
-            elevation = if (g.dark) 2.dp else 5.dp
+            border = borderColor.takeIf { it != Color.Unspecified } ?: if (g.dark) g.border.copy(alpha = 0.65f) else g.border.copy(alpha = 0.48f)
+            elevation = if (g.dark) 2.dp else 3.dp
         }
         "glass_hairline" -> {
             bg = g.surface
             border = if (borderColor != Color.Unspecified) borderColor else g.border
-            elevation = 2.dp
+            elevation = if (g.dark) 1.dp else 1.5.dp
             topSpecular = true
         }
         "hardware_tactile" -> {
@@ -187,24 +209,36 @@ fun CrispCard(
         }
     }
 
-    val outerMod = if (hardwareShadow) {
-        val shadowColor = if (g.dark) Color.Black.copy(alpha = 0.85f) else g.ink.copy(alpha = 0.16f)
-        val cornerPx = if (radius != Dp.Unspecified) d.radius(radius) else d.cardRadius
-        modifier
-            .fillMaxWidth()
-            .padding(end = 2.dp, bottom = 2.dp)
-            .drawBehind {
-                val off = 2.5.dp.toPx()
-                val cr = CornerRadius(cornerPx.toPx(), cornerPx.toPx())
-                drawRoundRect(
-                    color = shadowColor,
-                    topLeft = Offset(off, off),
-                    size = size,
-                    cornerRadius = cr,
+    val outerMod = when {
+        hardwareShadow -> {
+            val shadowColor = if (g.dark) Color.Black.copy(alpha = 0.85f) else g.ink.copy(alpha = 0.16f)
+            val cornerPx = if (radius != Dp.Unspecified) d.radius(radius) else d.cardRadius
+            modifier
+                .fillMaxWidth()
+                .padding(end = 2.dp, bottom = 2.dp)
+                .drawBehind {
+                    val off = 2.5.dp.toPx()
+                    val cr = CornerRadius(cornerPx.toPx(), cornerPx.toPx())
+                    drawRoundRect(
+                        color = shadowColor,
+                        topLeft = Offset(off, off),
+                        size = size,
+                        cornerRadius = cr,
+                    )
+                }
+        }
+        elevation > 0.dp -> {
+            modifier
+                .fillMaxWidth()
+                .shadow(
+                    elevation = elevation,
+                    shape = shape,
+                    clip = false,
+                    ambientColor = softShadowAmbient(g),
+                    spotColor = softShadowSpot(g),
                 )
-            }
-    } else {
-        modifier.fillMaxWidth()
+        }
+        else -> modifier.fillMaxWidth()
     }
 
     Surface(
@@ -212,7 +246,7 @@ fun CrispCard(
         shape = shape,
         color = bg,
         border = border?.let { BorderStroke(d.borderWidth, it) },
-        shadowElevation = elevation,
+        shadowElevation = 0.dp,
         tonalElevation = 0.dp,
     ) {
         val clickModifier = if (onClick != null || onLongClick != null) {
@@ -231,13 +265,15 @@ fun CrispCard(
                 )
             }
         } else Modifier
-        Column(
-            clickModifier
-                .then(specularMod)
-                .fillMaxWidth()
-                .padding(padding ?: PaddingValues(d.space(16.dp))),
-            content = content,
-        )
+        CompositionLocalProvider(LocalFlatCardContext provides true) {
+            Column(
+                clickModifier
+                    .then(specularMod)
+                    .fillMaxWidth()
+                    .padding(padding ?: PaddingValues(d.space(16.dp))),
+                content = content,
+            )
+        }
     }
 }
 
@@ -815,12 +851,14 @@ fun GaliaisSheet(onDismissRequest: () -> Unit, content: @Composable ColumnScope.
         contentWindowInsets = { WindowInsets(0, 0, 0, 0) },
         dragHandle = { BottomSheetDefaults.DragHandle(color = if (D.material) G.inkMuted.copy(alpha = 0.4f) else G.borderStrong) },
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .nestedScroll(BottomSheetUpwardOverscrollGuard),
-            content = content,
-        )
+        CompositionLocalProvider(LocalFlatCardContext provides true) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .nestedScroll(BottomSheetUpwardOverscrollGuard),
+                content = content,
+            )
+        }
     }
 }
 
@@ -849,7 +887,7 @@ fun CodeContent(
     val fontSize = d.codeSize(baseSize)
     val lineHeight = d.codeSize(baseSize * 1.52f)
     val totalLines = remember(text.text) { text.text.count { it == '\n' } + 1 }
-    val expandedLongState = remember(text.text) { androidx.compose.runtime.mutableStateOf(false) }
+    val expandedLongState = remember { androidx.compose.runtime.mutableStateOf(false) }
     val expandedLong = expandedLongState.value
     val collapseLimit = 80
     val shouldCollapse = totalLines > collapseLimit && !expandedLong
@@ -924,6 +962,7 @@ fun SubPageScaffold(
     snackbar: SnackbarHostState? = null,
     loading: Boolean = false,
     scrollable: Boolean = true,
+    contentPadding: PaddingValues = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
     actions: @Composable RowScope.() -> Unit = {},
     floatingActionButton: @Composable () -> Unit = {},
     content: @Composable ColumnScope.() -> Unit,
@@ -969,7 +1008,7 @@ fun SubPageScaffold(
             .consumeWindowInsets(padding)
             .imePadding()
             .let { if (scrollable) it.verticalScroll(rememberScrollState()) else it }
-            .padding(horizontal = 16.dp, vertical = 12.dp)
+            .padding(contentPadding)
         Column(
             modifier = bodyMod,
             verticalArrangement = Arrangement.spacedBy(D.space(10.dp)),
@@ -1178,7 +1217,7 @@ fun GaliaisDropdownMenu(
         shape = d.popupShape,
         containerColor = popupBg,
         tonalElevation = 0.dp,
-        shadowElevation = if (isHardware) 2.dp else if (g.dark) 8.dp else 10.dp,
+        shadowElevation = if (isHardware) 2.dp else if (g.dark) 5.dp else 6.dp,
         border = BorderStroke(d.borderWidth, if (isHardware) g.borderStrong else g.border),
         content = content,
     )
@@ -1258,6 +1297,7 @@ fun GaliaisAnchoredPopover(
         val hardwareOuter = if (isHardware) {
             val shadowColor = if (g.dark) Color.Black.copy(alpha = 0.85f) else g.ink.copy(alpha = 0.16f)
             Modifier
+                .padding(horizontal = 4.dp, vertical = 4.dp)
                 .widthIn(min = minWidth, max = maxWidth)
                 .padding(end = 2.dp, bottom = 2.dp)
                 .drawBehind {
@@ -1271,7 +1311,16 @@ fun GaliaisAnchoredPopover(
                     )
                 }
         } else {
-            Modifier.widthIn(min = minWidth, max = maxWidth)
+            Modifier
+                .padding(horizontal = 10.dp, vertical = 10.dp)
+                .widthIn(min = minWidth, max = maxWidth)
+                .shadow(
+                    elevation = if (g.dark) 6.dp else 8.dp,
+                    shape = d.popupShape,
+                    clip = false,
+                    ambientColor = softShadowAmbient(g),
+                    spotColor = softShadowSpot(g),
+                )
         }
 
         Surface(
@@ -1279,17 +1328,19 @@ fun GaliaisAnchoredPopover(
             shape = d.popupShape,
             color = popupBg,
             border = BorderStroke(d.borderWidth, if (isHardware) g.borderStrong else g.border),
-            shadowElevation = if (isHardware) 0.dp else if (g.dark) 10.dp else 12.dp,
+            shadowElevation = 0.dp,
             tonalElevation = 0.dp,
         ) {
-            Column(
-                modifier = specularMod
-                    .heightIn(max = 360.dp)
-                    .verticalScroll(rememberScrollState())
-                    .padding(contentPadding),
-                verticalArrangement = Arrangement.spacedBy(2.dp),
-                content = content,
-            )
+            CompositionLocalProvider(LocalFlatCardContext provides true) {
+                Column(
+                    modifier = specularMod
+                        .heightIn(max = 360.dp)
+                        .verticalScroll(rememberScrollState())
+                        .padding(contentPadding),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                    content = content,
+                )
+            }
         }
     }
 }
