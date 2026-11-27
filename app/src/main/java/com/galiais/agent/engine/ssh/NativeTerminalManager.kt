@@ -137,7 +137,7 @@ class LiveTerminalSession(
     private val writeLock = Any()
     private val draftLock = Any()
     private val typedLine = StringBuilder()
-    private val outbound = Channel<OutboundOp>(Channel.UNLIMITED)
+    private val outbound = Channel<OutboundOp>(256)
     @Volatile var disposed: Boolean = false
         private set
 
@@ -658,7 +658,12 @@ class NativeTerminalManager(
                 val initParts = buildList {
                     val remoteDir = host.defaultPath.trim()
                     if (remoteDir.isNotEmpty() && !remoteDir.contains('\n') && !remoteDir.contains('\r')) {
-                        add("cd '${remoteDir.replace("'", "'\\''")}' 2>/dev/null || true")
+                        val cdExpr = when {
+                            remoteDir == "~" -> "cd ~"
+                            remoteDir.startsWith("~/") -> "cd ~/'${remoteDir.removePrefix("~/").replace("'", "'\\''")}'"
+                            else -> "cd '${remoteDir.replace("'", "'\\''")}'"
+                        }
+                        add("$cdExpr 2>/dev/null || true")
                     }
                     val startup = host.startupCommand.trim()
                     if (startup.isNotEmpty() && !startup.contains('\r')) {

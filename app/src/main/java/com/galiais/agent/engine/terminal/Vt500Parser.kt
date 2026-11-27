@@ -39,9 +39,9 @@ class Vt500Parser(
     private var csiPrivate: Char = '\u0000'
     private var csiIntermediate: Char = '\u0000'
     private val csiRaw = StringBuilder(32)
-    private val oscRaw = ByteArrayOutputStream(256)
-    private val apcRaw = ByteArrayOutputStream(256)
-    private val dcsRaw = ByteArrayOutputStream(256)
+    private var oscRaw = ByteArrayOutputStream(256)
+    private var apcRaw = ByteArrayOutputStream(256)
+    private var dcsRaw = ByteArrayOutputStream(256)
     private var lastPrintedCp: Int = ' '.code
 
     // 流式 UTF-8 解码状态（容错跨包拆分的多字节中文/Emoji，严格拦截非法码点/代理区/过长编码）
@@ -49,15 +49,18 @@ class Vt500Parser(
     private var utf8Remaining = 0
     private var utf8MinCp = 0
 
+    private fun resetOrShrink(buf: ByteArrayOutputStream): ByteArrayOutputStream =
+        if (buf.size() > 65_536) ByteArrayOutputStream(256) else buf.apply { reset() }
+
     fun reset() {
         state = State.GROUND
         escIntermediate = 0
         csiPrivate = '\u0000'
         csiIntermediate = '\u0000'
         csiRaw.clear()
-        oscRaw.reset()
-        apcRaw.reset()
-        dcsRaw.reset()
+        oscRaw = resetOrShrink(oscRaw)
+        apcRaw = resetOrShrink(apcRaw)
+        dcsRaw = resetOrShrink(dcsRaw)
         utf8CodePoint = 0
         utf8Remaining = 0
         utf8MinCp = 0
@@ -539,7 +542,7 @@ class Vt500Parser(
     private fun dispatchDcs() {
         if (dcsRaw.size() == 0) return
         val text = dcsRaw.toString("ISO-8859-1")
-        dcsRaw.reset()
+        dcsRaw = resetOrShrink(dcsRaw)
         // DEC Sixel 图形/实时视频流：DCS [P1;P2;P3] q <sixel> ST
         val qIdx = text.indexOf('q')
         if (qIdx in 0..24) {
@@ -557,7 +560,7 @@ class Vt500Parser(
 
     private fun dispatchApc() {
         val text = apcRaw.toString("UTF-8")
-        apcRaw.reset()
+        apcRaw = resetOrShrink(apcRaw)
         if (!text.startsWith("G")) return
         val absRow = buffer.absoluteRowOfScreen(buffer.cursorRow)
         val (advanceRows, resp) = buffer.imageStore.handleKittyApc(text, absRow, buffer.cursorCol, buffer.cols, buffer.rows)
@@ -570,7 +573,7 @@ class Vt500Parser(
 
     private fun dispatchOsc() {
         val text = oscRaw.toString("UTF-8")
-        oscRaw.reset()
+        oscRaw = resetOrShrink(oscRaw)
         val sep = text.indexOf(';')
         val code: Int
         val payload: String

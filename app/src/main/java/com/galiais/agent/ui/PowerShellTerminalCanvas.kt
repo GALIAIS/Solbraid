@@ -33,7 +33,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -43,6 +42,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -70,12 +71,17 @@ import com.galiais.agent.engine.terminal.TerminalKey
 import com.galiais.agent.engine.terminal.TerminalLinkKind
 import com.galiais.agent.engine.terminal.TerminalLinkSpan
 import com.galiais.agent.engine.terminal.TerminalRow
+import com.galiais.agent.engine.terminal.TerminalRenderSnapshot
 import com.galiais.agent.engine.terminal.TerminalSearchMatch
 import com.galiais.agent.engine.terminal.TerminalSecretRedactor
 import com.galiais.agent.engine.terminal.TerminalSecretSpan
 import com.galiais.agent.engine.terminal.TerminalStyle
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
 import kotlin.math.abs
 import kotlin.math.floor
@@ -142,7 +148,6 @@ internal fun PowerShellTerminalCanvas(
     onRequestImeFocus: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val frameVersion by engine.frameVersion.collectAsState()
     val density = LocalDensity.current
     val textSizePx = with(density) { fontSizeSp.sp.toPx() }
     val padLeftPx = with(density) { 6.dp.toPx() }
@@ -205,8 +210,17 @@ internal fun PowerShellTerminalCanvas(
     var animFrameTick by remember { mutableIntStateOf(0) }
     var hasAppliedInitialSize by remember(engine) { mutableStateOf(false) }
 
-    val snapshot = remember(frameVersion, scrollOffsetLines, engine) {
-        engine.captureViewport(scrollOffsetLines)
+    val currentOffset by rememberUpdatedState(scrollOffsetLines)
+    var frame by remember(engine) { mutableStateOf<TerminalRenderSnapshot?>(null) }
+    LaunchedEffect(engine) {
+        combine(engine.frameVersion, snapshotFlow { currentOffset }) { _, _ -> Unit }.conflate().collect {
+            val offset = withFrameNanos { currentOffset }
+            frame = withContext(Dispatchers.Default) { engine.captureViewport(offset) }
+        }
+    }
+    val snapshot = frame ?: run {
+        Box(modifier.background(Color(scheme.background)).onSizeChanged { viewportSize = it })
+        return
     }
     val hasAnimatedImages = remember(snapshot) {
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && snapshot.inlineImages.any { it.isAnimatedEncoded() }
@@ -346,7 +360,7 @@ internal fun PowerShellTerminalCanvas(
         } else {
             hasAppliedInitialSize = true
         }
-        engine.resize(cols, rows)
+        withContext(Dispatchers.Default) { engine.resize(cols, rows) }
     }
 
     var lastTapMs by remember { mutableLongStateOf(0L) }

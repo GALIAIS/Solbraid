@@ -209,15 +209,25 @@ export function createTerminalHub({home, baseEnv, notify, prepareSshPtyLaunch, p
     return hasPython3;
   }
 
+  const activeSockets = new Set();
+
   async function ensureStreamServer() {
     if (streamServer && streamPort > 0) return {streamPort, streamToken};
     streamServer = net.createServer(socket => {
+      if (activeSockets.size >= 32) {
+        socket.destroy();
+        return;
+      }
+      activeSockets.add(socket);
       socket.setNoDelay(true);
       let authed = false;
       let attachedEntry = null;
       let buf = Buffer.alloc(0);
+      const authTimer = setTimeout(() => { if (!authed) socket.destroy(); }, 5000);
 
       const detach = () => {
+        clearTimeout(authTimer);
+        activeSockets.delete(socket);
         if (attachedEntry) {
           attachedEntry.clients.delete(socket);
           attachedEntry = null;
@@ -242,6 +252,7 @@ export function createTerminalHub({home, baseEnv, notify, prepareSshPtyLaunch, p
           const entry = sessions.get(hello.ptyId);
           if (!entry) { socket.write("ERR not_found\n"); socket.destroy(); return; }
           authed = true;
+          clearTimeout(authTimer);
           attachedEntry = entry;
           entry.clients.add(socket);
           socket.write("OK\n");
@@ -378,17 +389,39 @@ export function createTerminalHub({home, baseEnv, notify, prepareSshPtyLaunch, p
 
       const broadcastRaw = chunk => {
         appendRing(entry, chunk);
+        let needsBackpressure = false;
         if (entry.clients.size > 0) {
           const frame = encodeFrame(FRAME_DATA, chunk);
-          for (const sock of entry.clients) {
-            if (!sock.destroyed && sock.writable) sock.write(frame);
+          for (const sock of [...entry.clients]) {
+            if (sock.destroyed || !sock.writable) continue;
+            if (sock.writableLength > 4 * 1024 * 1024) {
+              sock.destroy();
+              entry.clients.delete(sock);
+              continue;
+            }
+            const ok = sock.write(frame);
+            if (!ok || sock.writableLength > 512 * 1024) needsBackpressure = true;
           }
         }
+        return needsBackpressure;
       };
 
       const consume = stream => stream.on("data", chunk => {
         if (entry.streamOnly) {
-          broadcastRaw(chunk);
+          if (broadcastRaw(chunk)) {
+            stream.pause();
+            let resumed = false;
+            const resumeOnce = () => {
+              if (resumed) return;
+              resumed = true;
+              clearTimeout(fallbackTimer);
+              stream.resume();
+            };
+            const fallbackTimer = setTimeout(resumeOnce, 120);
+            for (const sock of entry.clients) {
+              if (!sock.destroyed && sock.writable) sock.once("drain", resumeOnce);
+            }
+          }
           return;
         }
         stream.pause();
@@ -518,7 +551,8 @@ export function createTerminalHub({home, baseEnv, notify, prepareSshPtyLaunch, p
       entry.status = "closing";
       try { entry.ctrlStream?.end(); } catch {}
       try { entry.child.stdin?.end(); } catch {}
-      entry.child.kill("SIGTERM");
+      try { if (entry.child?.pid) process.kill(-entry.child.pid, "SIGTERM"); }
+      catch { try { entry.child.kill("SIGTERM"); } catch {} }
       let timer;
       try {
         await Promise.race([entry.closed, new Promise(resolve => { timer = setTimeout(resolve, 1500); })]);

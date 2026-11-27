@@ -33,10 +33,56 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileOutputStream
+import java.io.OutputStream
 import java.security.MessageDigest
 import java.util.Properties
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+
+/** 固定容量尾部保留字节流：防止远端命令海量输出导致 JVM OOM。 */
+private class BoundedTailOutputStream(private val maxBytes: Int = 256 * 1024) : OutputStream() {
+    private val buf = ByteArray(maxBytes)
+    private var head = 0
+    private var size = 0
+
+    @Synchronized
+    override fun write(b: Int) {
+        if (size < maxBytes) {
+            buf[(head + size) % maxBytes] = b.toByte()
+            size++
+        } else {
+            buf[head] = b.toByte()
+            head = (head + 1) % maxBytes
+        }
+    }
+
+    @Synchronized
+    override fun write(b: ByteArray, off: Int, len: Int) {
+        if (len <= 0) return
+        if (len >= maxBytes) {
+            System.arraycopy(b, off + len - maxBytes, buf, 0, maxBytes)
+            head = 0
+            size = maxBytes
+            return
+        }
+        for (i in 0 until len) write(b[off + i].toInt())
+    }
+
+    @Synchronized
+    fun toUtf8String(): String {
+        if (size == 0) return ""
+        val out = ByteArray(size)
+        val firstPart = minOf(size, maxBytes - head)
+        System.arraycopy(buf, head, out, 0, firstPart)
+        if (firstPart < size) {
+            System.arraycopy(buf, 0, out, firstPart, size - firstPart)
+        }
+        return String(out, Charsets.UTF_8)
+    }
+}
 
 /** 交互式 SSH 握手提示（首次连接 TOFU 指纹确认 / 主机密钥变更告警 / 2FA OTP 或缺失密码输入）。 */
 sealed interface PendingSshPrompt {
@@ -95,6 +141,19 @@ class NativeSshEngine(
     private val nativeTunnelsFlow = MutableStateFlow<List<SshActiveTunnel>>(emptyList())
     val activeNativeTunnels: StateFlow<List<SshActiveTunnel>> = nativeTunnelsFlow.asStateFlow()
 
+    private val ephemeralPasswords = ConcurrentHashMap<String, String>()
+    private val tunnelMonitor = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "Solbraid-SshTunnelMonitor").apply { isDaemon = true }
+    }.also { exec ->
+        exec.scheduleWithFixedDelay({
+            if (nativeTunnels.isNotEmpty()) runCatching { publishNativeTunnels() }
+        }, 15L, 15L, TimeUnit.SECONDS)
+    }
+
+    fun putEphemeralPassword(hostId: String, password: String) {
+        if (hostId.isNotBlank() && password.isNotEmpty()) ephemeralPasswords[hostId] = password
+    }
+
     fun respondHostKey(id: String, trust: Boolean) {
         val cur = promptFlow.value as? PendingSshPrompt.HostKeyVerify ?: return
         if (cur.id != id) return
@@ -116,7 +175,7 @@ class NativeSshEngine(
 
     private fun findPrivateKeyFile(keyName: String): File? {
         val safe = keyName.trim().ifEmpty { "id_ed25519" }
-        if (!Regex("^[A-Za-z0-9._-]{1,64}$").matches(safe)) return null
+        if (!SAFE_KEY_NAME_RE.matches(safe)) return null
         val local = File(keysDir, safe)
         if (local.isFile && local.canRead()) return local
         val guest = File(linuxSshDir(), safe)
@@ -197,10 +256,10 @@ class NativeSshEngine(
                 if (clean.isEmpty()) continue
                 val aliasKey = clean.substringAfter('@').substringBefore(':').lowercase()
                 val matched = byAlias[aliasKey]
-                if (matched != null && visited.add(matched.id)) {
-                    walk(matched)
-                    hops += matched
-                }
+                    ?: throw IllegalArgumentException("未找到 ProxyJump 跳板机配置：$clean，请先在主机簿添加对应别名")
+                require(visited.add(matched.id)) { "检测到 ProxyJump 跳板循环引用：$clean" }
+                walk(matched)
+                hops += matched
             }
         }
         walk(target)
@@ -219,7 +278,7 @@ class NativeSshEngine(
             attachIdentity(jsch, host.keyName.ifBlank { "id_ed25519" })
         }
         val savedPassword = if (host.authType == "password") {
-            settings.extensionSecret(EnvSshRepository.SSH_SECRET_BUCKET, host.id)
+            ephemeralPasswords.remove(host.id) ?: settings.extensionSecret(EnvSshRepository.SSH_SECRET_BUCKET, host.id)
         } else null
 
         val session = jsch.getSession(host.user.ifBlank { "root" }, connectHost, connectPort)
@@ -391,11 +450,17 @@ class NativeSshEngine(
         timeoutMs: Int = 30_000,
     ): SshExecResult = withContext(Dispatchers.IO) {
         val started = System.currentTimeMillis()
-        val fullCmd = if (remoteCwd.isBlank()) command else "cd '${remoteCwd.replace("'", "'\\''")}' && $command"
+        val trimCwd = remoteCwd.trim()
+        val fullCmd = when {
+            trimCwd.isEmpty() -> command
+            trimCwd == "~" -> "cd ~ && $command"
+            trimCwd.startsWith("~/") -> "cd ~/'${trimCwd.removePrefix("~/").replace("'", "'\\''")}' && $command"
+            else -> "cd '${trimCwd.replace("'", "'\\''")}' && $command"
+        }
         openSession(host, allHosts, interactive = interactive, timeoutMs = minOf(timeoutMs, 15_000)).use { handle ->
             val ch = handle.session.openChannel("exec") as ChannelExec
-            val outBuf = ByteArrayOutputStream()
-            val errBuf = ByteArrayOutputStream()
+            val outBuf = BoundedTailOutputStream(256 * 1024)
+            val errBuf = BoundedTailOutputStream(128 * 1024)
             ch.setCommand(fullCmd)
             ch.outputStream = outBuf
             ch.setErrStream(errBuf)
@@ -408,8 +473,8 @@ class NativeSshEngine(
             runCatching { ch.disconnect() }
             SshExecResult(
                 exitCode = code,
-                stdout = outBuf.toString("UTF-8").takeLast(40_000),
-                stderr = errBuf.toString("UTF-8").takeLast(20_000),
+                stdout = outBuf.toUtf8String().takeLast(40_000),
+                stderr = errBuf.toUtf8String().takeLast(20_000),
                 durationMs = (System.currentTimeMillis() - started).toInt(),
             )
         }
@@ -430,6 +495,38 @@ class NativeSshEngine(
     }
 
     // ── 原生 Android SSH 密钥与 known_hosts 管理（不依赖本地 Linux） ──────────────
+
+    private fun writePrivateKeyAtomic0600(privFile: File, bytes: ByteArray) {
+        privFile.parentFile?.mkdirs()
+        try {
+            val fd = android.system.Os.open(
+                privFile.absolutePath,
+                android.system.OsConstants.O_WRONLY or android.system.OsConstants.O_CREAT or android.system.OsConstants.O_EXCL,
+                0x180, // 0600
+            )
+            try {
+                FileOutputStream(fd).use { out ->
+                    out.write(bytes)
+                    out.flush()
+                    fd.sync()
+                }
+            } catch (e: Exception) {
+                runCatching { privFile.delete() }
+                throw e
+            }
+            runCatching { android.system.Os.chmod(privFile.absolutePath, 0x180) }
+        } catch (e: android.system.ErrnoException) {
+            if (e.errno == android.system.OsConstants.EEXIST) {
+                throw IllegalArgumentException("密钥 ${privFile.name} 已存在，请先删除或更换名称")
+            }
+            throw IllegalStateException("写入私钥失败：${e.message}", e)
+        } catch (_: UnsatisfiedLinkError) {
+            check(privFile.createNewFile()) { "密钥 ${privFile.name} 已存在，请先删除或更换名称" }
+            privFile.setReadable(false, false); privFile.setReadable(true, true)
+            privFile.setWritable(false, false); privFile.setWritable(true, true)
+            privFile.writeBytes(bytes)
+        }
+    }
 
     suspend fun listKeys(): List<SshKeyInfo> = withContext(Dispatchers.IO) {
         val seen = linkedMapOf<String, SshKeyInfo>()
@@ -467,7 +564,7 @@ class NativeSshEngine(
 
     suspend fun generateKey(name: String, type: String = "ed25519", comment: String = "solbraid-mobile", passphrase: String = ""): SshKeyInfo = withContext(Dispatchers.IO) {
         val safe = name.trim()
-        require(Regex("^[A-Za-z0-9._-]{1,64}$").matches(safe)) { "密钥名称无效" }
+        require(SAFE_KEY_NAME_RE.matches(safe)) { "密钥名称无效（仅支持字母数字开头，1–48 位字母/数字/._-）" }
         val privFile = File(keysDir, safe)
         require(!privFile.exists()) { "密钥 $safe 已存在，请更换名称" }
         val jsch = JSch()
@@ -475,14 +572,12 @@ class NativeSshEngine(
         val bits = if (kpType == KeyPair.RSA) 4096 else 256
         val kp = KeyPair.genKeyPair(jsch, kpType, bits)
         try {
-            if (passphrase.isNotEmpty()) {
-                kp.writeOpenSSHv1PrivateKey(privFile.absolutePath, passphrase.toByteArray(Charsets.UTF_8))
-            } else {
-                kp.writeOpenSSHv1PrivateKey(privFile.absolutePath)
-            }
+            val privBytes = ByteArrayOutputStream().also { out ->
+                val passBytes = passphrase.takeIf { it.isNotEmpty() }?.toByteArray(Charsets.UTF_8)
+                kp.writeOpenSSHv1PrivateKey(out, passBytes)
+            }.toByteArray()
+            writePrivateKeyAtomic0600(privFile, privBytes)
             kp.writePublicKey(File(keysDir, "$safe.pub").absolutePath, comment)
-            privFile.setReadable(false, false); privFile.setReadable(true, true)
-            privFile.setWritable(false, false); privFile.setWritable(true, true)
         } finally {
             kp.dispose()
         }
@@ -491,7 +586,9 @@ class NativeSshEngine(
 
     suspend fun importKey(name: String, privateKey: String, publicKey: String = "", passphrase: String = ""): SshKeyInfo = withContext(Dispatchers.IO) {
         val safe = name.trim()
-        require(Regex("^[A-Za-z0-9._-]{1,64}$").matches(safe)) { "密钥名称无效" }
+        require(SAFE_KEY_NAME_RE.matches(safe)) { "密钥名称无效（仅支持字母数字开头，1–48 位字母/数字/._-）" }
+        val privFile = File(keysDir, safe)
+        require(!privFile.exists()) { "密钥 $safe 已存在，请先删除原密钥或更换名称" }
         val privText = privateKey.trim() + "\n"
         require(privText.contains("PRIVATE KEY")) { "私钥格式无效（需为 PEM / OpenSSH 私钥）" }
         val jsch = JSch()
@@ -500,9 +597,7 @@ class NativeSshEngine(
             if (kp.isEncrypted) {
                 check(passphrase.isNotEmpty() && kp.decrypt(passphrase.toByteArray(Charsets.UTF_8))) { "私钥已加密，但口令为空或不正确" }
             }
-            val privFile = File(keysDir, safe)
-            privFile.writeText(privText, Charsets.UTF_8)
-            privFile.setReadable(false, false); privFile.setReadable(true, true)
+            writePrivateKeyAtomic0600(privFile, privText.toByteArray(Charsets.UTF_8))
             val pubFile = File(keysDir, "$safe.pub")
             if (publicKey.isNotBlank()) pubFile.writeText(publicKey.trim() + "\n", Charsets.UTF_8)
             else kp.writePublicKey(pubFile.absolutePath, "solbraid-imported")
@@ -514,7 +609,7 @@ class NativeSshEngine(
 
     suspend fun deleteKey(name: String) = withContext(Dispatchers.IO) {
         val safe = name.trim()
-        require(Regex("^[A-Za-z0-9._-]{1,64}$").matches(safe)) { "密钥名称无效" }
+        require(SAFE_KEY_NAME_RE.matches(safe)) { "密钥名称无效" }
         File(keysDir, safe).delete()
         File(keysDir, "$safe.pub").delete()
     }
@@ -590,5 +685,9 @@ class NativeSshEngine(
         val dead = nativeTunnels.entries.filter { !it.value.second.session.isConnected }.map { it.key }
         dead.forEach { nativeTunnels.remove(it)?.second?.close() }
         nativeTunnelsFlow.value = nativeTunnels.values.map { it.first }
+    }
+
+    companion object {
+        private val SAFE_KEY_NAME_RE = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$")
     }
 }

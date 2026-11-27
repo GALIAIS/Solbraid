@@ -102,7 +102,7 @@ class PortForwardManager(private val hub: AgentHubController) {
     private suspend fun bridgeClient(vmPort: Int, client: Socket, server: ServerSocket) {
         val connId = "tcp-" + newId()
         client.tcpNoDelay = true
-        val incoming = Channel<ByteArray>(64)
+        val incoming = Channel<ByteArray>(256)
         synchronized(servers) {
             if (servers[vmPort]?.first !== server || server.isClosed) { client.close(); return }
             activeSockets[connId] = client

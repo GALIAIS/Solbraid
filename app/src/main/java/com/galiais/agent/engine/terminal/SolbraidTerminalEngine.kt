@@ -50,6 +50,7 @@ class SolbraidTerminalEngine(
     initialCols: Int = 80,
     initialRows: Int = 24,
     private val onSendInput: (ByteArray) -> Unit,
+    private val onSendResponse: (ByteArray) -> Unit = onSendInput,
     private val onResize: (cols: Int, rows: Int) -> Unit = { _, _ -> },
     private val onBell: () -> Unit = {},
     private val onClipboardCopy: (String) -> Unit = {},
@@ -64,7 +65,7 @@ class SolbraidTerminalEngine(
     private val buffer = TerminalBuffer(initialCols, initialRows)
     private val parser = Vt500Parser(
         buffer = buffer,
-        onSendResponse = { resp -> onSendInput(resp) },
+        onSendResponse = onSendResponse,
         onBell = onBell,
         onClipboardCopy = onClipboardCopy,
         onTitleChanged = onTitleChanged,
@@ -181,7 +182,7 @@ class SolbraidTerminalEngine(
             buffer.rowAtAbsolute(firstAbs - 1)?.let { src -> TerminalRow(cCount).also { it.copyFrom(src) } }
         } else null
         val blockMap = HashMap<Int, TerminalCommandBlock>()
-        for (b in buffer.getBlocksSnapshot()) blockMap[b.id] = b
+        for (b in buffer.getBlocksSnapshot()) blockMap[b.id] = b.copy()
         TerminalRenderSnapshot(
             revision = revCounter.get(),
             cols = cCount,
@@ -209,7 +210,7 @@ class SolbraidTerminalEngine(
     }
 
     fun search(query: String, options: TerminalSearchOptions = TerminalSearchOptions()): List<TerminalSearchMatch> =
-        synchronized(lock) { buffer.search(query, options) }
+        synchronized(lock) { buffer.snapshotSearchRows() }.searchTerminalRows(query, options)
 
     fun logicalLineRange(absRow: Int): IntRange = synchronized(lock) { buffer.logicalLineRange(absRow) }
 

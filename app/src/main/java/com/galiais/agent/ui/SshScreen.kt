@@ -117,7 +117,7 @@ fun SshScreen(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(if (D.material) 60.dp else 54.dp)
+                .height(if (D.material) 64.dp else 56.dp)
                 .padding(start = 16.dp, end = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -722,6 +722,7 @@ fun SshScreen(
             onConnect = { host, save, pwd ->
                 showQuickConnect = false
                 if (save) runCatching { app.envSsh.upsertSshHost(host, pwd) }
+                else if (!pwd.isNullOrEmpty()) app.envSsh.nativeSsh.putEphemeralPassword(host.id, pwd)
                 onOpenTerminal(settings.defaultCwd, host)
             },
         )

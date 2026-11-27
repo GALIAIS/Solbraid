@@ -1162,7 +1162,7 @@ class TerminalBuffer(
         val droppedTop: Int
         if (reflowed.size <= r) {
             droppedTop = 0
-            for (k in reflowed.indices) nextPrimary[k] = reflowed[k]
+            for (k in reflowed.indices) nextPrimary[k].copyFrom(reflowed[k])
             if (useAltScreen) {
                 primarySaved.row = newPrimaryAbsCursor.coerceIn(0, r - 1)
                 primarySaved.col = newPrimaryCursorCol.coerceIn(0, c - 1)
@@ -1175,7 +1175,7 @@ class TerminalBuffer(
             val sbStart = max(0, sbCount - maxScrollback)
             droppedTop = sbStart
             for (k in sbStart until sbCount) scrollback.addLast(reflowed[k])
-            for (k in 0 until r) nextPrimary[k] = reflowed[sbCount + k]
+            for (k in 0 until r) nextPrimary[k].copyFrom(reflowed[sbCount + k])
             val shiftedCursor = (newPrimaryAbsCursor - sbCount).coerceIn(0, r - 1)
             if (useAltScreen) {
                 primarySaved.row = shiftedCursor
@@ -1228,52 +1228,14 @@ class TerminalBuffer(
     }
 
     /** 全文搜索回滚缓冲 + 当前屏幕（支持大小写、正则与全词匹配，精确映射 CJK/Emoji 终端列区间）。 */
-    fun search(
-        query: String,
-        options: TerminalSearchOptions = TerminalSearchOptions(),
-        maxMatches: Int = 500,
-    ): List<TerminalSearchMatch> {
-        val needle = query.trim()
-        if (needle.isEmpty()) return emptyList()
-        val regexOpts = if (options.caseSensitive) emptySet() else setOf(RegexOption.IGNORE_CASE)
-        val compiledRegex: Regex? = when {
-            options.useRegex -> runCatching {
-                val pattern = if (options.wholeWord) "\\b(?:$needle)\\b" else needle
-                Regex(pattern, regexOpts)
-            }.getOrNull() ?: return emptyList()
-            options.wholeWord -> runCatching { Regex("\\b${Regex.escape(needle)}\\b", regexOpts) }.getOrNull()
-            else -> null
-        }
-        val plainNeedle = if (options.caseSensitive) needle else needle.lowercase()
-        val results = ArrayList<TerminalSearchMatch>()
-        val total = totalLines
-        for (absRow in 0 until total) {
-            val row = rowAtAbsolute(absRow) ?: continue
-            val (text, startCols, endCols) = row.toStringWithColMap()
-            if (text.isEmpty()) continue
-            if (compiledRegex != null) {
-                for (m in compiledRegex.findAll(text)) {
-                    if (m.range.isEmpty()) continue
-                    val sc = startCols[m.range.first.coerceIn(0, startCols.lastIndex)]
-                    val ec = endCols[m.range.last.coerceIn(0, endCols.lastIndex)]
-                    results += TerminalSearchMatch(absRow, sc, ec.coerceAtMost(cols - 1))
-                    if (results.size >= maxMatches) return results
-                }
-            } else {
-                val hay = if (options.caseSensitive) text else text.lowercase()
-                var pos = hay.indexOf(plainNeedle)
-                while (pos >= 0) {
-                    val endCharIdx = (pos + plainNeedle.length - 1).coerceAtMost(endCols.lastIndex)
-                    val sc = startCols[pos.coerceIn(0, startCols.lastIndex)]
-                    val ec = endCols[endCharIdx]
-                    results += TerminalSearchMatch(absRow, sc, ec.coerceAtMost(cols - 1))
-                    if (results.size >= maxMatches) return results
-                    pos = hay.indexOf(plainNeedle, pos + plainNeedle.length)
-                }
-            }
-        }
-        return results
+    internal fun snapshotSearchRows(): List<TerminalRow> = buildList(totalLines) {
+        // 回滚行的文字不再修改。活动屏幕的行仍会复用，必须先复制再交给搜索线程。
+        if (!useAltScreen) addAll(scrollback)
+        for (row in activeScreen) add(TerminalRow(cols).apply { copyFrom(row) })
     }
+
+    fun search(query: String, options: TerminalSearchOptions = TerminalSearchOptions(), maxMatches: Int = 500): List<TerminalSearchMatch> =
+        snapshotSearchRows().searchTerminalRows(query, options, maxMatches)
 
     /** 语义词界选词（参照 Warp `selection.rs`：非空白连词优先，遇括号/引号/分号等代码边界自动收束）。 */
     fun wordBoundsAtCol(absRow: Int, col: Int): IntRange? {
@@ -1460,4 +1422,47 @@ class TerminalBuffer(
         private val URL_REGEX = Regex("""https?://[^\s"'<>()\[\]{}]+""")
         private val FILE_LINK_REGEX = Regex("""(?<![A-Za-z0-9_:])((?:\.\.?/|~/|/)[A-Za-z0-9._/\-]+\.[A-Za-z0-9]{1,12})(?::(\d+))?(?::(\d+))?""")
     }
+}
+
+internal fun List<TerminalRow>.searchTerminalRows(
+    query: String,
+    options: TerminalSearchOptions = TerminalSearchOptions(),
+    maxMatches: Int = 500,
+): List<TerminalSearchMatch> {
+    val needle = query.trim()
+    if (needle.isEmpty()) return emptyList()
+    val regexOpts = if (options.caseSensitive) emptySet() else setOf(RegexOption.IGNORE_CASE)
+    val compiledRegex: Regex? = when {
+        options.useRegex -> runCatching {
+            val pattern = if (options.wholeWord) "\\b(?:$needle)\\b" else needle
+            Regex(pattern, regexOpts)
+        }.getOrNull() ?: return emptyList()
+        options.wholeWord -> runCatching { Regex("\\b${Regex.escape(needle)}\\b", regexOpts) }.getOrNull()
+        else -> null
+    }
+    val results = ArrayList<TerminalSearchMatch>()
+    for ((absRow, row) in withIndex()) {
+        val (text, startCols, endCols) = row.toStringWithColMap()
+        if (text.isEmpty()) continue
+        if (compiledRegex != null) {
+            for (m in compiledRegex.findAll(text)) {
+                if (m.range.isEmpty()) continue
+                val sc = startCols[m.range.first.coerceIn(0, startCols.lastIndex)]
+                val ec = endCols[m.range.last.coerceIn(0, endCols.lastIndex)]
+                results += TerminalSearchMatch(absRow, sc, ec.coerceAtMost(row.cols - 1))
+                if (results.size >= maxMatches) return results
+            }
+        } else {
+            var pos = text.indexOf(needle, ignoreCase = !options.caseSensitive)
+            while (pos >= 0) {
+                val endCharIdx = (pos + needle.length - 1).coerceAtMost(endCols.lastIndex)
+                val sc = startCols[pos.coerceIn(0, startCols.lastIndex)]
+                val ec = endCols[endCharIdx]
+                results += TerminalSearchMatch(absRow, sc, ec.coerceAtMost(row.cols - 1))
+                if (results.size >= maxMatches) return results
+                pos = text.indexOf(needle, pos + needle.length, ignoreCase = !options.caseSensitive)
+            }
+        }
+    }
+    return results
 }

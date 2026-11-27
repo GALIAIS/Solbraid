@@ -115,13 +115,31 @@ internal class TerminalImeInputView(context: Context) : View(context) {
         onInputSent?.invoke()
     }
 
+    private fun syncImeSelection() {
+        val len = composingBuffer.length
+        val compStart = if (len > 0) 0 else -1
+        val compEnd = if (len > 0) len else -1
+        context.getSystemService(InputMethodManager::class.java)
+            ?.updateSelection(this, len, len, compStart, compEnd)
+    }
+
+    private fun deleteLastCodePointFromComposing(): Boolean {
+        if (composingBuffer.isEmpty()) return false
+        val end = composingBuffer.length
+        val cp = Character.codePointBefore(composingBuffer, end)
+        val count = Character.charCount(cp)
+        composingBuffer.delete((end - count).coerceAtLeast(0), end)
+        onComposingChanged?.invoke(composingBuffer.toString())
+        syncImeSelection()
+        return true
+    }
+
     override fun onCheckIsTextEditor(): Boolean = inputEnabled
 
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection? {
         if (!inputEnabled) return null
-        // TYPE_TEXT_VARIATION_VISIBLE_PASSWORD 禁止英文键盘无意义下划线联想，同时完整保留中文拼音候选词条
+        // 使用 TYPE_CLASS_TEXT + NO_SUGGESTIONS：关闭英文自动更正同时确保搜狗/百度/Gboard 中文拼音正常候选上屏
         outAttrs.inputType = InputType.TYPE_CLASS_TEXT or
-            InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or
             InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN or
             EditorInfo.IME_FLAG_NO_EXTRACT_UI or
@@ -133,12 +151,14 @@ internal class TerminalImeInputView(context: Context) : View(context) {
                 if (!inputEnabled) return true
                 val ok = super.setComposingText(text, newCursorPosition)
                 onComposingChanged?.invoke(composingBuffer.toString())
+                syncImeSelection()
                 return ok
             }
 
             override fun finishComposingText(): Boolean {
                 val ok = super.finishComposingText()
                 flushComposingIfAny()
+                syncImeSelection()
                 return ok
             }
 
@@ -146,6 +166,7 @@ internal class TerminalImeInputView(context: Context) : View(context) {
                 val str = text?.toString().orEmpty()
                 composingBuffer.clear()
                 onComposingChanged?.invoke("")
+                syncImeSelection()
                 if (str.isNotEmpty()) commitCleanText(str)
                 return true
             }
@@ -156,8 +177,14 @@ internal class TerminalImeInputView(context: Context) : View(context) {
                 val remAfter = afterLength.coerceIn(0, 64)
                 if (composingBuffer.isNotEmpty() && remBefore > 0) {
                     val take = remBefore.coerceAtMost(composingBuffer.length)
-                    composingBuffer.delete(composingBuffer.length - take, composingBuffer.length)
+                    var start = composingBuffer.length - take
+                    // 防止 UTF-16 代理对被腰斩
+                    if (start > 0 && Character.isLowSurrogate(composingBuffer[start]) && Character.isHighSurrogate(composingBuffer[start - 1])) {
+                        start -= 1
+                    }
+                    composingBuffer.delete(start, composingBuffer.length)
                     onComposingChanged?.invoke(composingBuffer.toString())
+                    syncImeSelection()
                     remBefore -= take
                 }
                 if (remBefore > 0) {
@@ -172,7 +199,21 @@ internal class TerminalImeInputView(context: Context) : View(context) {
             }
 
             override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean {
-                return deleteSurroundingText(beforeLength, afterLength)
+                if (!inputEnabled) return true
+                var remBefore = beforeLength.coerceIn(0, 64)
+                val remAfter = afterLength.coerceIn(0, 64)
+                while (remBefore > 0 && deleteLastCodePointFromComposing()) {
+                    remBefore--
+                }
+                if (remBefore > 0) {
+                    repeat(remBefore) { onDispatchKey?.invoke(TerminalKey.BACKSPACE, false, false, false) }
+                    onInputSent?.invoke()
+                }
+                if (remAfter > 0) {
+                    repeat(remAfter) { onDispatchKey?.invoke(TerminalKey.DELETE, false, false, false) }
+                    onInputSent?.invoke()
+                }
+                return true
             }
 
             override fun sendKeyEvent(event: KeyEvent): Boolean {
@@ -256,10 +297,9 @@ internal class TerminalImeInputView(context: Context) : View(context) {
         }
         if (event.action != KeyEvent.ACTION_DOWN) return false
 
-        // 拼音组合中按退格优先删除本地组合缓冲，按回车先上屏组合文字再发送回车
+        // 拼音组合中按退格优先删除本地组合缓冲（按完整 Unicode 码点删除），按回车先上屏组合文字再发送回车
         if (special == TerminalKey.BACKSPACE && composingBuffer.isNotEmpty()) {
-            composingBuffer.delete(composingBuffer.length - 1, composingBuffer.length)
-            onComposingChanged?.invoke(composingBuffer.toString())
+            deleteLastCodePointFromComposing()
             return true
         }
         if (special == TerminalKey.ENTER && composingBuffer.isNotEmpty()) {
