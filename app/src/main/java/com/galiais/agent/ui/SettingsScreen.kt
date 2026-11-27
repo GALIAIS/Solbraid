@@ -45,10 +45,13 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
     val sshHosts by app.envSsh.sshHosts.collectAsState()
     val activeTunnels by app.envSsh.activeTunnels.collectAsState()
     val mobileStatus by app.mobileUse.status.collectAsState()
+    val pcHosts by app.computerUse.hosts.collectAsState()
+    val pcEmergencyStop by app.computerUse.emergencyStop.collectAsState()
     val tcSnap by app.toolchains.snapshot.collectAsState()
     androidx.compose.runtime.LaunchedEffect(runtime.ready, runtime.mode) {
         app.mobileUse.refreshStatus()
         if (runtime.ready) {
+            app.computerUse.refreshHostsAsync()
             app.toolchains.refreshToolchainsAsync()
         }
     }
@@ -305,6 +308,31 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                     iconTint = if (mobileStatus.emergencyStopped) G.danger else if (mu.enabled) G.accent else G.inkMuted,
                     iconBg = if (mobileStatus.emergencyStopped) G.dangerTint else if (mu.enabled) G.accentContainer else G.surfaceSubtle,
                     onClick = { onNavigate("settings/mobileuse") },
+                )
+                Hairline(Modifier.padding(start = 66.dp))
+                val defaultPc = pcHosts.firstOrNull { it.isDefault } ?: pcHosts.firstOrNull()
+                val pcSummary = when {
+                    pcEmergencyStop -> "所有电脑操控已暂停"
+                    pcHosts.isEmpty() -> "未配对主机 · 支持 USB / 局域网 / SSH / 公网 / 中继操控电脑"
+                    else -> buildString {
+                        append("已配对 ${pcHosts.size} 台")
+                        if (defaultPc != null) {
+                            append(" · 默认 ${defaultPc.name}（${defaultPc.transportLabel} · ${defaultPc.permissionLabel}）")
+                        }
+                    }
+                }
+                SettingsNavRow(
+                    icon = GaliaisIcons.Monitor,
+                    title = "电脑操控（Computer Use）",
+                    subtitle = pcSummary,
+                    badge = when {
+                        pcEmergencyStop -> "急停"
+                        pcHosts.isNotEmpty() -> "${pcHosts.size} 台"
+                        else -> null
+                    },
+                    iconTint = if (pcEmergencyStop) G.danger else if (pcHosts.isNotEmpty()) G.accent else G.inkMuted,
+                    iconBg = if (pcEmergencyStop) G.dangerTint else if (pcHosts.isNotEmpty()) G.accentContainer else G.surfaceSubtle,
+                    onClick = { onNavigate("settings/computeruse") },
                 )
                 Hairline(Modifier.padding(start = 66.dp))
                 val sb = settings.selfBuild

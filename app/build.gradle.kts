@@ -15,6 +15,7 @@ abstract class RuntimeAssetsTask : DefaultTask() {
     @get:InputFile abstract val generator: RegularFileProperty
     @get:InputFile abstract val helper: RegularFileProperty
     @get:InputDirectory abstract val runtime: DirectoryProperty
+    @get:InputDirectory abstract val pcAgentNative: DirectoryProperty
     @get:InputFile abstract val claudeSdk: RegularFileProperty
     @get:InputFile abstract val officialPlan: RegularFileProperty
     @get:InputFiles abstract val terminalArchives: ConfigurableFileCollection
@@ -84,6 +85,7 @@ val prepareRuntimeAssets by tasks.registering(RuntimeAssetsTask::class) {
     generator.set(rootProject.layout.projectDirectory.file("tools/runtime-assets.cjs"))
     helper.set(rootProject.layout.projectDirectory.file("tools/component-manifest.cjs"))
     runtime.set(rootProject.layout.projectDirectory.dir("runtime"))
+    pcAgentNative.set(rootProject.layout.projectDirectory.dir("pc-agent-native"))
     claudeSdk.set(rootProject.layout.projectDirectory.file("downloads/runtime/$sdkArchive"))
     officialPlan.set(rootProject.layout.projectDirectory.file("downloads/runtime/$planArchive"))
     terminalArchives.from((componentConfig["terminal"] as? List<*>)?.map { raw ->

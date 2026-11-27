@@ -6,6 +6,7 @@ import android.system.OsConstants
 import android.util.AtomicFile
 import android.util.Log
 import com.galiais.agent.engine.AppSettings
+import com.galiais.agent.engine.ComputerUseRepository
 import com.galiais.agent.engine.ConversationRepository
 import com.galiais.agent.engine.EnvSshRepository
 import com.galiais.agent.engine.ExtensionRepository
@@ -22,6 +23,7 @@ class GaliaisApplication : Application() {
     val conversations: ConversationRepository by lazy { ConversationRepository(runtime, settings) }
     val fileManager: UnifiedFileRepository by lazy { UnifiedFileRepository(this, runtime, settings) }
     val mobileUse: MobileUseEngine by lazy { MobileUseEngine(this, runtime, settings, fileManager) }
+    val computerUse: ComputerUseRepository by lazy { ComputerUseRepository(runtime) { conversations.notify(it) } }
     val toolchains: ToolchainRepository by lazy { ToolchainRepository(runtime) { conversations.notify(it) } }
     val extensions: ExtensionRepository by lazy { conversations.extensions }
     val envSsh: EnvSshRepository by lazy { conversations.envSsh }

@@ -642,6 +642,12 @@ description: Solbraid Host 插件微内核开发与自进化升级指南（Phase
 - **动态可执行 Agent 驱动**：\`ctx.drivers.register({id, name, protocol: "plugin-driver", listModels, execute: async ({prompt, cwd, emitChunk, emitThought, emitTool, emitPlan}) => ({text})})\`
 - **热插拔 LLM 协议转换器**：\`ctx.providers.registerTranslator({id, name, baseProtocol, toUpstream: (req, ctx) => ({path, headers, body}), fromUpstream: (res, ctx) => ...})\`（在服务商中以 \`protocol: "plugin:<id>"\` 挂载）
 - **其他常用**：\`ctx.commands.register\`、\`ctx.panels.register\`、\`ctx.composer.registerAction\`、\`ctx.hooks.onBeforePrompt / onAfterResponse\`、\`ctx.rpc.register\`、\`ctx.storage\`、\`ctx.workspace\`。
+
+## 4. 跨平台 Computer Use 控制电脑（chroot / PRoot 通用 · 13 个 MCP 工具）
+- 电脑端启动 \`node pc-agent/solbraid-pc-agent.mjs\`（Windows 可运行 \`pc-agent/start-windows.ps1\`，自动配置 USB \`adb reverse tcp:29840 tcp:29840\`），调用 \`solbraid_pc_hosts(action="add", ...)\` 配对后即可全功能操控 Windows / macOS / Linux：
+  - **主机与唤醒**：\`solbraid_pc_hosts\`（支持 \`lan / usb / ssh / public / relay\`、\`observe / operate / admin\` 三档权限、急停与审计）、\`solbraid_pc_wake\`（WoL 远程开机）
+  - **视觉与桌面操控**：\`solbraid_pc_screenshot\`（原生多模态截图）、\`solbraid_pc_ui_tree\`（Windows UIA / macOS AX / Linux AT-SPI2）、\`solbraid_pc_window\`、\`solbraid_pc_mouse\`（支持 0..1000 归一化坐标）、\`solbraid_pc_keyboard\`（Unicode 直输与热键）
+  - **底层与协同**：\`solbraid_pc_shell\`、\`solbraid_pc_process\`、\`solbraid_pc_system\`、\`solbraid_pc_files\`（含手机↔电脑双向 pull/push）、\`solbraid_pc_clipboard\`、\`solbraid_pc_browser\`（Chrome/Edge CDP 接管）
 `;
 
 async function ensureBuiltinPluginSdkSkill() {

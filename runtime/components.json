@@ -70,6 +70,8 @@
     "ai-reviewer.mjs",
     "download-network.mjs",
     "env-ssh-hub.mjs",
+    "computer-use-hub.mjs",
+    "computer-use-builder.mjs",
     "toolchain-hub.mjs",
     "toolchain-versions.mjs",
     "project-deps-hub.mjs",

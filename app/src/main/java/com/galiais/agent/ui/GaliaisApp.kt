@@ -468,6 +468,7 @@ fun GaliaisApp(app: GaliaisApplication) {
             composable("settings/claude") { ClaudeSettingsScreen(app, snackbar, onBack = ::safePopBack, onOpenProviders = { safeNavigate("settings/providers") }) }
             composable("settings/workspace") { WorkspaceSettingsScreen(app, snackbar, onBack = ::safePopBack) }
             composable("settings/mobileuse") { MobileUseSettingsScreen(app, snackbar, onBack = ::safePopBack) }
+            composable("settings/computeruse") { ComputerUseScreen(app, snackbar, onBack = ::safePopBack) }
             composable("settings/toolchains") { ToolchainStudioScreen(app, snackbar, onBack = ::safePopBack) }
             composable("settings/runtime") { RuntimeSettingsScreen(app, snackbar, onBack = ::safePopBack) }
             composable("settings/selfbuild") { SelfBuildSettingsScreen(app, snackbar, onBack = ::safePopBack) }
@@ -597,6 +598,23 @@ fun GaliaisApp(app: GaliaisApplication) {
                 Text("${request.action} · ${request.packageName}", color = G.ink)
                 Text(request.details, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
                 Text(if (request.returnToApp) "确认后请在 30 秒内返回目标应用。授权仅限本次操作。" else "授权仅限本次操作。", color = G.inkMuted)
+            }
+        }
+        val pcApproval by app.computerUse.pendingApproval.collectAsState()
+        pcApproval?.let { req ->
+            GaliaisAlertDialog(
+                title = "确认高危电脑操作",
+                confirmText = "允许本次",
+                dismissText = "拒绝",
+                onConfirm = { app.computerUse.resolveApproval(req.id, true) },
+                onDismissRequest = { app.computerUse.resolveApproval(req.id, false) },
+            ) {
+                Text("${req.hostName} · ${req.action}${if (req.subAction.isNotBlank()) ".${req.subAction}" else ""}", color = G.ink, fontWeight = FontWeight.SemiBold)
+                Text(req.reason, style = MaterialTheme.typography.bodySmall, color = G.danger)
+                if (req.summary.isNotBlank()) {
+                    Text(req.summary, fontFamily = Mono, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                }
+                Text("授权仅限本次高危电脑操作生效（60 秒无响应自动拒绝）。", style = MaterialTheme.typography.labelSmall, color = G.inkSubtle)
             }
         }
         // 全局 SSH 交互式主机指纹确认（TOFU/MITM）与 2FA/OTP/密码质询弹窗

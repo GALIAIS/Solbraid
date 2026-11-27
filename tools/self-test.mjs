@@ -48,6 +48,9 @@ import {createDevToolsHub} from "../runtime/dev-tools-hub.mjs";
 import {PluginKernel, validatePluginManifest, negotiateCapabilities, validateSduiTree, startPluginControlServer} from "../runtime/plugin-kernel.mjs";
 import {registerBuiltinHostPlugins} from "../runtime/plugin-builtins.mjs";
 import {reviewResourceBundle, computeBundleSha256} from "../runtime/ai-reviewer.mjs";
+import {createComputerUseHub, buildWolPacket, signPcRequest} from "../runtime/computer-use-hub.mjs";
+import {createPcAgentApp} from "../pc-agent/solbraid-pc-agent.mjs";
+import {createRelayServer} from "../pc-agent/solbraid-relay.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -1168,19 +1171,23 @@ async function testSelfEvolvingPluginPipeline() {
   };
 
   try {
-    // 1. MCP initialize & tools/list 必须完整暴露 37 个工具（15 插件运维 + 5 安全文件 + 14 Mobile-Use + 3 工具链/依赖/编译）
+    // 1. MCP initialize & tools/list 必须完整暴露 50 个工具（15 插件运维 + 5 安全文件 + 14 Mobile-Use + 13 Computer-Use + 3 工具链/依赖/编译）
     const initResp = await rpc("initialize", {protocolVersion: "2025-06-18"});
     assert.equal(initResp.result.serverInfo.name, "solbraid-plugin-ctl");
     const listTools = await rpc("tools/list");
-    assert.equal(listTools.result.tools.length, 37);
+    assert.equal(listTools.result.tools.length, 50);
     assert.ok(listTools.result.tools.some(t => t.name === "solbraid_self_build"));
     assert.ok(listTools.result.tools.some(t => t.name === "solbraid_file_edit"));
     assert.ok(listTools.result.tools.some(t => t.name === "solbraid_mobile_screenshot"));
     assert.ok(listTools.result.tools.some(t => t.name === "solbraid_mobile_device"));
     assert.ok(listTools.result.tools.some(t => t.name === "solbraid_mobile_host"));
+    assert.ok(listTools.result.tools.some(t => t.name === "solbraid_pc_hosts"));
+    assert.ok(listTools.result.tools.some(t => t.name === "solbraid_pc_screenshot"));
+    assert.ok(listTools.result.tools.some(t => t.name === "solbraid_pc_browser"));
     assert.ok(listTools.result.tools.some(t => t.name === "solbraid_toolchains"));
     assert.ok(listTools.result.tools.some(t => t.name === "solbraid_deps"));
     assert.ok(listTools.result.tools.some(t => t.name === "solbraid_compile"));
+    assert.ok(listTools.result.tools.some(t => t.name === "solbraid_pc_wake"));
 
     const sbStatus = await callTool("solbraid_self_build", {action: "status"});
     assert.equal(sbStatus.isError, false);
@@ -1398,6 +1405,7 @@ async function testSelfEvolvingPluginPipeline() {
     for (const shName of ["prepare-vm-runtime.sh", "prepare-proot-runtime.sh", "sync-hot-runtime.sh", "sync-hot-runtime-proot.sh"]) {
       const shText = fs.readFileSync(path.join(rootDir, "runtime", shName), "utf8");
       assert.ok(shText.includes("plugin-mcp.mjs"), `${shName} must deploy plugin-mcp.mjs`);
+      assert.ok(shText.includes("computer-use-hub.mjs"), `${shName} must deploy computer-use-hub.mjs`);
       assert.ok(shText.includes("plugin-worker-host.mjs"), `${shName} must deploy plugin-worker-host.mjs`);
       assert.ok(shText.includes("self-build-apk.sh"), `${shName} must deploy self-build-apk.sh`);
       assert.ok(shText.includes("self-update-watchdog.sh"), `${shName} must deploy self-update-watchdog.sh`);
@@ -3946,6 +3954,196 @@ async function testCacheStabilityAndTelemetryFixes() {
   }
 }
 
+async function testComputerUseEndToEnd() {
+  // 1. 全量语法检查（computer-use-hub / pc-agent / backends / relay / sync-signing-credentials）
+  for (const rel of [
+    "runtime/computer-use-hub.mjs",
+    "runtime/computer-use-builder.mjs",
+    "pc-agent/solbraid-pc-agent.mjs",
+    "pc-agent/solbraid-relay.mjs",
+    "pc-agent/install-service.mjs",
+    "pc-agent/backends/common.mjs",
+    "pc-agent/backends/browser-cdp.mjs",
+    "pc-agent/backends/windows.mjs",
+    "pc-agent/backends/macos.mjs",
+    "pc-agent/backends/linux.mjs",
+    "tools/sync-signing-credentials.mjs",
+  ]) {
+    const chk = spawnSync(process.execPath, ["--check", path.join(rootDir, rel)], {encoding: "utf8"});
+    assert.equal(chk.status, 0, `${rel} syntax error: ${chk.stderr}`);
+  }
+
+  // 2. Wake-on-LAN 魔术包构造校验（6x 0xFF + 16x MAC = 102 字节）
+  const wol = buildWolPacket("aa:bb:cc:dd:ee:ff");
+  assert.equal(wol.length, 102);
+  assert.deepEqual([...wol.subarray(0, 6)], [0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+  assert.deepEqual([...wol.subarray(6, 12)], [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+  assert.deepEqual([...wol.subarray(96, 102)], [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+
+  // 3. 启动模拟 PC 守护进程 + 手机中枢（直连模式 + HMAC 防重放 + 权限档位 + 高危确认 + 双端急停 + 双向文件传）
+  const tmpPhoneHome = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-cu-phone-"));
+  const tmpPcCfg = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-cu-pc-"));
+  const tmpPcWork = path.join(tmpPcCfg, "pc-work");
+  fs.mkdirSync(tmpPcWork, {recursive: true});
+
+  const mockBackend = {
+    screenshot: async () => ({ok: true, width: 1280, height: 720, screenWidth: 1920, screenHeight: 1080, mimeType: "image/jpeg", imageBase64: Buffer.from("FAKE_JPEG_DATA").toString("base64")}),
+    uiTree: async () => ({ok: true, nodes: [{id: "uia-0", name: "确定", controlType: "Button", cx: 100, cy: 200}]}),
+    windowAction: async p => ({ok: true, action: p.action, windows: [{hwnd: "1", title: "Solbraid Test", active: true}]}),
+    mouseAction: async p => ({ok: true, action: p.action, x: p.x, y: p.y}),
+    keyboardAction: async p => ({ok: true, action: p.action, text: p.text || ""}),
+    processAction: async p => ({ok: true, action: p.action, processes: [{pid: 42, name: "node"}]}),
+    systemAction: async p => ({ok: true, action: p.action, hostname: "test-pc"}),
+    clipboardAction: async p => ({ok: true, text: p.action === "set" ? p.text : "CLIP_OK"}),
+  };
+
+  const token = "solbraid-test-secret-token-256bit-value";
+  const pcApp = createPcAgentApp({
+    host: "127.0.0.1", port: 0, token, permissionLevel: "admin", configDir: tmpPcCfg, backend: mockBackend,
+  });
+  const relaySecret = "solbraid-relay-channel-secret-2026";
+  const relaySrv = createRelayServer({secret: relaySecret});
+  let relayApp = null;
+  const hub = createComputerUseHub({home: tmpPhoneHome});
+
+  try {
+    const started = await pcApp.start();
+
+    // 3a. 未签名/错令牌/重放 Nonce 均必须被 HTTP 401 拒绝
+    const unauth = await fetch(`http://127.0.0.1:${started.port}/rpc`, {method: "POST", body: JSON.stringify({id: "1", method: "agent/ping"})});
+    assert.equal(unauth.status, 401);
+    const bodyStr = JSON.stringify({id: "2", method: "agent/ping"});
+    const signedHeaders = signPcRequest(token, bodyStr);
+    const okReq = await fetch(`http://127.0.0.1:${started.port}/rpc`, {method: "POST", headers: {"content-type": "application/json", ...signedHeaders}, body: bodyStr});
+    assert.equal(okReq.status, 200);
+    const replayReq = await fetch(`http://127.0.0.1:${started.port}/rpc`, {method: "POST", headers: {"content-type": "application/json", ...signedHeaders}, body: bodyStr});
+    assert.equal(replayReq.status, 401, "Replayed nonce must be rejected");
+
+    // 3b. 手机中枢配对 -> ping -> 多模态截图 -> Shell -> 双向文件传输
+    await hub.execute("hosts", {
+      action: "add", id: "my-pc", name: "主力电脑", transport: "usb", address: "127.0.0.1", port: started.port,
+      permissionLevel: "operate", token, setDefault: true,
+    });
+    const ping = await hub.execute("hosts", {action: "ping"});
+    assert.equal(ping.ok, true);
+    assert.equal(ping.remote.ok, true);
+
+    const shot = await hub.execute("screenshot", {});
+    assert.equal(shot._mcpMimeType, "image/jpeg");
+    assert.equal(Buffer.from(shot._mcpImageBase64, "base64").toString("utf8"), "FAKE_JPEG_DATA");
+
+    const shOut = await hub.execute("shell", {command: "echo CU_SHELL_PASS"});
+    assert.equal(shOut.ok, true);
+    assert.ok(shOut.stdout.includes("CU_SHELL_PASS"));
+
+    const remoteFile = path.join(tmpPcWork, "hello.txt");
+    await hub.execute("files", {action: "write", path: remoteFile, content: "SYNC_CONTENT_123"});
+    const phonePullPath = path.join(tmpPhoneHome, "pulled.txt");
+    const pulled = await hub.execute("files", {action: "pull", path: remoteFile, localPath: phonePullPath});
+    assert.equal(pulled.ok, true);
+    assert.equal(fs.readFileSync(phonePullPath, "utf8"), "SYNC_CONTENT_123");
+
+    const remotePushPath = path.join(tmpPcWork, "pushed.txt");
+    await hub.execute("files", {action: "push", path: remotePushPath, localPath: phonePullPath});
+    assert.equal(fs.readFileSync(remotePushPath, "utf8"), "SYNC_CONTENT_123");
+
+    // 3c. 三档权限与高危确认护栏校验
+    await hub.execute("hosts", {action: "set_permission", hostId: "my-pc", permissionLevel: "observe"});
+    await assert.rejects(() => hub.execute("mouse", {action: "click", x: 10, y: 10}), /权限不足/);
+    await hub.execute("hosts", {action: "set_permission", hostId: "my-pc", permissionLevel: "operate"});
+    await assert.rejects(() => hub.execute("system", {action: "shutdown"}), /权限不足/);
+    await hub.execute("hosts", {action: "set_permission", hostId: "my-pc", permissionLevel: "admin"});
+    await assert.rejects(() => hub.execute("process", {action: "kill", pid: 42}), /高危操作已拦截/);
+    const killOk = await hub.execute("process", {action: "kill", pid: 42, confirmHighRisk: true});
+    assert.equal(killOk.ok, true);
+
+    // 3d. 双端急停（手机急停 + 电脑 STOP 文件）
+    await hub.execute("hosts", {action: "emergency_stop", enabled: true});
+    await assert.rejects(() => hub.execute("window", {action: "list"}), /电脑操控已暂停/);
+    await hub.execute("hosts", {action: "emergency_stop", enabled: false});
+    const stopFile = path.join(tmpPcCfg, "STOP");
+    fs.writeFileSync(stopFile, "1", "utf8");
+    await assert.rejects(() => hub.execute("window", {action: "list"}), /急停文件生效/);
+    fs.unlinkSync(stopFile);
+
+    // 3e. 加固版公网反连中继模式 E2E（未鉴权通道必须 401 拦截 + 带 relaySecret 通过）
+    await new Promise(r => relaySrv.listen(0, "127.0.0.1", r));
+    const relayPort = relaySrv.address().port;
+    const relayUrl = `http://127.0.0.1:${relayPort}`;
+    const unauthPoll = await fetch(`${relayUrl}/relay/pc-nat-1/poll`);
+    assert.equal(unauthPoll.status, 401, "Relay poll without channel auth must be rejected with 401");
+    const unauthRelayRpc = await fetch(`${relayUrl}/relay/pc-nat-1/rpc`, {method: "POST", body: "{}"});
+    assert.equal(unauthRelayRpc.status, 401, "Relay rpc without channel auth must be rejected with 401");
+    relayApp = createPcAgentApp({
+      host: "127.0.0.1", port: 0, token, permissionLevel: "operate",
+      relayUrl, relaySecret, pairId: "pc-nat-1", ephemeralConfig: true, configDir: tmpPcCfg, backend: mockBackend,
+    });
+    await relayApp.start();
+    await new Promise(r => setTimeout(r, 120));
+    await hub.execute("hosts", {
+      action: "add", id: "nat-pc", name: "公网穿透电脑", transport: "relay",
+      relayUrl, relaySecret, pairId: "pc-nat-1", permissionLevel: "operate", token,
+    });
+    const relayPing = await hub.execute("hosts", {action: "ping", hostId: "nat-pc"});
+    assert.equal(relayPing.ok, true);
+    assert.equal(relayPing.via, "relay");
+    const relayClip = await hub.execute("clipboard", {hostId: "nat-pc", action: "get"});
+    assert.equal(relayClip.text, "CLIP_OK");
+
+    // 3g. 原生三端交叉编译状态 + 真实本机编译与缓存命中（如宿主机装有 Go）
+    const bStatus = await hub.execute("hosts", {action: "build_status"});
+    assert.equal(bStatus.ok, true);
+    assert.equal(bStatus.sourceReady, true);
+    assert.equal(bStatus.targets.length, 6);
+    if (bStatus.toolchain?.installed) {
+      const built1 = await hub.execute("hosts", {action: "build_native", os: "linux", arch: "arm64"});
+      assert.equal(built1.ok, true);
+      assert.equal(built1.results[0].cached, false);
+      assert.ok(built1.results[0].size > 1_000_000);
+      const built2 = await hub.execute("hosts", {action: "build_native", os: "linux", arch: "arm64"});
+      assert.equal(built2.results[0].cached, true, "Second build with unchanged sources must hit cache");
+    }
+
+    // 3f. 交互式 Android 高危操作审批回调（拒绝/放行）与状态变更通知
+    const approvalReqs = [];
+    const cuNotifications = [];
+    let allowHighRisk = false;
+    const hubInteractive = createComputerUseHub({
+      home: tmpPhoneHome,
+      onApproveHighRisk: async req => {
+        approvalReqs.push(req);
+        return {approved: allowHighRisk};
+      },
+      onNotify: (method, params) => cuNotifications.push({method, params}),
+    });
+    try {
+      await assert.rejects(
+        () => hubInteractive.execute("process", {hostId: "my-pc", action: "kill", pid: 42}),
+        /用户拒绝高危电脑操作/,
+      );
+      assert.equal(approvalReqs.length, 1);
+      assert.equal(approvalReqs[0].hostId, "my-pc");
+      assert.equal(approvalReqs[0].action, "process");
+      allowHighRisk = true;
+      const approvedKill = await hubInteractive.execute("process", {hostId: "my-pc", action: "kill", pid: 42});
+      assert.equal(approvedKill.ok, true);
+      assert.equal(approvalReqs.length, 2);
+      await hubInteractive.execute("hosts", {action: "emergency_stop", enabled: true});
+      await hubInteractive.execute("hosts", {action: "emergency_stop", enabled: false});
+      assert.ok(cuNotifications.some(n => n.method === "computerUse/emergencyStop"));
+    } finally {
+      hubInteractive.dispose();
+    }
+  } finally {
+    hub.dispose();
+    if (relayApp) await relayApp.stop().catch(() => {});
+    await pcApp.stop().catch(() => {});
+    relaySrv.close();
+    fs.rmSync(tmpPhoneHome, {recursive: true, force: true});
+    fs.rmSync(tmpPcCfg, {recursive: true, force: true});
+  }
+}
+
 async function testToolchainAndDepsHub() {
   for (const rel of ["runtime/toolchain-hub.mjs", "runtime/toolchain-versions.mjs", "runtime/project-deps-hub.mjs"]) {
     const chk = spawnSync(process.execPath, ["--check", path.join(rootDir, rel)], {encoding: "utf8"});
@@ -4165,6 +4363,7 @@ await testProviderTranslators();
 await testUsageLedger();
 await testProviderGatewayE2E();
 await testCacheStabilityAndTelemetryFixes();
+await testComputerUseEndToEnd();
 await testToolchainAndDepsHub();
 await testMermaidCycleAndShapes();
 await testExtensionSyncClaudeHooks();

@@ -3084,6 +3084,39 @@ export async function startPluginControlServer(kernel, options = {}) {
         const call = () => options.onMobileUse(mobileAction, params || {});
         return mobileAction === "status" ? await call() : await serialize("mobile", call);
       }
+      case "pcHosts":
+      case "pcScreenshot":
+      case "pcUiTree":
+      case "pcWindow":
+      case "pcMouse":
+      case "pcKeyboard":
+      case "pcShell":
+      case "pcProcess":
+      case "pcSystem":
+      case "pcFiles":
+      case "pcClipboard":
+      case "pcBrowser":
+      case "pcWake": {
+        if (typeof options.onComputerUse !== "function") {
+          throw new Error("Computer Use 控制通道未就绪，请确认 agent-hub 已初始化 computer-use-hub");
+        }
+        const pcActionMap = {
+          pcHosts: "hosts",
+          pcScreenshot: "screenshot",
+          pcUiTree: "ui_tree",
+          pcWindow: "window",
+          pcMouse: "mouse",
+          pcKeyboard: "keyboard",
+          pcShell: "shell",
+          pcProcess: "process",
+          pcSystem: "system",
+          pcFiles: "files",
+          pcClipboard: "clipboard",
+          pcBrowser: "browser",
+          pcWake: "wake",
+        };
+        return await options.onComputerUse(pcActionMap[action], params || {});
+      }
       case "toolchains":
       case "deps":
       case "compile": {

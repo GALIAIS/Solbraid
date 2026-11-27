@@ -32,6 +32,7 @@ import {createCliUpdater, resolveCliInstallation, bundledCliInstallation, cliPat
 import * as extSync from "./extension-sync.mjs";
 import * as worktreeMgr from "./worktree-manager.mjs";
 import * as envSsh from "./env-ssh-hub.mjs";
+import {createComputerUseHub} from "./computer-use-hub.mjs";
 import * as toolchainHub from "./toolchain-hub.mjs";
 import * as projectDeps from "./project-deps-hub.mjs";
 import * as usageLedger from "./usage-ledger.mjs";
@@ -41,6 +42,11 @@ import {normalizeDownloadNetwork, saveDownloadNetwork, downloadEnvironment, gith
 
 const execFileAsync = promisify(execFile);
 const HOME = process.env.HOME || "/home/agent";
+const computerUseHub = createComputerUseHub({
+  home: HOME,
+  onNotify: (method, params) => notify(method, params),
+  onApproveHighRisk: req => askClient("computerUse/approveHighRisk", req),
+});
 const SESSIONS_ROOT = path.join(HOME, ".galiais", "agent-sessions");
 const NPM_PREFIX = path.join(HOME, ".galiais", "npm-global");
 const NPM_CACHE = path.join(HOME, ".galiais", "npm-cache");
@@ -2606,6 +2612,7 @@ async function dispatchRequest(method, params = {}) {
         const ctlOpts = {
           ...(process.env.SOLBRAID_PLUGIN_CTL_SOCKET ? {socketPath: process.env.SOLBRAID_PLUGIN_CTL_SOCKET} : {}),
           onMobileUse: (action, actionParams = {}) => askClient("mobileUse/execute", {action, params: actionParams}),
+          onComputerUse: (action, actionParams = {}) => computerUseHub.execute(action, actionParams, {origin: "mcp"}),
           onToolchain: async (action, p = {}) => {
             const onProgress = evt => notify("toolchains/progress", evt);
             const onAptExec = req => askClient("toolchains/aptExec", req);
@@ -4506,6 +4513,12 @@ async function dispatchRequest(method, params = {}) {
       }
     }
 
+    case "computerUse/hosts":
+      return await computerUseHub.hosts(params || {}, {origin: "ui"});
+
+    case "computerUse/execute":
+      return await computerUseHub.execute(String(params?.action || ""), params?.params || {}, {origin: "ui"});
+
     case "toolchains/list": {
       const hostCanApt = await askClient("toolchains/aptStatus", {}).then(r => Boolean(r?.aptWritable)).catch(() => false);
       return await toolchainHub.listToolchains(HOME, {hasHostAptBridge: hostCanApt});
@@ -4611,6 +4624,7 @@ function shutdown() {
   void devTools.closeAll().catch(error => console.error("终端清理失败：", error.message));
   void envSsh.closeAllTunnels().catch(error => console.error("SSH 隧道清理失败：", error.message));
   void envSsh.closeSftpTransfers().catch(error => console.error("SFTP 清理失败：", error.message));
+  try { computerUseHub.dispose(); } catch {}
   for (const key of [...drivers.keys()]) stopSessionDriver(key);
   for (const id of [...authProcs.keys()]) stopAuth(id);
   if (packageOperation?.child) {

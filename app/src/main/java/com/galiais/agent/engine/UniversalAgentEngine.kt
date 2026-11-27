@@ -954,6 +954,34 @@ class AgentHubController(val repo: ConversationRepository) {
             }
             return
         }
+        if (packet.has("id") && method == "computerUse/approveHighRisk") {
+            val reqId = packet.get("id")
+            repo.scope.launch {
+                try {
+                    val cu = (runtime.app as com.galiais.agent.GaliaisApplication).computerUse
+                    val decision = cu.requestHighRiskApproval(params)
+                    runCatching { runtime.hubRespond(reqId, decision) }
+                } catch (cancel: CancellationException) {
+                    runCatching { runtime.hubReject(reqId, -32000, "高危电脑操作审批已取消") }
+                    throw cancel
+                } catch (err: Exception) {
+                    runCatching { runtime.hubReject(reqId, -32000, err.message ?: "高危电脑操作审批失败") }
+                }
+            }
+            return
+        }
+        if (method == "computerUse/emergencyStop") {
+            (runtime.app as? com.galiais.agent.GaliaisApplication)?.computerUse?.acceptEmergencyStop(params.getBoolean("enabled"))
+            return
+        }
+        if (method == "computerUse/changed") {
+            (runtime.app as? com.galiais.agent.GaliaisApplication)?.computerUse?.refreshHostsAsync()
+            return
+        }
+        if (method == "computerUse/buildProgress") {
+            (runtime.app as? com.galiais.agent.GaliaisApplication)?.computerUse?.onBuildProgress(params)
+            return
+        }
         if (method == "toolchains/progress") {
             (runtime.app as? com.galiais.agent.GaliaisApplication)?.toolchains?.onProgressEvent(params)
             return
