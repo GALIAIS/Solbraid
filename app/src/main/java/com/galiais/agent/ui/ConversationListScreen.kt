@@ -81,6 +81,7 @@ import com.galiais.agent.engine.RUNTIME_MODE_PROOT
 import com.galiais.agent.engine.RuntimeSnapshot
 import com.galiais.agent.engine.WorkspaceArchive
 import com.galiais.agent.engine.WorkspaceFiles
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @Composable
@@ -137,6 +138,21 @@ fun ConversationListScreen(
     var exportingDir by remember { mutableStateOf<String?>(null) }
     var searching by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
+    var codexSearchHits by remember { mutableStateOf<List<ConversationSummary>>(emptyList()) }
+    var searchingCodex by remember { mutableStateOf(false) }
+    var syncingAgy by remember { mutableStateOf(false) }
+    LaunchedEffect(query, runtime.ready) {
+        val clean = query.trim()
+        if (!runtime.ready || clean.length < 2) {
+            codexSearchHits = emptyList()
+            searchingCodex = false
+            return@LaunchedEffect
+        }
+        delay(260L)
+        searchingCodex = true
+        codexSearchHits = runCatching { app.conversations.codex.searchThreads(clean, limit = 25) }.getOrDefault(emptyList())
+        searchingCodex = false
+    }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val files = remember { WorkspaceFiles(app.runtime, app.envSsh) }
@@ -161,8 +177,14 @@ fun ConversationListScreen(
             s.title.lowercase().contains(q) ||
                 s.preview.lowercase().contains(q) ||
                 (s.cwd?.lowercase()?.contains(q) == true) ||
+                (s.tag?.lowercase()?.contains(q) == true) ||
+                (s.gitBranch?.lowercase()?.contains(q) == true) ||
                 s.key.engine.label.lowercase().contains(q)
         }
+    }
+    val extraCodexSearchHits = remember(codexSearchHits, filtered) {
+        val localKeys = filtered.map { it.key }.toSet()
+        codexSearchHits.filter { it.key !in localKeys }
     }
     val projectGroups = remember(filtered, settings.projects, query) {
         fun norm(cwd: String?): String = cwd?.trim()?.trimEnd('/')?.ifEmpty { "/" } ?: UNASSIGNED_PROJECT
@@ -259,6 +281,24 @@ fun ConversationListScreen(
                             if (runtime.ready) {
                                 GaliaisMenuRow("Super-Agent 编排看板", icon = GaliaisIcons.GitBranch, onClick = { showHomeMenu = false; showSuperAgentBoard = true })
                                 GaliaisMenuRow("已归档会话", icon = GaliaisIcons.Archive, onClick = { showHomeMenu = false; showArchived = true })
+                                GaliaisMenuRow(
+                                    title = if (syncingAgy) "同步 Antigravity 中…" else "同步原生 Antigravity 会话",
+                                    icon = GaliaisIcons.Refresh,
+                                    enabled = !syncingAgy,
+                                    onClick = {
+                                        showHomeMenu = false
+                                        syncingAgy = true
+                                        scope.launch {
+                                            runCatching { app.conversations.hub.syncAgyNativeSessions(settings.defaultCwd) }
+                                                .onSuccess { imported ->
+                                                    app.conversations.refresh()
+                                                    app.conversations.notify(if (imported > 0) "已从原生 agy 同步 $imported 条新会话" else "Antigravity 会话已是最新")
+                                                }
+                                                .onFailure { app.conversations.notify("同步 Antigravity 失败：${it.message}") }
+                                            syncingAgy = false
+                                        }
+                                    },
+                                )
                             }
                             GaliaisMenuRow("刷新会话列表", icon = GaliaisIcons.Refresh, enabled = runtime.ready && !loading, onClick = { showHomeMenu = false; app.conversations.refresh() })
                         }
@@ -351,7 +391,33 @@ fun ConversationListScreen(
                     RequestCard(request) { decision -> app.conversations.resolve(request, decision) }
                 }
 
-                if (query.isNotBlank() && projectGroups.isEmpty()) {
+                if (query.isNotBlank() && (searchingCodex || extraCodexSearchHits.isNotEmpty())) {
+                    item(key = "codex-fulltext-header") {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                if (searchingCodex) "正在检索 Codex 全历史消息…" else "Codex 全历史消息匹配（${extraCodexSearchHits.size}）",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = G.codex,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                    }
+                    items(extraCodexSearchHits, key = { "codex-hit-${it.key.route}" }) { hit ->
+                        ConversationRow(
+                            app = app,
+                            summary = hit,
+                            hasPendingRequest = hit.key in pendingKeys,
+                            open = open,
+                            showCwd = true,
+                        )
+                    }
+                }
+
+                if (query.isNotBlank() && projectGroups.isEmpty() && extraCodexSearchHits.isEmpty() && !searchingCodex) {
                     item {
                         Box(Modifier.fillMaxWidth().padding(vertical = 48.dp), contentAlignment = Alignment.Center) {
                             Text("没有匹配「${query.trim()}」的项目或会话", style = MaterialTheme.typography.bodyMedium, color = G.inkMuted)
@@ -800,6 +866,7 @@ private fun ConversationRow(
 ) {
     var menu by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf(false) }
+    var tagging by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
@@ -817,6 +884,12 @@ private fun ConversationRow(
                         EngineLabel(summary.key.engine)
                         if (summary.parent != null) {
                             TagPill("分支", fg = G.inkMuted, bg = G.surfaceSubtle)
+                        }
+                        summary.tag?.takeIf { it.isNotBlank() }?.let { t ->
+                            TagPill("#$t", fg = G.claude, bg = G.claudeTint)
+                        }
+                        summary.gitBranch?.takeIf { it.isNotBlank() }?.let { br ->
+                            TagPill(br.take(18), fg = G.inkMuted, bg = G.surfaceSubtle)
                         }
                         if (hasPendingRequest) {
                             TagPill("待确认", fg = G.warning, bg = G.warningTint)
@@ -871,6 +944,13 @@ private fun ConversationRow(
         GaliaisDropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 GaliaisMenuRow(title = "重命名", icon = GaliaisIcons.Edit, onClick = { menu = false; renaming = true })
+                if (summary.key.engine == EngineKind.CLAUDE) {
+                    GaliaisMenuRow(
+                        title = if (summary.tag.isNullOrBlank()) "设置标签" else "编辑标签 (#${summary.tag})",
+                        icon = GaliaisIcons.Sparkles,
+                        onClick = { menu = false; tagging = true },
+                    )
+                }
                 if (AgentCatalog.capabilitiesOf(summary.key.engine).fork) {
                     GaliaisMenuRow(
                         title = "创建会话分支",
@@ -909,6 +989,41 @@ private fun ConversationRow(
             app.conversations.rename(summary.key, it)
             renaming = false
         }
+    }
+    if (tagging) {
+        var tagDraft by remember(summary.tag) { mutableStateOf(summary.tag.orEmpty()) }
+        AlertDialog(
+            onDismissRequest = { tagging = false },
+            containerColor = G.surface,
+            shape = D.dialogShape,
+            title = { Text("设置 Claude 会话标签", color = G.ink) },
+            text = {
+                OutlinedTextField(
+                    value = tagDraft,
+                    onValueChange = { tagDraft = it.take(40) },
+                    placeholder = { Text("留空则清除标签，如 bugfix / release", color = G.inkSubtle) },
+                    singleLine = true,
+                    shape = D.fieldShape,
+                    colors = galiaisTextFieldColors(),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val clean = tagDraft.trim().takeIf { it.isNotEmpty() }
+                    tagging = false
+                    scope.launch {
+                        runCatching { app.conversations.claude.tag(summary.key, clean) }
+                            .onSuccess {
+                                app.conversations.refresh()
+                                app.conversations.notify(if (clean != null) "已设置标签 #$clean" else "已清除会话标签")
+                            }
+                            .onFailure { app.conversations.notify("设置标签失败：${it.message}") }
+                    }
+                }) { Text("保存", color = G.accent, fontWeight = FontWeight.SemiBold) }
+            },
+            dismissButton = { TextButton(onClick = { tagging = false }) { Text("取消", color = G.inkMuted) } },
+        )
     }
     if (deleting) {
         AlertDialog(

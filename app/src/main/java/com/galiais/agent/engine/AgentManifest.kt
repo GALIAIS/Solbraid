@@ -63,14 +63,14 @@ data class AgentCapabilities(
     companion object {
         val CODEX = AgentCapabilities(
             streaming = true, approval = true, reasoning = true, plan = true, diff = true,
-            images = true, modes = false, models = true, effort = true, steer = true,
+            images = true, modes = true, models = true, effort = true, steer = true,
             revert = true, fork = true, archive = true, slashCommands = true, mcp = true,
             skills = true, delegation = true, customProvider = true,
         )
         val CLAUDE = AgentCapabilities(
             streaming = true, approval = true, reasoning = true, plan = true, diff = true,
             images = true, modes = true, models = true, effort = true, steer = false,
-            revert = true, fork = true, archive = false, slashCommands = true, mcp = true,
+            revert = true, fork = true, archive = true, slashCommands = true, mcp = true,
             skills = true, delegation = true, customProvider = true,
         )
         val ACP_DEFAULT = AgentCapabilities(
@@ -420,7 +420,7 @@ object BuiltInAgents {
         capabilities = AgentCapabilities(
             streaming = true, approval = true, reasoning = true, plan = true, diff = true,
             images = true, modes = true, models = true, effort = true, steer = false,
-            revert = true, fork = false, archive = false, slashCommands = true,
+            revert = true, fork = true, archive = true, slashCommands = true,
             mcp = true, skills = true, delegation = true, customProvider = true,
         ),
     )

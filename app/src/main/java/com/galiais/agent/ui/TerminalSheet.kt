@@ -121,6 +121,7 @@ fun TerminalSheet(
     cwd: String,
     sshHost: SshHostConfig? = null,
     initialSessionId: String? = null,
+    initialCommand: String? = null,
     onDismiss: () -> Unit,
 ) {
     val manager = app.envSsh.nativeTerminals
@@ -353,9 +354,28 @@ fun TerminalSheet(
         }
     }
 
-    LaunchedEffect(autoBootDone, runtime.ready, initialSessionId, sshHost?.id) {
+    LaunchedEffect(autoBootDone, runtime.ready, initialSessionId, sshHost?.id, initialCommand) {
         if (autoBootDone) return@LaunchedEffect
         val list = manager.sessions.value
+        if (!initialCommand.isNullOrBlank() && runtime.ready) {
+            val fresh = runCatching { manager.openLocal(cwd) }
+                .onFailure { errorBanner = it.message }.getOrNull()
+            if (fresh != null) {
+                selectedId = fresh.id
+                autoBootDone = true
+                // 等待本地 shell PTY 准备就绪后自动注入原生 TUI 命令
+                var waited = 0
+                while (fresh.status.value != TermSessionStatus.RUNNING && waited < 3000) {
+                    delay(100L)
+                    waited += 100
+                }
+                delay(280L)
+                if (fresh.status.value == TermSessionStatus.RUNNING) {
+                    fresh.sendUserRaw("$initialCommand\r")
+                }
+            }
+            return@LaunchedEffect
+        }
         if (initialSessionId != null && list.any { it.id == initialSessionId }) {
             selectedId = initialSessionId
             autoBootDone = true

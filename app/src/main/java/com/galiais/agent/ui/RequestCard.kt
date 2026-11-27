@@ -763,8 +763,19 @@ fun JsonSchemaForm(
         mutableStateMapOf<String, String>().apply {
             fields.forEach { f ->
                 if (f.type != "boolean" && f.type != "multi_enum") {
-                    val init = initialValues?.opt(f.name)?.takeUnless { it == JSONObject.NULL }?.toString()
-                        ?: f.defaultValue
+                    val init = if (f.type == "string_array") {
+                        val arr = initialValues?.optJSONArray(f.name)
+                        if (arr != null) {
+                            buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }.filter { it.isNotBlank() }.joinToString("\n")
+                        } else if (f.defaultMultiValues.isNotEmpty()) {
+                            f.defaultMultiValues.joinToString("\n")
+                        } else {
+                            f.defaultValue
+                        }
+                    } else {
+                        initialValues?.opt(f.name)?.takeUnless { it == JSONObject.NULL }?.toString()
+                            ?: f.defaultValue
+                    }
                     if (!init.isNullOrBlank()) put(f.name, init)
                 }
             }

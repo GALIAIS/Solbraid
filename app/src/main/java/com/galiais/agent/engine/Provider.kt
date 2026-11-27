@@ -553,7 +553,23 @@ fun exportProvidersBundleJson(providers: List<CustomProvider>, groups: List<Rout
         .put("routingGroups", JSONArray().apply { groups.forEach { put(it.toJson()) } })
         .toString(2)
 
-/** 从 JSON 文本导入服务商配置（兼容单条对象、数组或完整 bundle）。 */
+private val SAFE_PROVIDER_ID_REGEX = Regex("^[a-zA-Z0-9_-]{1,64}$")
+
+private fun sanitizeImportedProvider(obj: JSONObject): CustomProvider {
+    val rawId = obj.optString("id").trim()
+    val safeId = if (SAFE_PROVIDER_ID_REGEX.matches(rawId)) rawId else newProviderId()
+    val copy = JSONObject(obj.toString()).put("id", safeId)
+    val p = CustomProvider.fromJson(copy, hasApiKey = false)
+    return p.copy(
+        baseUrl = validateProviderBaseUrl(p.baseUrl),
+        chatUrl = validateOptionalEndpointUrl(p.chatUrl),
+        responsesUrl = validateOptionalEndpointUrl(p.responsesUrl),
+        anthropicUrl = validateOptionalEndpointUrl(p.anthropicUrl),
+        geminiUrl = validateOptionalEndpointUrl(p.geminiUrl),
+    )
+}
+
+/** 从 JSON 文本导入服务商配置（兼容单条对象、数组或完整 bundle），校验所有协议端点 URL 与服务商 ID。 */
 fun parseProvidersBundleJson(raw: String): Pair<List<CustomProvider>, List<RoutingGroup>> {
     val trimmed = raw.trim()
     require(trimmed.isNotEmpty()) { "剪贴板内容为空" }
@@ -561,22 +577,19 @@ fun parseProvidersBundleJson(raw: String): Pair<List<CustomProvider>, List<Routi
     val groups = mutableListOf<RoutingGroup>()
     if (trimmed.startsWith("[")) {
         JSONArray(trimmed).objects().forEach { obj ->
-            val p = CustomProvider.fromJson(obj.put("id", obj.optString("id").ifBlank { newProviderId() }), hasApiKey = false)
-            providers += p.copy(baseUrl = validateProviderBaseUrl(p.baseUrl))
+            providers += sanitizeImportedProvider(obj)
         }
     } else {
         val root = JSONObject(trimmed)
         if (root.has("providers")) {
             root.arr("providers").objects().forEach { obj ->
-                val p = CustomProvider.fromJson(obj.put("id", obj.optString("id").ifBlank { newProviderId() }), hasApiKey = false)
-                providers += p.copy(baseUrl = validateProviderBaseUrl(p.baseUrl))
+                providers += sanitizeImportedProvider(obj)
             }
             root.arr("routingGroups").objects().forEach { obj ->
                 runCatching { RoutingGroup.fromJson(obj) }.getOrNull()?.let { groups += it }
             }
         } else if (root.has("baseUrl")) {
-            val p = CustomProvider.fromJson(root.put("id", root.optString("id").ifBlank { newProviderId() }), hasApiKey = false)
-            providers += p.copy(baseUrl = validateProviderBaseUrl(p.baseUrl))
+            providers += sanitizeImportedProvider(root)
         }
     }
     require(providers.isNotEmpty() || groups.isNotEmpty()) { "未在 JSON 中找到有效的服务商配置" }

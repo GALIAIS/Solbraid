@@ -294,7 +294,7 @@ fun SuperAgentBoardSheet(
                 }
                 SettingsToggleRow(
                     title = "独立 Git Worktree 隔离",
-                    subtitle = "每个工单独占分支与工作目录，并行修改互不冲突，验收后一键合并",
+                    subtitle = "每个工单独占分支与工作目录，并行修改互不冲突，验收后合并回主分支",
                     checked = isolateWorktree,
                     onCheckedChange = { isolateWorktree = it },
                 )
@@ -428,7 +428,7 @@ fun SuperAgentBoardSheet(
                                     }
                                     if (t.stage == TicketStage.AWAITING_REVIEW) {
                                         TagPill(
-                                            text = if (busy) "处理中…" else "一键合并",
+                                            text = if (busy) "处理中…" else "合并分支",
                                             fg = G.success,
                                             bg = G.successTint,
                                             onClick = if (!busy && runtime.ready) ({ confirmMergeTicket = t }) else null,

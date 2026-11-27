@@ -68,15 +68,24 @@ async function readJsonSafe(file, fallback) {
 }
 
 async function writeJsonAtomic(file, value, mode = 0o600) {
-  await writeAtomic(file, JSON.stringify(value, null, 2) + "\n", mode);
+  return await writeAtomic(file, JSON.stringify(value, null, 2) + "\n", mode);
 }
 
 async function writeAtomic(file, content, mode = 0o600) {
+  try {
+    const prev = await fs.readFile(file, "utf8");
+    if (prev === content) return false;
+  } catch (err) {
+    if (err?.code !== "ENOENT") {
+      // 读取失败时仍继续原子写入，不阻塞同步
+    }
+  }
   await fs.mkdir(path.dirname(file), {recursive: true});
   const tmp = `${file}.${randomUUID()}.tmp`;
   try {
     await fs.writeFile(tmp, content, {mode, flag: "wx"});
     await fs.rename(tmp, file);
+    return true;
   } finally {
     await fs.rm(tmp, {force: true});
   }
@@ -140,9 +149,18 @@ async function resolveEffectiveServers(registry, secrets, agentId, cwd) {
     if (!matchesScope(srv.scope, cwd)) continue;
 
     const srvSecrets = secretMap[srv.id] || (srv.pluginId ? secretMap[`plugin:${srv.pluginId}`] : null) || {};
-    const env = {...userEnv, ...downloadEnvironment(network, {...process.env, ...userEnv}), ...(srv.env || {})};
+    // 最小权限隔离：仅向第三方 MCP 透传基础路径与代理配置，不再把用户全部 EnvHub 变量/密钥广播给第三方进程
+    const safeUserBase = {};
+    if (userEnv.PATH) safeUserBase.PATH = userEnv.PATH;
+    if (userEnv.LANG) safeUserBase.LANG = userEnv.LANG;
+    if (userEnv.LC_ALL) safeUserBase.LC_ALL = userEnv.LC_ALL;
+    const env = {
+      ...safeUserBase,
+      ...downloadEnvironment(network, {...process.env, ...safeUserBase}),
+      ...(srv.env || {}),
+    };
     for (const k of (srv.secretEnvKeys || [])) {
-      const val = srvSecrets[k] ?? secretMap[k];
+      const val = srvSecrets[k] ?? secretMap[k] ?? userEnv[k];
       if (val !== undefined && val !== null && String(val).length > 0) env[k] = String(val);
     }
     const headers = {...(srv.headers || {})};
@@ -261,8 +279,8 @@ async function syncCodexConfigToml(registry, secrets) {
   const next = managedBlock
     ? (stripped ? `${stripped}\n\n${managedBlock}` : managedBlock)
     : (stripped ? `${stripped}\n` : "");
-  await writeAtomic(CODEX_CONFIG, next);
-  return servers.length;
+  const changed = await writeAtomic(CODEX_CONFIG, next);
+  return {count: servers.length, changed};
 }
 
 async function syncSkillSymlinkDir(targetDir, entries) {
@@ -665,7 +683,7 @@ export function refreshCodexEnvironment() {
   const current = extensionSyncTail.then(async () => {
     const registry = await readJsonSafe(REGISTRY_FILE, {mcpServers: [], skills: [], plugins: [], instructions: [], subagents: [], hooks: []});
     const secrets = await readJsonSafe(SECRETS_FILE, {});
-    const count = await syncCodexConfigToml(registry, secrets);
+    const {count} = await syncCodexConfigToml(registry, secrets);
     await syncAntigravityMcpConfig(registry, secrets).catch(() => {});
     return count;
   });
@@ -687,13 +705,13 @@ async function syncExtensionsNow({registry, secrets}) {
     await writeJsonAtomic(SECRETS_FILE, secrets, 0o600);
   }
   const effectiveSecrets = secrets || (await readJsonSafe(SECRETS_FILE, {}));
-  const codexMcpCount = await syncCodexConfigToml(cleanReg, effectiveSecrets);
+  const {count: codexMcpCount, changed: codexConfigChanged} = await syncCodexConfigToml(cleanReg, effectiveSecrets);
   const antigravityMcpCount = await syncAntigravityMcpConfig(cleanReg, effectiveSecrets).catch(() => 0);
   const skillStats = await syncSkillSymlinks(cleanReg);
   const instrStats = await syncAllInstructions(cleanReg).catch(() => ({}));
   const subagentStats = await syncAllSubagents(cleanReg).catch(() => ({}));
   const hookStats = await syncAllHooks(cleanReg).catch(() => ({}));
-  return {ok: true, codexMcpCount, antigravityMcpCount, ...skillStats, ...instrStats, ...subagentStats, ...hookStats};
+  return {ok: true, codexMcpCount, codexConfigChanged, antigravityMcpCount, ...skillStats, ...instrStats, ...subagentStats, ...hookStats};
 }
 
 /** 供不支持原生 Skill 发现的外部 CLI Agent 注入精简技能索引。 */

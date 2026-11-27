@@ -65,7 +65,14 @@ class DelegationCoordinator(private val repo: ConversationRepository) {
     }
 
     fun reset() {
-        for (entry in active.values) entry.job?.cancel()
+        for ((parent, entry) in active.entries.toList()) {
+            entry.job?.cancel()
+            repo.mutateItem<TimelineItem>(parent, entry.itemId, { null }) {
+                if (it is TimelineItem.Delegation && it.status == ItemStatus.RUNNING) {
+                    it.copy(result = "运行环境已重置，委派中断", status = ItemStatus.FAILED)
+                } else it
+            }
+        }
         active.clear()
         accepted.clear()
     }

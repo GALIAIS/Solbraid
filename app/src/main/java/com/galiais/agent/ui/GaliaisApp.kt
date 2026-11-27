@@ -97,6 +97,7 @@ private data class TerminalLaunchRequest(
     val cwd: String,
     val sshHost: SshHostConfig? = null,
     val initialSessionId: String? = null,
+    val initialCommand: String? = null,
     val onClosed: (() -> Unit)? = null,
 )
 
@@ -155,7 +156,7 @@ fun GaliaisApp(app: GaliaisApplication) {
     var pendingBrowseDir by remember { mutableStateOf<String?>(null) }
     var terminalRequest by remember { mutableStateOf<TerminalLaunchRequest?>(null) }
     val openTerminal: (cwd: String, sshHost: SshHostConfig?, initialSessionId: String?, onClosed: (() -> Unit)?) -> Unit = { cwd, sshHost, sessionId, onClosed ->
-        terminalRequest = TerminalLaunchRequest(cwd, sshHost, sessionId, onClosed)
+        terminalRequest = TerminalLaunchRequest(cwd, sshHost, sessionId, initialCommand = null, onClosed = onClosed)
         safeNavigate("terminal")
     }
 
@@ -488,6 +489,7 @@ fun GaliaisApp(app: GaliaisApplication) {
                         cwd = req?.cwd ?: settings.defaultCwd,
                         sshHost = req?.sshHost,
                         initialSessionId = req?.initialSessionId,
+                        initialCommand = req?.initialCommand,
                         onDismiss = {
                             req?.onClosed?.invoke()
                             safePopBack()
@@ -554,15 +556,23 @@ fun GaliaisApp(app: GaliaisApplication) {
                         onBack = ::safePopBack,
                         onOpenConversation = openConversation,
                         onReplaceConversation = { nextKey ->
-                            navigation.navigate("chat/${nextKey.route}") {
-                                popUpTo("chat/${key.route}") { inclusive = true }
-                                launchSingleTop = true
-                            }
+                            navigation.popBackStack()
+                            safeNavigate("chat/${nextKey.route}")
                         },
                         onOpenDirectory = { dir ->
                             pendingBrowseDir = dir
                             tab = 2
                             navigation.popBackStack("home", inclusive = false)
+                        },
+                        onOpenNativeTui = { tuiCwd, cmd, onClosed ->
+                            terminalRequest = TerminalLaunchRequest(
+                                cwd = tuiCwd,
+                                sshHost = null,
+                                initialSessionId = null,
+                                initialCommand = cmd,
+                                onClosed = onClosed,
+                            )
+                            safeNavigate("terminal")
                         },
                     )
                 }

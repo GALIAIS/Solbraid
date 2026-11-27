@@ -857,15 +857,16 @@ fun ProviderEditorDialog(
 
 @Composable
 internal fun RemoteModelPickerDialog(remote: List<String>, existing: Set<String>, onDismiss: () -> Unit, onConfirm: (List<String>) -> Unit) {
+    val uniqueRemote = remember(remote) { remote.distinct() }
     var query by remember { mutableStateOf("") }
-    val selected = remember { mutableStateListOf<String>().apply { addAll(existing.filter { it in remote }) } }
-    val filtered = remember(remote, query) {
+    val selected = remember(uniqueRemote) { mutableStateListOf<String>().apply { addAll(existing.filter { it in uniqueRemote }) } }
+    val filtered = remember(uniqueRemote, query) {
         val q = query.trim().lowercase()
-        if (q.isEmpty()) remote else remote.filter { it.lowercase().contains(q) }
+        if (q.isEmpty()) uniqueRemote else uniqueRemote.filter { it.lowercase().contains(q) }
     }
     GaliaisSheetScaffold(
         title = "选择远端模型",
-        subtitle = "已选 ${selected.size} / 共 ${remote.size} 个模型",
+        subtitle = "已选 ${selected.size} / 共 ${uniqueRemote.size} 个模型",
         onDismiss = onDismiss,
         scrollable = false,
         footer = {

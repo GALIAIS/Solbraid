@@ -39,7 +39,11 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
     private fun key(sessionId: String) = ConversationKey(EngineKind.CLAUDE, sessionId)
     private suspend fun call(method: String, params: JSONObject? = null) = runtime.requestObject(kind, method, params)
 
-    override suspend fun list(): List<ConversationSummary> {
+    override suspend fun list(): List<ConversationSummary> = listSessions(includeArchived = false)
+
+    suspend fun listArchived(): List<ConversationSummary> = listSessions(includeArchived = true).filter { it.archived }
+
+    private suspend fun listSessions(includeArchived: Boolean): List<ConversationSummary> {
         val summaries = linkedMapOf<ConversationKey, ConversationSummary>()
         var offset = 0
         while (true) {
@@ -62,8 +66,18 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
             }
             val page = resp.arr("sessions").objects()
             for (info in page) {
-                val item = ConversationSummary(key(info.getString("sessionId")), info.str("customTitle") ?: info.optString("summary").ifBlank { "未命名会话" },
-                    info.optString("firstPrompt"), info.str("cwd"), normalizeTime(info.optLong("lastModified")))
+                val archived = info.optBoolean("archived", false)
+                if (!includeArchived && archived) continue
+                val item = ConversationSummary(
+                    key = key(info.getString("sessionId")),
+                    title = info.str("customTitle") ?: info.optString("summary").ifBlank { "未命名会话" },
+                    preview = info.optString("firstPrompt"),
+                    cwd = info.str("cwd"),
+                    updatedAt = normalizeTime(info.optLong("lastModified")),
+                    archived = archived,
+                    tag = info.str("tag"),
+                    gitBranch = info.str("gitBranch"),
+                )
                 summaries[item.key] = item
             }
             if (page.size < 100) return summaries.values.toList()
@@ -324,7 +338,14 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                         if (reportedWindow != null || turnSum > 0L) {
                             val win = reportedWindow ?: curTokenUsage?.contextWindow ?: inferModelContextWindow(curModel)
                             curTokenUsage = curTokenUsage?.copy(contextWindow = win) ?: if (turnSum > 0L) {
-                                TokenUsage(turnSum, turnIn, resUsage?.optLong("cache_read_input_tokens") ?: 0L, turnOut, contextWindow = win)
+                                TokenUsage(
+                                    totalTokens = turnSum,
+                                    inputTokens = turnIn,
+                                    cachedInputTokens = resUsage?.optLong("cache_read_input_tokens") ?: 0L,
+                                    cacheWriteTokens = resUsage?.optLong("cache_creation_input_tokens") ?: 0L,
+                                    outputTokens = turnOut,
+                                    contextWindow = win,
+                                )
                             } else null
                         }
                     }
@@ -363,12 +384,23 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
 
     private fun normalizeDir(path: String): String = path.trim().trimEnd('/').ifEmpty { "/" }
 
-    private fun sessionOptions(cwd: String, providerId: String?, model: String?, effort: String? = null, permissionMode: String? = null, reasoningSummary: String? = null, fastMode: Boolean? = null): JSONObject {
+    private fun sessionOptions(
+        cwd: String,
+        providerId: String?,
+        model: String?,
+        effort: String? = null,
+        permissionMode: String? = null,
+        reasoningSummary: String? = null,
+        fastMode: Boolean? = null,
+        additionalDirectories: List<String> = emptyList(),
+        ultracode: Boolean = false,
+    ): JSONObject {
         val normCwd = normalizeDir(cwd)
         require(settings.state.value.trustedProjects.any { normalizeDir(it) == normCwd }) { "尚未信任此项目，不能加载它的 Claude Code 配置" }
         val state = settings.state.value
         val resolvedMode = permissionMode ?: state.claudePermissionMode
         val thinkingDisplay = if ((reasoningSummary ?: state.defaultReasoningSummaryFor(kind)) == "none") "omitted" else "summarized"
+        val extraDirsArr = JSONArray(additionalDirectories)
         if (providerId != null) {
             val provider = state.provider(providerId) ?: error("所选自定义服务商不存在")
             val (port, token) = runtime.gatewayEndpoint ?: error("本地协议网关未就绪")
@@ -385,6 +417,9 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                 "permissionMode" to resolvedMode,
                 "thinkingDisplay" to thinkingDisplay,
                 "fastMode" to fastMode,
+                "ultracode" to ultracode,
+                "promptSuggestions" to true,
+                "additionalDirectories" to extraDirsArr,
                 "promptCacheTtl" to state.claudePromptCacheTtl,
                 "commitAttribution" to state.claudeCommitAttribution,
                 "artifactsEnabled" to state.artifactsModeEnabled,
@@ -395,8 +430,39 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
             "oauthToken" to settings.claudeOauthToken(),
             "baseUrl" to state.claudeBaseUrl, "model" to officialModel, "effort" to effort,
             "permissionMode" to resolvedMode, "thinkingDisplay" to thinkingDisplay, "fastMode" to fastMode,
+            "ultracode" to ultracode, "promptSuggestions" to true, "additionalDirectories" to extraDirsArr,
             "promptCacheTtl" to state.claudePromptCacheTtl, "commitAttribution" to state.claudeCommitAttribution,
             "artifactsEnabled" to state.artifactsModeEnabled)
+    }
+
+    private fun applyInitMetadata(key: ConversationKey, init: JSONObject?) {
+        if (init == null) return
+        val style = init.str("output_style")
+        val styles = init.arr("available_output_styles").strings()
+        val acct = init.optJSONObject("account")
+        val accountSummary = acct?.let { a ->
+            listOfNotNull(
+                a.str("email"),
+                a.str("subscriptionType")?.uppercase(),
+                a.str("organization"),
+                a.str("apiProvider")?.takeIf { a.str("email").isNullOrBlank() },
+            ).joinToString(" / ").takeIf { it.isNotBlank() }
+        }
+        val fastState = init.str("fast_mode_state")
+        val fastReason = init.str("fast_mode_disabled_reason")
+        val cliVer = init.str("claude_code_version")
+        if (style != null || styles.isNotEmpty() || accountSummary != null || fastState != null || fastReason != null || cliVer != null) {
+            repo.update(key) { st ->
+                st.copy(
+                    outputStyle = style ?: st.outputStyle,
+                    availableOutputStyles = if (styles.isNotEmpty()) styles else st.availableOutputStyles,
+                    claudeAccountSummary = accountSummary ?: st.claudeAccountSummary,
+                    fastModeState = fastState ?: st.fastModeState,
+                    fastModeDisabledReason = fastReason ?: st.fastModeDisabledReason,
+                    claudeCodeVersion = cliVer ?: st.claudeCodeVersion,
+                )
+            }
+        }
     }
 
     private suspend fun ensureOpen(key: ConversationKey) {
@@ -407,10 +473,17 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
         val allowDelegation = settings.state.value.delegationEnabled && state.summary.parent == null
         if (providerId != null) repo.syncProvidersNow()
         repo.envSsh.syncBeforeLaunch()
-        call("session/open", sessionOptions(cwd, providerId, state.model, state.effort, state.permissionMode, state.reasoningSummary, state.fastMode).put("resume", key.id).put("allowDelegation", allowDelegation))
+        val opened = call(
+            "session/open",
+            sessionOptions(
+                cwd, providerId, state.model, state.effort, state.permissionMode,
+                state.reasoningSummary, state.fastMode, state.additionalDirectories, state.ultracode,
+            ).put("resume", key.id).put("allowDelegation", allowDelegation),
+        )
         connected += key.id
         settings.setClaudeSessionProvider(key.id, providerId)
         repo.update(key) { it.copy(providerId = providerId) }
+        applyInitMetadata(key, opened.optJSONObject("initialization"))
     }
 
     override suspend fun create(cwd: String, options: CreateOptions): ConversationKey {
@@ -452,10 +525,11 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                 fastMode = fastMode,
             )
         }
+        applyInitMetadata(key, opened.optJSONObject("initialization"))
         return key
     }
 
-    override suspend fun send(key: ConversationKey, text: String, attachments: List<ImageAttachment>) {
+    override suspend fun send(key: ConversationKey, text: String, attachments: List<ImageAttachment>) = repo.withEngineOperation(kind.id) {
         ensureOpen(key)
         val content: Any = if (attachments.isEmpty()) text else JSONArray().apply {
             for (att in attachments) {
@@ -477,7 +551,7 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
     }
 
     /** 发送 PDF 或文本文档块给 Claude Code 原生 `document` 内容接口。 */
-    suspend fun sendWithDocument(key: ConversationKey, text: String, docName: String, mimeType: String, base64OrPlain: String, isPdf: Boolean) {
+    suspend fun sendWithDocument(key: ConversationKey, text: String, docName: String, mimeType: String, base64OrPlain: String, isPdf: Boolean) = repo.withEngineOperation(kind.id) {
         ensureOpen(key)
         val source = if (isPdf) {
             jsonOf("type" to "base64", "media_type" to "application/pdf", "data" to base64OrPlain)
@@ -722,6 +796,7 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                         totalTokens = total,
                         inputTokens = prev?.inputTokens ?: total,
                         cachedInputTokens = prev?.cachedInputTokens ?: 0L,
+                        cacheWriteTokens = prev?.cacheWriteTokens ?: 0L,
                         outputTokens = prev?.outputTokens ?: 0L,
                         reasoningTokens = prev?.reasoningTokens ?: 0L,
                         contextWindow = max,
@@ -731,6 +806,337 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
             }
         }
         return res
+    }
+
+    /** 官方 `/usage` 实时限额窗口（5h/7d/Opus/Sonnet/OAuth）与会话费用报告。 */
+    suspend fun usageReport(key: ConversationKey? = null): EngineUsageReport {
+        val targetId = key?.id?.takeIf { it in connected } ?: connected.firstOrNull()
+        if (targetId == null && key != null) runCatching { ensureOpen(key) }
+        val activeId = key?.id?.takeIf { it in connected } ?: connected.firstOrNull()
+        val res = runCatching {
+            call("session/usage", jsonOf("sessionId" to activeId, "skipBehaviors" to true))
+        }.getOrElse { err ->
+            val st = key?.let { repo.state(it) }
+            return EngineUsageReport(
+                engine = EngineKind.CLAUDE,
+                sessionTokens = st?.tokenUsage?.sessionTotalTokens ?: st?.tokenUsage?.totalTokens,
+                note = err.message ?: "请先发送一条消息以连接 Claude Code 会话后再查询实时配额",
+            )
+        }
+        val usage = res.optJSONObject("usage") ?: JSONObject()
+        val acct = res.optJSONObject("account")
+        val session = usage.optJSONObject("session")
+        val rl = usage.optJSONObject("rate_limits")
+        val windows = mutableListOf<RateLimitSummary>()
+        fun addWindow(field: String, label: String) {
+            val w = rl?.optJSONObject(field) ?: return
+            if (w.isNull("utilization")) return
+            val pct = kotlin.math.round(w.optDouble("utilization", -1.0)).toInt()
+            if (pct >= 0) {
+                val resetRaw = w.str("resets_at")?.let { iso ->
+                    iso.replace('T', ' ').substringBefore('.').removeSuffix("Z").take(16)
+                }
+                windows += RateLimitSummary(label, pct.coerceIn(0, 100), resetRaw)
+            }
+        }
+        addWindow("five_hour", "5 小时滚动配额")
+        addWindow("seven_day", "7 天总配额")
+        addWindow("seven_day_sonnet", "7 天 Sonnet 配额")
+        addWindow("seven_day_opus", "7 天 Opus 配额")
+        addWindow("seven_day_oauth_apps", "7 天 OAuth 应用配额")
+        val modelRows = mutableListOf<Pair<String, String>>()
+        session?.optJSONObject("model_usage")?.let { mu ->
+            val keys = mu.keys()
+            while (keys.hasNext()) {
+                val m = keys.next()
+                val entry = mu.optJSONObject(m) ?: continue
+                val inT = entry.optLong("inputTokens", entry.optLong("input_tokens"))
+                val outT = entry.optLong("outputTokens", entry.optLong("output_tokens"))
+                val cost = entry.optDouble("costUSD", entry.optDouble("cost_usd", 0.0))
+                modelRows += m to String.format(java.util.Locale.ROOT, "入 %d / 出 %d · $%.4f", inT, outT, cost)
+            }
+        }
+        val plan = usage.str("subscription_type") ?: acct?.str("subscriptionType") ?: acct?.str("apiProvider")
+        val account = listOfNotNull(acct?.str("email"), acct?.str("organization")).joinToString(" · ").takeIf { it.isNotBlank() }
+        return EngineUsageReport(
+            engine = EngineKind.CLAUDE,
+            planLabel = plan,
+            accountLabel = account,
+            rateLimitsAvailable = usage.optBoolean("rate_limits_available", windows.isNotEmpty()),
+            windows = windows,
+            sessionCostUsd = session?.optDouble("total_cost_usd", Double.NaN)?.takeUnless { it.isNaN() },
+            sessionTokens = key?.let { repo.state(it)?.tokenUsage?.sessionTotalTokens ?: repo.state(it)?.tokenUsage?.totalTokens },
+            linesAdded = session?.optInt("total_lines_added", 0) ?: 0,
+            linesRemoved = session?.optInt("total_lines_removed", 0) ?: 0,
+            apiDurationMs = session?.optLong("total_api_duration_ms", 0L) ?: 0L,
+            totalDurationMs = session?.optLong("total_duration_ms", 0L) ?: 0L,
+            modelBreakdown = modelRows,
+            note = if (!usage.optBoolean("rate_limits_available", false)) "当前为 API Key / 第三方服务商会话，无 claude.ai 订阅限额窗口。" else null,
+        )
+    }
+
+    /** 官方 `/context` 上下文分类拆解（`getContextUsage({detail: 'full'})`）。 */
+    suspend fun contextBreakdown(key: ConversationKey, detail: String = "full"): ContextUsageBreakdown {
+        ensureOpen(key)
+        val res = call("session/contextUsage", jsonOf("sessionId" to key.id, "detail" to detail))
+        val total = res.optLong("totalTokens", 0L)
+        val max = res.optLong("maxTokens", res.optLong("rawMaxTokens", 200_000L))
+        val pct = res.optDouble("percentage", if (max > 0) total * 100.0 / max else 0.0)
+        val labelMap = mapOf(
+            "system_prompt" to "系统提示词",
+            "system_tools" to "内置工具定义",
+            "mcp_tools" to "MCP 工具定义",
+            "mcp_instructions" to "MCP 指令",
+            "mcp_tools_deferred" to "延迟加载 MCP 工具",
+            "system_tools_deferred" to "延迟加载系统工具",
+            "custom_agents" to "自定义子代理",
+            "memory_files" to "记忆文件 (CLAUDE.md)",
+            "skills" to "技能定义 (Skills)",
+            "messages" to "对话消息与工具结果",
+            "autocompact_buffer" to "自动压缩预留区",
+            "compact_buffer" to "压缩缓冲区",
+            "free_space" to "剩余可用窗口",
+        )
+        val cats = res.arr("categories").objects().map { c ->
+            val cid = c.str("id") ?: c.optString("name")
+            ContextCategoryRow(
+                id = cid,
+                name = labelMap[cid] ?: c.optString("name", cid),
+                tokens = c.optLong("tokens", 0L),
+                kind = c.optString("kind", "used"),
+                colorHex = c.str("color"),
+            )
+        }
+        val gridRows = buildList<List<ContextGridCell>> {
+            val rawRows = res.optJSONArray("gridRows") ?: return@buildList
+            for (r in 0 until rawRows.length()) {
+                val rowArr = rawRows.optJSONArray(r) ?: continue
+                val cells = buildList {
+                    for (c in 0 until rowArr.length()) {
+                        val cellObj = rowArr.optJSONObject(c)
+                        if (cellObj != null) {
+                            val cid = cellObj.str("categoryId") ?: cellObj.str("id") ?: cellObj.str("category") ?: "used"
+                            val kind = when {
+                                cid.contains("free", ignoreCase = true) -> "free"
+                                cid.contains("buffer", ignoreCase = true) -> "buffer"
+                                cid.contains("deferred", ignoreCase = true) -> "deferred"
+                                else -> "used"
+                            }
+                            add(ContextGridCell(cid, cellObj.str("color"), kind))
+                        } else {
+                            val rawStr = rowArr.optString(c).trim()
+                            if (rawStr.isNotEmpty()) {
+                                val kind = when {
+                                    rawStr.contains("free", ignoreCase = true) || rawStr == "." -> "free"
+                                    rawStr.contains("buffer", ignoreCase = true) -> "buffer"
+                                    else -> "used"
+                                }
+                                add(ContextGridCell(rawStr, null, kind))
+                            }
+                        }
+                    }
+                }
+                if (cells.isNotEmpty()) add(cells)
+            }
+        }
+        val memFiles = res.arr("memoryFiles").objects().map { m ->
+            Triple(m.optString("path"), m.optString("type"), m.optLong("tokens", 0L))
+        }
+        val mcpTools = res.arr("mcpTools").objects().map { t ->
+            Triple(t.optString("serverName"), t.optString("name"), t.optLong("tokens", 0L))
+        }
+        return ContextUsageBreakdown(
+            engine = EngineKind.CLAUDE,
+            model = res.str("model") ?: repo.state(key)?.model,
+            totalTokens = total,
+            maxTokens = max,
+            percentage = pct,
+            categories = cats,
+            gridRows = gridRows,
+            memoryFiles = memFiles,
+            mcpTools = mcpTools,
+        )
+    }
+
+    /** 官方 `/doctor` 健康体检（`claude doctor`）。 */
+    suspend fun diagnosticsReport(cwd: String? = null): EngineDiagnosticsReport {
+        val res = call("system/doctor", jsonOf("cwd" to cwd))
+        val ok = res.optBoolean("ok", false)
+        val cliVer = res.str("version")
+        val sdkVer = res.str("sdkVersion")
+        val out = listOf(res.optString("stdout"), res.optString("stderr")).filter { it.isNotBlank() }.joinToString("\n")
+        return EngineDiagnosticsReport(
+            engine = EngineKind.CLAUDE,
+            ok = ok,
+            version = listOfNotNull(cliVer?.let { "CLI $it" }, sdkVer?.let { "SDK $it" }).joinToString(" · "),
+            summary = if (ok) "Claude Code 体检通过" else "Claude Code 体检发现待关注项",
+            metrics = listOfNotNull(
+                cliVer?.let { "CLI 版本" to it },
+                sdkVer?.let { "Agent SDK 版本" to it },
+                "活跃会话数" to connected.size.toString(),
+            ),
+            rawOutput = out.ifBlank { "无额外输出" },
+        )
+    }
+
+    /** 支持指定任意历史消息节点分叉（`sdk.forkSession(..., {upToMessageId})`）。 */
+    suspend fun forkUpTo(key: ConversationKey, upToMessageId: String? = null, title: String? = null): ConversationKey {
+        val current = repo.state(key)
+        val cwd = current?.summary?.cwd
+        val params = jsonOf("sessionId" to key.id, "cwd" to cwd)
+        if (!upToMessageId.isNullOrBlank()) params.put("upToMessageId", upToMessageId)
+        if (!title.isNullOrBlank()) params.put("title", title)
+        val res = call("session/fork", params)
+        val newKey = key(res.getString("sessionId"))
+        settings.setClaudeSessionProvider(newKey.id, current?.providerId)
+        repo.update(newKey) { state ->
+            state.copy(
+                summary = ConversationSummary(
+                    key = newKey,
+                    title = title ?: (current?.summary?.title?.takeIf { it.isNotBlank() }?.let { "$it（分支）" }) ?: "分支会话",
+                    preview = current?.summary?.preview ?: "",
+                    cwd = cwd,
+                    updatedAt = System.currentTimeMillis(),
+                    parent = key,
+                ),
+                loaded = false,
+                providerId = current?.providerId,
+                model = current?.model,
+                effort = current?.effort,
+                permissionMode = current?.permissionMode ?: settings.state.value.claudePermissionMode,
+                reasoningSummary = current?.reasoningSummary,
+                fastMode = current?.fastMode,
+                additionalDirectories = current?.additionalDirectories.orEmpty(),
+                ultracode = current?.ultracode == true,
+            )
+        }
+        return newKey
+    }
+
+    /** 将阻塞中的前景任务（Bash / 子代理）转入后台（等价于原生 Ctrl+B）。 */
+    suspend fun backgroundTasks(key: ConversationKey, toolUseId: String? = null): Boolean {
+        if (key.id !in connected) return false
+        val params = jsonOf("sessionId" to key.id)
+        if (!toolUseId.isNullOrBlank()) params.put("toolUseId", toolUseId)
+        return call("session/backgroundTasks", params).optBoolean("backgrounded", false)
+    }
+
+    /** 精准停止指定后台任务（`query.stopTask(taskId)`）。 */
+    suspend fun stopTask(key: ConversationKey, taskId: String) {
+        ensureOpen(key)
+        call("session/stopTask", jsonOf("sessionId" to key.id, "taskId" to taskId))
+        repo.update(key) { st ->
+            st.copy(backgroundTasks = st.backgroundTasks.map { t ->
+                if (t.id == taskId) t.copy(status = "stopped") else t
+            })
+        }
+    }
+
+    /** 列举当前会话内的全部子代理 ID（`sdk.listSubagents`）。 */
+    suspend fun listSubagents(key: ConversationKey): List<String> =
+        call("session/listSubagents", jsonOf("sessionId" to key.id, "cwd" to repo.state(key)?.summary?.cwd))
+            .arr("subagents").strings()
+
+    /** 读取指定子代理的完整消息与工具调用链（`sdk.getSubagentMessages`）。 */
+    suspend fun subagentMessages(key: ConversationKey, agentId: String): List<SubagentMessageEntry> {
+        val raw = call("session/subagentMessages", jsonOf("sessionId" to key.id, "agentId" to agentId, "cwd" to repo.state(key)?.summary?.cwd))
+            .arr("messages").objects()
+        return raw.mapNotNull { m ->
+            val type = m.optString("type")
+            val content = m.optJSONObject("message")?.opt("content")
+            val body = when (content) {
+                is String -> content
+                is JSONArray -> content.objects().joinToString("\n\n") { b ->
+                    when (b.optString("type")) {
+                        "text" -> b.optString("text")
+                        "thinking" -> "【思考】\n${b.optString("thinking")}"
+                        "tool_use" -> "【工具 ${b.optString("name")}】\n${b.optJSONObject("input")?.toString(2)?.take(600) ?: ""}"
+                        "tool_result" -> "【结果】\n${blockText(b.opt("content")).take(600)}"
+                        else -> ""
+                    }
+                }.trim()
+                else -> ""
+            }
+            if (body.isBlank()) null else SubagentMessageEntry(
+                role = type,
+                title = when (type) { "user" -> "指令 / 工具结果"; "assistant" -> "子代理回复"; else -> type },
+                body = body,
+            )
+        }
+    }
+
+    /** 官方会话归档、恢复与标签（`archiveSession` / `unarchiveSession` / `tagSession`）。 */
+    suspend fun archive(key: ConversationKey) {
+        call("session/archive", jsonOf("sessionId" to key.id, "cwd" to repo.state(key)?.summary?.cwd))
+        connected -= key.id
+    }
+
+    suspend fun unarchive(key: ConversationKey) {
+        call("session/unarchive", jsonOf("sessionId" to key.id, "cwd" to repo.state(key)?.summary?.cwd))
+    }
+
+    suspend fun tag(key: ConversationKey, tag: String?) {
+        call("session/tag", jsonOf("sessionId" to key.id, "tag" to (tag ?: JSONObject.NULL), "cwd" to repo.state(key)?.summary?.cwd))
+        repo.update(key) { it.copy(summary = it.summary.copy(tag = tag?.takeIf { s -> s.isNotBlank() })) }
+    }
+
+    /** 会话内热重载插件（含 Prompt Cache 影响检测）、技能与输出风格。 */
+    suspend fun reloadPlugins(key: ConversationKey? = null, holdOnCacheImpact: Boolean = true): PluginReloadResult {
+        val params = jsonOf("holdOnCacheImpact" to holdOnCacheImpact, "refuseIfBusy" to true)
+        if (key != null && key.id in connected) params.put("sessionId", key.id)
+        val res = call("session/reloadPlugins", params)
+        val impact = res.optJSONObject("cache_impact")
+        return PluginReloadResult(
+            held = res.optBoolean("held", false),
+            errorCount = res.optInt("error_count", 0),
+            pluginCount = res.arr("plugins").length(),
+            commandCount = res.arr("commands").length(),
+            addedMcps = impact?.arr("mcp_servers_added")?.strings().orEmpty(),
+            removedMcps = impact?.arr("mcp_servers_removed")?.strings().orEmpty(),
+            lspChange = impact?.str("lsp_tool_change"),
+        )
+    }
+
+    suspend fun reloadSkills(key: ConversationKey? = null) {
+        val params = jsonOf()
+        if (key != null && key.id in connected) params.put("sessionId", key.id)
+        call("session/reloadSkills", params)
+    }
+
+    suspend fun reloadOutputStyles(key: ConversationKey? = null): List<String> {
+        val params = jsonOf()
+        if (key != null && key.id in connected) params.put("sessionId", key.id)
+        val res = call("session/reloadOutputStyles", params)
+        val styles = res.arr("output_styles").strings().ifEmpty { res.arr("available_output_styles").strings() }
+        if (key != null && styles.isNotEmpty()) repo.update(key) { it.copy(availableOutputStyles = styles) }
+        return styles
+    }
+
+    suspend fun setMcpPermissionOverride(serverName: String, mode: String?, key: ConversationKey? = null): String? {
+        val params = jsonOf("serverName" to serverName, "mode" to (mode ?: JSONObject.NULL))
+        if (key != null && key.id in connected) params.put("sessionId", key.id)
+        return call("mcp/setPermissionOverride", params).str("warning")
+    }
+
+    suspend fun setOutputStyle(key: ConversationKey, style: String) {
+        ensureOpen(key)
+        call("session/updateSettings", jsonOf("sessionId" to key.id, "source" to "localSettings", "settings" to jsonOf("outputStyle" to style)))
+        repo.update(key) { it.copy(outputStyle = style) }
+    }
+
+    suspend fun setUltracode(key: ConversationKey, enabled: Boolean) {
+        if (key.id in connected) call("session/setUltracode", jsonOf("sessionId" to key.id, "enabled" to enabled))
+        repo.update(key) { it.copy(ultracode = enabled) }
+    }
+
+    suspend fun addAdditionalDirectory(key: ConversationKey, dir: String) {
+        val st = repo.state(key) ?: error("会话不存在")
+        check(!st.running) { "请先等待本轮结束后再附加工作区目录" }
+        val next = (st.additionalDirectories + dir).distinct()
+        runCatching { call("session/close", jsonOf("sessionId" to key.id)) }
+        connected -= key.id
+        repo.update(key) { it.copy(additionalDirectories = next) }
+        repo.notify("已附加工作区目录 $dir（下次发送自动生效）")
     }
 
     suspend fun mcpServers(key: ConversationKey? = null): List<McpServerSummary> {
@@ -1002,6 +1408,34 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                         repo.scope.launch { runCatching { refreshContextUsage(key) } }
                     }
                 }
+                "task_started", "task_progress", "task_notification" -> {
+                    val taskId = message.str("task_id") ?: message.str("taskId") ?: message.str("id") ?: return
+                    val desc = message.str("description") ?: message.str("summary") ?: message.str("title") ?: message.str("task_type") ?: "后台任务"
+                    val cmd = message.str("command") ?: message.str("last_tool_name") ?: message.str("tool_name") ?: ""
+                    val nextStatus = when (message.optString("subtype")) {
+                        "task_started" -> "running"
+                        "task_progress" -> message.str("status") ?: "running"
+                        else -> message.str("status") ?: "completed"
+                    }
+                    repo.update(key) { st ->
+                        val prevList = st.backgroundTasks
+                        val entry = BackgroundTaskEntry(
+                            id = taskId,
+                            label = desc,
+                            command = cmd,
+                            status = nextStatus,
+                            cwd = message.str("output_file") ?: st.summary.cwd,
+                        )
+                        val updated = if (prevList.any { it.id == taskId }) {
+                            prevList.map { if (it.id == taskId) entry else it }
+                        } else prevList + entry
+                        st.copy(backgroundTasks = updated.takeLast(20))
+                    }
+                    if (live && message.optString("subtype") == "task_notification") {
+                        val summaryLine = message.str("summary")?.take(140) ?: desc
+                        repo.upsertItem(key, TimelineItem.Notice("task-$taskId", "后台任务已${if (nextStatus == "failed") "失败" else "完成"}：$summaryLine", error = nextStatus == "failed"))
+                    }
+                }
             }
             "stream_event" -> if (live) onStream(key, message.optJSONObject("event") ?: return)
             "assistant" -> {
@@ -1185,6 +1619,10 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                     })
                 }
             }
+            "prompt_suggestion" -> {
+                val pred = message.str("suggestion") ?: message.str("text")
+                if (!pred.isNullOrBlank()) repo.update(key) { it.copy(nextPromptPrediction = pred) }
+            }
             "result" -> {
                 val resUsage = message.optJSONObject("usage")
                 // 注意：Claude SDK 的 `result.usage` 是本轮所有工具调用子回合的累加总和，绝不能覆写单次上下文窗口占用！
@@ -1219,6 +1657,7 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                                 totalTokens = turnSum,
                                 inputTokens = turnIn,
                                 cachedInputTokens = resUsage?.optLong("cache_read_input_tokens") ?: 0L,
+                                cacheWriteTokens = resUsage?.optLong("cache_creation_input_tokens") ?: 0L,
                                 outputTokens = turnOut,
                                 contextWindow = win,
                                 sessionTotalTokens = cum,
@@ -1566,7 +2005,11 @@ class ClaudeEngine(private val repo: ConversationRepository) : EngineAdapter {
                 }
                 "delegate" -> {
                     val targetId = params.str("targetAgent")?.takeIf { it.isNotBlank() } ?: "codex"
-                    repo.delegation.requested(kind, id, sessionKey, EngineKind.of(targetId), params.optString("task"), repo.state(sessionKey ?: return)?.summary?.cwd)
+                    if (sessionKey == null) {
+                        runtime.reject(kind, id, -32602, "委派请求缺少来源会话")
+                    } else {
+                        repo.delegation.requested(kind, id, sessionKey, EngineKind.of(targetId), params.optString("task"), repo.state(sessionKey)?.summary?.cwd)
+                    }
                     null
                 }
                 else -> { runtime.reject(kind, id, -32602, "未知的 Claude Code 请求类型"); null }

@@ -308,8 +308,8 @@ async function openSession(params) {
   const allowedPermissionModes = ["default","acceptEdits","plan","auto","bypassPermissions"];
   const permissionMode = params.permissionMode ?? "default";
   if (!allowedPermissionModes.includes(permissionMode)) throw new Error("Invalid Claude Code permission mode");
-  const thinkingDisplay = params.thinkingDisplay ?? "summarized";
-  if (!["summarized","omitted"].includes(thinkingDisplay)) throw new Error("Invalid thinking display mode");
+  const thinkingDisplay = params.thinkingDisplay ?? null;
+  if (thinkingDisplay !== null && !["summarized","omitted","highlights"].includes(thinkingDisplay)) throw new Error("Invalid thinking display mode");
   if (params.fastMode !== undefined && params.fastMode !== null && typeof params.fastMode !== "boolean") throw new Error("Invalid fast mode setting");
 
   const configFingerprint = buildSessionFingerprint(params, cwd, env, permissionMode, thinkingDisplay);
@@ -352,7 +352,11 @@ async function openSession(params) {
     opening.delete(id);
     const mcpServers = {};
     try {
-      Object.assign(mcpServers, await loadMcpServersForClaude(cwd));
+      const loadedMcps = await loadMcpServersForClaude(cwd);
+      // 按名称字典序注入 MCP，避免不同启动次序造成 Claude toolSchemas 哈希漂移触发 tools_changed 缓存失效
+      for (const name of Object.keys(loadedMcps || {}).sort()) {
+        mcpServers[name] = loadedMcps[name];
+      }
     } catch (mcpErr) {
       appendStderrTail(session, `loadMcpServersForClaude warning: ${mcpErr?.message || mcpErr}\n`);
     }
@@ -365,12 +369,29 @@ async function openSession(params) {
     const systemPrompt = params.artifactsEnabled === false
       ? {type:"preset",preset:"claude_code"}
       : {type:"preset",preset:"claude_code",append:ARTIFACTS_APPEND_PROMPT};
-    if (params.promptCacheTtl && ["5m", "1h"].includes(params.promptCacheTtl)) {
-      env.ANTHROPIC_PROMPT_CACHE_TTL = params.promptCacheTtl;
-    }
     const extraSettings = {};
+    // 经逆向 Claude Code 2.1.331 实证：官方 TTL 解析读取 CLAUDE_CODE_PROMPT_CACHE_TTL / settings.promptCacheTtl / ENABLE_PROMPT_CACHING_1H，
+    // 而非此前误写的 ANTHROPIC_PROMPT_CACHE_TTL（二进制中无此环境变量）。
+    if (params.promptCacheTtl && ["5m", "1h"].includes(params.promptCacheTtl)) {
+      env.CLAUDE_CODE_PROMPT_CACHE_TTL = params.promptCacheTtl;
+      extraSettings.promptCacheTtl = params.promptCacheTtl;
+      if (params.promptCacheTtl === "1h") {
+        env.ENABLE_PROMPT_CACHING_1H = "1";
+      } else {
+        delete env.ENABLE_PROMPT_CACHING_1H;
+      }
+    }
     if (params.fastMode !== undefined && params.fastMode !== null) extraSettings.fastMode = params.fastMode;
+    if (params.ultracode === true) extraSettings.ultracode = true;
     if (params.commitAttribution === false) extraSettings.attribution = {commit: ""};
+    const additionalDirs = [];
+    if (Array.isArray(params.additionalDirectories)) {
+      for (const rawDir of params.additionalDirectories.slice(0, 16)) {
+        if (typeof rawDir === "string" && rawDir.trim()) {
+          try { additionalDirs.push(await directory(rawDir.trim())); } catch {}
+        }
+      }
+    }
     const options = {
       cwd,env,pathToClaudeCodeExecutable:executable,abortController:session.controller,
       permissionMode,allowDangerouslySkipPermissions:true,
@@ -378,24 +399,31 @@ async function openSession(params) {
       sandbox:{enabled:false},
       includePartialMessages:true,enableFileCheckpointing:true,mcpServers,
       mcpServersDelivery:"initialize",
+      promptSuggestions:params.promptSuggestions === true,
+      ...(additionalDirs.length ? {additionalDirectories:additionalDirs} : {}),
+      ...(typeof params.fallbackModel === "string" && params.fallbackModel.trim() ? {fallbackModel:string(params.fallbackModel,"fallback model",256)} : {}),
+      ...(typeof params.maxBudgetUsd === "number" && Number.isFinite(params.maxBudgetUsd) && params.maxBudgetUsd > 0 ? {maxBudgetUsd:params.maxBudgetUsd} : {}),
       stderr:chunk=>appendStderrTail(session, chunk),
       ...(params.resume === undefined ? {sessionId:id} : {resume:id}),
       ...(params.model === undefined ? {} : {model:string(params.model,"model",256)}),
       ...(params.effort === undefined || params.effort === null ? {} : {effort:params.effort}),
       ...(Object.keys(extraSettings).length ? {settings:extraSettings} : {}),
-      canUseTool:(toolName,input,request)=>{
+      canUseTool:async (toolName,input,request)=>{
         const {signal,...details}=request;
-        // 为 Claude Code 原生 Edit/Write 写前自动留存统一文件检查点（即使不在 Git 仓库中也可单文件一键撤回）
+        // 为 Claude Code 原生 Edit/Write 写前同步等待统一文件检查点（限 2s 防阻塞，彻底避免先写后快照竞态）
         if (toolName === "Edit" || toolName === "MultiEdit" || toolName === "Write" || toolName === "NotebookEdit") {
           const rawPath = input?.file_path || input?.path || input?.notebook_path;
           if (typeof rawPath === "string" && rawPath.trim()) {
-            void resolveSafeHomePath(rawPath, {cwd, allowMissing: true})
-              .then(resolved => captureFileCheckpoint(resolved, {sessionId: id}))
-              .catch(() => {});
+            await Promise.race([
+              resolveSafeHomePath(rawPath, {cwd, allowMissing: true})
+                .then(resolved => captureFileCheckpoint(resolved, {sessionId: id}))
+                .catch(() => {}),
+              new Promise(r => setTimeout(r, 2000)),
+            ]);
           }
         }
         // 委派工具本身会再向用户发起确认，这里不重复询问。
-        if (delegateTools.has(toolName) && session.delegation) return Promise.resolve({behavior:"allow"});
+        if (delegateTools.has(toolName) && session.delegation) return {behavior:"allow"};
         return ask(session,"permission",{toolName,input,...details},signal);
       },
       onElicitation:(request,{signal})=>ask(session,"elicitation",{request},signal),
@@ -417,7 +445,10 @@ async function openSession(params) {
       finally {closeSession(session);}
     })();
     const initialization = await session.query.initializationResult();
-    try { await session.query.setMaxThinkingTokens(null, thinkingDisplay); } catch {}
+    // 仅在显式指定 thinkingDisplay 时才覆盖，避免默认恢复会话时无谓触发 Claude thinking_display_changed 缓存失配
+    if (thinkingDisplay !== null) {
+      try { await session.query.setMaxThinkingTokens(null, thinkingDisplay); } catch {}
+    }
     return {sessionId:id,cwd,initialization};
   } catch(error) {
     const enriched = session ? new Error(withStderrContext(error?.message || String(error), session.stderrTail)) : error;
@@ -594,6 +625,116 @@ async function dispatch(method, params) {
       const detail = params.detail === "full" ? "full" : "summary";
       return await getSession(params).query.getContextUsage({detail});
     }
+    case "session/accountInfo": {
+      const target = params.sessionId ? getSession(params) : [...sessions.values()].find(s => !s.closed && s.query);
+      if (!target) throw new Error("请先打开或发送一条 Claude Code 会话消息后再查询账号信息");
+      if (typeof target.query.accountInfo !== "function") throw new Error("当前 Claude Code SDK 版本不支持 accountInfo");
+      return {account: await target.query.accountInfo()};
+    }
+    case "session/usage": {
+      const target = params.sessionId ? getSession(params) : [...sessions.values()].find(s => !s.closed && s.query);
+      if (!target) throw new Error("请先打开或发送一条 Claude Code 会话消息后再查询实时配额");
+      const usageFn = target.query.usage ?? target.query.getUsage ?? target.query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
+      if (typeof usageFn !== "function") throw new Error("当前 Claude Code SDK 版本未暴露结构化配额接口");
+      const usage = await usageFn.call(target.query, {skipBehaviors: params.skipBehaviors !== false});
+      const account = typeof target.query.accountInfo === "function"
+        ? await target.query.accountInfo().catch(() => null)
+        : null;
+      return {usage, account};
+    }
+    case "session/backgroundTasks": {
+      const target = getSession(params);
+      if (typeof target.query.backgroundTasks !== "function") throw new Error("当前 Claude Code SDK 版本不支持转入后台任务");
+      const toolUseId = typeof params.toolUseId === "string" && params.toolUseId.trim() ? params.toolUseId.trim() : undefined;
+      const moved = await target.query.backgroundTasks(toolUseId);
+      return {backgrounded: Boolean(moved)};
+    }
+    case "session/stopTask": {
+      const target = getSession(params);
+      if (typeof target.query.stopTask !== "function") throw new Error("当前 Claude Code SDK 版本不支持停止后台任务");
+      const taskId = string(params.taskId, "task id", 200);
+      await target.query.stopTask(taskId);
+      return {stopped: true, taskId};
+    }
+    case "session/listSubagents": {
+      const id = uuid(params.sessionId);
+      if (typeof sdk.listSubagents !== "function") return {subagents: []};
+      const opts = {...(params.cwd === undefined ? {} : {dir: await directory(params.cwd)})};
+      const subagents = await sdk.listSubagents(id, opts);
+      return {subagents: Array.isArray(subagents) ? subagents : []};
+    }
+    case "session/subagentMessages": {
+      const id = uuid(params.sessionId);
+      const agentId = string(params.agentId, "subagent id", 200);
+      if (typeof sdk.getSubagentMessages !== "function") return {messages: []};
+      const opts = {...(params.cwd === undefined ? {} : {dir: await directory(params.cwd)})};
+      const messages = await sdk.getSubagentMessages(id, agentId, opts);
+      return {messages: Array.isArray(messages) ? messages : []};
+    }
+    case "session/archive": {
+      const id = uuid(params.sessionId);
+      if (typeof sdk.archiveSession !== "function") throw new Error("当前 Claude Code SDK 版本不支持归档会话");
+      const existing = sessions.get(id);
+      if (existing && !existing.closed) {
+        if (existing.busy) throw new Error("当前会话正在运行任务，请先停止后再归档");
+        closeSession(existing);
+      }
+      await sdk.archiveSession(id, {...(params.cwd === undefined ? {} : {dir: await directory(params.cwd)})});
+      return {archived: true};
+    }
+    case "session/unarchive": {
+      const id = uuid(params.sessionId);
+      if (typeof sdk.unarchiveSession !== "function") throw new Error("当前 Claude Code SDK 版本不支持取消归档");
+      await sdk.unarchiveSession(id, {...(params.cwd === undefined ? {} : {dir: await directory(params.cwd)})});
+      return {archived: false};
+    }
+    case "session/tag": {
+      const id = uuid(params.sessionId);
+      if (typeof sdk.tagSession !== "function") throw new Error("当前 Claude Code SDK 版本不支持会话标签");
+      const tag = params.tag === null || params.tag === undefined || String(params.tag).trim() === ""
+        ? null : string(String(params.tag).trim(), "session tag", 64);
+      await sdk.tagSession(id, tag, {...(params.cwd === undefined ? {} : {dir: await directory(params.cwd)})});
+      return {tag};
+    }
+    case "mcp/setPermissionOverride": {
+      const target = params.sessionId ? getSession(params) : [...sessions.values()].find(s => !s.closed && s.query);
+      if (!target) throw new Error("No active Claude Code session");
+      if (typeof target.query.setMcpPermissionModeOverride !== "function") throw new Error("当前 Claude Code SDK 版本不支持单 MCP 权限覆写");
+      const serverName = string(params.serverName, "MCP server name", 200);
+      const mode = params.mode === null || params.mode === undefined ? null : string(params.mode, "MCP permission mode", 16);
+      if (mode !== null && !["default", "auto"].includes(mode)) throw new Error("Invalid MCP permission mode override");
+      return await target.query.setMcpPermissionModeOverride(serverName, mode);
+    }
+    case "session/updateSettings": {
+      const target = getSession(params);
+      if (typeof target.query.updateSettings !== "function") throw new Error("当前 Claude Code SDK 版本不支持持久化设置更新");
+      const source = string(params.source, "settings source", 32);
+      if (!["localSettings", "userSettings"].includes(source)) throw new Error("Invalid settings source");
+      const settingsObj = object(params.settings ?? {}, "settings");
+      await target.query.updateSettings(source, settingsObj);
+      return {ok: true};
+    }
+    case "session/setUltracode": {
+      await getSession(params).query.applyFlagSettings({ultracode: params.enabled === true});
+      return {ultracode: params.enabled === true};
+    }
+    case "system/doctor": {
+      const cwd = params.cwd ? await directory(params.cwd).catch(() => "/home/agent/workspace") : "/home/agent/workspace";
+      const userEnv = await loadEffectiveUserEnv(cwd, process.env.PATH || "").catch(() => ({}));
+      const env = {...process.env, ...userEnv, DISABLE_AUTOUPDATER: "1"};
+      try {
+        const {stdout, stderr} = await promisify(execFile)(executable, ["doctor"], {cwd, env, timeout: 30_000, maxBuffer: 512 * 1024});
+        return {ok: true, version: installation.version, sdkVersion: installation.sdkVersion, stdout: String(stdout || "").trim(), stderr: String(stderr || "").trim()};
+      } catch (err) {
+        return {
+          ok: false,
+          version: installation.version,
+          sdkVersion: installation.sdkVersion,
+          stdout: String(err?.stdout || "").trim(),
+          stderr: String(err?.stderr || err?.message || err).trim(),
+        };
+      }
+    }
     case "session/rewindFiles": {
       const msgId = string(params.userMessageId,"user message id",200);
       const dryRun = params.dryRun === true;
@@ -617,6 +758,39 @@ async function dispatch(method, params) {
       if (!target) throw new Error("No active Claude Code session");
       await target.query.reconnectMcpServer(name);
       return {};
+    }
+    case "mcp/setServers": {
+      const target = params.sessionId ? getSession(params) : [...sessions.values()].find(s => !s.closed && s.query);
+      if (!target) throw new Error("No active Claude Code session");
+      const servers = object(params.servers ?? {}, "MCP servers");
+      return await target.query.setMcpServers(servers);
+    }
+    case "session/reloadPlugins": {
+      const target = params.sessionId ? getSession(params) : [...sessions.values()].find(s => !s.closed && s.query);
+      if (!target) throw new Error("No active Claude Code session");
+      if (typeof target.query.reloadPlugins !== "function") throw new Error("当前 Claude Code SDK 版本不支持热重载插件");
+      const opts = {};
+      if (typeof params.holdOnCacheImpact === "boolean") opts.holdOnCacheImpact = params.holdOnCacheImpact;
+      if (typeof params.refuseIfBusy === "boolean") opts.refuseIfBusy = params.refuseIfBusy;
+      if (Array.isArray(params.addPlugins)) opts.addPlugins = params.addPlugins;
+      return await target.query.reloadPlugins(opts);
+    }
+    case "session/reloadSkills": {
+      const target = params.sessionId ? getSession(params) : [...sessions.values()].find(s => !s.closed && s.query);
+      if (!target) throw new Error("No active Claude Code session");
+      if (typeof target.query.reloadSkills !== "function") throw new Error("当前 Claude Code SDK 版本不支持热重载技能");
+      return await target.query.reloadSkills();
+    }
+    case "session/reloadOutputStyles": {
+      const target = params.sessionId ? getSession(params) : [...sessions.values()].find(s => !s.closed && s.query);
+      if (!target) throw new Error("No active Claude Code session");
+      if (typeof target.query.reloadOutputStyles !== "function") throw new Error("当前 Claude Code SDK 版本不支持热重载输出风格");
+      return await target.query.reloadOutputStyles();
+    }
+    case "session/reinitialize": {
+      const target = getSession(params);
+      if (typeof target.query.reinitialize !== "function") throw new Error("当前 Claude Code SDK 版本不支持重新初始化");
+      return {initialization: await target.query.reinitialize()};
     }
     case "agent/list": {
       const target = params.sessionId ? getSession(params) : [...sessions.values()].find(s => !s.closed && s.query);
@@ -649,7 +823,7 @@ async function dispatch(method, params) {
     }
     case "session/setThinkingDisplay": {
       const display = string(params.display,"thinking display",32);
-      if (!["summarized","omitted"].includes(display)) throw new Error("Invalid thinking display mode");
+      if (!["summarized","omitted","highlights"].includes(display)) throw new Error("Invalid thinking display mode");
       await getSession(params).query.setMaxThinkingTokens(null,display);
       return {};
     }

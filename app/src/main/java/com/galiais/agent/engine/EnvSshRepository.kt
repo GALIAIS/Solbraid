@@ -54,7 +54,7 @@ class EnvSshRepository(
     private val activeTunnelsFlow = MutableStateFlow<List<SshActiveTunnel>>(emptyList())
     val activeTunnels: StateFlow<List<SshActiveTunnel>> = activeTunnelsFlow.asStateFlow()
     private val containerTunnelsFlow = MutableStateFlow<List<SshActiveTunnel>>(emptyList())
-    private val transferJobs = ConcurrentHashMap<String, Job>()
+    private val transferJobs = ConcurrentHashMap<String, Pair<Job, java.util.concurrent.atomic.AtomicBoolean>>()
 
     val nativeSsh = NativeSshEngine(runtime.app, settings)
     val nativeSftp = NativeSftpClient(nativeSsh)
@@ -540,28 +540,49 @@ class EnvSshRepository(
             resultPath = null,
         )
         acceptTransfer(initial)
+        val cancelFlag = java.util.concurrent.atomic.AtomicBoolean(false)
         val job = scope.launch(Dispatchers.IO) {
             try {
                 if (direction == "upload") {
                     val srcFile = resolveLocalTransferFile(localPath)
                     require(srcFile.exists()) { "本地文件不存在：$localPath" }
                     if (srcFile.isDirectory) {
-                        val children = srcFile.walkTopDown().filter { it.isFile }.toList()
+                        val children = mutableListOf<File>()
+                        val visitedInodes = HashSet<Pair<Long, Long>>()
+                        val visitedPaths = HashSet<String>()
+                        fun walkNoSymlinks(dir: File, depth: Int) {
+                            if (depth > 64 || cancelFlag.get()) return
+                            val (isLink, inode) = com.galiais.agent.engine.fs.LocalFsHelper.lstatIdentity(dir)
+                            if (depth > 0 && isLink) return
+                            if (inode != null && !visitedInodes.add(inode)) return
+                            if (inode == null) {
+                                val canon = runCatching { dir.canonicalPath }.getOrDefault(dir.absolutePath)
+                                if (!visitedPaths.add(canon)) return
+                            }
+                            for (c in dir.listFiles().orEmpty()) {
+                                val (cLink, _) = com.galiais.agent.engine.fs.LocalFsHelper.lstatIdentity(c)
+                                if (cLink) continue
+                                if (c.isDirectory) walkNoSymlinks(c, depth + 1)
+                                else if (c.isFile) children += c
+                            }
+                        }
+                        walkNoSymlinks(srcFile, 0)
                         val total = children.size.coerceAtLeast(1)
                         val baseRemote = "${remotePath.trimEnd('/')}/${srcFile.name}"
-                        runCatching { nativeSftp.mkdir(host, sshHostsFlow.value, baseRemote) }
+                        nativeSftp.mkdirs(host, sshHostsFlow.value, baseRemote)
                         children.forEachIndexed { idx, file ->
+                            if (cancelFlag.get()) throw CancellationException("用户已取消")
                             val relDir = file.parentFile?.relativeTo(srcFile)?.path?.replace('\\', '/').orEmpty()
                             val targetDir = if (relDir.isEmpty()) baseRemote else "$baseRemote/$relDir"
-                            if (relDir.isNotEmpty()) runCatching { nativeSftp.mkdir(host, sshHostsFlow.value, targetDir) }
-                            nativeSftp.uploadFile(host, sshHostsFlow.value, file, targetDir) { pct ->
+                            if (relDir.isNotEmpty()) nativeSftp.mkdirs(host, sshHostsFlow.value, targetDir)
+                            nativeSftp.uploadFile(host, sshHostsFlow.value, file, targetDir, cancelled = cancelFlag) { pct ->
                                 val overall = ((idx * 100 + pct) / total).coerceIn(0, 100)
                                 acceptTransfer(initial.copy(progressPercent = overall, progressLabel = "${file.name} (${idx + 1}/$total)"))
                             }
                         }
                         acceptTransfer(initial.copy(phase = "completed", progressPercent = 100, resultPath = baseRemote))
                     } else {
-                        val dest = nativeSftp.uploadFile(host, sshHostsFlow.value, srcFile, remotePath) { pct ->
+                        val dest = nativeSftp.uploadFile(host, sshHostsFlow.value, srcFile, remotePath, cancelled = cancelFlag) { pct ->
                             acceptTransfer(initial.copy(progressPercent = pct, progressLabel = srcFile.name))
                         }
                         acceptTransfer(initial.copy(phase = "completed", progressPercent = 100, resultPath = dest))
@@ -569,12 +590,16 @@ class EnvSshRepository(
                     onNotify("上传完成：$name")
                 } else {
                     val destDir = resolveLocalTransferFile(localPath).apply { mkdirs() }
-                    val destFile = File(destDir, name.ifBlank { "download.bin" })
-                    nativeSftp.downloadFile(host, sshHostsFlow.value, remotePath, destFile) { pct ->
-                        acceptTransfer(initial.copy(progressPercent = pct, progressLabel = name))
+                    val safeFileName = com.galiais.agent.engine.fs.ExternalStorageBridge.sanitizeFilename(name.ifBlank { "download.bin" })
+                    val destFile = File(destDir, safeFileName)
+                    val dirCanon = destDir.canonicalPath.trimEnd(File.separatorChar)
+                    val dstCanon = destFile.canonicalPath
+                    check(dstCanon.startsWith(dirCanon + File.separatorChar)) { "检测到非法下载文件名，已拦截：$name" }
+                    nativeSftp.downloadFile(host, sshHostsFlow.value, remotePath, destFile, cancelled = cancelFlag) { pct ->
+                        acceptTransfer(initial.copy(progressPercent = pct, progressLabel = safeFileName))
                     }
                     acceptTransfer(initial.copy(phase = "completed", progressPercent = 100, resultPath = destFile.absolutePath))
-                    onNotify("已下载：$name")
+                    onNotify("已下载：$safeFileName")
                 }
             } catch (_: CancellationException) {
                 acceptTransfer(initial.copy(phase = "cancelled", error = "用户已取消"))
@@ -584,13 +609,14 @@ class EnvSshRepository(
                 transferJobs.remove(transferId)
             }
         }
-        transferJobs[transferId] = job
+        transferJobs[transferId] = job to cancelFlag
     }
 
     suspend fun cancelTransfer(id: String) {
-        val job = transferJobs.remove(id)
-        if (job != null) {
-            job.cancel()
+        val pair = transferJobs.remove(id)
+        if (pair != null) {
+            pair.second.set(true)
+            pair.first.cancel()
             return
         }
         if (runtime.hubAvailable) {

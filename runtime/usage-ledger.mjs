@@ -3,6 +3,7 @@
 // 支持 12 周热力图、多维筛选（周期/日期/Agent/服务商/模型/仅异常/关键词）、明细追踪、CSV 导出与按维度清空。
 import fs from "node:fs/promises";
 import path from "node:path";
+import {randomUUID} from "node:crypto";
 
 const HOME = process.env.HOME || "/home/agent";
 export const USAGE_DIR = path.join(HOME, ".galiais", "usage");
@@ -15,12 +16,13 @@ const LOCK_WAIT_TIMEOUT_MS = 6_000;
 /** 跨进程原子文件锁：串行化 provider-gateway 与 agent-hub 对 ledger.jsonl 的并发追加与条件清理，防止丢行。 */
 async function withCrossProcessLedgerLock(fn) {
   await fs.mkdir(USAGE_DIR, {recursive: true, mode: 0o700});
+  const ownerToken = `${process.pid}:${randomUUID()}`;
   const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
   let handle = null;
   while (!handle) {
     try {
       handle = await fs.open(LEDGER_LOCK_FILE, "wx", 0o600);
-      await handle.writeFile(`${process.pid}\n${Date.now()}\n`, "utf8").catch(() => {});
+      await handle.writeFile(`${ownerToken}\n${Date.now()}\n`, "utf8").catch(() => {});
       await handle.close().catch(() => {});
       break;
     } catch (err) {
@@ -35,7 +37,7 @@ async function withCrossProcessLedgerLock(fn) {
         await fs.rm(LEDGER_LOCK_FILE, {force: true}).catch(() => {});
         handle = await fs.open(LEDGER_LOCK_FILE, "wx", 0o600).catch(() => null);
         if (handle) {
-          await handle.writeFile(`${process.pid}\n${Date.now()}\n`, "utf8").catch(() => {});
+          await handle.writeFile(`${ownerToken}\n${Date.now()}\n`, "utf8").catch(() => {});
           await handle.close().catch(() => {});
           break;
         }
@@ -47,7 +49,10 @@ async function withCrossProcessLedgerLock(fn) {
   try {
     return await fn();
   } finally {
-    await fs.rm(LEDGER_LOCK_FILE, {force: true}).catch(() => {});
+    const currentOwner = await fs.readFile(LEDGER_LOCK_FILE, "utf8").then(s => s.split("\n")[0]?.trim()).catch(() => "");
+    if (currentOwner === ownerToken) {
+      await fs.rm(LEDGER_LOCK_FILE, {force: true}).catch(() => {});
+    }
   }
 }
 

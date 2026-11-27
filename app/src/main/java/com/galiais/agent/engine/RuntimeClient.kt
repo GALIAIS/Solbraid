@@ -21,6 +21,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -36,6 +37,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicInteger
 
 /** 开放 Agent 标识：内置 Codex/Claude 为常量，第三方 ACP / CLI Bridge Agent 动态扩展。 */
 data class EngineKind(val id: String, val label: String) {
@@ -91,6 +93,11 @@ class RuntimeClient(val app: Application) {
     val events: SharedFlow<EngineEvent> = eventFlow.asSharedFlow()
     private val hubEventFlow = MutableSharedFlow<JSONObject>(extraBufferCapacity = 4096, onBufferOverflow = BufferOverflow.SUSPEND)
     val hubEvents: SharedFlow<JSONObject> = hubEventFlow.asSharedFlow()
+    /** 高吞吐流式数据通道（pty/output、tcp/data），与审批/控制事件隔离，避免终端刷屏或端口转发触发主队列溢出。 */
+    private val hubStreamChannel = Channel<JSONObject>(Channel.UNLIMITED)
+    private val pendingPtyFrames = AtomicInteger(0)
+    private val hubStreamFlow = MutableSharedFlow<JSONObject>(extraBufferCapacity = 2048, onBufferOverflow = BufferOverflow.SUSPEND)
+    val hubStreamEvents: SharedFlow<JSONObject> = hubStreamFlow.asSharedFlow()
     private val environmentFlow = MutableStateFlow(EnvironmentStatus())
     val environment: StateFlow<EnvironmentStatus> = environmentFlow.asStateFlow()
     private val rootAvailableFlow = MutableStateFlow<Boolean?>(null)
@@ -132,6 +139,14 @@ class RuntimeClient(val app: Application) {
                 if (state in setOf("stopped", "ready", "error")) refreshEnvironment()
             }
         }
+        scope.launch {
+            for (packet in hubStreamChannel) {
+                if (packet.optString("method") == "pty/output") {
+                    pendingPtyFrames.decrementAndGet()
+                }
+                hubStreamFlow.emit(packet)
+            }
+        }
     }
 
     fun bind() {
@@ -160,15 +175,27 @@ class RuntimeClient(val app: Application) {
                 val engId = packet.engineName
                 val data = packet.data
                 if (engId == "agent-hub") {
+                    val method = data.optString("method")
+                    if (method == "pty/output" || method == "tcp/data") {
+                        if (method == "pty/output") {
+                            if (pendingPtyFrames.get() >= 2048) {
+                                Log.w("GALIAIS", "终端输出突发过快，已丢弃一帧过载 PTY 数据以保护主通道")
+                                return
+                            }
+                            pendingPtyFrames.incrementAndGet()
+                        }
+                        hubStreamChannel.trySend(data)
+                        return
+                    }
                     if (!hubEventFlow.tryEmit(data)) {
-                        Log.e("GALIAIS", "Agent Hub 事件队列已满，停止运行环境以免丢失审批或传输数据")
-                        stop()
+                        Log.w("GALIAIS", "Agent Hub 事件队列短暂拥塞，改由异步协程排空以避免误杀运行环境")
+                        scope.launch { hubEventFlow.emit(data) }
                     }
                 } else {
                     val event = EngineEvent(EngineKind.of(engId), data)
                     if (!eventFlow.tryEmit(event)) {
-                        Log.e("GALIAIS", "界面事件队列已满，停止运行环境以免状态不一致")
-                        stop()
+                        Log.w("GALIAIS", "界面事件队列短暂拥塞，改由异步协程排空")
+                        scope.launch { eventFlow.emit(event) }
                     }
                 }
             }
@@ -321,6 +348,17 @@ class RuntimeClient(val app: Application) {
     fun applyKeepAlive(keep: Boolean) { service?.applyKeepAlive(keep) }
 
     fun setActiveTurnRunning(active: Boolean) { service?.setActiveTurnRunning(active) }
+
+    /** 单引擎进程级热重载（仅重启 codex 或 claude 守护通道，不中断本地终端 PTY、SSH、SFTP 与其它引擎）。 */
+    suspend fun reloadSingleEngine(channel: String): JSONObject = try {
+        connected().reloadSingleEngine(channel).await()
+    } catch (error: CliRpcException) {
+        throw EngineException(error.code, error.message ?: "单引擎热重载失败")
+    } catch (error: java.util.concurrent.CompletionException) {
+        val cause = error.cause
+        if (cause is CliRpcException) throw EngineException(cause.code, cause.message ?: "单引擎热重载失败")
+        throw cause ?: error
+    }
 
     private fun connected(): VmRuntimeService = service ?: throw EngineException(-32000, "本地运行服务未连接")
 

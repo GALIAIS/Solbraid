@@ -242,8 +242,10 @@ fun UniversalAgentDetailScreen(
                             !runtime.ready -> "运行环境未就绪"
                             authStatus?.loggedIn == true -> when (authStatus?.authMethod) {
                                 "llm-gateway" -> "已通过本地网关（LLM Gateway）连接"
-                                "oauth-personal" -> "Google OAuth 已登录" + (authStatus?.email?.let { " · $it" } ?: "")
+                                "oauth-personal" -> "Google 个人 OAuth 已登录" + (authStatus?.email?.let { " · $it" } ?: "")
+                                "oauth-business" -> "Gemini Enterprise / Business 已登录" + (authStatus?.email?.let { " · $it" } ?: "")
                                 "gemini-api-key" -> "已使用 Gemini API Key 认证"
+                                "agent-platform" -> "已通过 Agent Platform 认证"
                                 else -> "已认证（${authStatus?.authMethod}）"
                             }
                             agentId == "antigravity" && settings.hasAntigravityKey -> "已加密保存 Gemini API Key"
@@ -267,6 +269,49 @@ fun UniversalAgentDetailScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = G.inkMuted,
                         )
+                        if (agentId == "antigravity" && runtime.ready) {
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text("官方 ACP 认证通道（4 种）", style = MaterialTheme.typography.labelSmall, color = G.inkMuted)
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    listOf(
+                                        "oauth-personal" to "Google 个人",
+                                        "oauth-business" to "Gemini Enterprise",
+                                        "gemini-api-key" to "Gemini API Key",
+                                        "agent-platform" to "Agent Platform",
+                                    ).forEach { (methodId, label) ->
+                                        val active = authStatus?.authMethod == methodId && authStatus?.loggedIn == true
+                                        TagPill(
+                                            text = if (active) "$label (当前)" else label,
+                                            fg = if (active) G.onAccent else G.ink,
+                                            bg = if (active) accent else G.surfaceSubtle,
+                                            border = if (active) null else G.border,
+                                            onClick = {
+                                                scope.launch {
+                                                    if (methodId == "gemini-api-key" && !settings.hasAntigravityKey) {
+                                                        app.conversations.notify("请先在下方填写并保存 GEMINI_API_KEY")
+                                                        return@launch
+                                                    }
+                                                    runCatching { app.conversations.hub.authenticateAgyMethod(methodId) }
+                                                        .onSuccess {
+                                                            refreshTick++
+                                                            app.conversations.notify("已切换 Antigravity 认证通道：$label")
+                                                        }
+                                                        .onFailure { err ->
+                                                            if (methodId == "oauth-personal" || methodId == "oauth-business") {
+                                                                runCatching { app.conversations.hub.startAuth(manifest, "oauth") }
+                                                                    .onSuccess { app.conversations.notify("正在启动 $label 交互式 OAuth 登录…") }
+                                                                    .onFailure { app.conversations.notify("认证失败：${err.message}") }
+                                                            } else {
+                                                                app.conversations.notify("切换 $label 认证失败：${err.message}")
+                                                            }
+                                                        }
+                                                }
+                                            },
+                                        )
+                                    }
+                                }
+                            }
+                        }
                         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             PrimaryPillButton(
                                 text = if (authState?.running == true) "等待授权完成…" else "开始 OAuth 登录",
@@ -281,7 +326,10 @@ fun UniversalAgentDetailScreen(
                             if (runtime.ready && authStatus?.loggedIn == true) {
                                 SecondaryPillButton("退出登录", danger = true, onClick = {
                                     scope.launch {
-                                        runCatching { app.conversations.hub.logoutAuth(agentId) }
+                                        runCatching {
+                                            if (agentId == "antigravity") app.conversations.hub.logoutAgyAccount()
+                                            else app.conversations.hub.logoutAuth(agentId)
+                                        }
                                             .onSuccess { refreshTick++; app.conversations.notify("已退出 ${manifest.name} 登录凭据") }
                                             .onFailure { app.conversations.notify("退出失败：${it.message}") }
                                     }

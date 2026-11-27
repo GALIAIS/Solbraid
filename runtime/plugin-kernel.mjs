@@ -2879,10 +2879,16 @@ export async function startPluginControlServer(kernel, options = {}) {
     await fs.rm(socketPath, {force: true}).catch(() => {});
   }
 
-  let mutationQueue = Promise.resolve();
-  const serialize = fn => {
-    const run = mutationQueue.then(fn, fn);
-    mutationQueue = run.catch(() => {});
+  const mutationQueues = new Map();
+  const serialize = (domain, fn) => {
+    const key = String(domain || "default");
+    const prev = mutationQueues.get(key) || Promise.resolve();
+    const run = prev.then(fn, fn);
+    const tail = run.catch(() => {});
+    mutationQueues.set(key, tail);
+    tail.finally(() => {
+      if (mutationQueues.get(key) === tail) mutationQueues.delete(key);
+    });
     return run;
   };
 
@@ -2893,7 +2899,7 @@ export async function startPluginControlServer(kernel, options = {}) {
       case "read":
         return await kernel.readPluginSource(params.pluginId);
       case "scaffold":
-        return await serialize(async () => {
+        return await serialize("plugin", async () => {
           const snap = await kernel.createLocalPlugin({
             id: params.id,
             name: params.name,
@@ -2909,9 +2915,9 @@ export async function startPluginControlServer(kernel, options = {}) {
       case "validate":
         return await kernel.validatePluginCandidate(params);
       case "apply":
-        return await serialize(() => kernel.applyPluginSourceUpdate(params));
+        return await serialize("plugin", () => kernel.applyPluginSourceUpdate(params));
       case "reload":
-        return await serialize(async () => {
+        return await serialize("plugin", async () => {
           if (params.pluginId) {
             const res = await kernel.reloadPlugin(params.pluginId);
             return {plugin: res.plugin, generationId: res.generationId, generationSeq: res.generationSeq};
@@ -2946,7 +2952,7 @@ export async function startPluginControlServer(kernel, options = {}) {
           snapshots: await kernel.listSourceSnapshots(params.pluginId),
         };
       case "rollback":
-        return await serialize(async () => {
+        return await serialize("plugin", async () => {
           if (params.restoreBuiltin) {
             const res = await kernel.restoreBuiltinPlugin(params.pluginId);
             return {ok: true, restoredBuiltin: true, plugin: res.plugin};
@@ -2955,11 +2961,11 @@ export async function startPluginControlServer(kernel, options = {}) {
           return {ok: true, snapshotId: res.snapshotId, restoredVersion: res.restoredVersion, plugin: res.plugin};
         });
       case "installDeps":
-        return await serialize(() => kernel.installPluginDependencies(params));
+        return await serialize("plugin", () => kernel.installPluginDependencies(params));
       case "testSdui":
         return await kernel.testPluginSdui(params);
       case "studioOverride":
-        return await serialize(() => kernel.manageStudioOverride(params));
+        return await serialize("plugin", () => kernel.manageStudioOverride(params));
       case "testDriver":
         return await kernel.testPluginDriverOrTranslator(params);
       case "translateRequest":
@@ -2969,7 +2975,7 @@ export async function startPluginControlServer(kernel, options = {}) {
       case "listTranslators":
         return {translators: kernel.snapshot().translators};
       case "selfBuild":
-        return await serialize(() => kernel.manageSelfBuild({
+        return await serialize("selfBuild", () => kernel.manageSelfBuild({
           ...params,
           source: "agent",
           onHostInstallApk: options.onHostInstallApk || null,
@@ -3001,31 +3007,29 @@ export async function startPluginControlServer(kernel, options = {}) {
           content: res.numberedContent,
         };
       }
-      case "fileEdit":
-        return await serialize(async () => {
-          const target = await resolveSafeHomePath(params.path, {cwd: params.cwd, allowedRoot: kernel.home});
-          return await safeEditFile(target, {
-            oldText: params.oldText,
-            newText: params.newText,
-            replaceAll: params.replaceAll,
-            edits: params.edits,
-            startLine: params.startLine,
-            endLine: params.endLine,
-            expectedSha256: params.expectedSha256,
-            sessionId: params.sessionId || "agent-fs",
-          });
-        });
-      case "fileCreate":
-        return await serialize(async () => {
-          const target = await resolveSafeHomePath(params.path, {cwd: params.cwd, allowedRoot: kernel.home, allowMissing: true});
-          return await safeCreateFile(target, String(params.content ?? ""), {
-            conflictPolicy: params.conflictPolicy || "fail_if_exists",
-            encoding: params.encoding || "utf-8",
-            lineEnding: params.lineEnding || "LF",
-            mode: params.mode,
-            sessionId: params.sessionId || "agent-fs",
-          });
-        });
+      case "fileEdit": {
+        const target = await resolveSafeHomePath(params.path, {cwd: params.cwd, allowedRoot: kernel.home});
+        return await serialize(`file:${target}`, () => safeEditFile(target, {
+          oldText: params.oldText,
+          newText: params.newText,
+          replaceAll: params.replaceAll,
+          edits: params.edits,
+          startLine: params.startLine,
+          endLine: params.endLine,
+          expectedSha256: params.expectedSha256,
+          sessionId: params.sessionId || "agent-fs",
+        }));
+      }
+      case "fileCreate": {
+        const target = await resolveSafeHomePath(params.path, {cwd: params.cwd, allowedRoot: kernel.home, allowMissing: true});
+        return await serialize(`file:${target}`, () => safeCreateFile(target, String(params.content ?? ""), {
+          conflictPolicy: params.conflictPolicy || "fail_if_exists",
+          encoding: params.encoding || "utf-8",
+          lineEnding: params.lineEnding || "LF",
+          mode: params.mode,
+          sessionId: params.sessionId || "agent-fs",
+        }));
+      }
       case "fileSearch": {
         const target = await resolveSafeHomePath(params.path, {cwd: params.cwd, allowedRoot: kernel.home});
         return await streamSearchFile(target, {
@@ -3035,15 +3039,14 @@ export async function startPluginControlServer(kernel, options = {}) {
           maxHits: params.maxHits,
         });
       }
-      case "fileRevert":
-        return await serialize(async () => {
-          const target = await resolveSafeHomePath(params.path, {cwd: params.cwd, allowedRoot: kernel.home, allowMissing: true});
-          return await revertFileCheckpoint({
-            sessionId: params.sessionId || "agent-fs",
-            checkpointId: String(params.checkpointId || ""),
-            filePath: target,
-          });
-        });
+      case "fileRevert": {
+        const target = await resolveSafeHomePath(params.path, {cwd: params.cwd, allowedRoot: kernel.home, allowMissing: true});
+        return await serialize(`file:${target}`, () => revertFileCheckpoint({
+          sessionId: params.sessionId || "agent-fs",
+          checkpointId: String(params.checkpointId || ""),
+          filePath: target,
+        }));
+      }
       case "mobileStatus":
       case "mobileScreenshot":
       case "mobileUiTree":
@@ -3079,7 +3082,7 @@ export async function startPluginControlServer(kernel, options = {}) {
         };
         const mobileAction = mobileActionMap[action];
         const call = () => options.onMobileUse(mobileAction, params || {});
-        return mobileAction === "status" ? await call() : await serialize(call);
+        return mobileAction === "status" ? await call() : await serialize("mobile", call);
       }
       default:
         throw new Error(`未知插件控制动作：${action}`);
@@ -3092,7 +3095,10 @@ export async function startPluginControlServer(kernel, options = {}) {
     conn.on("error", () => {});
     conn.on("data", chunk => {
       buf += chunk;
-      if (buf.length > 4 * 1024 * 1024) { conn.destroy(); return; }
+      if (buf.length > 10 * 1024 * 1024) {
+        if (!conn.destroyed) conn.end(JSON.stringify({ok: false, error: "控制通道单帧请求超出 10MB 上限"}) + "\n");
+        return;
+      }
       const nl = buf.indexOf("\n");
       if (nl < 0) return;
       const line = buf.slice(0, nl);

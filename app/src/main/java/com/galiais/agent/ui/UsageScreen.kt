@@ -452,14 +452,14 @@ fun UsageScreen(
             )
         }
     }
-    val facetAgents = remember(summary) { summary?.optJSONObject("facets")?.arr("agents")?.strings().orEmpty() }
+    val facetAgents = remember(summary) { summary?.optJSONObject("facets")?.arr("agents")?.strings().orEmpty().distinct() }
     val facetProviders = remember(summary) {
         summary?.optJSONObject("facets")?.arr("providers")?.objects().orEmpty().mapNotNull { o ->
             val id = o.optString("id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             id to o.optString("name", id)
-        }
+        }.distinctBy { it.first }
     }
-    val facetModels = remember(summary) { summary?.optJSONObject("facets")?.arr("models")?.strings().orEmpty() }
+    val facetModels = remember(summary) { summary?.optJSONObject("facets")?.arr("models")?.strings().orEmpty().distinct() }
     val recent = remember(summary) {
         summary?.arr("recent")?.objects().orEmpty().map { o ->
             UsageRequestRow(

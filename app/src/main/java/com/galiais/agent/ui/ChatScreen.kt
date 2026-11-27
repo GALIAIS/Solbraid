@@ -181,6 +181,7 @@ fun ChatScreen(
     onOpenConversation: (ConversationKey) -> Unit,
     onReplaceConversation: (ConversationKey) -> Unit = onOpenConversation,
     onOpenDirectory: (String) -> Unit = {},
+    onOpenNativeTui: (cwd: String, command: String, onClosed: () -> Unit) -> Unit = { _, _, _ -> },
 ) {
     val stateHolder = remember(key) { app.conversations.observeConversation(key) }.collectAsState(initial = app.conversations.state(key))
     val state = stateHolder.value
@@ -231,6 +232,15 @@ fun ChatScreen(
     var showVisualTemplates by remember { mutableStateOf(false) }
     var showLatexScratchpad by remember { mutableStateOf(false) }
     var showExpandedComposer by remember { mutableStateOf(false) }
+    var showUsageSheet by remember { mutableStateOf(false) }
+    var showContextSheet by remember { mutableStateOf(false) }
+    var showDiagnosticsSheet by remember { mutableStateOf(false) }
+    var showQueueTasksSheet by remember { mutableStateOf(false) }
+    var showMemoryGoalSheet by remember { mutableStateOf(false) }
+    var showSubagentsSheet by remember { mutableStateOf(false) }
+    var subagentInitialId by remember { mutableStateOf<String?>(null) }
+    var showClaudeReloadSheet by remember { mutableStateOf(false) }
+    var showAddDirDialog by remember { mutableStateOf(false) }
     var studioArtifact by remember { mutableStateOf<ChatArtifact?>(null) }
     var studioPluginId by remember { mutableStateOf<String?>(null) }
     var openingPluginSurface by remember { mutableStateOf<Pair<String, String>?>(null) }
@@ -399,6 +409,7 @@ fun ChatScreen(
     val turnBlocks = remember(key, state?.items, state?.turnDurations, state?.running) {
         turnBlockCache.group(state?.items.orEmpty(), state?.turnDurations.orEmpty(), state?.running == true)
     }
+    val latestTurnBlocks by rememberUpdatedState(turnBlocks)
     var visibleTurnLimit by remember(key) { mutableIntStateOf(25) }
     // 只有用户主动脱离底部且下方确实还有内容时才显示回底按钮，流式增长期间不闪烁。
     val showScrollDown by remember(list) { derivedStateOf { !followLatest && list.canScrollForward } }
@@ -602,10 +613,11 @@ fun ChatScreen(
     }
 
     fun computeEditImpact(target: TimelineItem.UserMessage): Triple<Int, Int, Boolean> {
-        val blockIdx = turnBlocks.indexOfFirst { it.userMessage?.id == target.id }
+        val currentBlocks = latestTurnBlocks
+        val blockIdx = currentBlocks.indexOfFirst { it.userMessage?.id == target.id }
         val turnNumber = if (blockIdx >= 0) blockIdx + 1 else 1
-        val laterTurnCount = if (blockIdx >= 0) (turnBlocks.lastIndex - blockIdx).coerceAtLeast(0) else 0
-        val hasFileEdits = if (blockIdx >= 0) turnBlocks.drop(blockIdx).any { it.editedFiles.isNotEmpty() } else false
+        val laterTurnCount = if (blockIdx >= 0) (currentBlocks.lastIndex - blockIdx).coerceAtLeast(0) else 0
+        val hasFileEdits = if (blockIdx >= 0) currentBlocks.drop(blockIdx).any { it.editedFiles.isNotEmpty() } else false
         return Triple(turnNumber, laterTurnCount, hasFileEdits)
     }
 
@@ -742,12 +754,16 @@ fun ChatScreen(
         }
     }
 
-    fun forkConversation() {
+    fun forkConversation(upToMessageId: String? = null) {
         scope.launch {
             try {
-                val forked = app.conversations.fork(key)
+                val forked = if (upToMessageId != null) {
+                    app.conversations.forkAtMessage(key, upToMessageId)
+                } else {
+                    app.conversations.fork(key)
+                }
                 if (forked != null) {
-                    app.conversations.notify("已创建会话分支")
+                    app.conversations.notify(if (upToMessageId != null) "已从所选节点创建分支会话" else "已创建会话分支")
                     onOpenConversation(forked)
                 } else {
                     app.conversations.notify("当前 Agent 不支持会话分支")
@@ -758,14 +774,43 @@ fun ChatScreen(
         }
     }
 
+    fun launchNativeTui() {
+        val targetCwd = cwd ?: settings.defaultCwd
+        val cmd = app.conversations.buildNativeTuiCommand(key)
+        onOpenNativeTui(targetCwd, cmd) {
+            scope.launch {
+                if (key.engine.id == "antigravity") {
+                    runCatching { app.conversations.hub.syncAgyNativeSessions(targetCwd) }
+                }
+                app.conversations.open(key)
+                app.conversations.refresh()
+            }
+        }
+    }
+
     fun runSlashCommand(cmd: SlashCommand) {
         replaceDraft("")
         when (cmd.localAction) {
+            "usage" -> showUsageSheet = true
+            "context" -> showContextSheet = true
             "compact" -> app.conversations.compact(key)
             "fork" -> forkConversation()
+            "queue", "tasks" -> showQueueTasksSheet = true
+            "memory" -> showMemoryGoalSheet = true
+            "agents" -> showSubagentsSheet = true
+            "reload" -> showClaudeReloadSheet = true
+            "add-dir" -> showAddDirDialog = true
+            "doctor" -> showDiagnosticsSheet = true
+            "tui" -> launchNativeTui()
             "plan" -> {
-                val next = if (state?.permissionMode == "plan") "default" else "plan"
-                app.conversations.setPermissionMode(key, next)
+                if (key.engine == EngineKind.CODEX) {
+                    val next = if (state?.collaborationMode == "plan") "default" else "plan"
+                    app.conversations.setCollaborationMode(key, next)
+                    app.conversations.notify(if (next == "plan") "Codex 已切换至计划协作模式" else "Codex 已恢复默认协作模式")
+                } else {
+                    val next = if (state?.permissionMode == "plan") "default" else "plan"
+                    app.conversations.setPermissionMode(key, next)
+                }
             }
             "archive" -> {
                 app.conversations.archive(key)
@@ -938,7 +983,7 @@ fun ChatScreen(
                                         .clip(D.chipShape)
                                         .background(if (active) G.accent else G.surface)
                                         .border(0.75.dp, if (active) G.accent else G.border, D.chipShape)
-                                        .clickable(enabled = !active) { onOpenConversation(sib) }
+                                        .clickable(enabled = !active) { onReplaceConversation(sib) }
                                         .padding(horizontal = 10.dp, vertical = 4.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(5.dp),
@@ -1144,7 +1189,14 @@ fun ChatScreen(
                             else -> app.conversations.setPermissionMode(key, "default")
                         }
                     }
-                    app.conversations.send(key, "批准以上执行计划《${plan.title.ifBlank { "执行计划" }}》，请开始按方案实施。")
+                    if (key.engine == EngineKind.CODEX) {
+                        scope.launch {
+                            runCatching { app.conversations.codex.prepareApprovedPlan(key, plan.text) }
+                            app.conversations.send(key, "批准以上执行计划《${plan.title.ifBlank { "执行计划" }}》，请开始按方案实施。")
+                        }
+                    } else {
+                        app.conversations.send(key, "批准以上执行计划《${plan.title.ifBlank { "执行计划" }}》，请开始按方案实施。")
+                    }
                     Unit
                 }) else null
             }
@@ -1186,13 +1238,18 @@ fun ChatScreen(
                         }
                     }) else null,
                     onFork = if (allowFork) ({ forkConversation() }) else null,
+                    onForkAt = if (allowFork) ({ user -> forkConversation(user.id) }) else null,
                     onInspectDiffs = { diffs -> inspectedDiffs = diffs },
                     onOpenArtifact = { art -> studioArtifact = art },
+                    onInspectSubagent = if (key.engine == EngineKind.CLAUDE) ({ aid ->
+                        subagentInitialId = aid
+                        showSubagentsSheet = true
+                    }) else null,
                     onApprovePlan = approvePlanAction,
                     onRevisePlan = revisePlanAction,
                 )
             }
-            val rememberedPluginFooter = remember(pluginMessageFooterSlots) {
+            val rememberedPluginFooter = remember(pluginMessageFooterSlots, key, cwd) {
                 pluginMessageFooterSlots to { slot: com.galiais.agent.engine.HostPluginUiSlot, msg: TimelineItem.AgentMessage ->
                     triggerPluginUiSlot(slot, msg.text)
                 }
@@ -1402,6 +1459,117 @@ fun ChatScreen(
                             } else VisualTransformation.None
                         }
                         AnimatedVisibility(visible = requests.isEmpty()) {
+                        Column(Modifier.fillMaxWidth()) {
+                            // Codex Guardian 自动审校拦截一键单次放行横幅
+                            state?.guardianDenied?.let { denied ->
+                                Surface(
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                                    shape = D.shape(10.dp),
+                                    color = G.warningTint,
+                                    border = BorderStroke(0.75.dp, G.warning.copy(alpha = 0.45f)),
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    ) {
+                                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                            Text(
+                                                "Guardian 拦截：${denied.summary}",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                color = G.warning,
+                                                fontWeight = FontWeight.SemiBold,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                            denied.rationale?.let { rat ->
+                                                Text(rat, style = MaterialTheme.typography.labelSmall, color = G.inkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                            }
+                                        }
+                                        TagPill("单次放行", fg = G.onAccent, bg = G.warning, onClick = {
+                                            scope.launch {
+                                                runCatching { app.conversations.codex.approveGuardianDeniedAction(key, denied.reviewId) }
+                                                    .onSuccess { app.conversations.notify("已单次放行被 Guardian 拦截的操作") }
+                                                    .onFailure { app.conversations.notify("放行失败：${it.message}") }
+                                            }
+                                        })
+                                        TagPill("忽略", fg = G.inkMuted, bg = G.surface, onClick = {
+                                            app.conversations.update(key) { it.copy(guardianDenied = null) }
+                                        })
+                                    }
+                                }
+                            }
+                            // 活跃目标 / Codex 原生队列 / Claude 后台任务与 Ctrl+B / 下一条提示词预测快捷栏
+                            val hasGoal = !state?.activeGoal.isNullOrBlank()
+                            val queueCount = state?.queuedSubmissions?.size ?: 0
+                            val activeClaudeBgCount = if (key.engine == EngineKind.CLAUDE) {
+                                state?.backgroundTasks?.count { it.status == "running" || it.status == "in_progress" } ?: 0
+                            } else 0
+                            val showClaudeBg = key.engine == EngineKind.CLAUDE && state?.running == true
+                            val showPred = draft.isBlank() && state?.running != true && !state?.nextPromptPrediction.isNullOrBlank()
+                            if (hasGoal || queueCount > 0 || activeClaudeBgCount > 0 || showClaudeBg || showPred) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .horizontalScroll(rememberScrollState())
+                                        .padding(horizontal = 12.dp, vertical = 4.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    if (hasGoal) {
+                                        TagPill(
+                                            text = "目标：${state.activeGoal.orEmpty().take(24)}",
+                                            fg = G.accent,
+                                            bg = G.accentContainer,
+                                            onClick = { showMemoryGoalSheet = true },
+                                        )
+                                    }
+                                    if (queueCount > 0) {
+                                        TagPill(
+                                            text = "队列中 $queueCount 条",
+                                            fg = G.codex,
+                                            bg = G.surfaceSubtle,
+                                            onClick = { showQueueTasksSheet = true },
+                                        )
+                                    }
+                                    if (activeClaudeBgCount > 0) {
+                                        TagPill(
+                                            text = "后台任务 $activeClaudeBgCount",
+                                            fg = G.claude,
+                                            bg = G.claudeTint,
+                                            onClick = { showQueueTasksSheet = true },
+                                        )
+                                    }
+                                    if (showClaudeBg) {
+                                        TagPill(
+                                            text = "转入后台 (Ctrl+B)",
+                                            fg = G.claude,
+                                            bg = G.surfaceSubtle,
+                                            onClick = {
+                                                scope.launch {
+                                                    runCatching { app.conversations.claude.backgroundTasks(key) }
+                                                        .onSuccess { moved ->
+                                                            app.conversations.notify(if (moved) "已将前景任务转入后台" else "当前无阻塞前景任务")
+                                                        }
+                                                        .onFailure { app.conversations.notify("转入后台失败：${it.message}") }
+                                                }
+                                            },
+                                        )
+                                    }
+                                    if (showPred) {
+                                        val predText = state.nextPromptPrediction.orEmpty()
+                                        TagPill(
+                                            text = "建议：${predText.take(28)}",
+                                            fg = G.inkMuted,
+                                            bg = G.surfaceSubtle,
+                                            onClick = {
+                                                replaceDraft(predText)
+                                                composerFocus.requestFocus()
+                                            },
+                                        )
+                                    }
+                                }
+                            }
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -2198,6 +2366,26 @@ fun ChatScreen(
                             } // 结束 weight(1f) 自适应左中区
 
                             if (canSteer) {
+                                if (draft.isNotBlank() && attachments.isEmpty()) {
+                                    TagPill(
+                                        text = "排队",
+                                        fg = G.codex,
+                                        bg = G.codexTint,
+                                        onClick = {
+                                            val queuedText = draft.trim()
+                                            replaceDraft("")
+                                            app.settings.setConversationDraft(key.route, "")
+                                            scope.launch {
+                                                runCatching { app.conversations.codex.enqueueMessage(key, queuedText) }
+                                                    .onSuccess { app.conversations.notify("已加入 Codex 顺延队列") }
+                                                    .onFailure {
+                                                        restoreDraft(queuedText)
+                                                        app.conversations.notify("加入队列失败：${it.message}")
+                                                    }
+                                            }
+                                        },
+                                    )
+                                }
                                 TagPill(
                                     text = "插话",
                                     fg = G.onAccent,
@@ -2271,6 +2459,7 @@ fun ChatScreen(
                             }
                         }
                     }
+                }
                 }
                 }
             } // 结束 AnimatedVisibility(visible = requests.isEmpty())
@@ -2623,10 +2812,13 @@ fun ChatScreen(
         )
     }
     if (showExpandedComposer) {
-        val inputReady = runtime.ready && state?.loaded == true && !needsTrust
+        val pluginDriverMissing = remember(key.engine.id, hostPlugins) {
+            AgentCatalog.find(key.engine.id) == null && !app.conversations.hub.isInstalled(key.engine.id)
+        }
+        val inputReady = runtime.ready && state?.loaded == true && !needsTrust && !pluginDriverMissing
         val isRun = state?.running == true
         val steerMode = inputReady && isRun && key.engine == EngineKind.CODEX && state.activeTurnId != null
-        val sendAllowed = inputReady && (!isRun || steerMode) && state.reverting != true && (draft.isNotBlank() || attachments.isNotEmpty())
+        val sendAllowed = inputReady && (!isRun || steerMode) && state.reverting != true && !editSubmitting && (draft.isNotBlank() || attachments.isNotEmpty())
         ExpandedComposerDialog(
             value = draftValue,
             settings = settings,
@@ -2644,6 +2836,82 @@ fun ChatScreen(
             cwd = cwd,
             editableScratchpad = true,
             onDismiss = { showLatexScratchpad = false },
+        )
+    }
+    if (showUsageSheet) {
+        EngineUsageSheet(
+            app = app,
+            key = key,
+            onOpenNativeTui = ::launchNativeTui,
+            onDismiss = { showUsageSheet = false },
+        )
+    }
+    if (showContextSheet) {
+        ContextBreakdownSheet(
+            app = app,
+            key = key,
+            onCompact = { app.conversations.compact(key) },
+            onOpenNativeTui = ::launchNativeTui,
+            onDismiss = { showContextSheet = false },
+        )
+    }
+    if (showDiagnosticsSheet) {
+        DiagnosticsSheet(
+            app = app,
+            key = key,
+            onDismiss = { showDiagnosticsSheet = false },
+        )
+    }
+    if (showQueueTasksSheet) {
+        QueueAndTasksSheet(
+            app = app,
+            key = key,
+            queued = state?.queuedSubmissions.orEmpty(),
+            claudeTasks = state?.backgroundTasks.orEmpty(),
+            running = state?.running == true,
+            onDismiss = { showQueueTasksSheet = false },
+        )
+    }
+    if (showMemoryGoalSheet) {
+        MemoryAndGoalSheet(
+            app = app,
+            key = key,
+            currentGoal = state?.activeGoal,
+            onDismiss = { showMemoryGoalSheet = false },
+        )
+    }
+    if (showSubagentsSheet) {
+        SubagentsInspectorSheet(
+            app = app,
+            key = key,
+            initialAgentId = subagentInitialId,
+            onDismiss = {
+                showSubagentsSheet = false
+                subagentInitialId = null
+            },
+        )
+    }
+    if (showClaudeReloadSheet) {
+        ClaudeSessionControlSheet(
+            app = app,
+            key = key,
+            currentStyle = state?.outputStyle,
+            availableStyles = state?.availableOutputStyles.orEmpty(),
+            ultracode = state?.ultracode == true,
+            onDismiss = { showClaudeReloadSheet = false },
+        )
+    }
+    if (showAddDirDialog) {
+        AddDirectoryDialog(
+            currentDirs = state?.additionalDirectories.orEmpty(),
+            defaultCwd = cwd ?: settings.defaultCwd,
+            onAdd = { dir ->
+                scope.launch {
+                    runCatching { app.conversations.addAdditionalDirectory(key, dir) }
+                        .onFailure { app.conversations.notify("附加目录失败：${it.message}") }
+                }
+            },
+            onDismiss = { showAddDirDialog = false },
         )
     }
     openingPluginSurface?.let { (pid, sid) ->

@@ -29,6 +29,7 @@ class CliRpcConnection(private val context: Context, private val event: (JSONObj
     private val closeCause = AtomicReference<Exception?>(null)
     private val isClosed get() = closeCause.get() != null
     private val failureReported = AtomicBoolean(false)
+    private val started = AtomicBoolean(false)
     private val launched = CompletableFuture<Unit>()
     private val writer = ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS, ArrayBlockingQueue(64))
     private val reader = Executors.newFixedThreadPool(2)
@@ -86,6 +87,7 @@ class CliRpcConnection(private val context: Context, private val event: (JSONObj
                 .put("capabilities", JSONObject().put("experimentalApi", true))
                 .put("galiaisKeepAlive", (context.applicationContext as GaliaisApplication).settings.state.value.keepRuntimeOnExit), 30_000).get(35, TimeUnit.SECONDS)
             notify("initialized", JSONObject())
+            started.set(true)
             return result as? JSONObject ?: error("引擎返回了无效启动状态")
         } catch (error: Exception) {
             val cause = (error as? ExecutionException)?.cause as? Exception ?: error
@@ -165,7 +167,8 @@ class CliRpcConnection(private val context: Context, private val event: (JSONObj
         if (!failureReported.compareAndSet(false, true) || isClosed) return
         var reason = message
         try { close(IllegalStateException(message)) } catch (error: Exception) { reason += "；" + (error.message ?: "无法确认引擎进程清理结果") }
-        stopped(reason)
+        // 仅在握手完成并正式运行后才异步上报 stopped；启动握手期间由 start() 同步抛出异常，避免竞态打断 CLI 自动回退重试
+        if (started.get()) stopped(reason)
     }
     private fun ensureOpen() { closeCause.get()?.let { throw it } }
 

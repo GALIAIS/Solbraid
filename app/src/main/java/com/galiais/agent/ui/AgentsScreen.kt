@@ -64,7 +64,15 @@ fun AgentsScreen(
     LaunchedEffect(runtime.ready) {
         if (runtime.ready && statuses.isEmpty()) {
             refreshing = true
-            try { app.conversations.hub.configureAndProbe() } finally { refreshing = false }
+            try {
+                app.conversations.hub.configureAndProbe()
+            } catch (cancel: kotlinx.coroutines.CancellationException) {
+                throw cancel
+            } catch (e: Exception) {
+                app.conversations.notify("初始化 Agent 状态失败：${e.message}")
+            } finally {
+                refreshing = false
+            }
         }
     }
 

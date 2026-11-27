@@ -1,21 +1,25 @@
 import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
-import {randomBytes, randomUUID} from "node:crypto";
+import {createHash, randomBytes, randomUUID} from "node:crypto";
 import {execFile, spawn} from "node:child_process";
 import {promisify} from "node:util";
 import {createInterface} from "node:readline";
+import {resolveSafeHomePath} from "./safe-file-io.mjs";
 import {
   AcpDriver,
   AcpStreamStallError,
   normalizeAcpMetaToolName,
   isAcpMetaToolName,
+  isAgyModelCatalogError,
+  isSocketPermissionOrNetworkBlocked,
   isSoftNetworkReply,
   isRetryableAcpError,
   formatAcpNetworkReason,
   parseAgyInternalRetryLine,
   computeRetryDelayMs,
   filterDuplicateAcpMcpServers,
+  buildAcpEmbeddedContextBlocks,
   computeUnifiedDiff,
   buildPerStepUsageRecords,
   captureFileCheckpoint,
@@ -46,7 +50,8 @@ const EXTRA_BINS = [
   "/usr/bin",
   "/bin",
 ];
-const IDLE_HIBERNATE_MS = 10 * 60 * 1000;
+// 给 Antigravity 内置 prompt_cache_keep_alive 留足空闲窗口，避免 10 分钟过早休眠强杀导致服务端缓存冷重建
+const IDLE_HIBERNATE_MS = 30 * 60 * 1000;
 const MAXIMUM_FRAME = 8 * 1024 * 1024 - 1024;
 const SESSION_MUTATIONS = new Set(["sessions/prompt", "sessions/revertBefore", "sessions/delete", "sessions/rename", "sessions/setModel", "sessions/setMode", "sessions/setConfigOption", "sessions/setProvider"]);
 const NPM_PACKAGE = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*(?:@[a-zA-Z0-9._~^+*-]+)?$/;
@@ -130,7 +135,16 @@ function notify(method, params) {
   output({method, params});
 }
 
-function askClient(method, params) {
+function defaultClientTimeoutMs(method) {
+  const m = String(method || "");
+  if (m === "toolchains/aptExec" || m === "selfBuild/installApk") return 10 * 60 * 1000;
+  if (m.includes("permission") || m.includes("approve") || m.includes("elicitation") || m.includes("dialog") || m.includes("delegate")) {
+    return 15 * 60 * 1000;
+  }
+  return 90 * 1000;
+}
+
+function askClient(method, params, timeoutMs = defaultClientTimeoutMs(method)) {
   if (pendingClientReqs.size >= 64) throw new Error("待处理审批过多，请先处理已有请求");
   const id = `hub-${++reverseSeq}`;
   return new Promise((resolve, reject) => {
@@ -140,7 +154,7 @@ function askClient(method, params) {
       try { notify("galiais/requestResolved", {id}); } catch (transportError) { error ??= transportError; }
       if (error) reject(error); else resolve(result);
     };
-    const timer = setTimeout(() => finish(new Error("用户审批等待超时")), 2 * 60 * 60 * 1000);
+    const timer = setTimeout(() => finish(new Error(`宿主请求等待超时 (${method})`)), timeoutMs);
     pendingClientReqs.set(id, {resolve: result => finish(null, result), reject: error => finish(error), params});
     try { output({id, method, params}); } catch (error) { finish(error); }
   });
@@ -230,12 +244,13 @@ function baseEnv(manifest, providerInfo, config = networkConfig, userEnv = userG
       if (providerInfo.model) env.AGY_LLM_GATEWAY_MODELS = providerInfo.model;
       env.GOOGLE_GEMINI_BASE_URL = geminiUrl;
       env.GEMINI_API_BASE_URL = geminiUrl;
+      // 经逆向 agy 1.5.16 实证：同时设置 GOOGLE_API_KEY 与 GEMINI_API_KEY 会触发冲突警告并优先取 GOOGLE_API_KEY
       env.GEMINI_API_KEY = gatewayConfig.token;
-      env.GOOGLE_API_KEY = gatewayConfig.token;
+      delete env.GOOGLE_API_KEY;
     }
   } else if (manifest?.id === "antigravity" && typeof extraApiKey === "string" && extraApiKey.trim()) {
     env.GEMINI_API_KEY = extraApiKey.trim();
-    env.GOOGLE_API_KEY = extraApiKey.trim();
+    delete env.GOOGLE_API_KEY;
   }
   return env;
 }
@@ -375,7 +390,19 @@ async function pruneAgyLogs(logDir, keepLatest = 20) {
   } catch {}
 }
 
+const deletedSessions = new Set();
+
+function markSessionDeleted(key) {
+  deletedSessions.add(key);
+  if (deletedSessions.size > 256) {
+    const oldest = deletedSessions.values().next().value;
+    if (oldest !== undefined) deletedSessions.delete(oldest);
+  }
+}
+
 async function saveSession(record) {
+  const key = `${record.agentId}:${record.id}`;
+  if (deletedSessions.has(key)) return;
   compactRecordDiffsInPlace(record);
   const dir = path.join(SESSIONS_ROOT, record.agentId);
   await fs.mkdir(dir, {recursive: true});
@@ -383,9 +410,10 @@ async function saveSession(record) {
   const tmp = target + "." + randomUUID() + ".part";
   try {
     await fs.writeFile(tmp, JSON.stringify(record), {encoding: "utf8", mode: 0o600});
+    if (deletedSessions.has(key)) return;
     await fs.rename(tmp, target);
   } finally { await fs.rm(tmp, {force: true}); }
-  touchSessionCache(`${record.agentId}:${record.id}`, record);
+  if (!deletedSessions.has(key)) touchSessionCache(key, record);
 }
 
 async function listStoredSessions(agentId) {
@@ -919,8 +947,9 @@ async function getDriver(manifest, cwd, providerInfo, sessionId, extraApiKey = n
   const existing = drivers.get(key);
   const userEnv = await envSsh.loadEffectiveUserEnv(cwd, process.env.PATH || "").catch(() => ({}));
   const effectiveKey = extraApiKey ?? sessionApiKeys.get(key) ?? null;
+  const effectiveKeyHash = effectiveKey ? createHash("sha256").update(String(effectiveKey)).digest("hex").slice(0, 16) : "";
   const launchOpts = launchOverrides || {};
-  const envKey = JSON.stringify([providerInfo || null, gatewayConfig, manifest.protocol, manifest.launch, userEnv, effectiveKey ? effectiveKey.length : 0, launchOpts]);
+  const envKey = JSON.stringify([providerInfo || null, gatewayConfig, manifest.protocol, manifest.launch, userEnv, effectiveKeyHash, launchOpts]);
   if (existing && !existing.closed && (existing._envKey === envKey || existing.pending?.size > 0 || existing.activeProcs?.size > 0)) {
     existing.lastActivity = Date.now();
     return existing;
@@ -1289,7 +1318,7 @@ registerBuiltinHostPlugins(pluginKernel, {
   },
   selfEvolution: {
     getControlInfo: () => pluginControlServer ? {socketPath: pluginControlServer.socketPath} : null,
-    listSnapshots: id => pluginKernel.listPluginSnapshots(id),
+    listSnapshots: id => pluginKernel.listSourceSnapshots(id),
     getSelfBuildConfig: () => pluginKernel.getSelfBuildConfig(),
   },
   usageLedger,
@@ -1359,7 +1388,10 @@ async function mcpServersForSession(agentId, sessionId, cwd, allowDelegation) {
       const globalNames = rawCfg?.mcpServers && typeof rawCfg.mcpServers === "object" ? Object.keys(rawCfg.mcpServers) : [];
       managed = filterDuplicateAcpMcpServers(managed, globalNames);
     }
-    if (Array.isArray(managed) && managed.length) list.push(...managed);
+    if (Array.isArray(managed) && managed.length) {
+      managed = [...managed].sort((a, b) => String(a?.name || "").localeCompare(String(b?.name || "")));
+      list.push(...managed);
+    }
   } catch {}
   if (!allowDelegation) return list;
   for (const [token, context] of hubDelegateTokenMap) {
@@ -1382,33 +1414,40 @@ async function mcpServersForSession(agentId, sessionId, cwd, allowDelegation) {
 
 const replayingSessions = new Set();
 
-async function attachAcpSession(driver, record) {
+async function attachAcpSession(driver, record, options = {}) {
   await driver.start();
-  if (driver._attachedSessionId === record.remoteSessionId && record.remoteSessionId) return;
+  if (driver._attachedSessionId === record.remoteSessionId && record.remoteSessionId) {
+    if (record.agentId !== "antigravity" || driver._modelCatalogLoaded !== false) return;
+  }
   const servers = await mcpServersForSession(record.agentId, record.id, record.cwd, record.allowDelegation === true);
+  const extraDirs = Array.isArray(record.additionalDirectories) ? record.additionalDirectories : [];
   let meta = null;
+  let createdFresh = false;
   if (record.remoteSessionId) {
     const canResume = Boolean(driver.agentCapabilities?.sessionCapabilities?.resume || driver.agentCapabilities?.loadSession);
     if (!canResume) {
-      const created = await driver.newSession(record.cwd, servers);
+      const created = await driver.newSession(record.cwd, servers, extraDirs);
       if (!created?.sessionId) throw new Error("Agent 未返回有效会话标识");
       record.remoteSessionId = created.sessionId;
       if (Array.isArray(record.messages) && record.messages.length > 0) record.pendingContextBridge = true;
       meta = created;
+      createdFresh = true;
     } else {
       const sessKey = `${record.agentId}:${record.id}`;
       replayingSessions.add(sessKey);
       try {
-        meta = await driver.resumeSession(record.remoteSessionId, record.cwd, servers);
+        meta = await driver.resumeSession(record.remoteSessionId, record.cwd, servers, extraDirs);
       } catch (resumeErr) {
         const msg = String(resumeErr?.message || resumeErr || "");
-        // 远端 ACP 会话已过期、未落盘或版本变更导致无法恢复时，平滑重建并桥接历史上下文而不卡死
-        if (/not found|no such|invalid session|unknown session|enoent|does not exist/i.test(msg)) {
-          const created = await driver.newSession(record.cwd, servers);
+        // 远端 ACP 会话已过期、未落盘或版本变更导致无法恢复时（含 agy 1.5.16 标准的 -32002），平滑重建并桥接历史上下文而不卡死；
+        // 注意显式排除 "unknown model key ...: model not found" 这类断网冷启模型表缺失错误，避免误毁有效会话 ID。
+        if (!isAgyModelCatalogError(msg) && (resumeErr?.code === -32002 || /not found|no such|invalid session|unknown session|enoent|does not exist/i.test(msg))) {
+          const created = await driver.newSession(record.cwd, servers, extraDirs);
           if (!created?.sessionId) throw new Error("Agent 未返回有效会话标识");
           record.remoteSessionId = created.sessionId;
           if (Array.isArray(record.messages) && record.messages.length > 0) record.pendingContextBridge = true;
           meta = created;
+          createdFresh = true;
         } else {
           throw resumeErr;
         }
@@ -1417,12 +1456,30 @@ async function attachAcpSession(driver, record) {
       }
     }
   } else {
-    const created = await driver.newSession(record.cwd, servers);
+    const created = await driver.newSession(record.cwd, servers, extraDirs);
     if (!created?.sessionId) throw new Error("Agent 未返回有效会话标识");
     record.remoteSessionId = created.sessionId;
     meta = created;
+    createdFresh = true;
   }
-  if (Array.isArray(meta?.models?.availableModels)) {
+  const loadedModelCount = Array.isArray(meta?.models?.availableModels) ? meta.models.availableModels.length : 0;
+  const loadedModelCfgCount = Array.isArray(meta?.configOptions)
+    ? (meta.configOptions.find(opt => opt?.id === "model")?.options?.length || 0)
+    : 0;
+  const hasModelCatalog = loadedModelCount > 0 || loadedModelCfgCount > 0;
+  driver._modelCatalogLoaded = hasModelCatalog;
+  // Antigravity 在锁屏/后台断网期间冷启动时，session/resume 虽能从本地 SQLite 成功返回，
+  // 但后端 loadCodeAssist/fetchAvailableModels 因 EPERM 失败导致内存模型表为空，继续发 prompt 必然触发
+  // "failed to construct executor: unknown model key MODEL_PLACEHOLDER_...: model not found"。
+  // 此处直接拦截并交由上层等待网络恢复后干净重建。
+  if (record.agentId === "antigravity" && options.requireModelCatalog !== false && !hasModelCatalog) {
+    const err = new Error("Antigravity 模型目录初始化失败（后台网络受限，模型配置未加载）");
+    err.code = "ACP_MODEL_CATALOG_UNAVAILABLE";
+    err.retryable = true;
+    err.needsNetworkWait = true;
+    throw err;
+  }
+  if (loadedModelCount > 0) {
     if (record.agentId === "antigravity") {
       cachedAgyRawModels = meta.models.availableModels;
       record.availableModels = groupAgyModelsList(meta.models.availableModels);
@@ -1430,22 +1487,105 @@ async function attachAcpSession(driver, record) {
       record.availableModels = meta.models.availableModels;
     }
   }
-  if (Array.isArray(meta?.modes?.availableModes)) record.availableModes = meta.modes.availableModes;
-  if (Array.isArray(meta?.configOptions)) record.configOptions = meta.configOptions;
+  if (Array.isArray(meta?.modes?.availableModes) && meta.modes.availableModes.length > 0) record.availableModes = meta.modes.availableModes;
+  if (Array.isArray(meta?.configOptions) && meta.configOptions.length > 0) record.configOptions = meta.configOptions;
+  // 恢复既有远端会话时仅在远端值与本地记录不一致（或离线修改过设置）时才下发 setModel/setMode/setConfigOption，
+  // 避免无谓重放设置变更破坏 Antigravity 服务端 Prompt Cache 与注入多余的 USER_SETTINGS_CHANGE。
+  const remoteModel = meta?.models?.currentModelId || null;
+  const remoteMode = meta?.modes?.currentModeId || null;
+  const remoteThought = Array.isArray(meta?.configOptions)
+    ? (meta.configOptions.find(opt => opt?.id === "thought_level")?.currentValue || null)
+    : null;
+  let activeRemoteModel = remoteModel;
+  let modelSwitchedToTarget = false;
   if (record.model) {
-    const concrete = record.agentId === "antigravity" ? resolveAgyConcreteModel(record.model, record.effort) : record.model;
-    await driver.setModel(record.remoteSessionId, concrete || record.model).catch(() => {});
+    const concrete = record.agentId === "antigravity"
+      ? resolveAgyConcreteModel(record.model, record.effort, null, record.availableModels)
+      : record.model;
+    const targetModel = concrete || record.model;
+    const needModelSync = remoteModel !== null
+      ? remoteModel !== targetModel
+      : (createdFresh || record._pendingModelSync === true);
+    if (needModelSync) {
+      const setOk = await driver.setModel(record.remoteSessionId, targetModel).then(() => true, () => false);
+      if (setOk) {
+        activeRemoteModel = targetModel;
+        modelSwitchedToTarget = true;
+        if (record.agentId === "antigravity") {
+          const targetSplit = splitAgyModelEffort(targetModel);
+          record.configOptions = updateConfigOptionValues(record.configOptions, {
+            model: targetSplit.baseId || record.model,
+            ...(targetSplit.effort ? {thought_level: targetSplit.effort} : {}),
+          });
+        } else {
+          record.configOptions = updateConfigOptionValues(record.configOptions, {model: targetModel});
+        }
+      } else if (typeof driver.setConfigOption === "function") {
+        const fallbackVal = record.agentId === "antigravity"
+          ? (splitAgyModelEffort(targetModel).baseId || record.model)
+          : targetModel;
+        const cfgRes = await driver.setConfigOption(record.remoteSessionId, "model", fallbackVal).catch(() => null);
+        if (Array.isArray(cfgRes?.configOptions)) record.configOptions = cfgRes.configOptions;
+        else if (cfgRes) record.configOptions = updateConfigOptionValues(record.configOptions, {model: fallbackVal});
+      }
+    }
   }
-  if (record.mode && record.mode !== "bypass") await driver.setMode(record.remoteSessionId, record.mode).catch(() => {});
+  if (record.mode && record.mode !== "bypass") {
+    const needModeSync = remoteMode !== null
+      ? remoteMode !== record.mode
+      : (createdFresh || record._pendingModeSync === true);
+    if (needModeSync) {
+      const modeOk = await driver.setMode(record.remoteSessionId, record.mode).then(() => true, () => false);
+      if (modeOk) {
+        record.configOptions = updateConfigOptionValues(record.configOptions, {mode: record.mode});
+      }
+    }
+  }
   if (record.effort) {
-    await driver.setConfigOption(record.remoteSessionId, "thought_level", record.effort).catch(() => {});
+    // Antigravity 的 concrete model（如 gemini-4-neon-xhigh）已内嵌推理档位，setModel 成功切换后无需再重复调用 setConfigOption(thought_level)
+    const effortCoveredByModel = modelSwitchedToTarget
+      && agyConcreteModelCoversEffort(record.agentId, activeRemoteModel, record.effort);
+    const currentThought = Array.isArray(record.configOptions)
+      ? (record.configOptions.find(opt => opt?.id === "thought_level")?.currentValue || null)
+      : remoteThought;
+    const needEffortSync = !effortCoveredByModel && (
+      currentThought !== null
+        ? currentThought !== record.effort
+        : (createdFresh || record._pendingEffortSync === true)
+    );
+    if (needEffortSync) {
+      const cfgRes = await driver.setConfigOption(record.remoteSessionId, "thought_level", record.effort).catch(() => null);
+      if (Array.isArray(cfgRes?.configOptions)) {
+        record.configOptions = cfgRes.configOptions;
+      } else if (cfgRes) {
+        record.configOptions = updateConfigOptionValues(record.configOptions, {thought_level: record.effort});
+      }
+    }
   }
+  delete record._pendingModelSync;
+  delete record._pendingModeSync;
+  delete record._pendingEffortSync;
   driver._attachedSessionId = record.remoteSessionId;
 }
 
 const AGY_EFFORT_SUFFIX = /-(low|medium|high|xhigh|max)$/i;
 const AGY_EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"];
 let cachedAgyRawModels = [];
+
+function updateConfigOptionValues(configOptions, patch) {
+  if (!Array.isArray(configOptions) || !patch || typeof patch !== "object") return configOptions || [];
+  return configOptions.map(opt => {
+    if (!opt || !Object.hasOwn(patch, opt.id)) return opt;
+    const nextVal = patch[opt.id];
+    return nextVal ? {...opt, currentValue: nextVal} : opt;
+  });
+}
+
+function agyConcreteModelCoversEffort(agentId, concreteModel, desiredEffort) {
+  if (agentId !== "antigravity" || !concreteModel || !desiredEffort) return false;
+  const {effort} = splitAgyModelEffort(concreteModel);
+  return Boolean(effort) && effort === String(desiredEffort).trim().toLowerCase();
+}
 
 function splitAgyModelEffort(rawId) {
   const clean = String(rawId || "").trim();
@@ -1488,11 +1628,28 @@ function groupAgyModelsList(rawList) {
   }));
 }
 
-function resolveAgyConcreteModel(modelId, effort, knownModels = null) {
+function resolveAgyConcreteModel(modelId, effort, knownModels = null, fallbackGroupedModels = null) {
   const clean = String(modelId || "").trim();
   if (!clean) return null;
   const source = Array.isArray(knownModels) && knownModels.length ? knownModels : cachedAgyRawModels;
   const rawIds = new Set(source.map(m => String(m?.modelId || m?.id || "").trim()).filter(Boolean));
+  // 进程重启后内存 cachedAgyRawModels 为空时，回退读取持久化在会话中的 grouped availableModels 变体表
+  if (rawIds.size === 0 && Array.isArray(fallbackGroupedModels)) {
+    for (const g of fallbackGroupedModels) {
+      if (Array.isArray(g?.variants)) {
+        for (const v of g.variants) {
+          const s = String(v || "").trim();
+          if (s) rawIds.add(s);
+        }
+      }
+      if (g?.variantMap && typeof g.variantMap === "object") {
+        for (const v of Object.values(g.variantMap)) {
+          const s = String(v || "").trim();
+          if (s) rawIds.add(s);
+        }
+      }
+    }
+  }
   const {baseId, effort: embeddedEffort} = splitAgyModelEffort(clean);
   const desiredEffort = String(effort || embeddedEffort || "").trim().toLowerCase();
   if (desiredEffort) {
@@ -1545,16 +1702,23 @@ function inferModelContextWindow(model, isCustomProvider = false) {
 }
 
 /** 将各驱动返回的 input/cache/output 归一化为统一总输入口径（totalIn = uncached + cacheRead + cacheWrite）。 */
-function resolveNormalizedTotalInput(rawIn, outTok, cacheR, cacheW, rawTotal, exclusiveByDefault = false) {
+function resolveNormalizedTotalInput(rawIn, outTok, cacheR, cacheW, rawTotal, exclusiveByDefault = false, reasoningTok = 0) {
   const inNum = Math.max(0, Number(rawIn || 0));
   const cSum = Math.max(0, Number(cacheR || 0)) + Math.max(0, Number(cacheW || 0));
   const outNum = Math.max(0, Number(outTok || 0));
+  const reasonNum = Math.max(0, Number(reasoningTok || 0));
   const totNum = Math.max(0, Number(rawTotal || 0));
   if (cSum <= 0) return inNum;
   if (inNum > 0 && inNum < cSum) return inNum + cSum;
   if (totNum > 0) {
-    const diffExcl = Math.abs(totNum - (inNum + cSum + outNum));
-    const diffIncl = Math.abs(totNum - (inNum + outNum));
+    const diffExcl = Math.min(
+      Math.abs(totNum - (inNum + cSum + outNum)),
+      Math.abs(totNum - (inNum + cSum + outNum + reasonNum)),
+    );
+    const diffIncl = Math.min(
+      Math.abs(totNum - (inNum + outNum)),
+      Math.abs(totNum - (inNum + outNum + reasonNum)),
+    );
     if (diffExcl < diffIncl) return inNum + cSum;
     if (diffIncl < diffExcl) return inNum;
   }
@@ -1565,11 +1729,12 @@ function stepContextTokensOf(u, exclusiveByDefault = false) {
   if (!u || typeof u !== "object") return 0;
   const rawIn = Number(u.input_tokens ?? u.inputTokens ?? u.prompt_tokens ?? u.promptTokenCount ?? 0);
   const outTok = Number(u.output_tokens ?? u.outputTokens ?? u.completion_tokens ?? u.candidatesTokenCount ?? 0);
-  const cacheR = Number(u.cache_read_tokens ?? u.cached_read_tokens ?? u.cachedReadTokens ?? u.cacheReadTokens ?? 0);
+  const cacheR = Number(u.cache_read_tokens ?? u.cached_read_tokens ?? u.cachedReadTokens ?? u.cacheReadTokens ?? u.cachedContentTokenCount ?? 0);
   const cacheW = Number(u.cache_write_tokens ?? u.cached_write_tokens ?? u.cachedWriteTokens ?? u.cacheWriteTokens ?? 0);
-  const total = Number(u.total_tokens ?? u.totalTokens ?? 0);
+  const reasoning = Number(u.thinking_tokens ?? u.thoughtTokens ?? u.reasoningTokens ?? u.thoughtsTokenCount ?? 0);
+  const total = Number(u.total_tokens ?? u.totalTokens ?? u.totalTokenCount ?? 0);
   if (rawIn > 0 || outTok > 0 || cacheR > 0 || cacheW > 0) {
-    const totalIn = resolveNormalizedTotalInput(rawIn, outTok, cacheR, cacheW, total, exclusiveByDefault);
+    const totalIn = resolveNormalizedTotalInput(rawIn, outTok, cacheR, cacheW, total, exclusiveByDefault, reasoning);
     return totalIn + Math.max(0, outTok);
   }
   return total;
@@ -1591,10 +1756,13 @@ class AgyStreamJsonDriver {
     this.lastActivity = Date.now();
   }
 
-  async prompt(sessionId, text, {cwd, model, effort, mode, remoteSessionId} = {}) {
+  async prompt(sessionId, text, {cwd, model, effort, mode, remoteSessionId, availableModels} = {}) {
     this.lastActivity = Date.now();
     const args = ["--output-format", "stream-json"];
-    const effectiveModel = resolveAgyConcreteModel(model, effort);
+    // 自定义服务商模型名不走官方 agy 变体后缀拼接，避免给第三方模型名错误追加 -high 等后缀
+    const effectiveModel = this.providerInfo?.id
+      ? (String(model || "").trim() || null)
+      : resolveAgyConcreteModel(model, effort, null, availableModels);
     if (this.providerInfo?.id) {
       const settingsFile = await writeAgyCustomSettings(this.providerInfo, effectiveModel || model, sessionId);
       if (settingsFile) {
@@ -1623,6 +1791,7 @@ class AgyStreamJsonDriver {
       let convId = remoteSessionId || null;
       let usage = null;
       let lastStepUsage = null;
+      let emittedStepUsage = false;
       const ctxWindowSize = inferModelContextWindow(effectiveModel || model, Boolean(this.providerInfo?.id));
       let stderrTail = "";
       let settled = false;
@@ -1662,6 +1831,7 @@ class AgyStreamJsonDriver {
             lastStepUsage = su.usage;
             const stepCtx = stepContextTokensOf(su.usage, true);
             if (stepCtx > 0) {
+              emittedStepUsage = true;
               this.onEvent({kind: "acp-update", update: {sessionUpdate: "usage_update", used: stepCtx, size: ctxWindowSize}});
             }
           }
@@ -1722,10 +1892,12 @@ class AgyStreamJsonDriver {
             fullText = obj.result.response;
             this.onEvent({kind: "acp-update", update: {sessionUpdate: "agent_message_chunk", content: {type: "text", text: fullText}}});
           }
-          // 优先使用最后单步请求上下文大小，防止多步工具调用时 result.usage 累计总和虚报超窗
-          const ctxUsed = stepContextTokensOf(lastStepUsage || usage, true);
-          if (ctxUsed > 0) {
-            this.onEvent({kind: "acp-update", update: {sessionUpdate: "usage_update", used: ctxUsed, size: ctxWindowSize}});
+          // 若本轮 step_update 尚未上报过 usage_update，再用 result 兜底上报，避免重复发射一条虚增的 llmSteps 记录
+          if (!emittedStepUsage) {
+            const ctxUsed = stepContextTokensOf(lastStepUsage || usage, true);
+            if (ctxUsed > 0) {
+              this.onEvent({kind: "acp-update", update: {sessionUpdate: "usage_update", used: ctxUsed, size: ctxWindowSize}});
+            }
           }
         }
       });
@@ -2170,6 +2342,169 @@ function buildContextBridgedPrompt(record, text, userMsgId) {
   return `[以下为此会话此前的对话上下文，请自然承接继续回答，勿提及此系统提示]\n${picked.join("\n\n")}\n\n[当前用户消息]\n${text}`;
 }
 
+const networkWaiters = new Set();
+
+function wakeNetworkWaiters() {
+  let count = 0;
+  for (const wake of [...networkWaiters]) {
+    try { wake(); count++; } catch {}
+  }
+  return count;
+}
+
+function parseProxyTarget(env) {
+  const raw = env?.https_proxy || env?.HTTPS_PROXY || env?.http_proxy || env?.HTTP_PROXY || env?.all_proxy || env?.ALL_PROXY || "";
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) return null;
+  try {
+    const normalized = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+    const u = new URL(normalized);
+    if (!u.hostname) return null;
+    const protocol = u.protocol.toLowerCase();
+    const port = Number(u.port) || (protocol === "https:" ? 443 : protocol.startsWith("socks") ? 1080 : 80);
+    const host = u.hostname.replace(/^\[|\]$/g, "");
+    const isLoopback = host === "127.0.0.1" || host === "localhost" || host === "::1";
+    const auth = (u.username || u.password)
+      ? Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString("base64")
+      : "";
+    return {protocol, host, port, isLoopback, auth};
+  } catch {
+    return null;
+  }
+}
+
+function probeTcpConnect(host, port, timeoutMs = 3500) {
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = res => {
+      if (settled) return;
+      settled = true;
+      try { sock.destroy(); } catch {}
+      resolve(res);
+    };
+    const sock = net.createConnection({host, port});
+    sock.setTimeout(timeoutMs, () => finish({ok: false, code: "ETIMEDOUT", message: `connect timeout ${host}:${port}`}));
+    sock.once("connect", () => finish({ok: true}));
+    sock.once("error", err => finish({ok: false, code: err?.code || "ERR", message: err?.message || String(err)}));
+  });
+}
+
+function probeHttpProxyConnect(proxyHost, proxyPort, targetHost, targetPort, authBase64 = "", timeoutMs = 3500) {
+  return new Promise(resolve => {
+    let settled = false;
+    let buf = "";
+    const finish = res => {
+      if (settled) return;
+      settled = true;
+      try { sock.destroy(); } catch {}
+      resolve(res);
+    };
+    const sock = net.createConnection({host: proxyHost, port: proxyPort});
+    sock.setTimeout(timeoutMs, () => finish({ok: false, code: "ETIMEDOUT", message: "proxy connect timeout"}));
+    sock.once("connect", () => {
+      const authLine = authBase64 ? `Proxy-Authorization: Basic ${authBase64}\r\n` : "";
+      sock.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${authLine}Proxy-Connection: close\r\n\r\n`);
+    });
+    sock.on("data", chunk => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\r\n");
+      if (nl < 0 && buf.length < 256) return;
+      const firstLine = (nl >= 0 ? buf.slice(0, nl) : buf).trim();
+      if (/^HTTP\/\d\.\d\s+200\b/i.test(firstLine)) finish({ok: true});
+      else finish({ok: false, code: "EPROXY", message: firstLine || "proxy rejected"});
+    });
+    sock.once("error", err => finish({ok: false, code: err?.code || "ERR", message: err?.message || String(err)}));
+    sock.once("close", () => finish({ok: false, code: "ECONNRESET", message: "proxy closed"}));
+  });
+}
+
+async function probeOutboundNetwork(env, timeoutMs = 3500) {
+  const override = String(process.env.GALIAIS_NET_PROBE_TARGET || "").trim();
+  if (override.toLowerCase() === "skip") return {ok: true};
+  if (override) {
+    const idx = override.lastIndexOf(":");
+    const host = idx > 0 ? override.slice(0, idx) : override;
+    const port = idx > 0 ? (Number(override.slice(idx + 1)) || 443) : 443;
+    return await probeTcpConnect(host, port, timeoutMs);
+  }
+  const targetHost = "daily-cloudcode-pa.googleapis.com";
+  const targetPort = 443;
+  const proxy = parseProxyTarget(env);
+  if (proxy) {
+    if (proxy.isLoopback && (proxy.protocol === "http:" || proxy.protocol === "https:")) {
+      return await probeHttpProxyConnect(proxy.host, proxy.port, targetHost, targetPort, proxy.auth, timeoutMs);
+    }
+    return await probeTcpConnect(proxy.host, proxy.port, timeoutMs);
+  }
+  return await probeTcpConnect(targetHost, targetPort, timeoutMs);
+}
+
+async function waitForNetworkRecovery(turn, {agentId, sessionId, env, initialReason = ""}) {
+  const maxWaitMs = Number(process.env.GALIAIS_NET_WAIT_MAX_MS) > 0
+    ? Number(process.env.GALIAIS_NET_WAIT_MAX_MS)
+    : 10 * 60 * 1000;
+  const customPollMs = Number(process.env.GALIAIS_NET_WAIT_POLL_MS) > 0
+    ? Number(process.env.GALIAIS_NET_WAIT_POLL_MS)
+    : 0;
+  const startedAt = Date.now();
+  let lastError = initialReason;
+  let lastNoticeAt = 0;
+  let pollIdx = 0;
+
+  while (!turn.cancelled) {
+    const probeTimeout = customPollMs ? Math.min(2000, Math.max(300, customPollMs * 2)) : 3500;
+    const probe = await probeOutboundNetwork(env, probeTimeout);
+    if (turn.cancelled) return {recovered: false, cancelled: true, lastError};
+    if (probe.ok) {
+      notify("agent/event", {
+        agentId,
+        sessionId,
+        kind: "acp-update",
+        update: {sessionUpdate: "focus_update", focus: "网络已恢复，正在重新连接 Antigravity…"},
+      });
+      return {recovered: true, cancelled: false};
+    }
+    lastError = probe.message || probe.code || lastError;
+    const elapsed = Date.now() - startedAt;
+    if (elapsed >= maxWaitMs) {
+      return {recovered: false, cancelled: false, lastError};
+    }
+    const now = Date.now();
+    if (now - lastNoticeAt >= 8000 || pollIdx === 0) {
+      lastNoticeAt = now;
+      const isPerm = /EPERM|operation\s+not\s+permitted/i.test(`${probe.code || ""} ${probe.message || ""} ${initialReason}`);
+      const waitFocus = isPerm
+        ? "锁屏或后台网络受限（系统省电/防火墙拦截），等待解锁或网络恢复后自动继续…"
+        : "网络暂时不可用，等待连接恢复后自动继续…";
+      notify("agent/event", {
+        agentId,
+        sessionId,
+        kind: "acp-update",
+        update: {sessionUpdate: "focus_update", focus: waitFocus},
+      });
+    }
+    const baseDelay = customPollMs || [1500, 2000, 3000, 4000][Math.min(pollIdx, 3)];
+    pollIdx++;
+    const remain = Math.max(40, Math.min(baseDelay, maxWaitMs - (Date.now() - startedAt)));
+    await new Promise(resolve => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        networkWaiters.delete(finish);
+        if (turn.abortRetry === finish) turn.abortRetry = null;
+        resolve();
+      };
+      networkWaiters.add(finish);
+      turn.abortRetry = finish;
+      const timer = setTimeout(finish, remain);
+      timer.unref?.();
+    });
+  }
+  return {recovered: false, cancelled: true, lastError};
+}
+
 function sleepCancellable(turn, delayMs) {
   if (!delayMs || delayMs <= 0) return Promise.resolve(!turn.cancelled);
   if (turn.cancelled) return Promise.resolve(false);
@@ -2306,7 +2641,12 @@ async function dispatchRequest(method, params = {}) {
 
     case "network/configure": {
       await updateNetworkConfig(params.network || params);
+      wakeNetworkWaiters();
       return {ok: true};
+    }
+
+    case "network/poke": {
+      return {ok: true, woken: wakeNetworkWaiters()};
     }
 
     case "network/test": {
@@ -2379,6 +2719,12 @@ async function dispatchRequest(method, params = {}) {
       }
       return res;
     }
+    case "cli/markApplied": {
+      const id = String(params?.agentId || "").trim();
+      CLI_DIRECTORIES = await cliPathDirectories();
+      const updated = await cliUpdater.markApplied(id);
+      return {update: updated};
+    }
 
     case "agents/stop": {
       stopDriver(params.agentId);
@@ -2423,9 +2769,11 @@ async function dispatchRequest(method, params = {}) {
         } catch {}
       }
       const allIds = [...new Set([...manifests.keys(), ...pluginDriverIds, ...diskAgentIds])];
-      const all = agentId
+      const includeArchived = params.includeArchived === true;
+      const all = (agentId
         ? await listStoredSessions(agentId)
-        : (await Promise.all(allIds.map(id => listStoredSessions(id)))).flat();
+        : (await Promise.all(allIds.map(id => listStoredSessions(id)))).flat()
+      ).filter(s => includeArchived || !s.archived);
       return {
         sessions: all.map(s => {
           const resolved = resolveManifestOrNull(s.agentId);
@@ -2434,6 +2782,8 @@ async function dispatchRequest(method, params = {}) {
             driverName: s.driverName || resolved?.name || null,
             driverAvailable: Boolean(resolved),
             id: s.id,
+            remoteSessionId: s.remoteSessionId || null,
+            archived: Boolean(s.archived),
             title: s.title || "新会话",
             preview: s.preview || "",
             cwd: s.cwd || path.join(HOME, "workspace"),
@@ -2464,6 +2814,8 @@ async function dispatchRequest(method, params = {}) {
       const key = `${m.id}:${id}`;
       const requestedMode = typeof params.mode === "string" && params.mode.trim() ? params.mode.trim() : null;
       const requestedEffort = typeof params.effort === "string" && params.effort.trim() ? params.effort.trim() : null;
+      const parsedParamModel = (m.id === "antigravity" && params.model) ? splitAgyModelEffort(params.model) : null;
+      const explicitEffort = requestedEffort || parsedParamModel?.effort || null;
       const launchOpts = {
         bypassPermissions: requestedMode === "bypass" || params.bypassPermissions === true,
         sandbox: params.sandbox === true,
@@ -2480,7 +2832,12 @@ async function dispatchRequest(method, params = {}) {
           if (!created?.sessionId) throw new Error("Agent 未返回有效会话标识");
           remoteSessionId = created.sessionId;
           drv._attachedSessionId = remoteSessionId;
-          if (Array.isArray(created?.models?.availableModels)) {
+          const createdModelCount = Array.isArray(created?.models?.availableModels) ? created.models.availableModels.length : 0;
+          const createdModelCfgCount = Array.isArray(created?.configOptions)
+            ? (created.configOptions.find(opt => opt?.id === "model")?.options?.length || 0)
+            : 0;
+          drv._modelCatalogLoaded = createdModelCount > 0 || createdModelCfgCount > 0;
+          if (createdModelCount > 0) {
             if (m.id === "antigravity") {
               cachedAgyRawModels = created.models.availableModels;
               availableModels = groupAgyModelsList(created.models.availableModels);
@@ -2489,37 +2846,75 @@ async function dispatchRequest(method, params = {}) {
             }
           }
           const rawCurrentModel = created?.models?.currentModelId || null;
+          if (Array.isArray(created?.modes?.availableModes)) availableModes = created.modes.availableModes;
+          if (created?.modes?.currentModeId) currentMode = created.modes.currentModeId;
+          if (Array.isArray(created?.configOptions)) configOptions = created.configOptions;
+          let remoteCurrentEffort = Array.isArray(configOptions)
+            ? (configOptions.find(opt => opt?.id === "thought_level")?.currentValue || null)
+            : null;
           if (m.id === "antigravity" && rawCurrentModel) {
             const split = splitAgyModelEffort(rawCurrentModel);
             currentModel = split.baseId;
-            if (!requestedEffort && split.effort) params.effort = split.effort;
+            if (!remoteCurrentEffort && split.effort) remoteCurrentEffort = split.effort;
+            if (!explicitEffort && split.effort) params.effort = split.effort;
           } else {
             currentModel = rawCurrentModel;
           }
           defaultModel = currentModel;
-          if (Array.isArray(created?.modes?.availableModes)) availableModes = created.modes.availableModes;
-          if (created?.modes?.currentModeId) currentMode = created.modes.currentModeId;
-          if (Array.isArray(created?.configOptions)) configOptions = created.configOptions;
-          const desiredEffort = requestedEffort || (typeof params.effort === "string" ? params.effort : null);
+          const desiredEffort = explicitEffort || (typeof params.effort === "string" ? params.effort : null);
+          let activeRemoteModel = rawCurrentModel;
+          let modelAppliedEffort = false;
           if (params.model) {
-            const concrete = m.id === "antigravity" ? resolveAgyConcreteModel(params.model, desiredEffort) : params.model;
+            const concrete = m.id === "antigravity" ? resolveAgyConcreteModel(params.model, desiredEffort, null, availableModels) : params.model;
             const targetModel = concrete || params.model;
-            const setOk = await drv.setModel(remoteSessionId, targetModel).then(() => true, () => false);
-            if (!setOk) {
-              const cfgRes = await drv.setConfigOption(remoteSessionId, "model", targetModel).catch(() => null);
-              if (Array.isArray(cfgRes?.configOptions)) configOptions = cfgRes.configOptions;
+            if (targetModel !== activeRemoteModel) {
+              const setOk = await drv.setModel(remoteSessionId, targetModel).then(() => true, () => false);
+              if (setOk) {
+                activeRemoteModel = targetModel;
+                if (m.id === "antigravity") {
+                  const targetSplit = splitAgyModelEffort(targetModel);
+                  configOptions = updateConfigOptionValues(configOptions, {
+                    model: targetSplit.baseId || parsedParamModel.baseId,
+                    ...(targetSplit.effort ? {thought_level: targetSplit.effort} : {}),
+                  });
+                  modelAppliedEffort = agyConcreteModelCoversEffort(m.id, targetModel, desiredEffort);
+                } else {
+                  configOptions = updateConfigOptionValues(configOptions, {model: targetModel});
+                }
+              } else {
+                const fallbackVal = m.id === "antigravity"
+                  ? (splitAgyModelEffort(targetModel).baseId || parsedParamModel.baseId)
+                  : targetModel;
+                const cfgRes = await drv.setConfigOption(remoteSessionId, "model", fallbackVal).catch(() => null);
+                if (Array.isArray(cfgRes?.configOptions)) {
+                  configOptions = cfgRes.configOptions;
+                  activeRemoteModel = fallbackVal;
+                } else if (cfgRes) {
+                  configOptions = updateConfigOptionValues(configOptions, {model: fallbackVal});
+                  activeRemoteModel = fallbackVal;
+                }
+              }
             }
-            currentModel = m.id === "antigravity" ? splitAgyModelEffort(params.model).baseId : params.model;
+            currentModel = m.id === "antigravity" ? parsedParamModel.baseId : params.model;
           }
           if (requestedMode && requestedMode !== "bypass" && requestedMode !== currentMode) {
-            await drv.setMode(remoteSessionId, requestedMode).catch(() => {});
+            const modeOk = await drv.setMode(remoteSessionId, requestedMode).then(() => true, () => false);
+            if (modeOk) configOptions = updateConfigOptionValues(configOptions, {mode: requestedMode});
             currentMode = requestedMode;
           } else if (requestedMode === "bypass") {
             currentMode = "bypass";
           }
-          if (desiredEffort) {
+          const syncedEffort = Array.isArray(configOptions)
+            ? (configOptions.find(opt => opt?.id === "thought_level")?.currentValue || remoteCurrentEffort)
+            : remoteCurrentEffort;
+          if (desiredEffort && !modelAppliedEffort && desiredEffort !== syncedEffort) {
             const cfgRes = await drv.setConfigOption(remoteSessionId, "thought_level", desiredEffort).catch(() => null);
             if (Array.isArray(cfgRes?.configOptions)) configOptions = cfgRes.configOptions;
+            else if (cfgRes) configOptions = updateConfigOptionValues(configOptions, {thought_level: desiredEffort});
+          }
+          // 若新建会话时因断网导致 Antigravity 未拉取到模型目录，立即回收该 0 模型进程，避免首条消息触发 unknown model key
+          if (m.id === "antigravity" && !params.provider?.id && !drv._modelCatalogLoaded) {
+            stopSessionDriver(key);
           }
         } else if (m.protocol === "plugin-driver") {
           const rawModels = await pluginKernel.listPluginDriverModels(m.driverId || m.id).catch(() => []);
@@ -2547,7 +2942,7 @@ async function dispatchRequest(method, params = {}) {
           model: currentModel,
           defaultModel,
           mode: currentMode,
-          effort: requestedEffort || (typeof params.effort === "string" ? params.effort : null),
+          effort: explicitEffort || (typeof params.effort === "string" ? params.effort : null),
           launchOpts,
           availableModels,
           availableModes,
@@ -2600,11 +2995,8 @@ async function dispatchRequest(method, params = {}) {
       if (images.length && m.protocol !== "acp") throw new Error("此 CLI 驱动不支持图片输入");
       const sessKey = `${m.id}:${record.id}`;
       if (typeof params.apiKey === "string" && params.apiKey.trim()) sessionApiKeys.set(sessKey, params.apiKey.trim());
-      let drv = m.protocol === "plugin-driver"
-        ? null
-        : await getDriver(m, record.cwd, params.provider || null, record.id, params.apiKey || null, record.launchOpts || null);
-      let isAgyStreamJson = drv instanceof AgyStreamJsonDriver;
-      if (m.protocol === "acp" && !isAgyStreamJson && drv) await attachAcpSession(drv, record);
+      let drv = null;
+      let isAgyStreamJson = m.id === "antigravity" && (record.launchOpts?.transport === "stream-json" || Boolean(params.provider?.id));
       const now = Date.now();
       const userMsgId = (typeof params.clientMessageId === "string" && params.clientMessageId.trim())
         ? params.clientMessageId.trim().slice(0, 128)
@@ -2700,10 +3092,12 @@ async function dispatchRequest(method, params = {}) {
       let replySaved = false;
       let exactUsage = null;
       let driverContextUsage = null;
+      let bridgedDuringTurn = false;
       const turnStartMs = Date.now();
       try {
         let promptTextForDriver = text;
         const consumedContextBridge = Boolean(record.pendingContextBridge);
+        bridgedDuringTurn = consumedContextBridge;
         if (consumedContextBridge) {
           promptTextForDriver = buildContextBridgedPrompt(record, text, userMsgId);
           record.pendingContextBridge = false;
@@ -2784,7 +3178,7 @@ async function dispatchRequest(method, params = {}) {
           stopReason = res.stopReason || "end_turn";
           exactUsage = res.usage || null;
         } else if (isAgyStreamJson || m.protocol === "acp") {
-          const maxRetries = 3;
+          const maxRetries = 5;
           let activePromptText = promptTextForDriver;
           let includeImages = true;
           let lastAttemptRemoteId = record.remoteSessionId;
@@ -2801,7 +3195,14 @@ async function dispatchRequest(method, params = {}) {
                 isAgyStreamJson = drv instanceof AgyStreamJsonDriver;
               }
               if (m.protocol === "acp" && !isAgyStreamJson && drv) {
-                await attachAcpSession(drv, record);
+                const prevRemoteId = record.remoteSessionId;
+                await attachAcpSession(drv, record, {requireModelCatalog: m.id === "antigravity" && !params.provider?.id});
+                if (m.id === "antigravity" && record.remoteSessionId && (!turn.brainBaseline || record.remoteSessionId !== prevRemoteId)) {
+                  turn.brainBaseline = await snapshotBrainArtifacts(record.remoteSessionId).catch(() => new Map());
+                }
+                if (record.remoteSessionId && record.remoteSessionId !== prevRemoteId) {
+                  await saveSession(record).catch(() => {});
+                }
               }
               if (attempt > 0) {
                 notify("agent/event", {
@@ -2814,6 +3215,7 @@ async function dispatchRequest(method, params = {}) {
                   activePromptText = "上一轮请求因网络波动中断，请直接从中断处继续完成上一条用户请求，无需重复已完成步骤。";
                   includeImages = false;
                 } else if (record.pendingContextBridge) {
+                  bridgedDuringTurn = true;
                   activePromptText = buildContextBridgedPrompt(record, text, userMsgId);
                   record.pendingContextBridge = false;
                   includeImages = true;
@@ -2821,6 +3223,11 @@ async function dispatchRequest(method, params = {}) {
                   activePromptText = promptTextForDriver;
                   includeImages = true;
                 }
+              } else if (record.pendingContextBridge) {
+                bridgedDuringTurn = true;
+                activePromptText = buildContextBridgedPrompt(record, text, userMsgId);
+                record.pendingContextBridge = false;
+                includeImages = true;
               }
               lastAttemptRemoteId = record.remoteSessionId;
               turn.serverAccepted = false;
@@ -2834,11 +3241,13 @@ async function dispatchRequest(method, params = {}) {
                     turn.currentThought = null;
                   }
                   notify("agent/event", {agentId: m.id, sessionId: record.id, kind: "thought-reset", focus: focusMsg});
-                  // 若底层连续失败 3 次（或后台网络受限 EPERM 连续 2 次），快速熔断并重建进程以刷新 Go HTTP/2 连接池与 DNS，避免干等 10+ 分钟
+                  // 若底层连续失败 3 次（或后台网络受限 EPERM 连续 2 次），熔断挂起重试并转入网络恢复等待，
+                  // 避免锁屏期间死等 10+ 分钟，或离线冷启导致 0 模型目录触发 unknown model key 崩溃
                   if (!internalCircuitError && (info.attempt >= 3 || (info.isSocketPermissionError && info.attempt >= 2))) {
                     internalCircuitError = new Error(info.reason || "网络连续重试失败");
                     internalCircuitError.code = "ACP_INTERNAL_RETRY_LOOP";
                     internalCircuitError.retryable = true;
+                    internalCircuitError.needsNetworkWait = Boolean(info.isSocketPermissionError);
                     drv?.cancel?.(record.remoteSessionId).catch(() => {});
                     rejectInternalCircuit?.(internalCircuitError);
                   }
@@ -2851,6 +3260,7 @@ async function dispatchRequest(method, params = {}) {
                   effort: record.effort,
                   mode: record.mode,
                   remoteSessionId: record.remoteSessionId,
+                  availableModels: record.availableModels,
                 });
                 replyText = res.text || turn.text || "";
                 stopReason = res.stopReason || "end_turn";
@@ -2860,6 +3270,10 @@ async function dispatchRequest(method, params = {}) {
               } else {
                 const blocks = [];
                 if (activePromptText) blocks.push({type: "text", text: activePromptText});
+                if (activePromptText && drv.agentCapabilities?.promptCapabilities?.embeddedContext === true) {
+                  const embedded = await buildAcpEmbeddedContextBlocks(activePromptText, record.cwd, {allowedRoot: HOME}).catch(() => []);
+                  if (embedded.length) blocks.push(...embedded);
+                }
                 if (includeImages) {
                   for (const img of images) {
                     if (img?.base64) blocks.push({type: "image", mimeType: img.mimeType || "image/jpeg", data: img.base64});
@@ -2884,6 +3298,10 @@ async function dispatchRequest(method, params = {}) {
                 const err = new Error(softErr ? replyText.trim() : "服务端未返回任何内容，连接可能已中断");
                 err.retryable = true;
                 err.isSoftNetwork = true;
+                if (isAgyModelCatalogError(err.message)) {
+                  err.code = "ACP_MODEL_CATALOG_UNAVAILABLE";
+                  err.needsNetworkWait = true;
+                }
                 throw err;
               }
               break;
@@ -2896,7 +3314,7 @@ async function dispatchRequest(method, params = {}) {
               }
               const canRetry = attempt < maxRetries && isRetryableAcpError(attemptErr);
               if (!canRetry) {
-                if (attemptErr?.isSoftNetwork || attemptErr?.code === "ACP_INTERNAL_RETRY_LOOP") {
+                if (attemptErr?.isSoftNetwork || attemptErr?.code === "ACP_INTERNAL_RETRY_LOOP" || attemptErr?.code === "ACP_MODEL_CATALOG_UNAVAILABLE" || isAgyModelCatalogError(attemptErr?.message)) {
                   const reasonLabel = formatAcpNetworkReason(attemptErr.message);
                   throw new Error(`网络连接异常（${reasonLabel}），已自动重试 ${attempt} 次仍失败，请检查网络或代理后重试`);
                 }
@@ -2936,34 +3354,65 @@ async function dispatchRequest(method, params = {}) {
                 turn.thoughts = [];
                 turn.timelineOrder = turn.timelineOrder.filter(entry => entry.type !== "thought");
               }
+              const needsNetworkWait = m.id === "antigravity" && !params.provider?.id && isSocketPermissionOrNetworkBlocked(attemptErr);
               const delayMs = computeRetryDelayMs(attempt);
               const reasonLabel = formatAcpNetworkReason(attemptErr.message);
               const delaySec = Math.max(1, Math.round(delayMs / 1000));
-              const retryFocus = `${reasonLabel}，${delaySec}秒后重建连接并重试（第 ${attempt + 1}/${maxRetries} 次）…`;
+              const retryFocus = needsNetworkWait
+                ? `${reasonLabel}，等待锁屏解除或网络恢复后自动重连（第 ${attempt + 1}/${maxRetries} 次）…`
+                : `${reasonLabel}，${delaySec}秒后重建连接并重试（第 ${attempt + 1}/${maxRetries} 次）…`;
               notify("agent/event", {
                 agentId: m.id,
                 sessionId: record.id,
                 kind: "turn-retry",
                 attempt: attempt + 1,
                 maxAttempts: maxRetries,
-                delayMs,
+                delayMs: needsNetworkWait ? 0 : delayMs,
                 reason: reasonLabel,
                 focus: retryFocus,
                 clearPartialThought: !hadTools,
                 discardSoftReply: true,
               });
-              // 主动重启底层进程以清空失效的 Go HTTP/2 连接池与陈旧 DNS/TUN 套接字，同时完整保留磁盘上的远端会话轨迹
+              // 主动停止失效进程以释放旧 Go HTTP/2 连接池与 0 模型缓存，并等待网络真正恢复后再冷启新进程
               stopSessionDriver(key);
               drv = null;
-              const keepGoing = await sleepCancellable(turn, delayMs);
-              if (!keepGoing || turn.cancelled) {
-                stopReason = "cancelled";
-                replyText = "";
-                break;
+              if (needsNetworkWait) {
+                const probeEnv = baseEnv(m, null, networkConfig, userGlobalEnv, null, record.id);
+                const waitRes = await waitForNetworkRecovery(turn, {
+                  agentId: m.id,
+                  sessionId: record.id,
+                  env: probeEnv,
+                  initialReason: attemptErr?.message || reasonLabel,
+                });
+                if (waitRes.cancelled || turn.cancelled) {
+                  stopReason = "cancelled";
+                  replyText = "";
+                  break;
+                }
+                if (!waitRes.recovered) {
+                  throw new Error(`锁屏或后台网络受限超过等待上限（${reasonLabel}），请解锁屏幕或检查网络/代理后重试`);
+                }
+                const settleMs = Number(process.env.GALIAIS_NET_WAIT_POLL_MS) > 0 ? 50 : 350;
+                const keepGoing = await sleepCancellable(turn, settleMs);
+                if (!keepGoing || turn.cancelled) {
+                  stopReason = "cancelled";
+                  replyText = "";
+                  break;
+                }
+              } else {
+                const keepGoing = await sleepCancellable(turn, delayMs);
+                if (!keepGoing || turn.cancelled) {
+                  stopReason = "cancelled";
+                  replyText = "";
+                  break;
+                }
               }
             }
           }
         } else {
+          if (!drv || drv.closed) {
+            drv = await getDriver(m, record.cwd, params.provider || null, record.id, params.apiKey || null, record.launchOpts || null);
+          }
           let effectivePrompt = promptTextForDriver;
           if (record.messages.length <= 1) {
             const skillIndex = await extSync.buildSkillsPromptIndex(m.id, record.cwd).catch(() => "");
@@ -2987,9 +3436,11 @@ async function dispatchRequest(method, params = {}) {
         if (effectiveWindow > 0) record.lastContextWindow = effectiveWindow;
         const effectiveContextUsed = turn.usageEnd ?? driverContextUsage?.used ?? null;
         const isCompactCommand = text.trim().toLowerCase().startsWith("/compact");
-        // Antigravity 在自定义服务商或 Stream-JSON 模式下达到 85% 真实上下文窗口时自动触发 /compact，防止后续请求超窗。
+        // Antigravity 在自定义服务商或 Stream-JSON 模式下达到 85% 真实上下文窗口时自动触发 /compact，防止后续请求超窗；
+        // 官方 agy acp 已有内置上下文管理，且 ACP session/prompt 会把 "/compact" 当普通文本处理，故仅限 Stream-JSON/自定义服务商。
         if (
           m.id === "antigravity" &&
+          (isAgyStreamJson || Boolean(params.provider?.id)) &&
           stopReason === "end_turn" &&
           !isCompactCommand &&
           effectiveContextUsed !== null &&
@@ -3001,7 +3452,7 @@ async function dispatchRequest(method, params = {}) {
           try {
             if (isAgyStreamJson) {
               const cmpRes = await drv.prompt(record.id, "/compact", {
-                cwd: record.cwd, model: record.model, effort: record.effort, mode: record.mode, remoteSessionId: record.remoteSessionId,
+                cwd: record.cwd, model: record.model, effort: record.effort, mode: record.mode, remoteSessionId: record.remoteSessionId, availableModels: record.availableModels,
               });
               if (cmpRes?.remoteSessionId) record.remoteSessionId = cmpRes.remoteSessionId;
               if (cmpRes?.contextUsage?.used > 0) {
@@ -3118,13 +3569,13 @@ async function dispatchRequest(method, params = {}) {
           : (turn.usageEnd || 0);
         const rawInTok = exactUsage?.input_tokens ?? exactUsage?.inputTokens ?? (acpDelta > estOut ? acpDelta - estOut : Math.max(acpDelta, estIn));
         const outTok = exactUsage?.output_tokens ?? exactUsage?.outputTokens ?? estOut;
-        const cacheRead = exactUsage?.cache_read_tokens ?? exactUsage?.cachedReadTokens ?? exactUsage?.cacheReadTokens ?? 0;
-        const cacheWrite = exactUsage?.cache_write_tokens ?? exactUsage?.cachedWriteTokens ?? exactUsage?.cacheWriteTokens ?? 0;
-        const reasoning = exactUsage?.thinking_tokens ?? exactUsage?.thoughtTokens ?? exactUsage?.reasoningTokens ?? 0;
-        const rawTotal = exactUsage?.total_tokens ?? exactUsage?.totalTokens ?? 0;
+        const cacheRead = exactUsage?.cache_read_tokens ?? exactUsage?.cached_read_tokens ?? exactUsage?.cachedReadTokens ?? exactUsage?.cacheReadTokens ?? exactUsage?.cachedContentTokenCount ?? 0;
+        const cacheWrite = exactUsage?.cache_write_tokens ?? exactUsage?.cached_write_tokens ?? exactUsage?.cachedWriteTokens ?? exactUsage?.cacheWriteTokens ?? 0;
+        const reasoning = exactUsage?.thinking_tokens ?? exactUsage?.thoughtTokens ?? exactUsage?.reasoningTokens ?? exactUsage?.thoughtsTokenCount ?? 0;
+        const rawTotal = exactUsage?.total_tokens ?? exactUsage?.totalTokens ?? exactUsage?.totalTokenCount ?? 0;
         // Antigravity (agy) 返回的 inputTokens 为未命中缓存的增量输入，需合并 cacheRead + cacheWrite 为统一总输入口径。
         const inTok = hasExactUsage
-          ? resolveNormalizedTotalInput(rawInTok, outTok, cacheRead, cacheWrite, rawTotal, m.id === "antigravity")
+          ? resolveNormalizedTotalInput(rawInTok, outTok, cacheRead, cacheWrite, rawTotal, m.id === "antigravity", reasoning)
           : Math.max(rawInTok, cacheRead + cacheWrite);
         const normalizedUsage = {
           inputTokens: inTok,
@@ -3201,7 +3652,7 @@ async function dispatchRequest(method, params = {}) {
         return {stopReason, text: replyText, turnDiff, usage: normalizedUsage, contextUsage: finalContextUsage};
       } catch (error) {
         stopSessionDriver(key);
-        if (consumedContextBridge && !replySaved) {
+        if (bridgedDuringTurn && !replySaved) {
           record.remoteSessionId = null;
           record.pendingContextBridge = true;
         }
@@ -3337,6 +3788,7 @@ async function dispatchRequest(method, params = {}) {
     case "sessions/delete": {
       const agentId = validateAgentId(params.agentId);
       const key = `${agentId}:${params.sessionId}`;
+      markSessionDeleted(key);
       for (const waiter of pendingClientReqs.values()) {
         if (`${waiter.params.agentId}:${waiter.params.sessionId}` === key) waiter.reject(new Error("会话已删除"));
       }
@@ -3352,6 +3804,11 @@ async function dispatchRequest(method, params = {}) {
         try { deletingTurn.abortRetry?.(); } catch {}
       }
       activeTurns.delete(key);
+      const existingRec = sessions.get(key) || await loadStoredSession(agentId, params.sessionId).catch(() => null);
+      const existingDrv = drivers.get(key);
+      if (existingDrv && existingRec?.remoteSessionId && typeof existingDrv.closeSession === "function") {
+        await existingDrv.closeSession(existingRec.remoteSessionId).catch(() => {});
+      }
       stopSessionDriver(key);
       sessionApiKeys.delete(key);
       await fs.rm(sessionFile(agentId, params.sessionId), {force: true});
@@ -3367,27 +3824,219 @@ async function dispatchRequest(method, params = {}) {
       return {ok: true};
     }
 
+    case "sessions/archive": {
+      const agentId = validateAgentId(params.agentId);
+      const record = await loadStoredSession(agentId, params.sessionId);
+      if (!record) throw new Error("会话不存在");
+      const key = `${agentId}:${record.id}`;
+      if (params.archived !== false && activeTurns.has(key)) throw new Error("当前会话正在运行任务，请先停止后再归档");
+      record.archived = params.archived !== false;
+      record.updatedAt = Date.now();
+      if (record.archived) stopSessionDriver(key);
+      await saveSession(record);
+      return {ok: true, archived: record.archived};
+    }
+
+    case "sessions/fork": {
+      const agentId = validateAgentId(params.agentId);
+      const source = await loadStoredSession(agentId, params.sessionId);
+      if (!source) throw new Error("源会话不存在");
+      const newId = randomUUID();
+      const rawMsgs = Array.isArray(source.messages) ? source.messages : [];
+      let clonedMsgs = rawMsgs.map(m => ({...m}));
+      if (typeof params.upToMessageId === "string" && params.upToMessageId.trim()) {
+        const idx = clonedMsgs.findIndex(m => m?.id === params.upToMessageId.trim());
+        if (idx >= 0) clonedMsgs = clonedMsgs.slice(0, idx + 1);
+      }
+      const hasHistory = clonedMsgs.some(m => (m?.role === "user" || m?.role === "agent") && typeof m.text === "string" && m.text.trim());
+      const cloned = {
+        ...source,
+        id: newId,
+        remoteSessionId: null,
+        archived: false,
+        title: (typeof params.title === "string" && params.title.trim())
+          ? params.title.trim().slice(0, 120)
+          : `${source.title || "会话"}（分支）`.slice(0, 120),
+        updatedAt: Date.now(),
+        messages: clonedMsgs,
+        pendingContextBridge: hasHistory,
+        additionalDirectories: Array.isArray(source.additionalDirectories) ? [...source.additionalDirectories] : [],
+      };
+      sessions.set(`${agentId}:${newId}`, cloned);
+      await saveSession(cloned);
+      return {session: cloned};
+    }
+
+    case "sessions/addDir": {
+      const agentId = validateAgentId(params.agentId);
+      const record = await loadStoredSession(agentId, params.sessionId);
+      if (!record) throw new Error("会话不存在");
+      const key = `${agentId}:${record.id}`;
+      if (activeTurns.has(key)) throw new Error("请先等待本轮结束后再附加工作区目录");
+      const rawDir = String(params.dir || "").trim();
+      if (!rawDir || !path.isAbsolute(rawDir)) throw new Error("附加目录必须是绝对路径");
+      const resolved = await fs.realpath(rawDir);
+      if (!(await fs.stat(resolved)).isDirectory()) throw new Error("附加目录不存在");
+      const prev = Array.isArray(record.additionalDirectories) ? record.additionalDirectories : [];
+      record.additionalDirectories = [...new Set([...prev, resolved])].slice(0, 16);
+      record.updatedAt = Date.now();
+      stopSessionDriver(key);
+      await saveSession(record);
+      return {ok: true, additionalDirectories: record.additionalDirectories};
+    }
+
+    case "sessions/syncAcp": {
+      const agentId = validateAgentId(params.agentId || "antigravity");
+      const m = requireManifest(agentId);
+      if (m.protocol !== "acp") return {imported: 0, total: 0};
+      const cwd = params.cwd || path.join(HOME, "workspace");
+      const probeKey = `${agentId}:__sync_acp__`;
+      const drv = await getDriver(m, cwd, null, "__sync_acp__", null, null);
+      try {
+        const listed = await drv.listSessions(params.cwd || null);
+        const remoteList = Array.isArray(listed?.sessions) ? listed.sessions : (Array.isArray(listed?.data) ? listed.data : []);
+        const existing = await listStoredSessions(agentId);
+        const knownRemote = new Set(existing.map(s => s.remoteSessionId).filter(Boolean));
+        let imported = 0;
+        for (const item of remoteList) {
+          const rId = String(item?.sessionId || item?.id || "").trim();
+          if (!rId || knownRemote.has(rId)) continue;
+          const localId = randomUUID();
+          const rec = {
+            agentId,
+            driverName: m.name || agentId,
+            id: localId,
+            remoteSessionId: rId,
+            title: String(item?.title || item?.name || "原生终端会话").slice(0, 100),
+            preview: String(item?.preview || item?.summary || "").slice(0, 140),
+            cwd: item?.cwd || cwd,
+            updatedAt: Number(item?.updatedAt || item?.lastModified || Date.now()),
+            model: item?.model || null,
+            mode: item?.mode || null,
+            providerId: null,
+            messages: [],
+            additionalDirectories: [],
+          };
+          sessions.set(`${agentId}:${localId}`, rec);
+          await saveSession(rec);
+          knownRemote.add(rId);
+          imported++;
+        }
+        return {imported, total: remoteList.length};
+      } finally {
+        stopSessionDriver(probeKey);
+      }
+    }
+
+    case "agy/changelog": {
+      const bin = antigravityInstallation.binary;
+      const env = baseEnv(manifests.get("antigravity") || null, null);
+      const {stdout, stderr} = await execFileAsync(bin, ["changelog"], {env, timeout: 20_000, maxBuffer: 512 * 1024}).catch(e => ({stdout: e.stdout || "", stderr: e.stderr || e.message}));
+      return {text: String(stdout || stderr || "").trim().slice(0, 64_000), version: antigravityInstallation.version};
+    }
+
+    case "agy/doctor": {
+      const bin = antigravityInstallation.binary;
+      const env = baseEnv(manifests.get("antigravity") || null, null);
+      const runSub = async (args) => {
+        try {
+          const {stdout, stderr} = await execFileAsync(bin, args, {env, timeout: 15_000, maxBuffer: 256 * 1024});
+          return {ok: true, out: String(stdout || stderr || "").trim()};
+        } catch (err) {
+          return {ok: false, out: String(err?.stdout || err?.stderr || err?.message || err).trim()};
+        }
+      };
+      const [ver, auth, mcp, plugins, agents] = await Promise.all([
+        runSub(["--version"]),
+        queryAuthStatus("antigravity").catch(e => ({loggedIn: false, authMethod: "error", raw: e.message})),
+        runSub(["mcp", "list"]),
+        runSub(["plugin", "list", "--json"]),
+        runSub(["agents"]),
+      ]);
+      return {
+        ok: ver.ok,
+        version: antigravityInstallation.version,
+        binary: bin,
+        auth,
+        mcpOutput: mcp.out,
+        pluginsOutput: plugins.out,
+        agentsOutput: agents.out,
+        versionOutput: ver.out,
+      };
+    }
+
+    case "agy/authLogout": {
+      const m = manifests.get("antigravity");
+      if (m) {
+        const probeKey = "antigravity:__logout__";
+        try {
+          const drv = await getDriver(m, path.join(HOME, "workspace"), null, "__logout__", null, null);
+          await drv.logout().catch(() => {});
+        } catch {} finally {
+          stopSessionDriver(probeKey);
+        }
+      }
+      return await logoutAuth("antigravity");
+    }
+
+    case "agy/authenticate": {
+      const allowed = new Set(["oauth-personal", "oauth-business", "gemini-api-key", "agent-platform"]);
+      const methodId = String(params?.methodId || "").trim();
+      if (!allowed.has(methodId)) throw new Error(`不支持的 Antigravity 认证方式：${methodId}`);
+      const m = requireManifest("antigravity");
+      const probeKey = "antigravity:__auth_method__";
+      const drv = await getDriver(m, path.join(HOME, "workspace"), null, "__auth_method__", params?.apiKey || null, null);
+      try {
+        await drv.start();
+        const result = await drv.authenticate(methodId);
+        return {ok: true, methodId, authMethods: drv.authMethods || [], result: result ?? {}};
+      } finally {
+        stopSessionDriver(probeKey);
+      }
+    }
+
     case "sessions/setModel": {
       const m = requireManifest(params.agentId, "切换模型");
       const record = await loadStoredSession(m.id, params.sessionId);
       if (!record) throw new Error("会话不存在");
       const previousModel = record.model;
+      const previousConfigOptions = record.configOptions;
       const rawSelected = params.model || (m.protocol === "acp" ? record.defaultModel : null);
       if (m.protocol === "acp" && !rawSelected) throw new Error("此会话未记录默认模型，请选择具体模型");
       const normalizedModel = m.id === "antigravity" && rawSelected ? splitAgyModelEffort(rawSelected).baseId : rawSelected;
       const concreteModel = m.id === "antigravity" && normalizedModel
-        ? (resolveAgyConcreteModel(normalizedModel, record.effort) || normalizedModel)
+        ? (resolveAgyConcreteModel(normalizedModel, record.effort, null, record.availableModels) || normalizedModel)
         : normalizedModel;
+      let appliedLive = false;
       if (m.protocol === "acp" && record.remoteSessionId && concreteModel) {
         const drv = drivers.get(`${m.id}:${record.id}`);
-        if (drv && !drv.closed && typeof drv.setModel === "function") {
-          await drv.setModel(record.remoteSessionId, concreteModel).catch(() =>
-            drv.setConfigOption?.(record.remoteSessionId, "model", concreteModel).catch(() => {}),
-          );
+        if (drv && !drv.closed && drv._attachedSessionId === record.remoteSessionId && typeof drv.setModel === "function") {
+          const setOk = await drv.setModel(record.remoteSessionId, concreteModel).then(() => true, () => false);
+          if (setOk) {
+            appliedLive = true;
+          } else if (typeof drv.setConfigOption === "function") {
+            const fallbackVal = m.id === "antigravity" ? normalizedModel : concreteModel;
+            const cfgRes = await drv.setConfigOption(record.remoteSessionId, "model", fallbackVal).catch(() => null);
+            if (cfgRes) {
+              if (Array.isArray(cfgRes.configOptions)) record.configOptions = cfgRes.configOptions;
+              appliedLive = true;
+            }
+          }
         }
       }
       record.model = normalizedModel;
-      try { await saveSession(record); } catch (error) { record.model = previousModel; stopSessionDriver(`${m.id}:${record.id}`); throw error; }
+      if (Array.isArray(record.configOptions) && record.configOptions.length && normalizedModel) {
+        const concreteSplit = m.id === "antigravity" ? splitAgyModelEffort(concreteModel) : {baseId: normalizedModel, effort: null};
+        record.configOptions = updateConfigOptionValues(record.configOptions, {
+          model: concreteSplit.baseId || normalizedModel,
+          ...(concreteSplit.effort ? {thought_level: concreteSplit.effort} : {}),
+        });
+      }
+      if (m.protocol === "acp" && normalizedModel && normalizedModel !== previousModel) {
+        if (appliedLive) delete record._pendingModelSync;
+        else record._pendingModelSync = true;
+      }
+      try { await saveSession(record); } catch (error) { record.model = previousModel; record.configOptions = previousConfigOptions; stopSessionDriver(`${m.id}:${record.id}`); throw error; }
       return {ok: true, model: record.model};
     }
 
@@ -3396,18 +4045,32 @@ async function dispatchRequest(method, params = {}) {
       const record = await loadStoredSession(m.id, params.sessionId);
       if (!record) throw new Error("会话不存在");
       const previousMode = record.mode;
+      const previousConfigOptions = record.configOptions;
       const nextMode = params.mode || null;
       const wantBypass = nextMode === "bypass";
       const wasBypass = Boolean(record.launchOpts?.bypassPermissions);
+      let appliedLive = false;
       if (m.protocol === "acp" && m.id === "antigravity" && wantBypass !== wasBypass) {
         record.launchOpts = {...(record.launchOpts || {}), bypassPermissions: wantBypass};
         stopSessionDriver(`${m.id}:${record.id}`);
       } else if (m.protocol === "acp" && record.remoteSessionId && nextMode && !wantBypass) {
         const drv = drivers.get(`${m.id}:${record.id}`);
-        if (drv && !drv.closed && typeof drv.setMode === "function") await drv.setMode(record.remoteSessionId, nextMode);
+        if (drv && !drv.closed && drv._attachedSessionId === record.remoteSessionId && typeof drv.setMode === "function") {
+          await drv.setMode(record.remoteSessionId, nextMode);
+          appliedLive = true;
+        }
       }
       record.mode = nextMode;
-      try { await saveSession(record); } catch (error) { record.mode = previousMode; stopSessionDriver(`${m.id}:${record.id}`); throw error; }
+      if (nextMode && !wantBypass && Array.isArray(record.configOptions) && record.configOptions.length) {
+        record.configOptions = updateConfigOptionValues(record.configOptions, {mode: nextMode});
+      }
+      if (m.protocol === "acp" && nextMode && !wantBypass && nextMode !== previousMode) {
+        if (appliedLive) delete record._pendingModeSync;
+        else record._pendingModeSync = true;
+      } else if (wantBypass) {
+        delete record._pendingModeSync;
+      }
+      try { await saveSession(record); } catch (error) { record.mode = previousMode; record.configOptions = previousConfigOptions; stopSessionDriver(`${m.id}:${record.id}`); throw error; }
       return {ok: true};
     }
 
@@ -3419,24 +4082,56 @@ async function dispatchRequest(method, params = {}) {
       const value = String(params.value || "").trim();
       if (!configId || !value) throw new Error("配置参数不能为空");
       let updatedOptions = record.configOptions || [];
+      let appliedLive = false;
       if (m.protocol === "acp" && record.remoteSessionId) {
         const drv = drivers.get(`${m.id}:${record.id}`);
-        if (drv && !drv.closed && typeof drv.setConfigOption === "function") {
+        if (drv && !drv.closed && drv._attachedSessionId === record.remoteSessionId && typeof drv.setConfigOption === "function") {
           const res = await drv.setConfigOption(record.remoteSessionId, configId, value).catch(() => null);
           if (Array.isArray(res?.configOptions)) updatedOptions = res.configOptions;
           else {
-            updatedOptions = updatedOptions.map(opt => opt?.id === configId ? {...opt, currentValue: value} : opt);
+            updatedOptions = updateConfigOptionValues(updatedOptions, {[configId]: value});
           }
-          // 同步切换对应的具体推理变体模型 ID（如 gemini-4-neon-xhigh）
-          if (m.id === "antigravity" && configId === "thought_level" && record.model && typeof drv.setModel === "function") {
-            const concrete = resolveAgyConcreteModel(record.model, value);
-            if (concrete) await drv.setModel(record.remoteSessionId, concrete).catch(() => {});
+          // 仅当 setConfigOption 失败或返回配置未确认目标 thought_level/model 时才回退补发 setModel，避免 agy 重复切换同一模型两次
+          const confirmedThought = Array.isArray(res?.configOptions)
+            ? res.configOptions.find(opt => opt?.id === "thought_level")?.currentValue
+            : null;
+          const confirmedModel = Array.isArray(res?.configOptions)
+            ? res.configOptions.find(opt => opt?.id === "model")?.currentValue
+            : null;
+          const expectedBaseModel = record.model ? splitAgyModelEffort(record.model).baseId : null;
+          const thoughtAlreadyApplied = Boolean(res)
+            && confirmedThought === value
+            && (!confirmedModel || !expectedBaseModel || confirmedModel === expectedBaseModel);
+          if (m.id === "antigravity" && configId === "thought_level" && record.model && typeof drv.setModel === "function" && !thoughtAlreadyApplied) {
+            const concrete = resolveAgyConcreteModel(record.model, value, null, record.availableModels);
+            const setOk = concrete ? await drv.setModel(record.remoteSessionId, concrete).then(() => true, () => false) : false;
+            appliedLive = Boolean(res) || setOk;
+          } else {
+            appliedLive = Boolean(res);
           }
         }
       }
+      if (!appliedLive) {
+        updatedOptions = updateConfigOptionValues(updatedOptions, {[configId]: value});
+      }
       record.configOptions = updatedOptions;
-      if (configId === "thought_level") record.effort = value;
-      if (configId === "model") record.model = value;
+      if (configId === "thought_level") {
+        record.effort = value;
+        if (m.protocol === "acp") {
+          if (appliedLive) delete record._pendingEffortSync;
+          else {
+            record._pendingEffortSync = true;
+            if (m.id === "antigravity" && record.model) record._pendingModelSync = true;
+          }
+        }
+      }
+      if (configId === "model") {
+        record.model = m.id === "antigravity" ? (splitAgyModelEffort(value).baseId || value) : value;
+        if (m.protocol === "acp") {
+          if (appliedLive) delete record._pendingModelSync;
+          else record._pendingModelSync = true;
+        }
+      }
       await saveSession(record);
       return {ok: true, configOptions: updatedOptions};
     }
@@ -3732,12 +4427,13 @@ async function dispatchRequest(method, params = {}) {
       });
 
     case "files/listCheckpoints": {
-      const baseCwd = params?.cwd || path.join(HOME, "workspace");
+      const baseCwd = await resolveSafeHomePath(String(params?.cwd || path.join(HOME, "workspace")), {
+        cwd: HOME, allowedRoot: HOME, allowMissing: true,
+      });
       const rawPath = String(params?.filePath || "").trim();
-      const target = rawPath ? path.resolve(baseCwd, rawPath) : "";
-      if (target && target !== HOME && !target.startsWith(HOME + "/")) {
-        throw new Error("文件路径超出用户目录边界，拒绝访问");
-      }
+      const target = rawPath
+        ? await resolveSafeHomePath(rawPath, {cwd: baseCwd, allowedRoot: HOME, allowMissing: true})
+        : "";
       const checkpoints = await listFileCheckpoints({
         sessionId: String(params?.sessionId || "default"),
         filePath: target,
@@ -3746,13 +4442,12 @@ async function dispatchRequest(method, params = {}) {
     }
 
     case "files/revertCheckpoint": {
-      const baseCwd = params?.cwd || path.join(HOME, "workspace");
+      const baseCwd = await resolveSafeHomePath(String(params?.cwd || path.join(HOME, "workspace")), {
+        cwd: HOME, allowedRoot: HOME, allowMissing: false,
+      });
       const rawPath = String(params?.filePath || "").trim();
       if (!rawPath) throw new Error("缺少要回滚的文件路径");
-      const target = path.resolve(baseCwd, rawPath);
-      if (target !== HOME && !target.startsWith(HOME + "/")) {
-        throw new Error("文件路径超出用户目录边界，拒绝回滚");
-      }
+      const target = await resolveSafeHomePath(rawPath, {cwd: baseCwd, allowedRoot: HOME, allowMissing: true});
       const sid = String(params?.sessionId || "default");
       try {
         return await revertFileCheckpoint({
@@ -3762,8 +4457,10 @@ async function dispatchRequest(method, params = {}) {
         });
       } catch (cpErr) {
         // 无独立文件检查点时（例如 Codex/Claude 通过 CLI 直接修改），尝试在 Git 工作区回退该单文件（先备份当前版保证可逆）
-        const dir = path.dirname(target);
         const rel = path.relative(baseCwd, target);
+        if (!rel || rel === "." || rel.startsWith("..") || path.isAbsolute(rel)) {
+          throw new Error(`未找到「${path.basename(target)}」的修改前快照且文件不在当前项目工作目录内：${cpErr.message}`);
+        }
         try {
           await execFileAsync("git", ["rev-parse", "--is-inside-work-tree"], {cwd: baseCwd, timeout: 4000});
           const undoCp = await captureFileCheckpoint(target, {sessionId: sid}).catch(() => null);

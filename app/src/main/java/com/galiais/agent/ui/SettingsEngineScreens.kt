@@ -57,6 +57,9 @@ import com.galiais.agent.GaliaisApplication
 import com.galiais.agent.engine.AgentAuthState
 import com.galiais.agent.engine.ClaudeAgentSummary
 import com.galiais.agent.engine.CliAuthStatus
+import com.galiais.agent.engine.CodexAccountSessionItem
+import com.galiais.agent.engine.CodexHookSummary
+import com.galiais.agent.engine.CodexPluginSummary
 import com.galiais.agent.engine.CustomProvider
 import com.galiais.agent.engine.EngineKind
 import com.galiais.agent.engine.ExperimentalFeatureItem
@@ -809,9 +812,13 @@ fun CodexSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, on
     val context = LocalContext.current
     val clipboard = LocalClipboard.current
     var account by remember { mutableStateOf<String?>(null) }
+    var accountSessions by remember { mutableStateOf<List<CodexAccountSessionItem>>(emptyList()) }
     var codexModels by remember { mutableStateOf<List<ModelOption>>(emptyList()) }
     var mcpServers by remember { mutableStateOf<List<McpServerSummary>>(emptyList()) }
     var skills by remember { mutableStateOf<List<SkillSummary>>(emptyList()) }
+    var nativeHooks by remember { mutableStateOf<List<CodexHookSummary>>(emptyList()) }
+    var nativePlugins by remember { mutableStateOf<List<CodexPluginSummary>>(emptyList()) }
+    var pluginActionBusy by remember { mutableStateOf<String?>(null) }
     var rateLimits by remember { mutableStateOf<List<RateLimitSummary>>(emptyList()) }
     var expFeatures by remember { mutableStateOf<List<ExperimentalFeatureItem>>(emptyList()) }
     var reloadingMcp by remember { mutableStateOf(false) }
@@ -823,7 +830,8 @@ fun CodexSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, on
 
     LaunchedEffect(runtime.ready, accountVersion) {
         if (!runtime.ready) {
-            account = null; mcpServers = emptyList(); skills = emptyList(); rateLimits = emptyList(); expFeatures = emptyList()
+            account = null; accountSessions = emptyList(); mcpServers = emptyList(); skills = emptyList()
+            nativeHooks = emptyList(); nativePlugins = emptyList(); rateLimits = emptyList(); expFeatures = emptyList()
             return@LaunchedEffect
         }
         account = try {
@@ -836,8 +844,11 @@ fun CodexSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, on
                 else -> value.optString("type")
             }
         } catch (e: Exception) { "读取失败：${e.message}" }
+        accountSessions = try { app.conversations.codex.accountSessions() } catch (_: Exception) { emptyList() }
         mcpServers = try { app.conversations.codex.mcpServers() } catch (_: Exception) { emptyList() }
         skills = try { app.conversations.codex.skills(settings.defaultCwd) } catch (_: Exception) { emptyList() }
+        nativeHooks = try { app.conversations.codex.listHooks() } catch (_: Exception) { emptyList() }
+        nativePlugins = try { app.conversations.codex.listNativePlugins() } catch (_: Exception) { emptyList() }
         rateLimits = try { app.conversations.codex.rateLimits() } catch (_: Exception) { emptyList() }
         expFeatures = try { app.conversations.codex.experimentalFeatures() } catch (_: Exception) { emptyList() }
     }
@@ -880,6 +891,27 @@ fun CodexSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, on
                             TagPill("退出登录", fg = G.danger, bg = G.dangerTint, onClick = {
                                 report("退出失败") { app.conversations.codex.logout(); app.conversations.notify("已退出 Codex 账号") }
                             })
+                        }
+                    }
+                    if (runtime.ready && accountSessions.isNotEmpty()) {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text("已保存账号会话（${accountSessions.size}，点击快切）", style = MaterialTheme.typography.labelSmall, color = G.inkMuted)
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                accountSessions.forEach { sess ->
+                                    TagPill(
+                                        text = (sess.email ?: sess.label) + if (sess.active) " (当前)" else "",
+                                        fg = if (sess.active) G.onAccent else G.ink,
+                                        bg = if (sess.active) G.codex else G.surfaceSubtle,
+                                        border = if (sess.active) null else G.border,
+                                        onClick = if (!sess.active) ({
+                                            report("切换账号失败") {
+                                                app.conversations.codex.switchAccountSession(sess.id)
+                                                app.conversations.notify("已切换 Codex 账号：${sess.email ?: sess.label}")
+                                            }
+                                        }) else null,
+                                    )
+                                }
+                            }
                         }
                     }
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1151,6 +1183,80 @@ fun CodexSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, on
                                         app.conversations.notify("${if (checked) "已启用" else "已停用"}技能 ${sk.name}")
                                     }
                                 })
+                            }
+                        }
+                    }
+                }
+            }
+
+            SectionLabel("原生插件与 Hooks")
+            CrispCard {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Codex 原生插件（${nativePlugins.size}）", style = MaterialTheme.typography.titleSmall, color = G.ink, modifier = Modifier.weight(1f))
+                        TagPill("刷新", fg = G.accent, bg = G.accentContainer, onClick = {
+                            report("刷新原生插件失败") {
+                                nativePlugins = app.conversations.codex.listNativePlugins()
+                                nativeHooks = app.conversations.codex.listHooks()
+                            }
+                        })
+                    }
+                    if (nativePlugins.isEmpty()) {
+                        Text("暂无可用的 Codex 原生插件。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                    } else {
+                        nativePlugins.take(15).forEach { pl ->
+                            val busy = pluginActionBusy == pl.id
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        Text(pl.name, fontFamily = Mono, fontSize = 12.5.sp, color = G.ink, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                                        if (pl.version.isNotBlank()) TagPill("v${pl.version}", fg = G.inkMuted, bg = G.surfaceSubtle)
+                                    }
+                                    if (pl.description.isNotBlank()) {
+                                        Text(pl.description, style = MaterialTheme.typography.bodySmall, color = G.inkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                    }
+                                }
+                                TagPill(
+                                    text = when {
+                                        busy -> "处理中…"
+                                        pl.installed -> "卸载"
+                                        else -> "安装"
+                                    },
+                                    fg = if (pl.installed) G.danger else G.onAccent,
+                                    bg = if (pl.installed) G.dangerTint else G.accent,
+                                    onClick = if (pluginActionBusy == null) ({
+                                        pluginActionBusy = pl.id
+                                        scope.launch {
+                                            try {
+                                                if (pl.installed) app.conversations.codex.uninstallNativePlugin(pl.id)
+                                                else app.conversations.codex.installNativePlugin(pl.id)
+                                                nativePlugins = app.conversations.codex.listNativePlugins()
+                                                app.conversations.notify(if (pl.installed) "已卸载插件 ${pl.name}" else "已安装插件 ${pl.name}")
+                                            } catch (e: Exception) {
+                                                app.conversations.notify("操作插件失败：${e.message}")
+                                            } finally {
+                                                pluginActionBusy = null
+                                            }
+                                        }
+                                    }) else null,
+                                )
+                            }
+                        }
+                    }
+                    Hairline()
+                    Text("已加载 Hooks（${nativeHooks.size}）", style = MaterialTheme.typography.titleSmall, color = G.ink)
+                    if (nativeHooks.isEmpty()) {
+                        Text("当前未检测到 Codex 原生 Hook（可在「资源库 → 钩子」中统一配置并自动同步）。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                    } else {
+                        nativeHooks.take(15).forEach { hk ->
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Text(hk.name, fontFamily = Mono, fontSize = 12.sp, color = if (hk.enabled) G.ink else G.inkSubtle, fontWeight = FontWeight.Medium)
+                                    if (hk.event.isNotBlank()) TagPill(hk.event, fg = G.codex, bg = G.codexTint)
+                                }
+                                if (hk.command.isNotBlank()) {
+                                    Text(hk.command, fontFamily = Mono, fontSize = 11.sp, color = G.inkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                }
                             }
                         }
                     }
@@ -1515,33 +1621,55 @@ fun ClaudeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, o
                         Text("暂无活动 MCP 服务。打开 Claude Code 会话后可查看。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
                     } else {
                         claudeMcpServers.forEach { s ->
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                    Text(s.name, fontFamily = Mono, fontSize = 12.5.sp, color = G.ink, fontWeight = FontWeight.Medium)
-                                    val detail = buildString {
-                                        append(s.status)
-                                        if (s.toolCount > 0) append(" · ${s.toolCount} 工具")
-                                        s.scope?.let { append(" · $it") }
-                                        s.error?.takeIf { it.isNotBlank() }?.let { append(" · $it") }
+                            var mcpPermOverride by remember(s.name) { mutableStateOf<String?>(null) }
+                            Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        Text(s.name, fontFamily = Mono, fontSize = 12.5.sp, color = G.ink, fontWeight = FontWeight.Medium)
+                                        val detail = buildString {
+                                            append(s.status)
+                                            if (s.toolCount > 0) append(" · ${s.toolCount} 工具")
+                                            s.scope?.let { append(" · $it") }
+                                            s.error?.takeIf { it.isNotBlank() }?.let { append(" · $it") }
+                                        }
+                                        Text(detail, style = MaterialTheme.typography.labelSmall, color = if (s.status == "failed") G.danger else G.inkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                     }
-                                    Text(detail, style = MaterialTheme.typography.labelSmall, color = if (s.status == "failed") G.danger else G.inkMuted, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                                }
-                                if (s.status != "connected" && s.enabled) {
-                                    TagPill("重连", fg = G.accent, bg = G.accentContainer, onClick = {
-                                        report("重连 MCP 失败") {
-                                            app.conversations.claude.reconnectMcpServer(s.name)
+                                    if (s.status != "connected" && s.enabled) {
+                                        TagPill("重连", fg = G.accent, bg = G.accentContainer, onClick = {
+                                            report("重连 MCP 失败") {
+                                                app.conversations.claude.reconnectMcpServer(s.name)
+                                                refreshTick++
+                                                app.conversations.notify("已请求重连 ${s.name}")
+                                            }
+                                        })
+                                    }
+                                    GaliaisSwitch(checked = s.enabled, onCheckedChange = { checked ->
+                                        report("切换 MCP 失败") {
+                                            app.conversations.claude.toggleMcpServer(s.name, checked)
                                             refreshTick++
-                                            app.conversations.notify("已请求重连 ${s.name}")
+                                            app.conversations.notify("${if (checked) "已启用" else "已停用"} MCP ${s.name}")
                                         }
                                     })
                                 }
-                                GaliaisSwitch(checked = s.enabled, onCheckedChange = { checked ->
-                                    report("切换 MCP 失败") {
-                                        app.conversations.claude.toggleMcpServer(s.name, checked)
-                                        refreshTick++
-                                        app.conversations.notify("${if (checked) "已启用" else "已停用"} MCP ${s.name}")
+                                if (s.enabled) {
+                                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        listOf(null to "跟随会话权限", "default" to "逐次审批", "auto" to "AI 审校").forEach { (mode, label) ->
+                                            val sel = mcpPermOverride == mode
+                                            TagPill(
+                                                text = label,
+                                                fg = if (sel) G.onAccent else G.inkMuted,
+                                                bg = if (sel) G.claude else G.surfaceSubtle,
+                                                onClick = {
+                                                    report("设置 MCP 权限覆写失败") {
+                                                        val warn = app.conversations.claude.setMcpPermissionOverride(s.name, mode)
+                                                        mcpPermOverride = mode
+                                                        app.conversations.notify(warn?.takeIf { it.isNotBlank() } ?: "MCP ${s.name} 权限已设为：$label")
+                                                    }
+                                                },
+                                            )
+                                        }
                                     }
-                                })
+                                }
                             }
                         }
                     }

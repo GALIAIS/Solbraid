@@ -38,6 +38,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.toClipEntry
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
@@ -853,7 +854,8 @@ private fun inline(
     val mathBg = overrideTextColor?.copy(alpha = 0.16f) ?: if (G.dark) G.claudeTint.copy(alpha = 0.25f) else G.claudeTint.copy(alpha = 0.45f)
     val mathFg = overrideTextColor ?: G.ink
     val linkColor = overrideTextColor ?: if (D.material) G.accent else G.codex
-    return remember(node, codeBg, codeFg, mathBg, mathFg, linkColor, renderMath, fileLinkHandler, stripLeadingChars, strikethrough) {
+    val uriHandler = LocalUriHandler.current
+    return remember(node, codeBg, codeFg, mathBg, mathFg, linkColor, renderMath, fileLinkHandler, uriHandler, stripLeadingChars, strikethrough) {
         buildAnnotatedString {
             var remainingStrip = stripLeadingChars
             fun appendBody(current: Node) {
@@ -882,7 +884,13 @@ private fun inline(
                         val fileTarget = parseFileLinkTarget(url)
                         when {
                             url.startsWith("https://") || url.startsWith("http://") -> {
-                                withLink(LinkAnnotation.Url(url, TextLinkStyles(SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline)))) {
+                                withLink(
+                                    LinkAnnotation.Url(
+                                        url = url,
+                                        styles = TextLinkStyles(SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline)),
+                                        linkInteractionListener = { runCatching { uriHandler.openUri(url) } },
+                                    ),
+                                ) {
                                     current.children().forEach(::appendBody)
                                 }
                             }

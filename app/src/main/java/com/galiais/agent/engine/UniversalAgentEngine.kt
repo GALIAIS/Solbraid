@@ -14,6 +14,7 @@ import com.galiais.agent.newId
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
@@ -93,20 +94,51 @@ class AgentHubController(val repo: ConversationRepository) {
     private val installAttempts = mutableMapOf<String, InstallAttempt>()
 
     init {
-        // 网络监听与应用仓库同寿命，网络切换后更新系统代理及 MCP 配置。
+        // 网络监听与应用仓库同寿命，网络切换后更新系统代理、MCP 配置并立即唤醒等待网络恢复的会话。
         runtime.app.getSystemService(ConnectivityManager::class.java)?.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) = refreshSystemNetwork()
+            override fun onAvailable(network: Network) {
+                refreshSystemNetwork()
+                notifyNetworkRecovered()
+            }
             override fun onLost(network: Network) = refreshSystemNetwork()
-            override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) = refreshSystemNetwork()
+            override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) {
+                refreshSystemNetwork()
+                notifyNetworkRecovered()
+            }
         })
         ContextCompat.registerReceiver(runtime.app, object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) = refreshSystemNetwork()
+            override fun onReceive(context: Context?, intent: Intent?) {
+                refreshSystemNetwork()
+                notifyNetworkRecovered()
+            }
         }, IntentFilter(Proxy.PROXY_CHANGE_ACTION), ContextCompat.RECEIVER_NOT_EXPORTED)
         repo.scope.launch {
             runtime.hubEvents.collect { packet ->
                 try { handleHubPacket(packet) }
                 catch (e: Exception) { Log.w("GALIAIS", "处理 Agent Hub 事件失败", e) }
             }
+        }
+        repo.scope.launch(Dispatchers.IO) {
+            runtime.hubStreamEvents.collect { packet ->
+                try {
+                    val method = packet.optString("method")
+                    val params = packet.optJSONObject("params") ?: JSONObject()
+                    when (method) {
+                        "pty/output" -> terminals.onPacket(method, params)
+                        "tcp/data" -> portForwarder.onRemoteData(params.optString("connId"), params.optString("dataBase64"))
+                    }
+                } catch (e: Exception) {
+                    Log.w("GALIAIS", "处理 Agent Hub 流式数据事件失败", e)
+                }
+            }
+        }
+    }
+
+    /** 应用回到前台或系统网络恢复时立即通知 Agent Hub 唤醒后台断网等待中的 Antigravity 重连任务。 */
+    fun notifyNetworkRecovered() {
+        if (!runtime.hubAvailable) return
+        repo.scope.launch {
+            runCatching { runtime.hubRequest("network/poke", JSONObject(), 5_000) }
         }
     }
 
@@ -745,6 +777,7 @@ class AgentHubController(val repo: ConversationRepository) {
                     "providerName" to providerName,
                     "model" to model,
                     "in" to inputTokens,
+                    "inNormalized" to true,
                     "out" to outputTokens,
                     "cacheRead" to cacheReadTokens,
                     "cacheWrite" to cacheWriteTokens,
@@ -1107,14 +1140,18 @@ class AgentHubController(val repo: ConversationRepository) {
                                 // 优先保持 usage_update / contextUsage 上报的真实上下文窗口占用，绝不用本轮累计账单 totalTok 覆盖！
                                 val currentContext = ctxUsed ?: prev?.totalTokens ?: totalTok
                                 val nextSessionTotal = (prev?.sessionTotalTokens ?: 0L) + totalTok.coerceAtLeast(0L)
+                                val hasTurnTokens = inTok > 0L || outTok > 0L
+                                val resolvedIn = if (inTok > 0L) inTok else (prev?.inputTokens ?: currentContext)
+                                val resolvedCacheRead = if (hasTurnTokens) cacheTok.coerceAtMost(resolvedIn) else (prev?.cachedInputTokens ?: 0L)
+                                val resolvedCacheWrite = if (hasTurnTokens) cacheWriteTok.coerceAtMost((resolvedIn - resolvedCacheRead).coerceAtLeast(0L)) else (prev?.cacheWriteTokens ?: 0L)
                                 st.copy(
                                     tokenUsage = TokenUsage(
                                         totalTokens = currentContext,
-                                        inputTokens = if (inTok > 0L) inTok else (prev?.inputTokens ?: currentContext),
-                                        cachedInputTokens = if (cacheTok > 0L) cacheTok else (prev?.cachedInputTokens ?: 0L),
-                                        cacheWriteTokens = if (cacheWriteTok > 0L) cacheWriteTok else (prev?.cacheWriteTokens ?: 0L),
-                                        outputTokens = if (outTok > 0L) outTok else (prev?.outputTokens ?: 0L),
-                                        reasoningTokens = if (thoughtTok > 0L) thoughtTok else (prev?.reasoningTokens ?: 0L),
+                                        inputTokens = resolvedIn,
+                                        cachedInputTokens = resolvedCacheRead,
+                                        cacheWriteTokens = resolvedCacheWrite,
+                                        outputTokens = if (hasTurnTokens) outTok else (prev?.outputTokens ?: 0L),
+                                        reasoningTokens = if (hasTurnTokens) thoughtTok else (prev?.reasoningTokens ?: 0L),
                                         contextWindow = resolvedWindow,
                                         sessionTotalTokens = nextSessionTotal.takeIf { it > 0L },
                                     ),
@@ -1128,8 +1165,9 @@ class AgentHubController(val repo: ConversationRepository) {
                                 st.copy(
                                     tokenUsage = TokenUsage(
                                         totalTokens = ctxUsed ?: (prev?.totalTokens ?: 0L),
-                                        inputTokens = ctxUsed ?: (prev?.inputTokens ?: 0L),
+                                        inputTokens = prev?.inputTokens ?: (ctxUsed ?: 0L),
                                         cachedInputTokens = prev?.cachedInputTokens ?: 0L,
+                                        cacheWriteTokens = prev?.cacheWriteTokens ?: 0L,
                                         outputTokens = prev?.outputTokens ?: 0L,
                                         reasoningTokens = prev?.reasoningTokens ?: 0L,
                                         contextWindow = ctxSize ?: prev?.contextWindow ?: inferModelContextWindow(st.model),
@@ -1440,8 +1478,9 @@ class AgentHubController(val repo: ConversationRepository) {
                         state.copy(
                             tokenUsage = TokenUsage(
                                 totalTokens = if (used >= 0L) used else (prev?.totalTokens ?: 0L),
-                                inputTokens = if (used >= 0L) used else (prev?.inputTokens ?: 0L),
+                                inputTokens = prev?.inputTokens ?: if (used >= 0L) used else 0L,
                                 cachedInputTokens = prev?.cachedInputTokens ?: 0L,
+                                cacheWriteTokens = prev?.cacheWriteTokens ?: 0L,
                                 outputTokens = prev?.outputTokens ?: 0L,
                                 reasoningTokens = prev?.reasoningTokens ?: 0L,
                                 contextWindow = size ?: prev?.contextWindow ?: inferModelContextWindow(state.model),
@@ -1631,6 +1670,139 @@ class AgentHubController(val repo: ConversationRepository) {
             else -> rawOutput.toString()
         }
     }
+
+    /** Antigravity / 外部 Agent 的 `/usage` 本地实时统计与原生 TUI 云端限额跳转。 */
+    suspend fun usageReport(key: ConversationKey): EngineUsageReport {
+        val st = repo.state(key)
+        val u = st?.tokenUsage
+        val auth = if (key.engine.id == "antigravity") {
+            runCatching { runtime.hubRequest("agents/authStatus", jsonOf("agentId" to "antigravity"), timeoutMs = 10_000) }.getOrNull()
+        } else null
+        return EngineUsageReport(
+            engine = key.engine,
+            planLabel = auth?.str("subscriptionType") ?: auth?.str("authMethod")?.takeIf { it != "none" },
+            accountLabel = auth?.str("email"),
+            rateLimitsAvailable = false,
+            sessionTokens = u?.sessionTotalTokens ?: u?.totalTokens,
+            note = if (key.engine.id == "antigravity") {
+                "当前已展示本地实时上下文/Token 统计。Antigravity 云端 5 小时 / 7 天模型组限额窗口由官方 TUI 宿主实时查询。"
+            } else {
+                "当前展示该外部 Agent 会话的本地累计 Token 统计。"
+            },
+            tuiHint = if (key.engine.id == "antigravity") {
+                "点击下方按钮将以同一会话 ID 打开内置原生 agy TUI，输入 /usage 即可核对实时云端配额，退出后自动回到本会话。"
+            } else null,
+        )
+    }
+
+    /** Antigravity `/doctor` 环境与认证自检。 */
+    suspend fun diagnosticsReport(key: ConversationKey): EngineDiagnosticsReport {
+        if (key.engine.id != "antigravity") {
+            val st = statusesFlow.value[key.engine.id]
+            return EngineDiagnosticsReport(
+                engine = key.engine,
+                ok = st?.installed == true,
+                version = st?.version,
+                summary = if (st?.installed == true) "${key.engine.label} 运行正常" else "${key.engine.label} 未安装或未就绪",
+                metrics = listOfNotNull(
+                    st?.version?.let { "版本" to it },
+                    st?.binaryPath?.let { "路径" to it },
+                ),
+            )
+        }
+        val res = runtime.hubRequest("agy/doctor", jsonOf(), timeoutMs = 30_000)
+        val auth = res.optJSONObject("auth")
+        val loggedIn = auth?.optBoolean("loggedIn", false) == true
+        val method = auth?.optString("authMethod", "none").orEmpty()
+        val email = auth?.str("email")
+        val raw = buildString {
+            appendLine("=== Version ===")
+            appendLine(res.optString("versionOutput"))
+            appendLine("\n=== Agents ===")
+            appendLine(res.optString("agentsOutput").ifBlank { "(none)" })
+            appendLine("\n=== MCP ===")
+            appendLine(res.optString("mcpOutput").ifBlank { "(none)" })
+            appendLine("\n=== Plugins ===")
+            appendLine(res.optString("pluginsOutput").ifBlank { "(none)" })
+        }.trim()
+        return EngineDiagnosticsReport(
+            engine = key.engine,
+            ok = res.optBoolean("ok", false),
+            version = res.str("version"),
+            summary = if (res.optBoolean("ok", false)) {
+                "Antigravity CLI 正常" + if (loggedIn) "（已登录：$method）" else "（未登录或使用自定义网关）"
+            } else "Antigravity CLI 体检异常",
+            metrics = listOfNotNull(
+                res.str("version")?.let { "CLI 版本" to it },
+                "认证状态" to if (loggedIn) (email ?: method) else "未登录",
+                res.str("binary")?.let { "可执行文件" to it },
+            ),
+            rawOutput = raw,
+        )
+    }
+
+    /** Antigravity / 外部 Agent 会话分叉（保留上下文至可选消息节点）。 */
+    suspend fun forkSession(key: ConversationKey, upToMessageId: String? = null, title: String? = null): ConversationKey {
+        val params = jsonOf("agentId" to key.engine.id, "sessionId" to key.id)
+        if (!upToMessageId.isNullOrBlank()) params.put("upToMessageId", upToMessageId)
+        if (!title.isNullOrBlank()) params.put("title", title)
+        val res = runtime.hubRequest("sessions/fork", params)
+        val session = res.getJSONObject("session")
+        val newId = session.getString("id")
+        val newKey = ConversationKey(key.engine, newId)
+        val current = repo.state(key)
+        repo.update(newKey) {
+            ConversationState(
+                summary = ConversationSummary(
+                    key = newKey,
+                    title = session.str("title") ?: "分支会话",
+                    preview = session.optString("preview"),
+                    cwd = session.str("cwd") ?: current?.summary?.cwd,
+                    updatedAt = System.currentTimeMillis(),
+                    parent = key,
+                ),
+                loaded = false,
+                providerId = current?.providerId,
+                model = session.str("model") ?: current?.model,
+                effort = session.str("effort") ?: current?.effort,
+                permissionMode = session.str("mode") ?: current?.permissionMode ?: "default",
+                additionalDirectories = session.arr("additionalDirectories").strings(),
+            )
+        }
+        return newKey
+    }
+
+    /** 为 Antigravity / ACP 会话动态附加工作区目录（`/add-dir`）。 */
+    suspend fun addAdditionalDirectory(key: ConversationKey, dir: String) {
+        val res = runtime.hubRequest("sessions/addDir", jsonOf("agentId" to key.engine.id, "sessionId" to key.id, "dir" to dir))
+        val updated = res.arr("additionalDirectories").strings()
+        repo.update(key) { it.copy(additionalDirectories = updated) }
+        repo.notify("已附加工作区目录 $dir（下次发送自动生效）")
+    }
+
+    /** 同步原生 `agy` TUI 创建的持久化会话到 Solbraid 列表。 */
+    suspend fun syncAgyNativeSessions(cwd: String? = null): Int {
+        val res = runtime.hubRequest("sessions/syncAcp", jsonOf("agentId" to "antigravity", "cwd" to cwd), timeoutMs = 30_000)
+        return res.optInt("imported", 0)
+    }
+
+    /** 获取官方 `agy changelog`。 */
+    suspend fun fetchAgyChangelog(): String =
+        runtime.hubRequest("agy/changelog", jsonOf(), timeoutMs = 25_000).optString("text")
+
+    /** 通过 ACP `auth/logout` 登出 Antigravity 账号。 */
+    suspend fun logoutAgyAccount() {
+        runtime.hubRequest("agy/authLogout", jsonOf(), timeoutMs = 20_000)
+        authStatesFlow.value = authStatesFlow.value - "antigravity"
+    }
+
+    /** 通过 ACP `authenticate(methodId)` 切换官方 4 类认证方式（oauth-personal / oauth-business / gemini-api-key / agent-platform）。 */
+    suspend fun authenticateAgyMethod(methodId: String): JSONObject =
+        runtime.hubRequest(
+            "agy/authenticate",
+            jsonOf("methodId" to methodId, "apiKey" to settings.antigravityApiKey()),
+            timeoutMs = 35_000,
+        )
 }
 
 /** 单个外部 Agent 的通用协议适配器：将 `EngineAdapter` 全部方法路由到 `agent-hub.mjs`。 */
@@ -1805,6 +1977,8 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
                 model = model,
                 effort = resolvedEffort ?: state.effort,
                 permissionMode = mode,
+                remoteSessionId = session.str("remoteSessionId") ?: state.remoteSessionId,
+                additionalDirectories = session.arr("additionalDirectories").strings().ifEmpty { state.additionalDirectories },
             )
         }
     }
@@ -1853,6 +2027,8 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
                 model = session.str("model") ?: resolvedModel,
                 effort = initialEffort,
                 permissionMode = session.str("mode") ?: defaultMode ?: "default",
+                remoteSessionId = session.str("remoteSessionId"),
+                additionalDirectories = session.arr("additionalDirectories").strings(),
             )
         }
         return key
@@ -1905,6 +2081,10 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
                 repo.upsertItem(key, TimelineItem.Notice("cancelled-" + newId(), "已中断"))
             }
         } catch (e: Exception) {
+            // 若消息在送达或产生任何回复前即失败，回滚乐观插入的用户消息气泡，避免留下发送失败的幽灵消息
+            repo.update(key) { st ->
+                if (st.items.lastOrNull()?.id == clientId) st.copy(items = st.items.dropLast(1)) else st
+            }
             val errMsg = e.message ?: "${kind.label} 执行失败"
             val lastNotice = repo.state(key)?.items?.lastOrNull() as? TimelineItem.Notice
             if (lastNotice == null || !lastNotice.error || lastNotice.text != errMsg) {
@@ -1954,6 +2134,8 @@ class UniversalAgentAdapter(private val hub: AgentHubController, override val ki
     override suspend fun compact(key: ConversationKey) {
         send(key, "/compact")
     }
+
+    override suspend fun fork(key: ConversationKey): ConversationKey = hub.forkSession(key)
 
     override suspend fun startReview(key: ConversationKey, instructions: String?) {
         val prompt = instructions?.takeIf { it.isNotBlank() } ?: "请审查当前工作区 git diff 的未提交改动并指出潜在问题。"

@@ -80,7 +80,9 @@ class ExtensionRepository(
             )
             val res = runtime.hubRequest("extensions/sync", payload, timeoutMs = 20_000)
             check(res.optBoolean("ok")) { res.str("message") ?: "扩展同步失败" }
-            onReloadCodexMcp()
+            if (res.optBoolean("codexConfigChanged", true)) {
+                onReloadCodexMcp()
+            }
             res
         } finally {
             syncingFlow.value = false

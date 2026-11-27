@@ -564,11 +564,14 @@ class SuperAgentCoordinator(
         try {
             val stopped = withTimeoutOrNull(110_000) {
                 val job = runningJobs[ticketId]
-                // 先等准备阶段落盘；仅在收到会话停止事件后取消等待，防止删掉仍在写入的目录。
+                val waitStart = System.currentTimeMillis()
+                // 若子会话已运行则先中断并等待确认；若仍处于前置准备阶段或子会话未在运行则短等后直接取消协程，避免卡死 110 秒。
                 while (job?.isActive == true) {
                     val child = ticketsFlow.value.firstOrNull { it.id == ticketId }?.childConversation
                     if (child != null && repo.state(child)?.running == true) {
                         interruptAndWait(child)
+                        job.cancelAndJoin()
+                    } else if (System.currentTimeMillis() - waitStart >= 1_500) {
                         job.cancelAndJoin()
                     } else {
                         delay(100)

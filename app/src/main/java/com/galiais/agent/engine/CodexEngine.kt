@@ -65,11 +65,22 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
             parent = thread.str("parentThreadId")?.let(::key) ?: parent)
     }
 
-    /** 将用户配置的自定义服务商注册到 Codex config.toml（指向本机回环网关，不写入真实 API Key）。 */
+    private val syncedCodexProviderIds = mutableSetOf<String>()
+
+    /** 将用户配置的自定义服务商注册到 Codex config.toml（指向本机回环网关，不写入真实 API Key），并清理已删除的残留节。 */
     suspend fun syncProviders(providers: List<CustomProvider>) {
-        if (providers.isEmpty()) return
+        val currentIds = providers.map { it.codexProviderId }.toSet()
+        val staleIds = syncedCodexProviderIds - currentIds
+        if (providers.isEmpty() && staleIds.isEmpty()) return
         val (port, token) = runtime.gatewayEndpoint ?: error("本地协议网关未就绪")
         val edits = JSONArray()
+        for (staleId in staleIds) {
+            edits.put(jsonOf(
+                "keyPath" to "model_providers.$staleId",
+                "mergeStrategy" to "replace",
+                "value" to JSONObject.NULL,
+            ))
+        }
         for (provider in providers) {
             edits.put(jsonOf(
                 "keyPath" to "model_providers.${provider.codexProviderId}",
@@ -85,6 +96,8 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
             ))
         }
         call("config/batchWrite", jsonOf("edits" to edits, "reloadUserConfig" to true))
+        syncedCodexProviderIds.clear()
+        syncedCodexProviderIds.addAll(currentIds)
     }
 
     // modelProviders 传空数组 = 全部服务商；省略时 Codex 只返回默认服务商的会话，会隐藏自定义服务商（galiais_*）创建的会话。
@@ -145,7 +158,8 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                     }
                 },
         )
-        if (settings.delegationEnabled) params.put("dynamicTools", JSONArray().put(delegateTool()).put(delegateToAgentTool()))
+        val allowDelegation = settings.delegationEnabled && current?.summary?.parent == null
+        if (allowDelegation) params.put("dynamicTools", JSONArray().put(delegateTool()).put(delegateToAgentTool()))
         if (saved != null) params.put("serviceTier", current?.serviceTier ?: JSONObject.NULL)
         hydratingThreads += key.id
         val resumed = try {
@@ -292,7 +306,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         ),
     )
 
-    override suspend fun send(key: ConversationKey, text: String, attachments: List<ImageAttachment>) {
+    override suspend fun send(key: ConversationKey, text: String, attachments: List<ImageAttachment>) = repo.withEngineOperation(kind.id) {
         attach(key)
         val current = repo.state(key)
         val capability = models(key).selectedModel(current?.model)
@@ -338,6 +352,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
             }
             repo.update(key) { it.copy(running = true, activeTurnId = turnId ?: it.activeTurnId, turnStartedAt = System.currentTimeMillis()) }
         } catch (error: Exception) {
+            repo.update(key) { st -> st.copy(items = st.items.filterNot { it.id == clientId }) }
             repo.upsertItem(key, TimelineItem.Notice("send-error-$clientId", "消息未发送：${error.message}", error = true))
             throw error
         }
@@ -352,12 +367,17 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         if (text.isNotBlank()) inputs.put(jsonOf("type" to "text", "text" to text, "text_elements" to JSONArray()))
         for (att in attachments) inputs.put(jsonOf("type" to "image", "url" to "data:${att.mimeType};base64,${att.base64}"))
         repo.upsertItem(key, TimelineItem.UserMessage(clientId, "↳ 插话：$text", imageCount = attachments.size, turnId = expectedTurnId))
-        call("turn/steer", jsonOf(
-            "threadId" to key.id,
-            "expectedTurnId" to expectedTurnId,
-            "clientUserMessageId" to clientId,
-            "input" to inputs,
-        ))
+        try {
+            call("turn/steer", jsonOf(
+                "threadId" to key.id,
+                "expectedTurnId" to expectedTurnId,
+                "clientUserMessageId" to clientId,
+                "input" to inputs,
+            ))
+        } catch (error: Exception) {
+            repo.update(key) { st -> st.copy(items = st.items.filterNot { it.id == clientId }) }
+            throw error
+        }
     }
 
     /** 将持久化对话历史回退到指定轮次之前（不撤销本地磁盘改动）。 */
@@ -415,7 +435,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         attached -= key.id
     }
 
-    override suspend fun compact(key: ConversationKey) {
+    override suspend fun compact(key: ConversationKey): Unit = repo.withEngineOperation(kind.id) {
         attach(key)
         repo.update(key) { it.copy(running = true, turnStartedAt = System.currentTimeMillis()) }
         try {
@@ -449,7 +469,8 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                     }
                 },
         ).put("serviceTier", current?.serviceTier ?: JSONObject.NULL)
-        if (settings.delegationEnabled) params.put("dynamicTools", JSONArray().put(delegateTool()).put(delegateToAgentTool()))
+        val allowDelegation = settings.delegationEnabled && current?.summary?.parent == null
+        if (allowDelegation) params.put("dynamicTools", JSONArray().put(delegateTool()).put(delegateToAgentTool()))
         val forked = call("thread/fork", params)
         val thread = forked.getJSONObject("thread")
         val newKey = key(thread.getString("id"))
@@ -473,7 +494,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         return newKey
     }
 
-    override suspend fun startReview(key: ConversationKey, instructions: String?) {
+    override suspend fun startReview(key: ConversationKey, instructions: String?) = repo.withEngineOperation(kind.id) {
         attach(key)
         val target = if (instructions.isNullOrBlank()) jsonOf("type" to "uncommittedChanges")
         else jsonOf("type" to "custom", "instructions" to instructions.trim())
@@ -560,6 +581,294 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         return list
     }
 
+    /** 统一 `/usage` 实时配额与用量报告（合并 `account/rateLimits/read` + `account/usage/read` + `account/read`）。 */
+    suspend fun usageReport(key: ConversationKey? = null): EngineUsageReport {
+        val acct = runCatching { call("account/read", null) }.getOrNull()
+        val rlRes = runCatching { call("account/rateLimits/read", null) }.getOrNull()
+        val usageRes = runCatching { call("account/usage/read", null) }.getOrNull()
+        val windows = mutableListOf<RateLimitSummary>()
+        val rl = rlRes?.optJSONObject("rateLimits")
+        fun addWin(obj: JSONObject?, label: String) {
+            if (obj == null) return
+            val pct = obj.optInt("usedPercent", -1)
+            if (pct >= 0) {
+                val resets = obj.optLong("resetsAt", 0L).takeIf { it > 0L }?.let { ts ->
+                    java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date(normalizeTime(ts)))
+                }
+                windows += RateLimitSummary(label, pct.coerceIn(0, 100), resets)
+            }
+        }
+        addWin(rl?.optJSONObject("primary"), "短期配额（5 小时窗口）")
+        addWin(rl?.optJSONObject("secondary"), "周配额（7 天窗口）")
+        val ordinaryAllowed = if (rlRes != null && rlRes.has("ordinaryUsageAllowed") && !rlRes.isNull("ordinaryUsageAllowed")) {
+            rlRes.optBoolean("ordinaryUsageAllowed")
+        } else null
+        val sessionTok = key?.let { repo.state(it)?.tokenUsage?.sessionTotalTokens ?: repo.state(it)?.tokenUsage?.totalTokens }
+        val breakdown = mutableListOf<Pair<String, String>>()
+        usageRes?.let { u ->
+            u.optLong("totalTokens", -1L).takeIf { it >= 0L }?.let { breakdown += "账号累计 Token" to it.toString() }
+            u.optDouble("totalCostUsd", Double.NaN).takeIf { !it.isNaN() }?.let { breakdown += "累计费用" to String.format(java.util.Locale.ROOT, "$%.4f", it) }
+            u.optJSONArray("byModel")?.objects()?.forEach { row ->
+                val m = row.str("model") ?: return@forEach
+                val t = row.optLong("totalTokens", row.optLong("inputTokens", 0L) + row.optLong("outputTokens", 0L))
+                breakdown += m to "$t tok"
+            }
+        }
+        val email = acct?.optJSONObject("account")?.str("email") ?: acct?.str("email")
+        val plan = acct?.optJSONObject("account")?.str("planType") ?: acct?.str("planType") ?: acct?.str("authMode")
+        return EngineUsageReport(
+            engine = EngineKind.CODEX,
+            planLabel = plan,
+            accountLabel = email,
+            rateLimitsAvailable = windows.isNotEmpty(),
+            ordinaryUsageAllowed = ordinaryAllowed,
+            windows = windows,
+            sessionTokens = sessionTok,
+            modelBreakdown = breakdown,
+            note = if (windows.isEmpty()) "当前使用 API Key 或自定义服务商，无官方订阅窗口配额。" else null,
+        )
+    }
+
+    /** `/doctor` 官方守护进程健康体检（`server/diagnostics`）。 */
+    suspend fun diagnosticsReport(): EngineDiagnosticsReport {
+        val res = runCatching { call("server/diagnostics", jsonOf()) }
+        if (res.isFailure) {
+            return EngineDiagnosticsReport(
+                engine = EngineKind.CODEX,
+                ok = false,
+                summary = "无法读取 Codex 诊断信息：${res.exceptionOrNull()?.message}",
+            )
+        }
+        val obj = res.getOrThrow()
+        val metrics = mutableListOf<Pair<String, String>>()
+        obj.optJSONObject("process")?.let { proc ->
+            proc.optLong("pid", -1L).takeIf { it > 0 }?.let { metrics += "PID" to it.toString() }
+            proc.optLong("uptimeSeconds", -1L).takeIf { it >= 0 }?.let { metrics += "运行时长" to "${it}s" }
+            proc.optLong("rssBytes", -1L).takeIf { it > 0 }?.let { metrics += "常驻内存" to "${it / (1024 * 1024)} MB" }
+        }
+        obj.optJSONArray("gauges")?.objects()?.forEach { g ->
+            val name = g.str("name") ?: return@forEach
+            val value = g.opt("value")?.toString() ?: ""
+            metrics += name to value
+        }
+        return EngineDiagnosticsReport(
+            engine = EngineKind.CODEX,
+            ok = true,
+            version = runtime.snapshot.value.engineInfo?.optJSONObject("codex")?.str("userAgent"),
+            summary = "Codex app-server 运行正常（${metrics.size} 项运行指标）",
+            metrics = metrics,
+            rawOutput = obj.toString(2),
+        )
+    }
+
+    /** 拉取官方协作模式（`collaborationMode/list`）。 */
+    suspend fun collaborationModes(): List<CollaborationModeItem> =
+        runCatching {
+            call("collaborationMode/list", jsonOf()).arr("data").objects().mapNotNull { item ->
+                val id = item.str("id") ?: item.str("mode") ?: item.str("name") ?: return@mapNotNull null
+                CollaborationModeItem(
+                    id = id,
+                    name = item.str("displayName") ?: item.str("name") ?: id,
+                    description = item.str("description") ?: "",
+                )
+            }
+        }.getOrDefault(emptyList())
+
+    /** 原生消息队列（`thread/queue/...`）。 */
+    suspend fun listQueue(key: ConversationKey): List<QueuedSubmission> {
+        val list = call("thread/queue/list", jsonOf("threadId" to key.id)).arr("data").objects().mapNotNull { item ->
+            val id = item.str("id") ?: item.str("submissionId") ?: return@mapNotNull null
+            val text = item.str("text") ?: item.optJSONArray("input")?.objects()?.mapNotNull { it.str("text") }?.joinToString("\n") ?: item.toString()
+            QueuedSubmission(id, text, normalizeTime(item.optLong("createdAt", 0L)))
+        }
+        repo.update(key) { it.copy(queuedSubmissions = list) }
+        return list
+    }
+
+    suspend fun enqueueMessage(key: ConversationKey, text: String) {
+        attach(key)
+        val input = JSONArray().put(jsonOf("type" to "text", "text" to text))
+        call("thread/queue/add", jsonOf("threadId" to key.id, "input" to input))
+        runCatching { listQueue(key) }
+    }
+
+    suspend fun updateQueuedMessage(key: ConversationKey, submissionId: String, newText: String) {
+        attach(key)
+        val input = JSONArray().put(jsonOf("type" to "text", "text" to newText.trim()))
+        call("thread/queue/update", jsonOf("threadId" to key.id, "submissionId" to submissionId, "input" to input))
+        runCatching { listQueue(key) }
+    }
+
+    suspend fun reorderQueuedMessages(key: ConversationKey, orderedIds: List<String>) {
+        attach(key)
+        call("thread/queue/reorder", jsonOf("threadId" to key.id, "submissionIds" to JSONArray(orderedIds)))
+        runCatching { listQueue(key) }
+    }
+
+    suspend fun deleteQueuedMessage(key: ConversationKey, submissionId: String) {
+        call("thread/queue/delete", jsonOf("threadId" to key.id, "submissionId" to submissionId))
+        runCatching { listQueue(key) }
+    }
+
+    suspend fun startQueuedNow(key: ConversationKey) {
+        call("thread/queue/start", jsonOf("threadId" to key.id))
+        runCatching { listQueue(key) }
+    }
+
+    /** 审批通过 Plan 后通知 Codex app-server 切换执行准备状态（`thread/prepareApprovedPlan`）。 */
+    suspend fun prepareApprovedPlan(key: ConversationKey, planText: String? = null) {
+        attach(key)
+        val params = jsonOf("threadId" to key.id)
+        if (!planText.isNullOrBlank()) params.put("plan", planText)
+        runCatching { call("thread/prepareApprovedPlan", params) }
+    }
+
+    /** 单次放行被 Guardian 自动审校拦截的操作（`thread/approveGuardianDeniedAction`）。 */
+    suspend fun approveGuardianDeniedAction(key: ConversationKey, reviewId: String) {
+        attach(key)
+        call("thread/approveGuardianDeniedAction", jsonOf("threadId" to key.id, "reviewId" to reviewId))
+        repo.update(key) { st ->
+            if (st.guardianDenied?.reviewId == reviewId) st.copy(guardianDenied = null) else st
+        }
+    }
+
+    /** 线程后台终端列表与治理（`thread/backgroundTerminals/...`）。 */
+    suspend fun listBackgroundTerminals(key: ConversationKey): List<BackgroundTaskEntry> =
+        call("thread/backgroundTerminals/list", jsonOf("threadId" to key.id)).arr("data").objects().mapNotNull { item ->
+            val id = item.str("id") ?: item.str("terminalId") ?: return@mapNotNull null
+            BackgroundTaskEntry(
+                id = id,
+                label = item.str("title") ?: item.str("command") ?: "后台终端 $id",
+                command = item.str("command") ?: "",
+                status = item.str("status") ?: "running",
+                cwd = item.str("cwd"),
+            )
+        }
+
+    suspend fun terminateBackgroundTerminal(key: ConversationKey, terminalId: String) {
+        call("thread/backgroundTerminals/terminate", jsonOf("threadId" to key.id, "terminalId" to terminalId))
+    }
+
+    suspend fun cleanBackgroundTerminals(key: ConversationKey) {
+        call("thread/backgroundTerminals/clean", jsonOf("threadId" to key.id))
+    }
+
+    /** 会话目标（`thread/goal/...`）。 */
+    suspend fun getGoal(key: ConversationKey): String? {
+        val g = call("thread/goal/get", jsonOf("threadId" to key.id)).let { it.str("goal") ?: it.obj("goal")?.str("text") }
+        repo.update(key) { it.copy(activeGoal = g) }
+        return g
+    }
+
+    suspend fun setGoal(key: ConversationKey, goal: String) {
+        call("thread/goal/set", jsonOf("threadId" to key.id, "goal" to goal.trim()))
+        repo.update(key) { it.copy(activeGoal = goal.trim()) }
+    }
+
+    suspend fun clearGoal(key: ConversationKey) {
+        call("thread/goal/clear", jsonOf("threadId" to key.id))
+        repo.update(key) { it.copy(activeGoal = null) }
+    }
+
+    /** 长期记忆状态与管理（`memory/...` + `thread/memory/...`）。 */
+    suspend fun memoryStatus(key: ConversationKey? = null): MemoryStatusSummary {
+        val status = runCatching { call("memory/status", jsonOf()) }.getOrNull()
+        val threadMem = key?.let { runCatching { call("thread/memory/read", jsonOf("threadId" to it.id)) }.getOrNull() }
+        return MemoryStatusSummary(
+            ready = status?.optBoolean("v2Ready", false) == true,
+            consolidatedThreads = status?.optInt("v2ConsolidatedThreads", 0) ?: 0,
+            mode = threadMem?.str("mode"),
+            content = threadMem?.str("memory") ?: threadMem?.str("content") ?: "",
+        )
+    }
+
+    suspend fun setMemoryMode(key: ConversationKey, mode: String) {
+        call("thread/memoryMode/set", jsonOf("threadId" to key.id, "mode" to mode))
+    }
+
+    suspend fun resetMemory() {
+        call("memory/reset", null)
+    }
+
+    /** 全历史消息搜索（`thread/search`）。 */
+    suspend fun searchThreads(query: String, limit: Int = 30): List<ConversationSummary> {
+        val res = call("thread/search", jsonOf("query" to query.trim(), "limit" to limit))
+        val rows = res.optJSONArray("data")?.objects() ?: res.optJSONArray("threads")?.objects() ?: emptyList()
+        return rows.mapNotNull { row ->
+            val th = row.optJSONObject("thread") ?: row
+            val id = th.str("id") ?: th.str("threadId") ?: return@mapNotNull null
+            ConversationSummary(
+                key = key(id),
+                title = th.str("name")?.takeIf { it.isNotBlank() } ?: th.optString("preview", "未命名会话").take(60),
+                preview = row.str("snippet") ?: th.optString("preview"),
+                cwd = th.str("cwd"),
+                updatedAt = normalizeTime(th.optLong("updatedAt", System.currentTimeMillis())),
+            )
+        }
+    }
+
+    /** 请求下一条提示词预测（`thread/prediction/request`）。 */
+    suspend fun requestPrediction(key: ConversationKey): String? = runCatching {
+        val res = call("thread/prediction/request", jsonOf("threadId" to key.id))
+        val text = res.str("prediction") ?: res.str("text")
+        if (!text.isNullOrBlank()) repo.update(key) { it.copy(nextPromptPrediction = text) }
+        text
+    }.getOrNull()
+
+    /** 多账号会话列表与切换（`accountSession/...`）。 */
+    suspend fun accountSessions(): List<CodexAccountSessionItem> = runCatching {
+        call("accountSession/list", jsonOf()).arr("data").objects().mapNotNull { item ->
+            val id = item.str("id") ?: item.str("sessionId") ?: return@mapNotNull null
+            CodexAccountSessionItem(
+                id = id,
+                label = item.str("label") ?: item.str("email") ?: id,
+                email = item.str("email"),
+                active = item.optBoolean("active", false) || item.optBoolean("isCurrent", false),
+            )
+        }
+    }.getOrDefault(emptyList())
+
+    suspend fun switchAccountSession(sessionId: String) {
+        call("accountSession/switch", jsonOf("sessionId" to sessionId))
+        accountVersionFlow.value += 1
+    }
+
+    /** 原生 Hooks 与插件列表（`hooks/list`、`plugin/...`）。 */
+    suspend fun listHooks(): List<CodexHookSummary> = runCatching {
+        call("hooks/list", jsonOf()).arr("data").objects().mapNotNull { h ->
+            val name = h.str("name") ?: h.str("id") ?: return@mapNotNull null
+            CodexHookSummary(
+                name = name,
+                event = h.str("event") ?: h.str("trigger") ?: "",
+                command = h.str("command") ?: "",
+                enabled = h.optBoolean("enabled", true),
+            )
+        }
+    }.getOrDefault(emptyList())
+
+    suspend fun listNativePlugins(): List<CodexPluginSummary> = runCatching {
+        val installedIds = call("plugin/installed", jsonOf()).arr("data").objects()
+            .mapNotNull { it.str("id") ?: it.str("name") }.toSet()
+        call("plugin/list", jsonOf()).arr("data").objects().mapNotNull { p ->
+            val id = p.str("id") ?: p.str("name") ?: return@mapNotNull null
+            CodexPluginSummary(
+                id = id,
+                name = p.str("displayName") ?: p.str("name") ?: id,
+                description = p.str("description") ?: "",
+                installed = id in installedIds || p.optBoolean("installed", false),
+                version = p.str("version") ?: "",
+            )
+        }
+    }.getOrDefault(emptyList())
+
+    suspend fun installNativePlugin(pluginId: String) {
+        call("plugin/install", jsonOf("id" to pluginId))
+    }
+
+    suspend fun uninstallNativePlugin(pluginId: String) {
+        call("plugin/uninstall", jsonOf("id" to pluginId))
+    }
+
     override suspend fun models(key: ConversationKey?): List<ModelOption> {
         return modelsForProvider(if (key == null) settings.codexProviderId else repo.state(key)?.providerId)
     }
@@ -633,7 +942,9 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                     "approvalsReviewer" to effectiveReviewer(key),
                     "config" to configObj,
                 ).put("serviceTier", JSONObject.NULL)
-                if (settings.delegationEnabled) forkParams.put("dynamicTools", JSONArray().put(delegateTool()).put(delegateToAgentTool()))
+                if (settings.delegationEnabled && current.summary.parent == null) {
+                    forkParams.put("dynamicTools", JSONArray().put(delegateTool()).put(delegateToAgentTool()))
+                }
                 call("thread/fork", forkParams)
             } catch (e: Exception) {
                 val msg = e.message.orEmpty()
@@ -702,7 +1013,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
             "model" to resolvedModel,
             "config" to configObj,
         ).put("serviceTier", JSONObject.NULL)
-        if (settings.delegationEnabled) startParams.put("dynamicTools", JSONArray().put(delegateTool()).put(delegateToAgentTool()))
+        if (settings.delegationEnabled && current.summary.parent == null) startParams.put("dynamicTools", JSONArray().put(delegateTool()).put(delegateToAgentTool()))
         val started = call("thread/start", startParams)
         val thread = started.getJSONObject("thread")
         val newKey = key(thread.getString("id"))
@@ -991,7 +1302,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                 stepStartedAt[key.id] = now
                 stepFirstTokenAt.remove(key.id)
                 stepLastTokenAt.remove(key.id)
-                repo.update(key) { it.copy(running = true, activeTurnId = params.obj("turn")?.optString("id"), turnStartedAt = now, turnDiff = null) }
+                repo.update(key) { it.copy(running = true, activeTurnId = params.obj("turn")?.optString("id"), turnStartedAt = now, turnDiff = null, guardianDenied = null) }
             }
             "turn/diff/updated" -> threadKey?.let { key -> repo.update(key) { it.copy(turnDiff = params.str("diff")?.takeIf { d -> d.isNotBlank() }) } }
             "turn/plan/updated" -> threadKey?.let { key ->
@@ -1022,6 +1333,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                 val ctxIn = ctx.optLong("inputTokens")
                 val ctxOut = ctx.optLong("outputTokens")
                 val ctxCache = ctx.optLong("cachedInputTokens")
+                val ctxCacheWrite = ctx.optLong("cacheWriteInputTokens")
                 val ctxReason = ctx.optLong("reasoningOutputTokens")
                 val ctxTotal = ctx.optLong("totalTokens").takeIf { it > 0L } ?: (ctxIn + ctxOut)
                 val sessionTotal = billing.optLong("totalTokens").takeIf { it > 0L }
@@ -1030,6 +1342,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                     totalTokens = ctxTotal,
                     inputTokens = ctxIn,
                     cachedInputTokens = ctxCache,
+                    cacheWriteTokens = ctxCacheWrite,
                     outputTokens = ctxOut,
                     reasoningTokens = ctxReason,
                     contextWindow = window,
@@ -1039,6 +1352,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                     totalTokens = sessionTotal ?: 0L,
                     inputTokens = billing.optLong("inputTokens"),
                     cachedInputTokens = billing.optLong("cachedInputTokens"),
+                    cacheWriteTokens = billing.optLong("cacheWriteInputTokens"),
                     outputTokens = billing.optLong("outputTokens"),
                     reasoningTokens = billing.optLong("reasoningOutputTokens"),
                     contextWindow = window,
@@ -1058,18 +1372,21 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                     val deltaIn: Long
                     val deltaOut: Long
                     val deltaCache: Long
+                    val deltaCacheWrite: Long
                     val deltaReason: Long
                     if (prevBilled == null && last != null) {
                         // 应用冷启动后恢复历史线程若未提前收到基线事件，直接采用本步 last 避免把整条历史会话累计值重复入账
                         deltaIn = ctxIn.coerceAtLeast(0L)
                         deltaOut = ctxOut.coerceAtLeast(0L)
-                        deltaCache = ctxCache.coerceAtLeast(0L)
+                        deltaCache = ctxCache.coerceIn(0L, deltaIn)
+                        deltaCacheWrite = ctxCacheWrite.coerceIn(0L, (deltaIn - deltaCache).coerceAtLeast(0L))
                         deltaReason = ctxReason.coerceAtLeast(0L)
                     } else {
                         val base = prevBilled ?: TokenUsage(0, 0, 0, 0, 0)
                         deltaIn = (billSnapshot.inputTokens - base.inputTokens).coerceAtLeast(0L)
                         deltaOut = (billSnapshot.outputTokens - base.outputTokens).coerceAtLeast(0L)
-                        deltaCache = (billSnapshot.cachedInputTokens - base.cachedInputTokens).coerceAtLeast(0L)
+                        deltaCache = (billSnapshot.cachedInputTokens - base.cachedInputTokens).coerceIn(0L, deltaIn)
+                        deltaCacheWrite = (billSnapshot.cacheWriteTokens - base.cacheWriteTokens).coerceIn(0L, (deltaIn - deltaCache).coerceAtLeast(0L))
                         deltaReason = (billSnapshot.reasoningTokens - base.reasoningTokens).coerceAtLeast(0L)
                     }
                     billedTotalUsage[key.id] = billSnapshot
@@ -1088,6 +1405,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                             inputTokens = deltaIn,
                             outputTokens = deltaOut,
                             cacheReadTokens = deltaCache,
+                            cacheWriteTokens = deltaCacheWrite,
                             reasoningTokens = deltaReason,
                             durationMs = stepDurMs,
                             ttftMs = ttftMs,
@@ -1194,10 +1512,53 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                 val review = params.obj("review") ?: return
                 val st = review.optString("status")
                 if (st in setOf("denied", "timedOut", "aborted")) {
-                    val risk = review.str("riskLevel")?.let { "（风险：$it）" } ?: ""
-                    val rationale = review.str("rationale")?.take(160)?.let { "：$it" } ?: ""
-                    repo.upsertItem(key, TimelineItem.Notice("guardian-${params.str("reviewId") ?: newId()}", "Guardian 自动审校拦截$risk$rationale", error = true))
+                    val reviewId = params.str("reviewId") ?: review.str("id") ?: newId()
+                    val riskLevel = review.str("riskLevel")
+                    val risk = riskLevel?.let { "（风险：$it）" } ?: ""
+                    val rationaleRaw = review.str("rationale")?.take(160)
+                    val rationale = rationaleRaw?.let { "：$it" } ?: ""
+                    repo.upsertItem(key, TimelineItem.Notice("guardian-$reviewId", "Guardian 自动审校拦截$risk$rationale", error = true))
+                    if (st == "denied") {
+                        val actionSummary = review.str("actionSummary") ?: review.str("command") ?: "被 Guardian 拦截的操作"
+                        repo.update(key) { cur ->
+                            cur.copy(guardianDenied = GuardianDeniedAction(reviewId, actionSummary, riskLevel, rationaleRaw))
+                        }
+                    }
                 }
+            }
+            "thread/queue/changed" -> threadKey?.let { key ->
+                val rawItems = params.optJSONArray("data")?.objects()
+                    ?: params.optJSONArray("queue")?.objects()
+                    ?: params.optJSONArray("submissions")?.objects()
+                    ?: emptyList()
+                val mapped = rawItems.mapNotNull { item ->
+                    val id = item.str("id") ?: item.str("submissionId") ?: return@mapNotNull null
+                    val text = item.str("text") ?: item.optJSONArray("input")?.objects()?.mapNotNull { it.str("text") }?.joinToString("\n") ?: ""
+                    QueuedSubmission(id, text, normalizeTime(item.optLong("createdAt", 0L)))
+                }
+                repo.update(key) { it.copy(queuedSubmissions = mapped) }
+            }
+            "thread/goal/updated" -> threadKey?.let { key ->
+                val g = params.str("goal") ?: params.obj("goal")?.str("text")
+                repo.update(key) { it.copy(activeGoal = g?.takeIf { s -> s.isNotBlank() }) }
+            }
+            "thread/goal/cleared" -> threadKey?.let { key ->
+                repo.update(key) { it.copy(activeGoal = null) }
+            }
+            "thread/prediction/updated" -> threadKey?.let { key ->
+                val pred = params.str("prediction") ?: params.str("text")
+                repo.update(key) { it.copy(nextPromptPrediction = pred?.takeIf { s -> s.isNotBlank() }) }
+            }
+            "guardianWarning" -> threadKey?.let { key ->
+                val msg = params.str("message") ?: params.str("reason") ?: return
+                repo.upsertItem(key, TimelineItem.Notice("guardian-warn-" + newId(), "Guardian 警告：$msg", error = true))
+            }
+            "account/rateLimits/updated" -> {
+                accountVersionFlow.value += 1
+            }
+            "configWarning", "deprecationNotice" -> {
+                val msg = params.str("message") ?: params.str("summary") ?: return
+                repo.notify("Codex 提示：$msg")
             }
             "item/started", "item/completed" -> threadKey?.let { key ->
                 val item = params.obj("item") ?: return

@@ -16,6 +16,16 @@ import {
   anthropicToChatRequest,
   anthropicToResponsesRequest,
   anthropicToGeminiRequest,
+  chatToResponsesRequest,
+  geminiToResponsesRequest,
+  pipeChatToResponses,
+  pipeAnthropicToResponses,
+  pipeGeminiToResponses,
+  pipeChatToAnthropic,
+  pipeResponsesToAnthropic,
+  pipeGeminiToAnthropic,
+  pipeResponsesToCompatible,
+  CompatibleResponseWriter,
 } from "../runtime/provider-translators.mjs";
 import {estimateCostUsd} from "../runtime/usage-ledger.mjs";
 import {
@@ -23,6 +33,8 @@ import {
   AcpStreamStallError,
   normalizeAcpMetaToolName,
   isAcpMetaToolName,
+  isAgyModelCatalogError,
+  isSocketPermissionOrNetworkBlocked,
   isSoftNetworkReply,
   isRetryableAcpError,
   formatAcpNetworkReason,
@@ -2738,8 +2750,17 @@ async function testAntigravityResilienceAndWatchdog() {
   // 2. 软网络报错与可重试错误识别
   assert.equal(isSoftNetworkReply("\n⚠ There was a network issue connecting to the server, please try again.\n"), true);
   assert.equal(isSoftNetworkReply("⚠ Service unavailable, please try again later."), true);
+  assert.equal(isSoftNetworkReply("failed to construct executor: unknown model key MODEL_PLACEHOLDER_M535: model not found"), true);
+  assert.equal(isSoftNetworkReply("⚠ failed to construct executor: unknown model key MODEL_PLACEHOLDER_M535: model not found"), true);
+  assert.equal(isSoftNetworkReply("已定位锁屏后出现 failed to construct executor: unknown model key MODEL_PLACEHOLDER_M535: model not found 的原因：这是后台断网所致。"), false);
   assert.equal(isSoftNetworkReply("A".repeat(450) + " There was a network issue connecting to the server, please try again."), false);
   assert.equal(isSoftNetworkReply("已为你修复了所有问题。"), false);
+
+  assert.equal(isAgyModelCatalogError("failed to construct executor: unknown model key MODEL_PLACEHOLDER_M535: model not found"), true);
+  assert.equal(isSocketPermissionOrNetworkBlocked(new Error("failed to construct executor: unknown model key MODEL_PLACEHOLDER_M535: model not found")), true);
+  assert.equal(isSocketPermissionOrNetworkBlocked(new Error("write udp 198.18.0.1->1.1.1.1:53: write: operation not permitted")), true);
+  assert.equal(isRetryableAcpError(new Error("failed to construct executor: unknown model key MODEL_PLACEHOLDER_M535: model not found")), true);
+  assert.equal(formatAcpNetworkReason("failed to construct executor: unknown model key MODEL_PLACEHOLDER_M535: model not found"), "后台断网导致模型配置未加载");
 
   assert.equal(isRetryableAcpError(new AcpStreamStallError(120_000)), true);
   assert.equal(isRetryableAcpError(new Error("stream reading error: unexpected EOF")), true);
@@ -3261,9 +3282,744 @@ async function testMobileUseAndDualModeParity() {
   }
 }
 
+async function testCacheStabilityAndTelemetryFixes() {
+  // 1. 跨协议历史工具 call_id 确定性 + prompt_cache_key 传递 + Anthropic cache_control 自动断点注入
+  const gemBody = {
+    contents: [
+      {role: "user", parts: [{text: "check file"}]},
+      {role: "model", parts: [{functionCall: {name: "read_file", args: {path: "a.txt"}}}]},
+      {role: "user", parts: [{functionResponse: {name: "read_file", response: {ok: true}}}]},
+      {role: "user", parts: [{text: "next step"}]},
+    ],
+  };
+  const g1 = geminiToResponsesRequest(gemBody, "gpt-5", {sessionId: "sess-gem-1"});
+  const g2 = geminiToResponsesRequest(gemBody, "gpt-5", {sessionId: "sess-gem-1"});
+  assert.deepEqual(g1, g2, "geminiToResponsesRequest must produce byte-identical history across turns");
+  assert.equal(g1.prompt_cache_key, "sess-gem-1");
+  assert.equal(g1.input.find(i => i.type === "function_call")?.call_id, "call_gem_1");
+
+  const respHist = {
+    model: "claude-sonnet-4",
+    instructions: "You are a coding assistant.",
+    tools: [
+      {type: "function", name: "read", description: "r", parameters: {type: "object", properties: {}}},
+      {type: "function", name: "edit", description: "e", parameters: {type: "object", properties: {}}},
+    ],
+    input: [
+      {type: "message", role: "user", content: [{type: "input_text", text: "turn 1"}]},
+      {type: "function_call", name: "read", arguments: "{}"},
+      {type: "function_call_output", call_id: "toolu_ra_1", output: "ok"},
+      {type: "message", role: "user", content: [{type: "input_text", text: "turn 2"}]},
+    ],
+  };
+  const rc1 = responsesToChatRequest(respHist).req;
+  const rc2 = responsesToChatRequest(respHist).req;
+  assert.deepEqual(rc1, rc2, "responsesToChatRequest must generate deterministic fallback call_id");
+
+  const ra1 = responsesToAnthropicRequest(respHist).req;
+  const ra2 = responsesToAnthropicRequest(respHist).req;
+  assert.deepEqual(ra1, ra2, "responsesToAnthropicRequest must generate deterministic fallback toolu_id");
+  assert.ok(Array.isArray(ra1.system) && ra1.system[0]?.cache_control?.type === "ephemeral", "system must carry ephemeral cache_control");
+  assert.equal(ra1.tools[0].cache_control, undefined);
+  assert.equal(ra1.tools[1].cache_control?.type, "ephemeral", "last tool must carry ephemeral cache_control");
+  const penult = ra1.messages[ra1.messages.length - 2];
+  assert.equal(penult.content[penult.content.length - 1]?.cache_control?.type, "ephemeral", "penultimate message must carry cache_control");
+
+  const aToR = anthropicToResponsesRequest({model: "gpt-5", messages: [{role: "user", content: "hi"}]}, {sessionId: "sess-a2r"});
+  assert.equal(aToR.prompt_cache_key, "sess-a2r");
+  const cToR = chatToResponsesRequest({model: "gpt-5", messages: [{role: "user", content: "hi"}]}, {sessionId: "sess-c2r"});
+  assert.equal(cToR.prompt_cache_key, "sess-c2r");
+
+  // 2. 跨协议 SSE/JSON 响应透传 cached_tokens、reasoning_tokens 与 Anthropic 总输入归一化
+  const makeMockRes = () => {
+    let buf = "";
+    return {
+      headers: {},
+      statusCode: 0,
+      writableLength: 0,
+      writeHead(code, h) { this.statusCode = code; this.headers = h || {}; },
+      write(chunk) { buf += String(chunk); },
+      end(chunk) { if (chunk) buf += String(chunk); },
+      text: () => buf,
+    };
+  };
+  const makeFakeUpstream = (jsonObj) => ({
+    headers: new Headers({"content-type": "application/json"}),
+    json: async () => jsonObj,
+  });
+
+  // 2a. Anthropic -> Responses: input_tokens(1000) + cache_read(8000) + cache_write(500) => input_tokens=9500, cached_tokens=8000, cache_write_tokens=500
+  const rAnth2Resp = makeMockRes();
+  await pipeAnthropicToResponses(makeFakeUpstream({
+    content: [{type: "text", text: "done"}],
+    stop_reason: "end_turn",
+    usage: {input_tokens: 1000, cache_read_input_tokens: 8000, cache_creation_input_tokens: 500, output_tokens: 120},
+  }), rAnth2Resp, "claude-sonnet-4");
+  assert.ok(rAnth2Resp.text().includes('"input_tokens":9500'), `Expected total input 9500 in ${rAnth2Resp.text()}`);
+  assert.ok(rAnth2Resp.text().includes('"cached_tokens":8000'), `Expected cached_tokens 8000 in ${rAnth2Resp.text()}`);
+  assert.ok(rAnth2Resp.text().includes('"cache_write_tokens":500'), `Expected cache_write_tokens 500 in ${rAnth2Resp.text()}`);
+
+  // 2b. Chat -> Responses: cached_tokens + reasoning_tokens preserved
+  const rChat2Resp = makeMockRes();
+  await pipeChatToResponses(makeFakeUpstream({
+    choices: [{message: {role: "assistant", content: "ok"}, finish_reason: "stop"}],
+    usage: {prompt_tokens: 5000, completion_tokens: 400, prompt_tokens_details: {cached_tokens: 4200}, completion_tokens_details: {reasoning_tokens: 180}},
+  }), rChat2Resp, "gpt-5");
+  assert.ok(rChat2Resp.text().includes('"cached_tokens":4200'));
+  assert.ok(rChat2Resp.text().includes('"reasoning_tokens":180'));
+
+  // 2c. Gemini -> Responses: cachedContentTokenCount + thoughtsTokenCount preserved
+  const rGem2Resp = makeMockRes();
+  await pipeGeminiToResponses(makeFakeUpstream({
+    candidates: [{content: {role: "model", parts: [{text: "hi"}]}, finishReason: "STOP"}],
+    usageMetadata: {promptTokenCount: 6000, cachedContentTokenCount: 4500, candidatesTokenCount: 200, thoughtsTokenCount: 150},
+  }), rGem2Resp, "gemini-2.5-pro");
+  assert.ok(rGem2Resp.text().includes('"input_tokens":6000'));
+  assert.ok(rGem2Resp.text().includes('"output_tokens":350'));
+  assert.ok(rGem2Resp.text().includes('"cached_tokens":4500'));
+  assert.ok(rGem2Resp.text().includes('"reasoning_tokens":150'));
+
+  // 2d. Chat/Gemini -> Anthropic: uncached input_tokens = total - cacheRead (防止 Claude Code 重复叠加)
+  const rChat2Anth = makeMockRes();
+  await pipeChatToAnthropic(makeFakeUpstream({
+    choices: [{message: {role: "assistant", content: "hi"}, finish_reason: "stop"}],
+    usage: {prompt_tokens: 10000, completion_tokens: 250, prompt_tokens_details: {cached_tokens: 8000}},
+  }), rChat2Anth, "gpt-5");
+  assert.ok(rChat2Anth.text().includes('"input_tokens":2000'), `Expected uncached 2000 in ${rChat2Anth.text()}`);
+  assert.ok(rChat2Anth.text().includes('"cache_read_input_tokens":8000'));
+
+  const rGem2Anth = makeMockRes();
+  await pipeGeminiToAnthropic(makeFakeUpstream({
+    candidates: [{content: {role: "model", parts: [{text: "ok"}]}, finishReason: "STOP"}],
+    usageMetadata: {promptTokenCount: 9000, cachedContentTokenCount: 7000, candidatesTokenCount: 120, thoughtsTokenCount: 80},
+  }), rGem2Anth, "gemini-2.5-pro");
+  assert.ok(rGem2Anth.text().includes('"input_tokens":2000'));
+  assert.ok(rGem2Anth.text().includes('"cache_read_input_tokens":7000'));
+  assert.ok(rGem2Anth.text().includes('"output_tokens":200'));
+
+  // 2e. Responses -> Compatible (Gemini & OpenAI Chat): preserve cached & reasoning without double-counting candidates
+  const rResp2Gem = makeMockRes();
+  await pipeResponsesToCompatible(makeFakeUpstream({
+    status: "completed",
+    output: [{type: "message", content: [{type: "output_text", text: "done"}]}],
+    usage: {input_tokens: 8000, output_tokens: 300, input_tokens_details: {cached_tokens: 6000}, output_tokens_details: {reasoning_tokens: 100}},
+  }), new CompatibleResponseWriter(rResp2Gem, "gemini-2.5-pro", "gemini", false));
+  const gemOut = JSON.parse(rResp2Gem.text());
+  assert.equal(gemOut.usageMetadata.promptTokenCount, 8000);
+  assert.equal(gemOut.usageMetadata.cachedContentTokenCount, 6000);
+  assert.equal(gemOut.usageMetadata.candidatesTokenCount, 200);
+  assert.equal(gemOut.usageMetadata.thoughtsTokenCount, 100);
+  assert.equal(gemOut.usageMetadata.totalTokenCount, 8300);
+
+  // 3. Gateway E2E：round_robin 会话粘滞、Gemini /cachedContents 透传、cache_control 400 自动剥离重试、session_id 透传
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-gw-cache-test-"));
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", c => chunks.push(c));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8");
+      let parsed = null;
+      try { parsed = raw ? JSON.parse(raw) : null; } catch {}
+      seen.push({method: req.method, url: req.url, headers: req.headers, body: parsed});
+      if (req.url?.startsWith("/strict-anth/v1/messages")) {
+        const hasCc = JSON.stringify(parsed || {}).includes("cache_control");
+        if (hasCc) {
+          res.writeHead(400, {"Content-Type": "application/json"});
+          return res.end(JSON.stringify({error: {message: "cache_control is not supported by this relay"}}));
+        }
+        res.writeHead(200, {"Content-Type": "application/json"});
+        return res.end(JSON.stringify({
+          id: "msg_cc", type: "message", role: "assistant", model: parsed?.model || "m",
+          content: [{type: "text", text: "STRIPPED_OK"}],
+          usage: {input_tokens: 50, output_tokens: 10},
+        }));
+      }
+      if (req.url?.startsWith("/gem-native/cachedContents")) {
+        res.writeHead(200, {"Content-Type": "application/json"});
+        return res.end(JSON.stringify({name: "cachedContents/cc-123", method: req.method, model: parsed?.model || null}));
+      }
+      if (req.url?.startsWith("/rr-a/") || req.url?.startsWith("/rr-b/")) {
+        const node = req.url.startsWith("/rr-a/") ? "A" : "B";
+        res.writeHead(200, {"Content-Type": "application/json"});
+        return res.end(JSON.stringify({
+          id: `msg_${node}`, type: "message", role: "assistant", model: parsed?.model || "m",
+          content: [{type: "text", text: `NODE_${node}`}],
+          usage: {input_tokens: 20, output_tokens: 5},
+        }));
+      }
+      if (req.url === "/oai/responses") {
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "x-codex-turn-state": "sticky-state-v1",
+          "x-reasoning-included": "true",
+        });
+        return res.end(JSON.stringify({
+          id: "resp_1", object: "response", status: "completed",
+          output: [{type: "message", content: [{type: "output_text", text: `${req.headers["session_id"] || ""}|${req.headers["x-codex-turn-state"] || ""}|${req.headers["x-codex-window-id"] || ""}`}]}],
+          usage: {input_tokens: 100, output_tokens: 5, input_tokens_details: {cached_tokens: 60, cache_write_tokens: 25}},
+        }));
+      }
+      res.writeHead(404);
+      res.end();
+    });
+  });
+  await new Promise(r => upstream.listen(0, "127.0.0.1", r));
+  const upPort = upstream.address().port;
+  const gw = spawn(process.execPath, [path.join(rootDir, "runtime", "provider-gateway.mjs")], {
+    env: {...process.env, HOME: tmpHome, USERPROFILE: tmpHome},
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const rl = createInterface({input: gw.stdout, crlfDelay: Infinity});
+  const pending = new Map();
+  rl.on("line", line => {
+    const msg = JSON.parse(line);
+    if (msg.id !== undefined && pending.has(msg.id)) {
+      const p = pending.get(msg.id);
+      pending.delete(msg.id);
+      if (msg.error) p.reject(new Error(msg.error.message)); else p.resolve(msg.result);
+    }
+  });
+  let rpcId = 1;
+  const rpc = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = rpcId++;
+    pending.set(id, {resolve, reject});
+    gw.stdin.write(JSON.stringify({id, method, params}) + "\n");
+  });
+  try {
+    const init = await rpc("initialize");
+    const base = `http://127.0.0.1:${init.port}`;
+    const auth = {Authorization: `Bearer ${init.token}`, "Content-Type": "application/json"};
+    await rpc("providers/sync", {
+      providers: [
+        {id: "p_strict", name: "STRICT", protocol: "anthropic_messages", baseUrl: `http://127.0.0.1:${upPort}/strict-anth`, authMode: "none", enabled: true},
+        {id: "p_gem", name: "GEM", protocol: "google_gemini", baseUrl: `http://127.0.0.1:${upPort}/gem-native`, authMode: "none", enabled: true},
+        {id: "p_rra", name: "RRA", protocol: "anthropic_messages", baseUrl: `http://127.0.0.1:${upPort}/rr-a`, authMode: "none", enabled: true},
+        {id: "p_rrb", name: "RRB", protocol: "anthropic_messages", baseUrl: `http://127.0.0.1:${upPort}/rr-b`, authMode: "none", enabled: true},
+        {id: "p_oai", name: "OAI", protocol: "openai_responses", baseUrl: `http://127.0.0.1:${upPort}/oai`, authMode: "none", enabled: true},
+      ],
+      routingGroups: [
+        {
+          id: "g_rr", name: "RR Group", strategy: "round_robin",
+          targets: [
+            {providerId: "p_rra", model: "m-a", weight: 1},
+            {providerId: "p_rrb", model: "m-b", weight: 1},
+          ],
+        },
+      ],
+    });
+
+    // 3a. Codex -> 拒绝 cache_control 的 Anthropic 中转站自动剥离重试成功
+    const rStrip = await fetch(`${base}/openai-responses/p_strict/responses`, {
+      method: "POST", headers: auth,
+      body: JSON.stringify({model: "claude-sonnet-4", instructions: "sys", input: "hello"}),
+    });
+    assert.equal(rStrip.status, 200);
+    const stripTxt = await rStrip.text();
+    assert.ok(stripTxt.includes("STRIPPED_OK"), `Expected STRIPPED_OK in ${stripTxt}`);
+
+    // 3b. Gemini /cachedContents 完整透传 POST/GET/DELETE，非 Gemini 上游返回 501
+    const rCcPost = await fetch(`${base}/gemini/p_gem/v1beta/cachedContents`, {
+      method: "POST", headers: auth,
+      body: JSON.stringify({model: "models/gemini-2.5-pro", contents: []}),
+    });
+    assert.equal(rCcPost.status, 200);
+    assert.equal((await rCcPost.json()).name, "cachedContents/cc-123");
+    const rCcGet = await fetch(`${base}/gemini/p_gem/v1beta/cachedContents/cc-123`, {
+      method: "GET", headers: {Authorization: `Bearer ${init.token}`},
+    });
+    assert.equal(rCcGet.status, 200);
+    assert.equal((await rCcGet.json()).method, "GET");
+    const rCcDel = await fetch(`${base}/gemini/p_gem/v1beta/cachedContents/cc-123`, {
+      method: "DELETE", headers: {Authorization: `Bearer ${init.token}`},
+    });
+    assert.equal(rCcDel.status, 200);
+    assert.equal((await rCcDel.json()).method, "DELETE");
+    const rCc501 = await fetch(`${base}/gemini/p_oai/v1beta/cachedContents`, {
+      method: "POST", headers: auth,
+      body: JSON.stringify({model: "models/gemini-2.5-pro", contents: []}),
+    });
+    assert.equal(rCc501.status, 501);
+
+    // 3c. round_robin 同会话粘滞到同一上游节点，不同会话轮询到下一节点
+    const rrReq = (sid) => fetch(`${base}/anthropic/group_g_rr/sid/${sid}/v1/messages`, {
+      method: "POST", headers: auth,
+      body: JSON.stringify({model: "auto", stream: false, max_tokens: 16, messages: [{role: "user", content: "hi"}]}),
+    }).then(r => r.json()).then(j => j.content?.[0]?.text);
+    const s1t1 = await rrReq("sess-sticky-1");
+    const s1t2 = await rrReq("sess-sticky-1");
+    const s2t1 = await rrReq("sess-sticky-2");
+    assert.equal(s1t1, "NODE_A");
+    assert.equal(s1t2, "NODE_A", "Same session must stay pinned to NODE_A to preserve prompt cache");
+    assert.equal(s2t1, "NODE_B", "New session must round-robin to NODE_B");
+
+    // 3d. 原生 openai_responses 双向透传 Codex 粘滞路由头（session_id / x-codex-turn-state / x-codex-window-id）及 cache_write_tokens 入账
+    const rOai = await fetch(`${base}/openai-responses/p_oai/responses`, {
+      method: "POST",
+      headers: {...auth, session_id: "codex-sess-xyz", "x-codex-turn-state": "req-state-0", "x-codex-window-id": "win-9"},
+      body: JSON.stringify({model: "gpt-5", input: "hi", stream: false}),
+    });
+    assert.equal(rOai.status, 200);
+    assert.equal(rOai.headers.get("x-codex-turn-state"), "sticky-state-v1");
+    assert.equal(rOai.headers.get("x-reasoning-included"), "true");
+    assert.equal((await rOai.json()).output?.[0]?.content?.[0]?.text, "codex-sess-xyz|req-state-0|win-9");
+    await new Promise(r => setTimeout(r, 80));
+    const gwLedger = fs.readFileSync(path.join(tmpHome, ".galiais", "usage", "ledger.jsonl"), "utf8").trim().split("\n").map(l => JSON.parse(l));
+    const oaiRec = gwLedger.find(x => x.providerId === "p_oai");
+    assert.equal(oaiRec?.cacheRead, 60);
+    assert.equal(oaiRec?.cacheWrite, 25);
+
+    // 3e. 校验逆向三引擎本体后的关键宿主契约（Claude TTL 真实变量 / MCP 排序 / agy 避免 GOOGLE_API_KEY 冲突与 -32002）
+    const claudeHostSrc = fs.readFileSync(path.join(rootDir, "runtime", "claude-host.mjs"), "utf8");
+    assert.ok(!/env\.ANTHROPIC_PROMPT_CACHE_TTL\b/.test(claudeHostSrc), "Dead env.ANTHROPIC_PROMPT_CACHE_TTL must not be assigned");
+    assert.ok(claudeHostSrc.includes("CLAUDE_CODE_PROMPT_CACHE_TTL"), "claude-host must set CLAUDE_CODE_PROMPT_CACHE_TTL");
+    assert.ok(claudeHostSrc.includes("extraSettings.promptCacheTtl"), "claude-host must set settings.promptCacheTtl");
+    assert.ok(claudeHostSrc.includes("ENABLE_PROMPT_CACHING_1H"), "claude-host must set ENABLE_PROMPT_CACHING_1H for 1h TTL");
+    const agentHubSrc = fs.readFileSync(path.join(rootDir, "runtime", "agent-hub.mjs"), "utf8");
+    assert.ok(agentHubSrc.includes("delete env.GOOGLE_API_KEY"), "agent-hub must avoid GOOGLE_API_KEY + GEMINI_API_KEY collision");
+    assert.ok(agentHubSrc.includes("resumeErr?.code === -32002"), "agent-hub must handle ACP -32002 missing session error");
+  } finally {
+    gw.kill("SIGTERM");
+    upstream.close();
+    fs.rmSync(tmpHome, {recursive: true, force: true});
+  }
+
+  // 4. extension-sync 幂等写入：重复同步相同配置不改写 config.toml 且返回 codexConfigChanged=false
+  const extHome = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-ext-noop-"));
+  try {
+    const extUrl = new URL("../runtime/extension-sync.mjs", import.meta.url).href;
+    const script = `
+      import assert from "node:assert/strict";
+      import fs from "node:fs";
+      import path from "node:path";
+      import {syncExtensions} from ${JSON.stringify(extUrl)};
+      const reg = {mcpServers: [], skills: [], plugins: [], instructions: [], subagents: [], hooks: []};
+      const r1 = await syncExtensions({registry: reg, secrets: {}});
+      assert.equal(r1.codexConfigChanged, true);
+      const tomlPath = path.join(process.env.HOME, ".codex", "config.toml");
+      const st1 = fs.statSync(tomlPath);
+      const r2 = await syncExtensions({registry: reg, secrets: {}});
+      assert.equal(r2.codexConfigChanged, false);
+      const st2 = fs.statSync(tomlPath);
+      assert.equal(st1.ino, st2.ino, "No-op sync must not rewrite config.toml inode");
+    `;
+    await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+        env: {...process.env, HOME: extHome, USERPROFILE: extHome},
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let err = "";
+      child.stderr.on("data", d => { err += d.toString("utf8"); });
+      child.on("close", code => code === 0 ? resolve() : reject(new Error(err || `exit ${code}`)));
+    });
+  } finally {
+    fs.rmSync(extHome, {recursive: true, force: true});
+  }
+
+  // 5. AcpDriver.resumeSession 在不支持 loadSession 时必须抛出错误而非静默吞错返回 null
+  const mockNoLoad = `
+    const readline = require('readline');
+    const rl = readline.createInterface({input: process.stdin});
+    const send = o => process.stdout.write(JSON.stringify(o) + '\\n');
+    rl.on('line', l => {
+      const m = JSON.parse(l);
+      if (m.method === 'initialize') return send({jsonrpc:'2.0', id:m.id, result:{protocolVersion:1, agentCapabilities:{loadSession:false, sessionCapabilities:{resume:{}}}}});
+      if (m.method === 'session/resume') return send({jsonrpc:'2.0', id:m.id, error:{code:-32000, message:'session not found'}});
+    });
+  `;
+  const noLoadDrv = new AcpDriver({
+    agentId: "acp-noload-test",
+    manifest: {name: "NoLoad", launch: {command: process.execPath, args: ["-e", mockNoLoad]}},
+    env: process.env,
+    cwd: rootDir,
+    onEvent: () => {},
+  });
+  try {
+    await assert.rejects(() => noLoadDrv.resumeSession("missing-id", rootDir, []), /session not found/i);
+  } finally {
+    noLoadDrv.close();
+  }
+
+  // 6. Antigravity ACP E2E（依赖 POSIX shebang 可执行脚本，Windows 宿主跳过，Linux/Android 全量运行）
+  if (process.platform === "win32") return;
+  const agyHome = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-agy-dedup-"));
+  const agyWs = path.join(agyHome, "workspace");
+  fs.mkdirSync(agyWs, {recursive: true});
+  const rpcLogFile = path.join(agyHome, "agy-rpcs.jsonl");
+  const resumeStateFile = path.join(agyHome, "resume-state.json");
+  fs.writeFileSync(resumeStateFile, JSON.stringify({currentModelId: "gemini-4-neon-high", thoughtLevel: "high"}));
+  const fakeRel = "99.0.0-deadbeef";
+  const fakeCliDir = path.join(agyHome, ".galiais", "cli", "antigravity", "versions", fakeRel);
+  fs.mkdirSync(fakeCliDir, {recursive: true});
+  fs.writeFileSync(path.join(agyHome, ".galiais", "cli", "antigravity", "active.json"), JSON.stringify({version: "99.0.0", release: fakeRel}));
+  fs.writeFileSync(path.join(fakeCliDir, "release.json"), JSON.stringify({id: "antigravity", version: "99.0.0"}));
+  const fakeAgyScript = path.join(fakeCliDir, "agy");
+  fs.writeFileSync(fakeAgyScript, [
+    `#!${process.execPath}`,
+    `if (process.argv.includes("--version")) { console.log("99.0.0"); process.exit(0); }`,
+    `const fs = require("fs");`,
+    `const readline = require("readline");`,
+    `const logFile = ${JSON.stringify(rpcLogFile)};`,
+    `const stateFile = ${JSON.stringify(resumeStateFile)};`,
+    `const send = o => process.stdout.write(JSON.stringify(o) + "\\n");`,
+    `const logRpc = (method, params) => fs.appendFileSync(logFile, JSON.stringify({method, params}) + "\\n");`,
+    `const availModels = [`,
+    `  {modelId: "gemini-4-neon-low", name: "Gemini 4 Neon (Low)"},`,
+    `  {modelId: "gemini-4-neon-medium", name: "Gemini 4 Neon (Medium)"},`,
+    `  {modelId: "gemini-4-neon-high", name: "Gemini 4 Neon (High)"},`,
+    `  {modelId: "gemini-4-neon-xhigh", name: "Gemini 4 Neon (Extra)"},`,
+    `];`,
+    `const makeConfigOpts = (modelBase, thought) => [`,
+    `  {id: "model", name: "Model", category: "model", type: "select", currentValue: modelBase, options: [{value: "gemini-4-neon", name: "Gemini 4 Neon"}]},`,
+    `  {id: "thought_level", name: "Thinking Level", category: "thought_level", type: "select", currentValue: thought, options: [{value: "low", name: "Low"}, {value: "medium", name: "Medium"}, {value: "high", name: "High"}, {value: "xhigh", name: "Extra"}]},`,
+    `];`,
+    `let curBase = "gemini-4-neon", curThought = "high";`,
+    `const rl = readline.createInterface({input: process.stdin});`,
+    `rl.on("line", l => {`,
+    `  if (!l.trim()) return;`,
+    `  const m = JSON.parse(l);`,
+    `  if (m.method === "initialize") return send({jsonrpc: "2.0", id: m.id, result: {protocolVersion: 1, agentCapabilities: {loadSession: true, sessionCapabilities: {resume: {}}}}});`,
+    `  if (m.method === "session/new") {`,
+    `    logRpc(m.method, m.params);`,
+    `    curBase = "gemini-4-neon"; curThought = "high";`,
+    `    return send({jsonrpc: "2.0", id: m.id, result: {sessionId: "remote-agy-1", models: {currentModelId: "gemini-4-neon-high", availableModels: availModels}, modes: {currentModeId: "default", availableModes: [{id: "default", name: "Default"}]}, configOptions: makeConfigOpts("gemini-4-neon", "high")}});`,
+    `  }`,
+    `  if (m.method === "session/resume") {`,
+    `    logRpc(m.method, m.params);`,
+    `    const st = JSON.parse(fs.readFileSync(stateFile, "utf8"));`,
+    `    curBase = "gemini-4-neon"; curThought = st.thoughtLevel;`,
+    `    return send({jsonrpc: "2.0", id: m.id, result: {sessionId: m.params.sessionId, models: {currentModelId: st.currentModelId, availableModels: availModels}, modes: {currentModeId: "default", availableModes: [{id: "default", name: "Default"}]}, configOptions: makeConfigOpts("gemini-4-neon", st.thoughtLevel)}});`,
+    `  }`,
+    `  if (m.method === "session/set_model") {`,
+    `    logRpc(m.method, m.params);`,
+    `    const mm = /-(low|medium|high|xhigh)$/.exec(m.params.modelId || "");`,
+    `    if (mm) curThought = mm[1];`,
+    `    return send({jsonrpc: "2.0", id: m.id, result: {}});`,
+    `  }`,
+    `  if (m.method === "session/set_config_option") {`,
+    `    logRpc(m.method, m.params);`,
+    `    if (m.params.configId === "thought_level" && m.params.value === "low") {`,
+    `      return send({jsonrpc: "2.0", id: m.id, error: {code: -32000, message: "simulated set_config_option failure"}});`,
+    `    }`,
+    `    if (m.params.configId === "thought_level") curThought = m.params.value;`,
+    `    return send({jsonrpc: "2.0", id: m.id, result: {configOptions: makeConfigOpts(curBase, curThought)}});`,
+    `  }`,
+    `  if (m.method === "session/prompt") {`,
+    `    logRpc(m.method, m.params);`,
+    `    send({jsonrpc: "2.0", method: "session/update", params: {sessionId: m.params.sessionId, update: {sessionUpdate: "agent_message_chunk", content: {type: "text", text: "OK"}}}});`,
+    `    return send({jsonrpc: "2.0", id: m.id, result: {stopReason: "end_turn"}});`,
+    `  }`,
+    `});`,
+  ].join("\n") + "\n", {mode: 0o755});
+
+  const hubSock = path.join(agyHome, "plugin-ctl.sock");
+  const agyHub = spawn(process.execPath, [path.join(rootDir, "runtime", "agent-hub.mjs")], {
+    env: {...process.env, HOME: agyHome, USERPROFILE: agyHome, SOLBRAID_PLUGIN_CTL_SOCKET: hubSock},
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const agyHubRl = createInterface({input: agyHub.stdout, crlfDelay: Infinity});
+  const agyHubPending = new Map();
+  let agyHubSeq = 1;
+  agyHubRl.on("line", line => {
+    if (!line.trim()) return;
+    const msg = JSON.parse(line);
+    if (msg.id !== undefined && agyHubPending.has(msg.id)) {
+      const p = agyHubPending.get(msg.id);
+      agyHubPending.delete(msg.id);
+      if (msg.error) p.reject(new Error(msg.error.message)); else p.resolve(msg.result);
+    }
+  });
+  const agyRpc = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = agyHubSeq++;
+    const timer = setTimeout(() => { agyHubPending.delete(id); reject(new Error(`agyHub timeout: ${method}`)); }, 15_000);
+    agyHubPending.set(id, {resolve: v => { clearTimeout(timer); resolve(v); }, reject: e => { clearTimeout(timer); reject(e); }});
+    agyHub.stdin.write(JSON.stringify({id, method, params}) + "\n");
+  });
+  const readLoggedRpcs = () => fs.existsSync(rpcLogFile)
+    ? fs.readFileSync(rpcLogFile, "utf8").trim().split("\n").filter(Boolean).map(l => JSON.parse(l))
+    : [];
+  const clearLoggedRpcs = () => { if (fs.existsSync(rpcLogFile)) fs.writeFileSync(rpcLogFile, ""); };
+
+  try {
+    await agyRpc("initialize");
+    await agyRpc("hub/configure", {
+      manifests: [{id: "antigravity", name: "Antigravity", protocol: "acp", install: {}, launch: {}}],
+    });
+
+    // 6a. sessions/create(model=gemini-4-neon, effort=xhigh) 仅发 1 次 set_model，不重复发 set_config_option，且 configOptions.thought_level 立即更新为 xhigh
+    clearLoggedRpcs();
+    const createdRes = await agyRpc("sessions/create", {
+      agentId: "antigravity", cwd: agyWs, model: "gemini-4-neon", effort: "xhigh", mode: "bypass",
+    });
+    const sid = createdRes.session.id;
+    const createRpcs = readLoggedRpcs();
+    assert.equal(createRpcs.filter(r => r.method === "session/set_model").length, 1, `Expected 1 set_model on create, got ${JSON.stringify(createRpcs)}`);
+    assert.equal(createRpcs.find(r => r.method === "session/set_model")?.params?.modelId, "gemini-4-neon-xhigh");
+    assert.equal(createRpcs.filter(r => r.method === "session/set_config_option").length, 0, `Expected 0 duplicate set_config_option on create, got ${JSON.stringify(createRpcs)}`);
+    assert.equal(createdRes.session.configOptions.find(o => o.id === "thought_level")?.currentValue, "xhigh");
+
+    // 6b. 活跃会话切换 thought_level=medium：agy 已在 set_config_option 确认目标档位，不再补发重复 set_model
+    clearLoggedRpcs();
+    const cfgRes = await agyRpc("sessions/setConfigOption", {
+      agentId: "antigravity", sessionId: sid, configId: "thought_level", value: "medium",
+    });
+    const cfgRpcs = readLoggedRpcs();
+    assert.equal(cfgRpcs.filter(r => r.method === "session/set_config_option").length, 1);
+    assert.equal(cfgRpcs.filter(r => r.method === "session/set_model").length, 0, `Expected 0 redundant set_model after confirmed set_config_option, got ${JSON.stringify(cfgRpcs)}`);
+    assert.equal(cfgRes.configOptions.find(o => o.id === "thought_level")?.currentValue, "medium");
+
+    // 6c. 模拟 set_config_option 失败（value=low）：必须自动回退调用 set_model("gemini-4-neon-low")
+    clearLoggedRpcs();
+    await agyRpc("sessions/setConfigOption", {
+      agentId: "antigravity", sessionId: sid, configId: "thought_level", value: "low",
+    });
+    const fbRpcs = readLoggedRpcs();
+    assert.equal(fbRpcs.filter(r => r.method === "session/set_config_option").length, 1);
+    assert.equal(fbRpcs.find(r => r.method === "session/set_model")?.params?.modelId, "gemini-4-neon-low");
+
+    // 6d. 停止驱动后恢复会话（mock resume 返回默认 gemini-4-neon-high / thought_level=high，但本地记录为 low）：
+    // 只发 1 次 set_model("gemini-4-neon-low")，0 次重复 set_config_option，且落盘 session 的 configOptions.thought_level 为 low
+    await agyRpc("agents/stop", {agentId: "antigravity"});
+    clearLoggedRpcs();
+    await agyRpc("sessions/prompt", {agentId: "antigravity", sessionId: sid, text: "hello"});
+    const resumeMismatchRpcs = readLoggedRpcs();
+    assert.equal(resumeMismatchRpcs.filter(r => r.method === "session/set_model").length, 1, `Expected 1 set_model on resume, got ${JSON.stringify(resumeMismatchRpcs)}`);
+    assert.equal(resumeMismatchRpcs.find(r => r.method === "session/set_model")?.params?.modelId, "gemini-4-neon-low");
+    assert.equal(resumeMismatchRpcs.filter(r => r.method === "session/set_config_option").length, 0, `Expected 0 duplicate set_config_option on resume, got ${JSON.stringify(resumeMismatchRpcs)}`);
+    const loadedAfterResume = await agyRpc("sessions/load", {agentId: "antigravity", sessionId: sid});
+    assert.equal(loadedAfterResume.session.configOptions.find(o => o.id === "thought_level")?.currentValue, "low");
+
+    // 6e. 再次恢复会话，若远端已处于 gemini-4-neon-low / thought_level=low，则 0 次 set_model、0 次 set_config_option
+    await agyRpc("agents/stop", {agentId: "antigravity"});
+    fs.writeFileSync(resumeStateFile, JSON.stringify({currentModelId: "gemini-4-neon-low", thoughtLevel: "low"}));
+    clearLoggedRpcs();
+    await agyRpc("sessions/prompt", {agentId: "antigravity", sessionId: sid, text: "hello again"});
+    const resumeMatchRpcs = readLoggedRpcs();
+    assert.equal(resumeMatchRpcs.filter(r => r.method === "session/set_model").length, 0, `Expected 0 set_model when already matched, got ${JSON.stringify(resumeMatchRpcs)}`);
+    assert.equal(resumeMatchRpcs.filter(r => r.method === "session/set_config_option").length, 0, `Expected 0 set_config_option when already matched, got ${JSON.stringify(resumeMatchRpcs)}`);
+  } finally {
+    agyHub.kill("SIGTERM");
+    await new Promise(r => setTimeout(r, 150));
+    fs.rmSync(agyHome, {recursive: true, force: true});
+  }
+
+  // 7. 锁屏/后台断网冷启防护 E2E：
+  //    a) 0 模型目录冷启（resume 返回空 availableModels）必须被 attachAcpSession 拦截，绝不向 0 模型进程发 prompt，
+  //       而是等待网络恢复 + 支持 network/poke 立即唤醒；
+  //    b) 即使 agy 返回软错误 "failed to construct executor: unknown model key MODEL_PLACEHOLDER_M535: model not found"，
+  //       也必须自动识别重试并保留原 remoteSessionId（绝不误当 session not found 毁掉会话），最终成功完成。
+  const lockHome = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-agy-lock-"));
+  const lockWs = path.join(lockHome, "workspace");
+  fs.mkdirSync(lockWs, {recursive: true});
+  const lockRpcLog = path.join(lockHome, "lock-rpcs.jsonl");
+  const lockPhaseFile = path.join(lockHome, "phase.json");
+  fs.writeFileSync(lockPhaseFile, JSON.stringify({resumeCount: 0, promptCount: 0}));
+  // 预分配一个空闲本地端口：初始关闭（模拟锁屏断网），稍后监听（模拟解锁恢复网络）
+  const probeSrv = net.createServer(sock => sock.end());
+  await new Promise(r => probeSrv.listen(0, "127.0.0.1", r));
+  const probePort = probeSrv.address().port;
+  await new Promise(r => probeSrv.close(r));
+
+  const lockRel = "99.0.0-cafebabe";
+  const lockCliDir = path.join(lockHome, ".galiais", "cli", "antigravity", "versions", lockRel);
+  fs.mkdirSync(lockCliDir, {recursive: true});
+  fs.writeFileSync(path.join(lockHome, ".galiais", "cli", "antigravity", "active.json"), JSON.stringify({version: "99.0.0", release: lockRel}));
+  fs.writeFileSync(path.join(lockCliDir, "release.json"), JSON.stringify({id: "antigravity", version: "99.0.0"}));
+  fs.writeFileSync(path.join(lockCliDir, "agy"), [
+    `#!${process.execPath}`,
+    `if (process.argv.includes("--version")) { console.log("99.0.0"); process.exit(0); }`,
+    `const fs = require("fs");`,
+    `const readline = require("readline");`,
+    `const logFile = ${JSON.stringify(lockRpcLog)};`,
+    `const phaseFile = ${JSON.stringify(lockPhaseFile)};`,
+    `const send = o => process.stdout.write(JSON.stringify(o) + "\\n");`,
+    `const logRpc = (method, extra) => fs.appendFileSync(logFile, JSON.stringify({method, ...extra}) + "\\n");`,
+    `const availModels = [{modelId: "gemini-4-neon-xhigh", name: "Gemini 4 Neon (Extra)"}];`,
+    `const cfgOpts = [{id: "model", category: "model", type: "select", currentValue: "gemini-4-neon", options: [{value: "gemini-4-neon", name: "Gemini 4 Neon"}]}, {id: "thought_level", category: "thought_level", type: "select", currentValue: "xhigh", options: [{value: "xhigh", name: "Extra"}]}];`,
+    `const rl = readline.createInterface({input: process.stdin});`,
+    `rl.on("line", l => {`,
+    `  if (!l.trim()) return;`,
+    `  const m = JSON.parse(l);`,
+    `  const st = JSON.parse(fs.readFileSync(phaseFile, "utf8"));`,
+    `  if (m.method === "initialize") return send({jsonrpc: "2.0", id: m.id, result: {protocolVersion: 1, agentCapabilities: {loadSession: true, sessionCapabilities: {resume: {}}}}});`,
+    `  if (m.method === "session/new") {`,
+    `    logRpc("session/new", {});`,
+    `    return send({jsonrpc: "2.0", id: m.id, result: {sessionId: "remote-lock-orig", models: {currentModelId: "gemini-4-neon-xhigh", availableModels: availModels}, modes: {currentModeId: "default", availableModes: [{id: "default", name: "Default"}]}, configOptions: cfgOpts}});`,
+    `  }`,
+    `  if (m.method === "session/resume") {`,
+    `    st.resumeCount++;`,
+    `    fs.writeFileSync(phaseFile, JSON.stringify(st));`,
+    `    logRpc("session/resume", {resumeCount: st.resumeCount, sessionId: m.params.sessionId});`,
+    `    // 第 1 次恢复模拟锁屏 EPERM 期间冷启：无 availableModels 与 configOptions`,
+    `    if (st.resumeCount === 1) {`,
+    `      return send({jsonrpc: "2.0", id: m.id, result: {sessionId: m.params.sessionId}});`,
+    `    }`,
+    `    return send({jsonrpc: "2.0", id: m.id, result: {sessionId: m.params.sessionId, models: {currentModelId: "gemini-4-neon-xhigh", availableModels: availModels}, modes: {currentModeId: "default", availableModes: [{id: "default", name: "Default"}]}, configOptions: cfgOpts}});`,
+    `  }`,
+    `  if (m.method === "session/prompt") {`,
+    `    st.promptCount++;`,
+    `    fs.writeFileSync(phaseFile, JSON.stringify(st));`,
+    `    logRpc("session/prompt", {promptCount: st.promptCount, resumeCount: st.resumeCount, sessionId: m.params.sessionId});`,
+    `    // 第 1 次 prompt 模拟 agy 返回软错误 failed to construct executor: unknown model key MODEL_PLACEHOLDER_M535: model not found`,
+    `    if (st.promptCount === 1) {`,
+    `      send({jsonrpc: "2.0", method: "session/update", params: {sessionId: m.params.sessionId, update: {sessionUpdate: "agent_message_chunk", content: {type: "text", text: "failed to construct executor: unknown model key MODEL_PLACEHOLDER_M535: model not found"}}}});`,
+    `      return send({jsonrpc: "2.0", id: m.id, result: {stopReason: "end_turn"}});`,
+    `    }`,
+    `    send({jsonrpc: "2.0", method: "session/update", params: {sessionId: m.params.sessionId, update: {sessionUpdate: "agent_message_chunk", content: {type: "text", text: "RECOVERED_AFTER_UNLOCK_OK"}}}});`,
+    `    return send({jsonrpc: "2.0", id: m.id, result: {stopReason: "end_turn"}});`,
+    `  }`,
+    `});`,
+  ].join("\n") + "\n", {mode: 0o755});
+
+  const lockHubSock = path.join(lockHome, "plugin-ctl.sock");
+  const lockHub = spawn(process.execPath, [path.join(rootDir, "runtime", "agent-hub.mjs")], {
+    env: {
+      ...process.env,
+      HOME: lockHome,
+      USERPROFILE: lockHome,
+      SOLBRAID_PLUGIN_CTL_SOCKET: lockHubSock,
+      GALIAIS_NET_PROBE_TARGET: `127.0.0.1:${probePort}`,
+      GALIAIS_NET_WAIT_POLL_MS: "2000",
+      GALIAIS_NET_WAIT_MAX_MS: "15000",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const lockHubRl = createInterface({input: lockHub.stdout, crlfDelay: Infinity});
+  const lockPending = new Map();
+  let lockSeq = 1;
+  lockHubRl.on("line", line => {
+    if (!line.trim()) return;
+    const msg = JSON.parse(line);
+    if (msg.id !== undefined && lockPending.has(msg.id)) {
+      const p = lockPending.get(msg.id);
+      lockPending.delete(msg.id);
+      if (msg.error) p.reject(new Error(msg.error.message)); else p.resolve(msg.result);
+    }
+  });
+  const lockRpc = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = lockSeq++;
+    const timer = setTimeout(() => { lockPending.delete(id); reject(new Error(`lockHub timeout: ${method}`)); }, 15_000);
+    lockPending.set(id, {resolve: v => { clearTimeout(timer); resolve(v); }, reject: e => { clearTimeout(timer); reject(e); }});
+    lockHub.stdin.write(JSON.stringify({id, method, params}) + "\n");
+  });
+
+  let unlockedSrv = null;
+  try {
+    await lockRpc("initialize");
+    await lockRpc("hub/configure", {
+      manifests: [{id: "antigravity", name: "Antigravity", protocol: "acp", install: {}, launch: {}}],
+    });
+    const created = await lockRpc("sessions/create", {
+      agentId: "antigravity", cwd: lockWs, model: "gemini-4-neon", effort: "xhigh", mode: "bypass",
+    });
+    const lockSid = created.session.id;
+    await lockRpc("agents/stop", {agentId: "antigravity"});
+
+    // 发起 prompt（此时 probePort 关闭，第 1 次 resume 返回空模型表 -> 应进入网络等待而非向 0 模型进程发 prompt）
+    const promptPromise = lockRpc("sessions/prompt", {agentId: "antigravity", sessionId: lockSid, text: "continue work"});
+    await new Promise(r => setTimeout(r, 350));
+    const midLogs = fs.existsSync(lockRpcLog)
+      ? fs.readFileSync(lockRpcLog, "utf8").trim().split("\n").filter(Boolean).map(l => JSON.parse(l))
+      : [];
+    assert.equal(midLogs.filter(x => x.method === "session/resume").length, 1, "First resume must have run");
+    assert.equal(midLogs.filter(x => x.method === "session/prompt").length, 0, "Must NEVER send session/prompt to a 0-model cold-boot agy process");
+
+    // 模拟锁屏解锁/网络恢复：开启 probePort 并由宿主发送 network/poke 立即唤醒等待
+    unlockedSrv = net.createServer(sock => sock.end());
+    await new Promise(r => unlockedSrv.listen(probePort, "127.0.0.1", r));
+    const pokeRes = await lockRpc("network/poke");
+    assert.equal(pokeRes.ok, true);
+    assert.ok(pokeRes.woken >= 1, `Expected network/poke to wake waiting session, got ${JSON.stringify(pokeRes)}`);
+
+    const finalRes = await promptPromise;
+    assert.equal(finalRes.text, "RECOVERED_AFTER_UNLOCK_OK");
+    const loadedLock = await lockRpc("sessions/load", {agentId: "antigravity", sessionId: lockSid});
+    assert.equal(loadedLock.session.remoteSessionId, "remote-lock-orig", "remoteSessionId must be preserved across model-catalog recovery");
+  } finally {
+    if (unlockedSrv) await new Promise(r => unlockedSrv.close(r));
+    lockHub.kill("SIGTERM");
+    await new Promise(r => setTimeout(r, 150));
+    fs.rmSync(lockHome, {recursive: true, force: true});
+  }
+}
+
+async function testThreeAgentProtocolParity() {
+  // 1. 验证 guest-mux.mjs 单通道 --stop 支持与安全校验
+  const muxSrc = fs.readFileSync(path.join(rootDir, "runtime", "guest-mux.mjs"), "utf8");
+  assert.ok(muxSrc.includes('args[0] === "--stop" && args[1]'), "guest-mux must support --stop <channel>");
+  assert.ok(muxSrc.includes("stopChannelDaemon(ch)"), "guest-mux --stop must call stopChannelDaemon");
+
+  // 2. 验证 claude-host.mjs 已暴露全部官方 SDK 控制面与热重载 RPC
+  const claudeHostSrc = fs.readFileSync(path.join(rootDir, "runtime", "claude-host.mjs"), "utf8");
+  for (const method of [
+    "session/accountInfo",
+    "session/usage",
+    "session/backgroundTasks",
+    "session/stopTask",
+    "session/listSubagents",
+    "session/subagentMessages",
+    "session/archive",
+    "session/unarchive",
+    "session/tag",
+    "session/reloadPlugins",
+    "session/reloadSkills",
+    "session/reloadOutputStyles",
+    "session/reinitialize",
+    "session/updateSettings",
+    "session/setUltracode",
+    "mcp/setServers",
+    "mcp/setPermissionOverride",
+    "system/doctor",
+  ]) {
+    assert.ok(claudeHostSrc.includes(`case "${method}":`), `claude-host missing RPC ${method}`);
+  }
+
+  // 3. 验证 acp-driver.mjs 与 agent-hub.mjs 全量 ACP / Antigravity 能力与单引擎热重载标记
+  const acpSrc = fs.readFileSync(path.join(rootDir, "runtime", "acp-driver.mjs"), "utf8");
+  for (const fn of ["async logout()", "async listSessions(", "async closeSession(", "additionalDirectories"]) {
+    assert.ok(acpSrc.includes(fn), `acp-driver missing ${fn}`);
+  }
+  const hubSrc = fs.readFileSync(path.join(rootDir, "runtime", "agent-hub.mjs"), "utf8");
+  for (const method of [
+    "cli/markApplied",
+    "sessions/archive",
+    "sessions/fork",
+    "sessions/addDir",
+    "sessions/syncAcp",
+    "agy/changelog",
+    "agy/doctor",
+    "agy/authLogout",
+    "agy/authenticate",
+  ]) {
+    assert.ok(hubSrc.includes(`case "${method}":`), `agent-hub missing RPC ${method}`);
+  }
+
+  // 4. 实测 buildAcpEmbeddedContextBlocks：正常 @file 转标准 ACP resource 块，越权与目录遍历严格拦截
+  const {buildAcpEmbeddedContextBlocks} = await import(pathToFileURL(path.join(rootDir, "runtime", "acp-driver.mjs")).href);
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-acp-embed-"));
+  try {
+    const ws = path.join(tmpRoot, "workspace");
+    fs.mkdirSync(path.join(ws, "src"), {recursive: true});
+    fs.writeFileSync(path.join(ws, "src", "app.ts"), "export const answer = 42;\n", "utf8");
+    const blocks = await buildAcpEmbeddedContextBlocks(
+      "请审查 @src/app.ts 并忽略 @../etc/passwd 和 @missing.txt",
+      ws,
+      {allowedRoot: tmpRoot},
+    );
+    assert.equal(blocks.length, 1);
+    assert.equal(blocks[0].type, "resource");
+    assert.equal(blocks[0].resource.mimeType, "text/typescript");
+    assert.ok(blocks[0].resource.uri.endsWith("/src/app.ts"));
+    assert.ok(blocks[0].resource.text.includes("answer = 42"));
+  } finally {
+    fs.rmSync(tmpRoot, {recursive: true, force: true});
+  }
+}
+
 await testProviderTranslators();
 await testUsageLedger();
 await testProviderGatewayE2E();
+await testCacheStabilityAndTelemetryFixes();
 await testMermaidCycleAndShapes();
 await testExtensionSyncClaudeHooks();
 await testAcpDriver();
@@ -3283,4 +4039,5 @@ await testOrphanedHotPluginResourcesE2E();
 await test14AuditIssuesRegression();
 await testClaudeFixesAndSelfBuildDefaultOff();
 await testEditAndResendRuntimeContracts();
+await testThreeAgentProtocolParity();
 console.log("ALL_SELF_TESTS_PASSED");

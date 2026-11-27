@@ -105,8 +105,10 @@ class ChatTimelineActions(
     val onUndoTurn: ((TimelineItem.UserMessage) -> Unit)? = null,
     val onRewindFiles: ((TimelineItem.UserMessage) -> Unit)? = null,
     val onFork: (() -> Unit)? = null,
+    val onForkAt: ((TimelineItem.UserMessage) -> Unit)? = null,
     val onInspectDiffs: (List<FileDiff>) -> Unit,
     val onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
+    val onInspectSubagent: ((String?) -> Unit)? = null,
     val onApprovePlan: ((TimelineItem.Plan) -> Unit)? = null,
     val onRevisePlan: ((TimelineItem.Plan, String) -> Unit)? = null,
 )
@@ -343,11 +345,15 @@ fun LazyListScope.turnBlockItems(
             val revertCb: ((String) -> Unit)? = remember(canEdit, user, actions.onUndoTurn) {
                 if (canEdit && actions.onUndoTurn != null) ({ _: String -> actions.onUndoTurn.invoke(user) }) else null
             }
+            val forkAtCb: (() -> Unit)? = remember(canEdit, user, actions.onForkAt) {
+                if (canEdit && actions.onForkAt != null) ({ actions.onForkAt.invoke(user) }) else null
+            }
             UserMessageBubble(
                 item = user,
                 onQuote = actions.onQuote,
                 onEditResend = editCb,
                 onRevert = revertCb,
+                onForkAt = forkAtCb,
                 isEditing = editingUserMessageId == user.id,
             )
         }
@@ -364,6 +370,7 @@ fun LazyListScope.turnBlockItems(
                 onOpenConversation = actions.onOpenConversation,
                 onCancelDelegation = actions.onCancelDelegation,
                 onOpenArtifact = actions.onOpenArtifact,
+                onInspectSubagent = actions.onInspectSubagent,
             )
         }
     }
@@ -500,6 +507,9 @@ fun LazyListScope.turnBlockItems(
             val rewindCb = remember(block.editedFiles, editableUser, actions.onRewindFiles) {
                 if (block.editedFiles.isNotEmpty()) editableUser?.let { u -> actions.onRewindFiles?.let { cb -> ({ cb(u) }) } } else null
             }
+            val forkCb = remember(editableUser, actions.onForkAt, actions.onFork) {
+                editableUser?.let { u -> actions.onForkAt?.let { cb -> ({ cb(u) }) } } ?: actions.onFork
+            }
             TurnFooterActionBar(
                 copyText = answerText,
                 onQuote = quoteCb,
@@ -508,7 +518,7 @@ fun LazyListScope.turnBlockItems(
                 onViewDiffs = viewDiffsCb,
                 onUndo = undoCb,
                 onRewindFiles = rewindCb,
-                onFork = actions.onFork,
+                onFork = forkCb,
             )
         }
     }
@@ -696,6 +706,7 @@ private fun CodexTurnTrace(
     onOpenConversation: (ConversationKey) -> Unit,
     onCancelDelegation: () -> Unit,
     onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
+    onInspectSubagent: ((String?) -> Unit)? = null,
 ) {
     val autoKeepOpen = block.finalMessage == null && !block.inProgress
     var userOverride by rememberSaveable(block.id) { mutableStateOf<Boolean?>(null) }
@@ -802,19 +813,16 @@ private fun CodexTurnTrace(
                                     item = item,
                                     onOpenConversation = onOpenConversation,
                                     onCancelDelegation = onCancelDelegation,
-                                    expandThinking = true,
+                                    expandThinking = expandByDefault,
                                     onOpenArtifact = onOpenArtifact,
+                                    onInspectSubagent = onInspectSubagent,
                                 )
                             }
                             is TraceSegment.ActivityCluster -> FramelessActivityCluster(
                                 cluster = seg,
                                 cwd = cwd,
-                                defaultExpanded = block.inProgress && seg.items.any {
-                                    (it as? TimelineItem.CommandRun)?.status == ItemStatus.RUNNING ||
-                                        (it as? TimelineItem.FileEdit)?.status == ItemStatus.RUNNING ||
-                                        (it as? TimelineItem.ToolCall)?.status == ItemStatus.RUNNING
-                                },
                                 onOpenArtifact = onOpenArtifact,
+                                onInspectSubagent = onInspectSubagent,
                             )
                         }
                     }
@@ -824,15 +832,25 @@ private fun CodexTurnTrace(
     }
 }
 
-/** 图 2 风格的轻量无框活动聚合行（如 `[>_] 运行了命令 ⌄` / `[📄] 读取了文件` / `[✎] 编辑了文件`）。 */
+private fun compactClusterItemHint(item: TimelineItem, cwd: String?): String = when (item) {
+    is TimelineItem.FileEdit -> item.changes.firstOrNull()?.path?.let { stripCwdPrefix(it, cwd).substringAfterLast('/') }
+        ?.takeIf { it.isNotBlank() } ?: "文件"
+    is TimelineItem.CommandRun -> item.actionSummary?.takeIf { it.isNotBlank() }
+        ?: item.command.replace(Regex("\\s+"), " ").trim().take(36)
+    is TimelineItem.ToolCall -> stripCwdPrefix(describeToolCall(item.name, item.input, item.kind).summary, cwd).take(36)
+    else -> ""
+}
+
+/** 轻量无框活动聚合行（如 `[📄] 读取了 3 个文件 ⌄` / `[>_] 运行了命令 ⌄`）：默认始终折叠，点击后展开逐项明细。 */
 @Composable
 private fun FramelessActivityCluster(
     cluster: TraceSegment.ActivityCluster,
     cwd: String?,
-    defaultExpanded: Boolean,
     onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
+    onInspectSubagent: ((String?) -> Unit)? = null,
 ) {
-    var open by rememberSaveable(cluster.id) { mutableStateOf(defaultExpanded) }
+    // 始终默认折叠（尤其是读取/搜索/目录浏览等高频只读工具），仅响应用户主动点击展开，不再因运行中自动撑开刷屏
+    var open by rememberSaveable(cluster.id) { mutableStateOf(false) }
     val kinds = remember(cluster.items) {
         cluster.items.map { item ->
             when (item) {
@@ -843,25 +861,68 @@ private fun FramelessActivityCluster(
             }
         }.distinct()
     }
-    val anyRunning = cluster.items.any {
+    val runningItem = cluster.items.lastOrNull {
         (it as? TimelineItem.CommandRun)?.status == ItemStatus.RUNNING ||
             (it as? TimelineItem.FileEdit)?.status == ItemStatus.RUNNING ||
             (it as? TimelineItem.ToolCall)?.status == ItemStatus.RUNNING
     }
-    val summaryText = buildList {
-        if (ToolCallKind.EDIT_FILE in kinds || ToolCallKind.DELETE_FILE in kinds) add("编辑了文件")
-        if (ToolCallKind.TERMINAL in kinds) add("运行了命令")
-        if (ToolCallKind.READ_FILE in kinds) add("读取了文件")
-        if (ToolCallKind.LIST_DIR in kinds) add("浏览了目录")
-        if (ToolCallKind.SEARCH_CODE in kinds || ToolCallKind.FIND_FILES in kinds) add("搜索了代码")
-        if (ToolCallKind.WEB_SEARCH in kinds || ToolCallKind.WEB_FETCH in kinds) add("检索了网页")
-        if (ToolCallKind.MCP in kinds) add("调用了 MCP")
-        if (ToolCallKind.SUBAGENT in kinds) add("派发了子代理")
-        if (ToolCallKind.SKILL in kinds) add("调用了技能")
-        if (ToolCallKind.PLAN_TODO in kinds) add("更新了任务清单")
-        if (ToolCallKind.IMAGE in kinds) add("查看了图片")
-        if (isEmpty() && ToolCallKind.GENERIC in kinds) add("调用了工具")
-    }.take(2).joinToString(" · ").ifBlank { "执行了操作" }
+    val anyRunning = runningItem != null
+    val count = cluster.items.size
+    val summaryText = remember(cluster.items, kinds, runningItem, cwd) {
+        if (runningItem != null) {
+            val activeLabel = when (runningItem) {
+                is TimelineItem.FileEdit -> "正在编辑"
+                is TimelineItem.CommandRun -> when (classifyCommandRun(runningItem)) {
+                    ToolCallKind.READ_FILE -> "正在读取"
+                    ToolCallKind.LIST_DIR -> "正在浏览目录"
+                    ToolCallKind.SEARCH_CODE -> "正在搜索"
+                    ToolCallKind.FIND_FILES -> "正在查找文件"
+                    else -> "正在运行命令"
+                }
+                is TimelineItem.ToolCall -> "正在${describeToolCall(runningItem.name, runningItem.input, runningItem.kind).badge}"
+                else -> "正在执行"
+            }
+            val hint = compactClusterItemHint(runningItem, cwd)
+            val base = if (hint.isNotBlank() && !activeLabel.contains(hint)) "$activeLabel · $hint" else activeLabel
+            if (count > 1) "$base（共 $count 项）" else base
+        } else if (count == 1) {
+            val only = cluster.items.first()
+            val action = when (kinds.firstOrNull()) {
+                ToolCallKind.EDIT_FILE -> "编辑了文件"
+                ToolCallKind.DELETE_FILE -> "删除了文件"
+                ToolCallKind.TERMINAL -> "运行了命令"
+                ToolCallKind.READ_FILE -> "读取了文件"
+                ToolCallKind.LIST_DIR -> "浏览了目录"
+                ToolCallKind.SEARCH_CODE -> "搜索了代码"
+                ToolCallKind.FIND_FILES -> "查找了文件"
+                ToolCallKind.WEB_SEARCH, ToolCallKind.WEB_FETCH -> "检索了网页"
+                ToolCallKind.MCP -> "调用了 MCP"
+                ToolCallKind.SUBAGENT -> "派发了子代理"
+                ToolCallKind.SKILL -> "调用了技能"
+                ToolCallKind.PLAN_TODO -> "更新了任务清单"
+                ToolCallKind.IMAGE -> "查看了图片"
+                else -> "调用了工具"
+            }
+            val hint = compactClusterItemHint(only, cwd)
+            if (hint.isNotBlank() && hint != action) "$action · $hint" else action
+        } else {
+            val base = buildList {
+                if (ToolCallKind.EDIT_FILE in kinds || ToolCallKind.DELETE_FILE in kinds) add("编辑了文件")
+                if (ToolCallKind.TERMINAL in kinds) add("运行了命令")
+                if (ToolCallKind.READ_FILE in kinds) add("读取了文件")
+                if (ToolCallKind.LIST_DIR in kinds) add("浏览了目录")
+                if (ToolCallKind.SEARCH_CODE in kinds || ToolCallKind.FIND_FILES in kinds) add("搜索了代码")
+                if (ToolCallKind.WEB_SEARCH in kinds || ToolCallKind.WEB_FETCH in kinds) add("检索了网页")
+                if (ToolCallKind.MCP in kinds) add("调用了 MCP")
+                if (ToolCallKind.SUBAGENT in kinds) add("派发了子代理")
+                if (ToolCallKind.SKILL in kinds) add("调用了技能")
+                if (ToolCallKind.PLAN_TODO in kinds) add("更新了任务清单")
+                if (ToolCallKind.IMAGE in kinds) add("查看了图片")
+                if (isEmpty() && ToolCallKind.GENERIC in kinds) add("调用了工具")
+            }.take(2).joinToString(" · ").ifBlank { "执行了操作" }
+            "$base（$count 项）"
+        }
+    }
 
     val primaryKind = when {
         ToolCallKind.EDIT_FILE in kinds && ToolCallKind.TERMINAL !in kinds -> ToolCallKind.EDIT_FILE
@@ -924,7 +985,7 @@ private fun FramelessActivityCluster(
                                 when (item) {
                                     is TimelineItem.CommandRun -> CompactCommandRow(item, cwd)
                                     is TimelineItem.FileEdit -> CompactFileEditRow(item, cwd)
-                                    is TimelineItem.ToolCall -> CompactToolRow(item, cwd, onOpenArtifact)
+                                    is TimelineItem.ToolCall -> CompactToolRow(item, cwd, onOpenArtifact, onInspectSubagent)
                                     else -> Unit
                                 }
                             }
@@ -938,7 +999,7 @@ private fun FramelessActivityCluster(
 
 @Composable
 private fun CompactCommandRow(item: TimelineItem.CommandRun, sessionCwd: String?) {
-    var showOutput by remember { mutableStateOf(item.status == ItemStatus.RUNNING) }
+    var showOutput by rememberSaveable(item.id) { mutableStateOf(false) }
     var expandFullCommand by remember(item.id) { mutableStateOf(false) }
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
@@ -1110,7 +1171,7 @@ private fun CompactCommandRow(item: TimelineItem.CommandRun, sessionCwd: String?
 
 @Composable
 private fun CompactFileEditRow(item: TimelineItem.FileEdit, cwd: String?) {
-    var open by remember { mutableStateOf(false) }
+    var open by rememberSaveable(item.id) { mutableStateOf(false) }
     val names = remember(item.changes, cwd) {
         item.changes.joinToString("、") { stripCwdPrefix(it.path, cwd).substringAfterLast('/') }.ifBlank { "文件修改" }
     }
@@ -1156,8 +1217,13 @@ private fun CompactFileEditRow(item: TimelineItem.FileEdit, cwd: String?) {
 }
 
 @Composable
-private fun CompactToolRow(item: TimelineItem.ToolCall, cwd: String?, onOpenArtifact: ((ChatArtifact) -> Unit)? = null) {
-    var open by remember { mutableStateOf(false) }
+private fun CompactToolRow(
+    item: TimelineItem.ToolCall,
+    cwd: String?,
+    onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
+    onInspectSubagent: ((String?) -> Unit)? = null,
+) {
+    var open by rememberSaveable(item.id) { mutableStateOf(false) }
     val meta = remember(item.name, item.input, item.kind) { describeToolCall(item.name, item.input, item.kind) }
     val widgetArtifact = remember(item.id, item.name, item.input) { extractArtifactsFromItems(listOf(item)).firstOrNull() }
     val summary = remember(meta.summary, cwd) { stripCwdPrefix(meta.summary, cwd) }
@@ -1187,6 +1253,14 @@ private fun CompactToolRow(item: TimelineItem.ToolCall, cwd: String?, onOpenArti
             Text(summary, fontFamily = Mono, fontSize = 11.5.sp, color = if (open) G.ink else G.inkMuted, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
             if (widgetArtifact != null && onOpenArtifact != null) {
                 TagPill("预览", fg = G.accent, bg = G.accentContainer, onClick = { onOpenArtifact(widgetArtifact) })
+            }
+            if (meta.kind == ToolCallKind.SUBAGENT && onInspectSubagent != null) {
+                val hintId = remember(item.result, item.id) {
+                    Regex("""agentId["']?\s*[:=]\s*["']?([A-Za-z0-9_-]+)""", RegexOption.IGNORE_CASE)
+                        .find(item.result.orEmpty())?.groupValues?.getOrNull(1)
+                        ?: item.id.takeIf { it.isNotBlank() }
+                }
+                TagPill("查看记录", fg = G.claude, bg = G.claudeTint, onClick = { onInspectSubagent(hintId) })
             }
             if (item.status == ItemStatus.FAILED) {
                 Icon(GaliaisIcons.AlertTriangle, contentDescription = null, tint = G.danger, modifier = Modifier.size(12.dp))

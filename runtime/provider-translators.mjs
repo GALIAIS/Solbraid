@@ -89,6 +89,7 @@ export function responsesToChatRequest(body) {
     messages.push({role: "system", content: body.instructions});
   }
   let pendingAssistant = null;
+  let syntheticCallSeq = 0;
   const flushAssistant = () => { if (pendingAssistant) { messages.push(pendingAssistant); pendingAssistant = null; } };
   const input = typeof body.input === "string"
     ? [{type: "message", role: "user", content: [{type: "input_text", text: body.input}]}]
@@ -109,12 +110,18 @@ export function responsesToChatRequest(body) {
       } else {
         messages.push({role, content});
       }
+    } else if (item.type === "reasoning") {
+      const thought = textOfContent(item.summary);
+      if (thought) {
+        if (!pendingAssistant) pendingAssistant = {role: "assistant", content: null};
+        pendingAssistant.reasoning_content = [pendingAssistant.reasoning_content, thought].filter(Boolean).join("\n");
+      }
     } else if (item.type === "function_call" || item.type === "custom_tool_call") {
       if (!pendingAssistant) pendingAssistant = {role: "assistant", content: null};
       if (!pendingAssistant.tool_calls) pendingAssistant.tool_calls = [];
       const args = item.type === "custom_tool_call" ? JSON.stringify({input: item.input ?? ""}) : (item.arguments ?? "{}");
       pendingAssistant.tool_calls.push({
-        id: item.call_id ?? item.id ?? ("call_" + randomUUID().slice(0, 8)),
+        id: item.call_id ?? item.id ?? ("call_rc_" + (++syntheticCallSeq)),
         type: "function",
         function: {name: encodeToolName(item.namespace, item.name), arguments: args},
       });
@@ -124,15 +131,21 @@ export function responsesToChatRequest(body) {
     }
   }
   flushAssistant();
+  const isReasoningModel = /^(?:o[1-9]|gpt-5)/i.test(String(body.model || ""));
   const req = {model: body.model, messages, stream: true, stream_options: {include_usage: true}};
   if (tools.length) {
     req.tools = tools.map((t) => ({type: "function", function: {name: t.name, description: t.description, parameters: t.parameters}}));
     if (typeof body.tool_choice === "string") req.tool_choice = body.tool_choice;
-    else if (body.tool_choice?.type === "function" && body.tool_choice.name) req.tool_choice = {type: "function", function: {name: body.tool_choice.name}};
+    else if (body.tool_choice?.type === "function" && body.tool_choice.name) {
+      req.tool_choice = {type: "function", function: {name: encodeToolName(body.tool_choice.namespace, body.tool_choice.name)}};
+    }
   }
-  if (body.max_output_tokens) req.max_tokens = body.max_output_tokens;
-  if (body.temperature != null) req.temperature = body.temperature;
-  if (body.top_p != null) req.top_p = body.top_p;
+  if (body.max_output_tokens) {
+    if (isReasoningModel) req.max_completion_tokens = body.max_output_tokens;
+    else req.max_tokens = body.max_output_tokens;
+  }
+  if (body.temperature != null && !isReasoningModel) req.temperature = body.temperature;
+  if (body.top_p != null && !isReasoningModel) req.top_p = body.top_p;
   if (body.stop != null) req.stop = body.stop;
   if (body.reasoning?.effort) req.reasoning_effort = body.reasoning.effort;
   if (body.text?.format) req.response_format = body.text.format.type === "json_schema"
@@ -146,6 +159,7 @@ export function responsesToAnthropicRequest(body) {
   const systemParts = [];
   if (typeof body.instructions === "string" && body.instructions.trim()) systemParts.push(body.instructions);
   const messages = [];
+  let syntheticCallSeq = 0;
   const pushMsg = (role, blocks) => {
     if (!blocks.length) return;
     const prev = messages[messages.length - 1];
@@ -181,15 +195,36 @@ export function responsesToAnthropicRequest(body) {
       let parsedInput = {};
       if (item.type === "custom_tool_call") parsedInput = {input: item.input ?? ""};
       else { try { parsedInput = JSON.parse(item.arguments || "{}"); } catch { parsedInput = {}; } }
-      pushMsg("assistant", [{type: "tool_use", id: item.call_id ?? item.id ?? ("toolu_" + randomUUID().slice(0, 8)), name: encodeToolName(item.namespace, item.name), input: parsedInput}]);
+      pushMsg("assistant", [{type: "tool_use", id: item.call_id ?? item.id ?? ("toolu_ra_" + (++syntheticCallSeq)), name: encodeToolName(item.namespace, item.name), input: parsedInput}]);
     } else if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
       pushMsg("user", [{type: "tool_result", tool_use_id: item.call_id, content: textOfContent(item.output)}]);
     }
   }
   if (!messages.length) messages.push({role: "user", content: [{type: "text", text: "Continue"}]});
+  // 为跨协议转入 Anthropic Messages 的请求注入 Prompt Caching 断点（最多 3 个 <= Anthropic 上限 4 个），
+  // 使 Codex / Antigravity 通过 Claude 上游时能命中 90% 前缀缓存。
+  if (messages.length >= 2) {
+    const prevBlocks = messages[messages.length - 2]?.content;
+    if (Array.isArray(prevBlocks)) {
+      for (let i = prevBlocks.length - 1; i >= 0; i--) {
+        const b = prevBlocks[i];
+        if (b && ["text", "tool_use", "tool_result", "image", "document"].includes(b.type) && (b.type !== "text" || Boolean(b.text))) {
+          prevBlocks[i] = {...b, cache_control: {type: "ephemeral"}};
+          break;
+        }
+      }
+    }
+  }
   const req = {model: body.model, max_tokens: body.max_output_tokens ?? 8192, messages, stream: true};
-  if (systemParts.length) req.system = systemParts.join("\n\n");
-  if (tools.length) req.tools = tools.map((t) => ({name: t.name, description: t.description, input_schema: t.parameters}));
+  if (systemParts.length) req.system = [{type: "text", text: systemParts.join("\n\n"), cache_control: {type: "ephemeral"}}];
+  if (tools.length) {
+    req.tools = tools.map((t, idx) => ({
+      name: t.name,
+      description: t.description,
+      input_schema: t.parameters,
+      ...(idx === tools.length - 1 ? {cache_control: {type: "ephemeral"}} : {}),
+    }));
+  }
   if (body.tool_choice === "required") req.tool_choice = {type: "any"};
   else if (body.tool_choice === "none" || body.tool_choice === "auto") req.tool_choice = {type: body.tool_choice};
   else if (body.tool_choice?.type === "function") req.tool_choice = {type: "tool", name: encodeToolName(body.tool_choice.namespace, body.tool_choice.name)};
@@ -302,16 +337,19 @@ export function anthropicToChatRequest(body) {
       }
     } else if (msg.role === "assistant") {
       const texts = [];
+      const thoughts = [];
       const toolCalls = [];
       for (const b of blocks) {
         if (b?.type === "text" && b.text) texts.push(b.text);
+        else if (b?.type === "thinking" && b.thinking) thoughts.push(b.thinking);
         else if (b?.type === "tool_use") {
           toolCalls.push({id: b.id, type: "function", function: {name: b.name, arguments: JSON.stringify(b.input ?? {})}});
         }
       }
       const entry = {role: "assistant", content: texts.length ? texts.join("\n") : null};
+      if (thoughts.length) entry.reasoning_content = thoughts.join("\n");
       if (toolCalls.length) entry.tool_calls = toolCalls;
-      if (entry.content !== null || entry.tool_calls) messages.push(entry);
+      if (entry.content !== null || entry.tool_calls || entry.reasoning_content) messages.push(entry);
     }
   }
   const isReasoningModel = /^(?:o[1-9]|gpt-5)/i.test(String(body.model || ""));
@@ -335,7 +373,7 @@ export function anthropicToChatRequest(body) {
   return req;
 }
 
-export function anthropicToResponsesRequest(body) {
+export function anthropicToResponsesRequest(body, opts = {}) {
   const input = [];
   for (const msg of body.messages ?? []) {
     if (!msg) continue;
@@ -364,8 +402,12 @@ export function anthropicToResponsesRequest(body) {
     } else if (msg.role === "assistant") {
       const parts = [];
       for (const b of blocks) {
-        if (b?.type === "text" && b.text) parts.push({type: "output_text", text: b.text});
-        else if (b?.type === "tool_use") {
+        if (b?.type === "thinking" && b.thinking) {
+          if (parts.length) { input.push({type: "message", role: "assistant", content: parts.splice(0)}); }
+          input.push({type: "reasoning", summary: [{type: "summary_text", text: b.thinking}]});
+        } else if (b?.type === "text" && b.text) {
+          parts.push({type: "output_text", text: b.text});
+        } else if (b?.type === "tool_use") {
           if (parts.length) { input.push({type: "message", role: "assistant", content: parts.splice(0)}); }
           input.push({type: "function_call", call_id: b.id, name: b.name, arguments: JSON.stringify(b.input ?? {})});
         }
@@ -374,6 +416,8 @@ export function anthropicToResponsesRequest(body) {
     }
   }
   const req = {model: body.model, input, stream: true};
+  const cacheKey = opts?.sessionId || body.metadata?.user_id;
+  if (cacheKey) req.prompt_cache_key = String(cacheKey).slice(0, 64);
   const systemText = textOfContent(body.system);
   if (systemText) req.instructions = systemText;
   if (body.max_tokens) req.max_output_tokens = body.max_tokens;
@@ -411,7 +455,8 @@ export function anthropicToGeminiRequest(body) {
     if (typeof msg.content === "string") { push(role, [{text: msg.content}]); continue; }
     const parts = [];
     for (const b of Array.isArray(msg.content) ? msg.content : []) {
-      if (b?.type === "text" && b.text) parts.push({text: b.text});
+      if (b?.type === "thinking" && b.thinking) parts.push({text: b.thinking, thought: true});
+      else if (b?.type === "text" && b.text) parts.push({text: b.text});
       else if (b?.type === "document" && b.source) {
         if (b.source.type === "base64" && b.source.media_type) parts.push({inlineData: {mimeType: b.source.media_type, data: b.source.data}});
         else if (b.source.type === "text") parts.push({text: b.source.data || ""});
@@ -498,13 +543,28 @@ function writeSse(res, event, payload) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
 }
 
-// 统一生成 Codex 所需的 OpenAI Responses SSE 事件流。
+function safeParseToolJson(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return {json: "{}", obj: {}};
+  try {
+    const parsed = JSON.parse(s);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return {json: s, obj: parsed};
+    }
+    return {json: JSON.stringify({value: parsed}), obj: {value: parsed}};
+  } catch {
+    return {json: "{}", obj: {}};
+  }
+}
+
+// 统一生成 Codex 所需的 OpenAI Responses SSE 事件流（stream=false 时聚合返回单条 JSON）。
 export class ResponsesSseWriter {
-  constructor(res, model, namespaceMap = new Map(), customSet = new Set()) {
+  constructor(res, model, namespaceMap = new Map(), customSet = new Set(), stream = true) {
     this.res = res;
     this.model = model;
     this.namespaceMap = namespaceMap;
     this.customSet = customSet;
+    this.stream = stream !== false;
     this.responseId = "resp_" + randomUUID().replaceAll("-", "").slice(0, 20);
     this.nextIndex = 0;
     this.reasoning = null;
@@ -517,6 +577,7 @@ export class ResponsesSseWriter {
   start() {
     if (this.started) return;
     this.started = true;
+    if (!this.stream) return;
     this.res.writeHead(200, {"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "Connection": "keep-alive"});
     writeSse(this.res, "response.created", {type: "response.created", response: {id: this.responseId, object: "response", status: "in_progress", model: this.model, output: []}});
   }
@@ -527,11 +588,13 @@ export class ResponsesSseWriter {
       const id = "rs_" + randomUUID().slice(0, 12);
       const index = this.nextIndex++;
       this.reasoning = {id, index, text: ""};
-      writeSse(this.res, "response.output_item.added", {type: "response.output_item.added", output_index: index, item: {id, type: "reasoning", summary: []}});
-      writeSse(this.res, "response.reasoning_summary_part.added", {type: "response.reasoning_summary_part.added", item_id: id, output_index: index, summary_index: 0, part: {type: "summary_text", text: ""}});
+      if (this.stream) {
+        writeSse(this.res, "response.output_item.added", {type: "response.output_item.added", output_index: index, item: {id, type: "reasoning", summary: []}});
+        writeSse(this.res, "response.reasoning_summary_part.added", {type: "response.reasoning_summary_part.added", item_id: id, output_index: index, summary_index: 0, part: {type: "summary_text", text: ""}});
+      }
     }
     this.reasoning.text += delta;
-    writeSse(this.res, "response.reasoning_summary_text.delta", {type: "response.reasoning_summary_text.delta", item_id: this.reasoning.id, output_index: this.reasoning.index, summary_index: 0, delta});
+    if (this.stream) writeSse(this.res, "response.reasoning_summary_text.delta", {type: "response.reasoning_summary_text.delta", item_id: this.reasoning.id, output_index: this.reasoning.index, summary_index: 0, delta});
   }
   closeReasoning() {
     if (!this.reasoning) return;
@@ -539,7 +602,7 @@ export class ResponsesSseWriter {
     this.reasoning = null;
     const item = {id: r.id, type: "reasoning", summary: [{type: "summary_text", text: r.text}]};
     this.completedOutput.push(item);
-    writeSse(this.res, "response.output_item.done", {type: "response.output_item.done", output_index: r.index, item});
+    if (this.stream) writeSse(this.res, "response.output_item.done", {type: "response.output_item.done", output_index: r.index, item});
   }
   textDelta(delta) {
     if (!delta) return;
@@ -549,21 +612,25 @@ export class ResponsesSseWriter {
       const id = "msg_" + randomUUID().slice(0, 12);
       const index = this.nextIndex++;
       this.message = {id, index, text: ""};
-      writeSse(this.res, "response.output_item.added", {type: "response.output_item.added", output_index: index, item: {id, type: "message", role: "assistant", status: "in_progress", content: []}});
-      writeSse(this.res, "response.content_part.added", {type: "response.content_part.added", item_id: id, output_index: index, content_index: 0, part: {type: "output_text", text: ""}});
+      if (this.stream) {
+        writeSse(this.res, "response.output_item.added", {type: "response.output_item.added", output_index: index, item: {id, type: "message", role: "assistant", status: "in_progress", content: []}});
+        writeSse(this.res, "response.content_part.added", {type: "response.content_part.added", item_id: id, output_index: index, content_index: 0, part: {type: "output_text", text: ""}});
+      }
     }
     this.message.text += delta;
-    writeSse(this.res, "response.output_text.delta", {type: "response.output_text.delta", item_id: this.message.id, output_index: this.message.index, content_index: 0, delta});
+    if (this.stream) writeSse(this.res, "response.output_text.delta", {type: "response.output_text.delta", item_id: this.message.id, output_index: this.message.index, content_index: 0, delta});
   }
   closeMessage() {
     if (!this.message) return;
     const m = this.message;
     this.message = null;
-    writeSse(this.res, "response.output_text.done", {type: "response.output_text.done", item_id: m.id, output_index: m.index, content_index: 0, text: m.text});
-    writeSse(this.res, "response.content_part.done", {type: "response.content_part.done", item_id: m.id, output_index: m.index, content_index: 0, part: {type: "output_text", text: m.text}});
     const item = {id: m.id, type: "message", role: "assistant", status: "completed", content: [{type: "output_text", text: m.text}]};
     this.completedOutput.push(item);
-    writeSse(this.res, "response.output_item.done", {type: "response.output_item.done", output_index: m.index, item});
+    if (this.stream) {
+      writeSse(this.res, "response.output_text.done", {type: "response.output_text.done", item_id: m.id, output_index: m.index, content_index: 0, text: m.text});
+      writeSse(this.res, "response.content_part.done", {type: "response.content_part.done", item_id: m.id, output_index: m.index, content_index: 0, part: {type: "output_text", text: m.text}});
+      writeSse(this.res, "response.output_item.done", {type: "response.output_item.done", output_index: m.index, item});
+    }
   }
   toolDelta(slot, callId, rawName, argsDelta) {
     this.start();
@@ -577,10 +644,12 @@ export class ResponsesSseWriter {
       const isCustom = this.customSet.has(rawName);
       call = {id, index, callId: callId || ("call_" + randomUUID().slice(0, 12)), name: ns ? ns.name : (rawName || ""), namespace: ns ? ns.namespace : null, isCustom, arguments: ""};
       this.calls.set(slot, call);
-      const added = isCustom
-        ? {id, type: "custom_tool_call", call_id: call.callId, name: call.name, input: "", status: "in_progress"}
-        : {id, type: "function_call", call_id: call.callId, name: call.name, ...(call.namespace ? {namespace: call.namespace} : {}), arguments: "", status: "in_progress"};
-      writeSse(this.res, "response.output_item.added", {type: "response.output_item.added", output_index: index, item: added});
+      if (this.stream) {
+        const added = isCustom
+          ? {id, type: "custom_tool_call", call_id: call.callId, name: call.name, input: "", status: "in_progress"}
+          : {id, type: "function_call", call_id: call.callId, name: call.name, ...(call.namespace ? {namespace: call.namespace} : {}), arguments: "", status: "in_progress"};
+        writeSse(this.res, "response.output_item.added", {type: "response.output_item.added", output_index: index, item: added});
+      }
     } else {
       if (callId && !call.callId) call.callId = callId;
       if (rawName && !call.name) {
@@ -591,14 +660,23 @@ export class ResponsesSseWriter {
     }
     if (argsDelta) {
       call.arguments += argsDelta;
-      if (!call.isCustom) {
+      if (this.stream && !call.isCustom) {
         writeSse(this.res, "response.function_call_arguments.delta", {type: "response.function_call_arguments.delta", item_id: call.id, output_index: call.index, delta: argsDelta});
       }
     }
   }
-  setUsage(input, output) {
+  setUsage(input, output, {cachedTokens = null, cacheWriteTokens = null, reasoningTokens = null} = {}) {
     if (input != null) this.usage.input_tokens = input;
     if (output != null) this.usage.output_tokens = output;
+    if (cachedTokens != null && cachedTokens > 0) {
+      this.usage.input_tokens_details = {...(this.usage.input_tokens_details || {}), cached_tokens: cachedTokens};
+    }
+    if (cacheWriteTokens != null && cacheWriteTokens > 0) {
+      this.usage.input_tokens_details = {...(this.usage.input_tokens_details || {}), cache_write_tokens: cacheWriteTokens};
+    }
+    if (reasoningTokens != null && reasoningTokens > 0) {
+      this.usage.output_tokens_details = {...(this.usage.output_tokens_details || {}), reasoning_tokens: reasoningTokens};
+    }
     this.usage.total_tokens = (this.usage.input_tokens || 0) + (this.usage.output_tokens || 0);
   }
   finish(stopReason = "stop") {
@@ -615,41 +693,88 @@ export class ResponsesSseWriter {
         item = {id: call.id, type: "function_call", call_id: call.callId, name: call.name, ...(call.namespace ? {namespace: call.namespace} : {}), arguments: call.arguments || "{}", status: "completed"};
       }
       this.completedOutput.push(item);
-      writeSse(this.res, "response.output_item.done", {type: "response.output_item.done", output_index: call.index, item});
+      if (this.stream) writeSse(this.res, "response.output_item.done", {type: "response.output_item.done", output_index: call.index, item});
     }
     this.calls.clear();
     const limited = ["length", "max_tokens", "MAX_TOKENS"].includes(stopReason);
+    const responseObj = {
+      id: this.responseId,
+      object: "response",
+      status: limited ? "incomplete" : "completed",
+      model: this.model,
+      ...(limited ? {incomplete_details: {reason: "max_output_tokens"}} : {}),
+      output: this.completedOutput,
+      usage: this.usage,
+    };
+    if (!this.stream) {
+      responseObj.output_text = this.completedOutput
+        .filter(it => it.type === "message")
+        .flatMap(it => Array.isArray(it.content) ? it.content.map(c => c.text || "") : [])
+        .join("");
+      this.res.writeHead(200, {"Content-Type": "application/json; charset=utf-8"});
+      this.res.end(JSON.stringify(responseObj));
+      return;
+    }
     const type = limited ? "response.incomplete" : "response.completed";
-    writeSse(this.res, type, {type, response: {id: this.responseId, object: "response", status: limited ? "incomplete" : "completed", model: this.model,
-      ...(limited ? {incomplete_details: {reason: "max_output_tokens"}} : {}), output: this.completedOutput, usage: this.usage}});
+    writeSse(this.res, type, {type, response: responseObj});
     this.res.end();
   }
 }
 
-// 统一生成 Claude Code 所需的 Anthropic Messages SSE 事件流。
+// 统一生成 Claude Code 所需的 Anthropic Messages SSE 事件流（stream=false 时聚合返回单条 JSON）。
 export class AnthropicSseWriter {
-  constructor(res, model) {
+  constructor(res, model, stream = true) {
     this.res = res;
     this.model = model;
+    this.stream = stream !== false;
     this.messageId = "msg_" + randomUUID().replaceAll("-", "").slice(0, 20);
     this.nextIndex = 0;
     this.openBlock = null;
+    this.completedBlocks = [];
     this.toolBlocks = new Map();
     this.sawTool = false;
-    this.inputTokens = 0;
+    this.totalInputTokens = 0;
+    this.cacheReadTokens = 0;
+    this.cacheWriteTokens = 0;
     this.outputTokens = 0;
     this.started = false;
   }
-  start(inputTokens = 0) {
+  get inputTokens() { return this.totalInputTokens; }
+  set inputTokens(v) { this.totalInputTokens = Math.max(0, Number(v) || 0); }
+  setUsage(totalInput, output, {cacheRead = null, cacheWrite = null} = {}) {
+    if (totalInput != null) this.totalInputTokens = Math.max(0, Number(totalInput) || 0);
+    if (output != null) this.outputTokens = Math.max(0, Number(output) || 0);
+    if (cacheRead != null) this.cacheReadTokens = Math.max(0, Number(cacheRead) || 0);
+    if (cacheWrite != null) this.cacheWriteTokens = Math.max(0, Number(cacheWrite) || 0);
+  }
+  buildUsage(initial = false) {
+    // Anthropic Messages 协议要求 input_tokens 仅为未命中缓存部分，否则 Claude Code 会把 input_tokens + cache_read 重复叠加
+    const uncachedIn = Math.max(0, this.totalInputTokens - this.cacheReadTokens - this.cacheWriteTokens);
+    return {
+      input_tokens: uncachedIn,
+      output_tokens: initial ? 1 : this.outputTokens,
+      ...(this.cacheReadTokens > 0 ? {cache_read_input_tokens: this.cacheReadTokens} : {}),
+      ...(this.cacheWriteTokens > 0 ? {cache_creation_input_tokens: this.cacheWriteTokens} : {}),
+    };
+  }
+  start(inputTokens = 0, details = {}) {
     if (this.started) return;
     this.started = true;
-    this.inputTokens = inputTokens;
+    if (inputTokens > 0 || details?.cacheRead || details?.cacheWrite) {
+      this.setUsage(inputTokens > 0 ? inputTokens : null, null, details);
+    }
+    if (!this.stream) return;
     this.res.writeHead(200, {"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "Connection": "keep-alive"});
-    writeSse(this.res, "message_start", {type: "message_start", message: {id: this.messageId, type: "message", role: "assistant", content: [], model: this.model, stop_reason: null, stop_sequence: null, usage: {input_tokens: inputTokens, output_tokens: 1}}});
+    writeSse(this.res, "message_start", {type: "message_start", message: {id: this.messageId, type: "message", role: "assistant", content: [], model: this.model, stop_reason: null, stop_sequence: null, usage: this.buildUsage(true)}});
   }
   closeCurrent() {
     if (!this.openBlock) return;
-    writeSse(this.res, "content_block_stop", {type: "content_block_stop", index: this.openBlock.index});
+    if (this.openBlock.type === "thinking") {
+      this.completedBlocks.push({type: "thinking", thinking: this.openBlock.buf});
+    } else if (this.openBlock.type === "text") {
+      this.completedBlocks.push({type: "text", text: this.openBlock.buf});
+    }
+    if (this.stream) writeSse(this.res, "content_block_stop", {type: "content_block_stop", index: this.openBlock.index});
     this.openBlock = null;
   }
   thinkingDelta(delta) {
@@ -658,10 +783,11 @@ export class AnthropicSseWriter {
     if (this.openBlock?.type !== "thinking") {
       this.closeCurrent();
       const index = this.nextIndex++;
-      this.openBlock = {type: "thinking", index};
-      writeSse(this.res, "content_block_start", {type: "content_block_start", index, content_block: {type: "thinking", thinking: ""}});
+      this.openBlock = {type: "thinking", index, buf: ""};
+      if (this.stream) writeSse(this.res, "content_block_start", {type: "content_block_start", index, content_block: {type: "thinking", thinking: ""}});
     }
-    writeSse(this.res, "content_block_delta", {type: "content_block_delta", index: this.openBlock.index, delta: {type: "thinking_delta", thinking: delta}});
+    this.openBlock.buf += delta;
+    if (this.stream) writeSse(this.res, "content_block_delta", {type: "content_block_delta", index: this.openBlock.index, delta: {type: "thinking_delta", thinking: delta}});
   }
   textDelta(delta) {
     if (!delta) return;
@@ -669,10 +795,11 @@ export class AnthropicSseWriter {
     if (this.openBlock?.type !== "text") {
       this.closeCurrent();
       const index = this.nextIndex++;
-      this.openBlock = {type: "text", index};
-      writeSse(this.res, "content_block_start", {type: "content_block_start", index, content_block: {type: "text", text: ""}});
+      this.openBlock = {type: "text", index, buf: ""};
+      if (this.stream) writeSse(this.res, "content_block_start", {type: "content_block_start", index, content_block: {type: "text", text: ""}});
     }
-    writeSse(this.res, "content_block_delta", {type: "content_block_delta", index: this.openBlock.index, delta: {type: "text_delta", text: delta}});
+    this.openBlock.buf += delta;
+    if (this.stream) writeSse(this.res, "content_block_delta", {type: "content_block_delta", index: this.openBlock.index, delta: {type: "text_delta", text: delta}});
   }
   toolDelta(slot, callId, name, partialJson) {
     this.start();
@@ -689,12 +816,15 @@ export class AnthropicSseWriter {
     const block = this.toolBlocks.get(slot);
     if (!block || block.emitted) return;
     if (!block.name) throw new Error("Upstream tool call is missing its name");
-    JSON.parse(block.json || "{}");
+    const safeArgs = safeParseToolJson(block.json);
     this.closeCurrent();
-    const index = this.nextIndex++;
-    writeSse(this.res, "content_block_start", {type: "content_block_start", index, content_block: {type: "tool_use", id: block.id, name: block.name, input: {}}});
-    writeSse(this.res, "content_block_delta", {type: "content_block_delta", index, delta: {type: "input_json_delta", partial_json: block.json || "{}"}});
-    writeSse(this.res, "content_block_stop", {type: "content_block_stop", index});
+    this.completedBlocks.push({type: "tool_use", id: block.id, name: block.name, input: safeArgs.obj});
+    if (this.stream) {
+      const index = this.nextIndex++;
+      writeSse(this.res, "content_block_start", {type: "content_block_start", index, content_block: {type: "tool_use", id: block.id, name: block.name, input: {}}});
+      writeSse(this.res, "content_block_delta", {type: "content_block_delta", index, delta: {type: "input_json_delta", partial_json: safeArgs.json}});
+      writeSse(this.res, "content_block_stop", {type: "content_block_stop", index});
+    }
     block.emitted = true;
   }
   finish(stopReason = null) {
@@ -702,13 +832,35 @@ export class AnthropicSseWriter {
     this.closeCurrent();
     for (const slot of this.toolBlocks.keys()) this.closeTool(slot);
     const reason = stopReason === "max_tokens" ? stopReason : this.sawTool ? "tool_use" : (stopReason || "end_turn");
-    writeSse(this.res, "message_delta", {type: "message_delta", delta: {stop_reason: reason, stop_sequence: null}, usage: {input_tokens: this.inputTokens, output_tokens: this.outputTokens}});
+    if (!this.stream) {
+      this.res.writeHead(200, {"Content-Type": "application/json; charset=utf-8"});
+      this.res.end(JSON.stringify({
+        id: this.messageId,
+        type: "message",
+        role: "assistant",
+        model: this.model,
+        content: this.completedBlocks,
+        stop_reason: reason,
+        stop_sequence: null,
+        usage: this.buildUsage(false),
+      }));
+      return;
+    }
+    writeSse(this.res, "message_delta", {type: "message_delta", delta: {stop_reason: reason, stop_sequence: null}, usage: this.buildUsage(false)});
     writeSse(this.res, "message_stop", {type: "message_stop"});
     this.res.end();
   }
 }
 
-export async function pipeChatToResponses(upstream, res, model, namespaceMap, customSet, writer = new ResponsesSseWriter(res, model, namespaceMap, customSet)) {
+export async function pipeChatToResponses(upstream, res, model, namespaceMap, customSet, writer = null, stream = true) {
+  writer = writer || new ResponsesSseWriter(res, model, namespaceMap, customSet, stream);
+  const applyChatUsage = (u) => {
+    if (!u) return;
+    writer.setUsage(u.prompt_tokens, u.completion_tokens, {
+      cachedTokens: u.prompt_tokens_details?.cached_tokens ?? u.prompt_cache_hit_tokens ?? null,
+      reasoningTokens: u.completion_tokens_details?.reasoning_tokens ?? null,
+    });
+  };
   const ct = upstream.headers.get("content-type") || "";
   if (!ct.includes("text/event-stream")) {
     const data = await upstream.json();
@@ -717,7 +869,7 @@ export async function pipeChatToResponses(upstream, res, model, namespaceMap, cu
     if (choice?.reasoning_content || choice?.reasoning) writer.reasoningDelta(choice.reasoning_content || choice.reasoning);
     if (choice?.content) writer.textDelta(choice.content);
     for (const [i, tc] of (choice?.tool_calls ?? []).entries()) writer.toolDelta(i, tc.id, tc.function?.name, tc.function?.arguments ?? "{}");
-    if (data.usage) writer.setUsage(data.usage.prompt_tokens, data.usage.completion_tokens);
+    if (data.usage) applyChatUsage(data.usage);
     writer.finish(data.choices?.[0]?.finish_reason);
     return;
   }
@@ -727,7 +879,7 @@ export async function pipeChatToResponses(upstream, res, model, namespaceMap, cu
     if (ev.data === "[DONE]") { completed = true; break; }
     let chunk;
     try { chunk = JSON.parse(ev.data); } catch { continue; }
-    if (chunk.usage) writer.setUsage(chunk.usage.prompt_tokens, chunk.usage.completion_tokens);
+    if (chunk.usage) applyChatUsage(chunk.usage);
     if (chunk.choices?.[0]?.finish_reason) { completed = true; stopReason = chunk.choices[0].finish_reason; }
     const delta = chunk.choices?.[0]?.delta;
     if (!delta) continue;
@@ -742,7 +894,8 @@ export async function pipeChatToResponses(upstream, res, model, namespaceMap, cu
   writer.finish(stopReason);
 }
 
-export async function pipeAnthropicToResponses(upstream, res, model, namespaceMap, customSet, writer = new ResponsesSseWriter(res, model, namespaceMap, customSet)) {
+export async function pipeAnthropicToResponses(upstream, res, model, namespaceMap, customSet, writer = null, stream = true) {
+  writer = writer || new ResponsesSseWriter(res, model, namespaceMap, customSet, stream);
   if (!(upstream.headers.get("content-type") || "").includes("text/event-stream")) {
     const data = await upstream.json();
     if (data.error || !Array.isArray(data.content)) throw new Error(data.error?.message || "Invalid Anthropic response");
@@ -751,24 +904,38 @@ export async function pipeAnthropicToResponses(upstream, res, model, namespaceMa
       else if (block.type === "thinking") writer.reasoningDelta(block.thinking);
       else if (block.type === "tool_use") writer.toolDelta(index, block.id, block.name, JSON.stringify(block.input ?? {}));
     }
-    writer.setUsage(data.usage?.input_tokens, data.usage?.output_tokens);
+    if (data.usage) {
+      const cacheRead = data.usage.cache_read_input_tokens ?? 0;
+      const cacheWrite = data.usage.cache_creation_input_tokens ?? 0;
+      const totalIn = (data.usage.input_tokens ?? 0) + cacheRead + cacheWrite;
+      writer.setUsage(totalIn, data.usage.output_tokens, {cachedTokens: cacheRead || null, cacheWriteTokens: cacheWrite || null});
+    }
     writer.finish(data.stop_reason);
     return;
   }
   let completed = false;
   let stopReason = "end_turn";
+  let anthIn = 0, anthCacheRead = 0, anthCacheWrite = 0, anthOut = 0;
+  const applyAnthUsage = (u) => {
+    if (!u || typeof u !== "object") return;
+    if (typeof u.input_tokens === "number") anthIn = Math.max(anthIn, u.input_tokens);
+    if (typeof u.cache_read_input_tokens === "number") anthCacheRead = Math.max(anthCacheRead, u.cache_read_input_tokens);
+    if (typeof u.cache_creation_input_tokens === "number") anthCacheWrite = Math.max(anthCacheWrite, u.cache_creation_input_tokens);
+    if (typeof u.output_tokens === "number") anthOut = Math.max(anthOut, u.output_tokens);
+    writer.setUsage(anthIn + anthCacheRead + anthCacheWrite, anthOut, {cachedTokens: anthCacheRead || null, cacheWriteTokens: anthCacheWrite || null});
+  };
   for await (const ev of parseSse(upstream.body)) {
     let chunk;
     try { chunk = JSON.parse(ev.data); } catch { continue; }
     const type = chunk.type || ev.event;
-    if (type === "message_start" && chunk.message?.usage) writer.setUsage(chunk.message.usage.input_tokens, chunk.message.usage.output_tokens);
+    if (type === "message_start" && chunk.message?.usage) applyAnthUsage(chunk.message.usage);
     else if (type === "content_block_start" && chunk.content_block?.type === "tool_use") writer.toolDelta(chunk.index, chunk.content_block.id, chunk.content_block.name, "");
     else if (type === "content_block_delta") {
       if (chunk.delta?.type === "thinking_delta") writer.reasoningDelta(chunk.delta.thinking);
       else if (chunk.delta?.type === "text_delta") writer.textDelta(chunk.delta.text);
       else if (chunk.delta?.type === "input_json_delta") writer.toolDelta(chunk.index, null, null, chunk.delta.partial_json);
     } else if (type === "message_delta") {
-      if (chunk.usage) writer.setUsage(null, chunk.usage.output_tokens);
+      if (chunk.usage) applyAnthUsage(chunk.usage);
       stopReason = chunk.delta?.stop_reason || stopReason;
     } else if (type === "message_stop") completed = true;
   }
@@ -776,13 +943,22 @@ export async function pipeAnthropicToResponses(upstream, res, model, namespaceMa
   writer.finish(stopReason);
 }
 
-export async function pipeGeminiToResponses(upstream, res, model, namespaceMap, customSet, writer = new ResponsesSseWriter(res, model, namespaceMap, customSet)) {
+export async function pipeGeminiToResponses(upstream, res, model, namespaceMap, customSet, writer = null, stream = true) {
+  writer = writer || new ResponsesSseWriter(res, model, namespaceMap, customSet, stream);
   let callIndex = 0;
   let stopReason = null;
   const handle = (chunk) => {
     if (chunk.error || chunk.promptFeedback?.blockReason) throw new Error(chunk.error?.message || "Gemini blocked the prompt: " + chunk.promptFeedback.blockReason);
     if (chunk.candidates?.[0]?.finishReason) stopReason = chunk.candidates[0].finishReason;
-    if (chunk.usageMetadata) writer.setUsage(chunk.usageMetadata.promptTokenCount, chunk.usageMetadata.candidatesTokenCount);
+    if (chunk.usageMetadata) {
+      const um = chunk.usageMetadata;
+      const thoughts = um.thoughtsTokenCount ?? 0;
+      const cand = um.candidatesTokenCount ?? 0;
+      writer.setUsage(um.promptTokenCount, cand + thoughts, {
+        cachedTokens: um.cachedContentTokenCount ?? null,
+        reasoningTokens: thoughts || null,
+      });
+    }
     for (const part of chunk.candidates?.[0]?.content?.parts ?? []) {
       if (part.thought && part.text) writer.reasoningDelta(part.text);
       else if (part.text) writer.textDelta(part.text);
@@ -806,15 +982,21 @@ export async function pipeGeminiToResponses(upstream, res, model, namespaceMap, 
   writer.finish(stopReason);
 }
 
-export async function pipeChatToAnthropic(upstream, res, model) {
-  const writer = new AnthropicSseWriter(res, model);
+export async function pipeChatToAnthropic(upstream, res, model, stream = true) {
+  const writer = new AnthropicSseWriter(res, model, stream);
   let stopReason = "end_turn";
+  const applyChatUsage = (u) => {
+    if (!u) return;
+    const cacheRead = u.prompt_tokens_details?.cached_tokens ?? u.prompt_cache_hit_tokens ?? 0;
+    writer.setUsage(u.prompt_tokens ?? writer.totalInputTokens, u.completion_tokens ?? writer.outputTokens, {cacheRead});
+    writer.start();
+  };
   const ct = upstream.headers.get("content-type") || "";
   if (!ct.includes("text/event-stream")) {
     const data = await upstream.json();
     if (data.error || !data.choices?.[0]?.message) throw new Error(data.error?.message || "Upstream returned no completion");
-    writer.start(data.usage?.prompt_tokens ?? 0);
-    writer.outputTokens = data.usage?.completion_tokens ?? 1;
+    if (data.usage) applyChatUsage(data.usage);
+    else { writer.start(0); writer.outputTokens = 1; }
     const msg = data.choices?.[0]?.message;
     if (msg?.reasoning_content || msg?.reasoning) writer.thinkingDelta(msg.reasoning_content || msg.reasoning);
     if (msg?.content) writer.textDelta(msg.content);
@@ -830,10 +1012,7 @@ export async function pipeChatToAnthropic(upstream, res, model) {
     if (ev.data === "[DONE]") { completed = true; break; }
     let chunk;
     try { chunk = JSON.parse(ev.data); } catch { continue; }
-    if (chunk.usage) {
-      writer.start(chunk.usage.prompt_tokens ?? 0);
-      writer.outputTokens = chunk.usage.completion_tokens ?? writer.outputTokens;
-    }
+    if (chunk.usage) applyChatUsage(chunk.usage);
     const choice = chunk.choices?.[0];
     if (!choice) continue;
     if (choice.finish_reason) completed = true;
@@ -852,11 +1031,32 @@ export async function pipeChatToAnthropic(upstream, res, model) {
   writer.finish(stopReason);
 }
 
-export async function pipeResponsesToAnthropic(upstream, res, model) {
-  const writer = new AnthropicSseWriter(res, model);
+export async function pipeResponsesToAnthropic(upstream, res, model, stream = true) {
+  const writer = new AnthropicSseWriter(res, model, stream);
+  const ct = upstream.headers.get("content-type") || "";
+  if (!ct.includes("text/event-stream")) {
+    const response = await upstream.json();
+    if (response.error || response.status === "failed") throw new Error(response.error?.message || "Responses upstream failed");
+    const u = response.usage;
+    if (u) {
+      writer.setUsage(u.input_tokens ?? 0, u.output_tokens ?? 0, {cacheRead: u.input_tokens_details?.cached_tokens ?? 0});
+    }
+    writer.start();
+    for (const [index, item] of (response.output ?? []).entries()) {
+      if (item.type === "reasoning") writer.thinkingDelta(textOfContent(item.summary));
+      else if (item.type === "message") writer.textDelta(textOfContent(item.content));
+      else if (item.type === "function_call") {
+        writer.toolDelta(index, item.call_id, item.name, item.arguments || "{}");
+        writer.closeTool(index);
+      }
+    }
+    writer.finish(response.status === "incomplete" ? "max_tokens" : "end_turn");
+    return;
+  }
   let completed = false;
   let stopReason = "end_turn";
   for await (const ev of parseSse(upstream.body)) {
+    if (ev.data === "[DONE]") continue;
     let chunk;
     try { chunk = JSON.parse(ev.data); } catch { continue; }
     const type = chunk.type || ev.event;
@@ -865,28 +1065,42 @@ export async function pipeResponsesToAnthropic(upstream, res, model) {
     else if (type === "response.output_text.delta") writer.textDelta(chunk.delta);
     else if (type === "response.output_item.added" && chunk.item?.type === "function_call") writer.toolDelta(chunk.output_index, chunk.item.call_id, chunk.item.name, "");
     else if (type === "response.function_call_arguments.delta") writer.toolDelta(chunk.output_index, null, null, chunk.delta);
-    else if (type === "response.output_item.done" && chunk.item?.type === "function_call") writer.closeTool(chunk.output_index);
+    else if (type === "response.output_item.done" && chunk.item?.type === "function_call") {
+      const existing = writer.toolBlocks.get(chunk.output_index);
+      if (!existing || !existing.json) {
+        writer.toolDelta(chunk.output_index, chunk.item.call_id, chunk.item.name, chunk.item.arguments || "{}");
+      }
+      writer.closeTool(chunk.output_index);
+    }
     else if (type === "response.completed" || type === "response.incomplete") {
       completed = true;
       stopReason = type === "response.incomplete" ? "max_tokens" : "end_turn";
-      writer.inputTokens = chunk.response?.usage?.input_tokens ?? writer.inputTokens;
-      writer.outputTokens = chunk.response?.usage?.output_tokens ?? writer.outputTokens;
+      const u = chunk.response?.usage;
+      if (u) {
+        writer.setUsage(u.input_tokens ?? writer.totalInputTokens, u.output_tokens ?? writer.outputTokens, {
+          cacheRead: u.input_tokens_details?.cached_tokens ?? 0,
+        });
+      }
     }
   }
   if (!completed) throw new Error("Responses stream ended before completion");
   writer.finish(stopReason);
 }
 
-export async function pipeGeminiToAnthropic(upstream, res, model) {
-  const writer = new AnthropicSseWriter(res, model);
+export async function pipeGeminiToAnthropic(upstream, res, model, stream = true) {
+  const writer = new AnthropicSseWriter(res, model, stream);
   let callIndex = 0;
   let stopReason = "end_turn";
   let completed = false;
   const handle = (chunk) => {
     if (chunk.error || chunk.promptFeedback?.blockReason) throw new Error(chunk.error?.message || "Gemini blocked the prompt: " + chunk.promptFeedback.blockReason);
     if (chunk.usageMetadata) {
-      writer.start(chunk.usageMetadata.promptTokenCount ?? 0);
-      writer.outputTokens = chunk.usageMetadata.candidatesTokenCount ?? writer.outputTokens;
+      const um = chunk.usageMetadata;
+      const outTok = (um.candidatesTokenCount ?? 0) + (um.thoughtsTokenCount ?? 0);
+      writer.setUsage(um.promptTokenCount ?? writer.totalInputTokens, outTok || writer.outputTokens, {
+        cacheRead: um.cachedContentTokenCount ?? 0,
+      });
+      writer.start();
     }
     const cand = chunk.candidates?.[0];
     if (cand?.finishReason) completed = true;
@@ -918,7 +1132,7 @@ export async function pipeGeminiToAnthropic(upstream, res, model) {
   writer.finish(stopReason);
 }
 
-export function chatToResponsesRequest(body) {
+export function chatToResponsesRequest(body, opts = {}) {
   if (!Array.isArray(body.messages)) throw new Error("Chat messages must be an array");
   if (body.n != null && body.n !== 1) throw new Error("Cross-protocol requests support one completion at a time");
   const input = [];
@@ -941,6 +1155,8 @@ export function chatToResponsesRequest(body) {
     }
   }
   const result = {model: body.model, input, stream: true};
+  const cacheKey = body.prompt_cache_key || opts?.sessionId;
+  if (cacheKey) result.prompt_cache_key = String(cacheKey).slice(0, 64);
   if (body.tools?.length) result.tools = body.tools.map(tool => {
     if (tool.type !== "function" || !tool.function?.name) throw new Error("Unsupported chat tool");
     return {type: "function", ...tool.function};
@@ -957,17 +1173,19 @@ export function chatToResponsesRequest(body) {
   return result;
 }
 
-export function geminiToResponsesRequest(body, model) {
+export function geminiToResponsesRequest(body, model, opts = {}) {
   if (!Array.isArray(body.contents)) throw new Error("Gemini contents must be an array");
   const input = [];
   const calls = new Map();
+  let syntheticCallSeq = 0;
   for (const content of body.contents) {
     const role = content.role === "model" ? "assistant" : "user";
     for (const part of content.parts ?? []) {
       if (part.functionCall) {
         if (part.thoughtSignature) throw new Error("Gemini signed tool history requires a Gemini upstream provider");
         const call = part.functionCall;
-        const id = call.id || "call_" + randomUUID();
+        // 确定性生成缺失的历史工具调用 ID，避免每轮随机 UUID 破坏上游 Prompt Cache 前缀匹配
+        const id = call.id || ("call_gem_" + (++syntheticCallSeq));
         const pending = calls.get(call.name) || [];
         pending.push(id); calls.set(call.name, pending);
         input.push({type: "function_call", call_id: id, name: call.name, arguments: JSON.stringify(call.args ?? {})});
@@ -988,6 +1206,7 @@ export function geminiToResponsesRequest(body, model) {
   const config = body.generationConfig || {};
   if (config.candidateCount != null && config.candidateCount !== 1) throw new Error("Cross-protocol requests support one candidate at a time");
   const result = {model, input, stream: true};
+  if (opts?.sessionId) result.prompt_cache_key = String(opts.sessionId).slice(0, 64);
   const system = (body.systemInstruction?.parts ?? []).map(part => part.text || "").join("\n");
   if (system) result.instructions = system;
   const normalizeSchema = value => {
@@ -995,14 +1214,17 @@ export function geminiToResponsesRequest(body, model) {
     if (!value || typeof value !== "object") return value;
     return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, key === "type" && typeof item === "string" ? item.toLowerCase() : normalizeSchema(item)]));
   };
-  result.tools = (body.tools ?? []).flatMap(tool => {
+  let mappedTools = (body.tools ?? []).flatMap(tool => {
     if (!Array.isArray(tool.functionDeclarations)) throw new Error("Cross-protocol Gemini requests only support function tools");
     return tool.functionDeclarations.map(fn => ({type: "function", name: fn.name, description: fn.description || "", parameters: normalizeSchema(fn.parametersJsonSchema ?? fn.parameters ?? {type: "object", properties: {}})}));
   });
   const calling = body.toolConfig?.functionCallingConfig;
-  if (calling?.mode === "NONE") result.tool_choice = "none";
-  else if (calling?.mode === "ANY") result.tool_choice = "required";
-  if (calling?.allowedFunctionNames?.length) result.tools = result.tools.filter(tool => calling.allowedFunctionNames.includes(tool.name));
+  if (calling?.allowedFunctionNames?.length) mappedTools = mappedTools.filter(tool => calling.allowedFunctionNames.includes(tool.name));
+  if (mappedTools.length) {
+    result.tools = mappedTools;
+    if (calling?.mode === "NONE") result.tool_choice = "none";
+    else if (calling?.mode === "ANY") result.tool_choice = "required";
+  }
   if (config.maxOutputTokens != null) result.max_output_tokens = config.maxOutputTokens;
   if (config.temperature != null) result.temperature = config.temperature;
   if (config.topP != null) result.top_p = config.topP;
@@ -1018,7 +1240,7 @@ export class CompatibleResponseWriter {
     this.res = res; this.model = model; this.protocol = protocol; this.stream = stream;
     this.id = "chatcmpl-" + randomUUID(); this.created = Math.floor(Date.now() / 1000);
     this.text = ""; this.thought = ""; this.calls = new Map(); this.started = false;
-    this.inputTokens = 0; this.outputTokens = 0; this.bytes = 0;
+    this.inputTokens = 0; this.outputTokens = 0; this.cachedTokens = 0; this.reasoningTokens = 0; this.bytes = 0;
   }
   account(text) {
     this.bytes += Buffer.byteLength(text || "");
@@ -1064,15 +1286,23 @@ export class CompatibleResponseWriter {
       if (this.protocol === "openai-chat") this.chat({tool_calls: [{index: call.index, function: {arguments: delta}}]});
     }
   }
-  setUsage(input, output) {
+  setUsage(input, output, {cachedTokens = null, reasoningTokens = null} = {}) {
     if (input != null) this.inputTokens = input;
     if (output != null) this.outputTokens = output;
+    if (cachedTokens != null && cachedTokens > 0) this.cachedTokens = cachedTokens;
+    if (reasoningTokens != null && reasoningTokens > 0) this.reasoningTokens = reasoningTokens;
   }
   finish(stopReason = "stop") {
     const limited = ["length", "max_tokens", "MAX_TOKENS"].includes(stopReason);
     if (this.protocol === "openai-chat") {
       const reason = limited ? "length" : this.calls.size ? "tool_calls" : "stop";
-      const usage = {prompt_tokens: this.inputTokens, completion_tokens: this.outputTokens, total_tokens: this.inputTokens + this.outputTokens};
+      const usage = {
+        prompt_tokens: this.inputTokens,
+        completion_tokens: this.outputTokens,
+        total_tokens: this.inputTokens + this.outputTokens,
+        ...(this.cachedTokens > 0 ? {prompt_tokens_details: {cached_tokens: this.cachedTokens}} : {}),
+        ...(this.reasoningTokens > 0 ? {completion_tokens_details: {reasoning_tokens: this.reasoningTokens}} : {}),
+      };
       if (this.stream) {
         this.chat({}, reason);
         this.emit({id: this.id, object: "chat.completion.chunk", created: this.created, model: this.model, choices: [], usage});
@@ -1088,9 +1318,18 @@ export class CompatibleResponseWriter {
       const parts = [];
       if (!this.stream && this.thought) parts.push({text: this.thought, thought: true});
       if (!this.stream && this.text) parts.push({text: this.text});
-      for (const call of this.calls.values()) parts.push({functionCall: {id: call.id, name: call.name, args: JSON.parse(call.arguments || "{}")}});
-      const data = {candidates: [{index: 0, content: {role: "model", parts}, finishReason: limited ? "MAX_TOKENS" : "STOP"}],
-        usageMetadata: {promptTokenCount: this.inputTokens, candidatesTokenCount: this.outputTokens, totalTokenCount: this.inputTokens + this.outputTokens}};
+      for (const call of this.calls.values()) parts.push({functionCall: {id: call.id, name: call.name, args: safeParseToolJson(call.arguments).obj}});
+      const candOut = this.reasoningTokens > 0 && this.outputTokens >= this.reasoningTokens
+        ? (this.outputTokens - this.reasoningTokens)
+        : this.outputTokens;
+      const usageMetadata = {
+        promptTokenCount: this.inputTokens,
+        candidatesTokenCount: candOut,
+        ...(this.cachedTokens > 0 ? {cachedContentTokenCount: this.cachedTokens} : {}),
+        ...(this.reasoningTokens > 0 ? {thoughtsTokenCount: this.reasoningTokens} : {}),
+        totalTokenCount: this.inputTokens + this.outputTokens,
+      };
+      const data = {candidates: [{index: 0, content: {role: "model", parts}, finishReason: limited ? "MAX_TOKENS" : "STOP"}], usageMetadata};
       if (this.stream) { this.emit(data); this.res.end(); }
       else { this.res.writeHead(200, {"Content-Type": "application/json"}); this.res.end(JSON.stringify(data)); }
     }
@@ -1098,6 +1337,13 @@ export class CompatibleResponseWriter {
 }
 
 export async function pipeResponsesToCompatible(upstream, writer) {
+  const applyRespUsage = (u) => {
+    if (!u) return;
+    writer.setUsage(u.input_tokens, u.output_tokens, {
+      cachedTokens: u.input_tokens_details?.cached_tokens ?? null,
+      reasoningTokens: u.output_tokens_details?.reasoning_tokens ?? null,
+    });
+  };
   if (!(upstream.headers.get("content-type") || "").includes("text/event-stream")) {
     const response = await upstream.json();
     if (response.error || response.status === "failed") throw new Error(response.error?.message || "Model response failed");
@@ -1106,7 +1352,7 @@ export async function pipeResponsesToCompatible(upstream, writer) {
       else if (item.type === "reasoning") writer.reasoningDelta(textOfContent(item.summary));
       else if (item.type === "function_call") writer.toolDelta(index, item.call_id, item.name, item.arguments || "{}");
     }
-    writer.setUsage(response.usage?.input_tokens, response.usage?.output_tokens);
+    applyRespUsage(response.usage);
     writer.finish(response.status === "incomplete" ? "length" : "stop");
     return;
   }
@@ -1123,7 +1369,7 @@ export async function pipeResponsesToCompatible(upstream, writer) {
       if (!existing?.arguments) writer.toolDelta(chunk.output_index, chunk.item.call_id, chunk.item.name, chunk.item.arguments || "{}");
     }
     else if (chunk.type === "response.completed" || chunk.type === "response.incomplete") {
-      writer.setUsage(chunk.response?.usage?.input_tokens, chunk.response?.usage?.output_tokens);
+      applyRespUsage(chunk.response?.usage);
       writer.finish(chunk.type === "response.incomplete" ? "length" : "stop");
       completed = true;
       break;

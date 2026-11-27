@@ -89,18 +89,20 @@ fun TimelineItemView(
     onQuote: ((String) -> Unit)? = null,
     onEditResend: (() -> Unit)? = null,
     onRevert: ((String) -> Unit)? = null,
+    onForkAt: (() -> Unit)? = null,
     isEditing: Boolean = false,
     expandThinking: Boolean = false,
     onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
+    onInspectSubagent: ((String?) -> Unit)? = null,
 ) {
     when (item) {
-        is TimelineItem.UserMessage -> UserMessageBubble(item, onQuote, onEditResend, onRevert, isEditing)
+        is TimelineItem.UserMessage -> UserMessageBubble(item, onQuote, onEditResend, onRevert, onForkAt, isEditing)
         is TimelineItem.AgentMessage -> AgentMessageView(item, onQuote, onOpenArtifact = onOpenArtifact)
         is TimelineItem.Reasoning -> ThinkingBlock(item, initiallyOpen = expandThinking)
         is TimelineItem.Plan -> PlanArtifactCard(item = item, onOpenArtifact = onOpenArtifact)
         is TimelineItem.CommandRun -> CommandCard(item)
         is TimelineItem.FileEdit -> FileEditCard(item)
-        is TimelineItem.ToolCall -> SmartToolCallCard(item, onOpenArtifact = onOpenArtifact)
+        is TimelineItem.ToolCall -> SmartToolCallCard(item, onOpenArtifact = onOpenArtifact, onInspectSubagent = onInspectSubagent)
         is TimelineItem.Delegation -> DelegationCard(item, onOpenConversation, onCancelDelegation)
         is TimelineItem.InteractionReceipt -> InteractionReceiptCard(item)
         is TimelineItem.Notice -> Surface(
@@ -137,6 +139,7 @@ internal fun UserMessageBubble(
     onQuote: ((String) -> Unit)?,
     onEditResend: (() -> Unit)? = null,
     onRevert: ((String) -> Unit)? = null,
+    onForkAt: (() -> Unit)? = null,
     isEditing: Boolean = false,
 ) {
     val clipboard = LocalClipboard.current
@@ -268,6 +271,19 @@ internal fun UserMessageBubble(
                         Text("引用", style = MaterialTheme.typography.labelSmall, color = G.inkSubtle)
                     }
                 }
+                if (onForkAt != null) {
+                    Row(
+                        modifier = Modifier.clip(D.shape(6.dp)).clickable {
+                            showActions = false
+                            onForkAt()
+                        }.padding(horizontal = 5.dp, vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(3.dp),
+                    ) {
+                        Icon(GaliaisIcons.GitBranch, contentDescription = null, tint = G.accent, modifier = Modifier.size(12.dp))
+                        Text("从此轮分支", style = MaterialTheme.typography.labelSmall, color = G.accent)
+                    }
+                }
                 if (onRevert != null) {
                     Row(
                         modifier = Modifier.clip(D.shape(6.dp)).clickable {
@@ -287,14 +303,18 @@ internal fun UserMessageBubble(
 }
 
 @Composable
-private fun SmartToolCallCard(item: TimelineItem.ToolCall, onOpenArtifact: ((ChatArtifact) -> Unit)? = null) {
+private fun SmartToolCallCard(
+    item: TimelineItem.ToolCall,
+    onOpenArtifact: ((ChatArtifact) -> Unit)? = null,
+    onInspectSubagent: ((String?) -> Unit)? = null,
+) {
     val parsed = remember(item.name, item.input, item.kind) { describeToolCall(item.name, item.input, item.kind) }
     val widgetArtifact = remember(item.id, item.name, item.input) { extractArtifactsFromItems(listOf(item)).firstOrNull() }
     if (widgetArtifact != null && item.status != ItemStatus.RUNNING) {
         InlineVisualArtifactCard(artifact = widgetArtifact, onOpenStudio = onOpenArtifact)
         return
     }
-    var open by remember { mutableStateOf(item.status == ItemStatus.RUNNING) }
+    var open by rememberSaveable(item.id) { mutableStateOf(false) }
     Surface(
         Modifier.fillMaxWidth(),
         shape = D.shape(12.dp),
@@ -329,6 +349,14 @@ private fun SmartToolCallCard(item: TimelineItem.ToolCall, onOpenArtifact: ((Cha
                 AnimatedChevron(expanded = open)
                 if (widgetArtifact != null && onOpenArtifact != null) {
                     TagPill("预览组件", fg = G.accent, bg = G.accentContainer, onClick = { onOpenArtifact(widgetArtifact) })
+                }
+                if (parsed.kind == ToolCallKind.SUBAGENT && onInspectSubagent != null) {
+                    val hintId = remember(item.result, item.id) {
+                        Regex("""agentId["']?\s*[:=]\s*["']?([A-Za-z0-9_-]+)""", RegexOption.IGNORE_CASE)
+                            .find(item.result.orEmpty())?.groupValues?.getOrNull(1)
+                            ?: item.id.takeIf { it.isNotBlank() }
+                    }
+                    TagPill("查看子代理", fg = G.claude, bg = G.claudeTint, onClick = { onInspectSubagent(hintId) })
                 }
                 if (item.status == ItemStatus.FAILED || item.status == ItemStatus.DECLINED) {
                     StatusMark(item.status)
@@ -1356,7 +1384,7 @@ internal fun ThinkingBlock(item: TimelineItem.Reasoning, initiallyOpen: Boolean)
 
 @Composable
 private fun CommandCard(item: TimelineItem.CommandRun) {
-    var open by remember { mutableStateOf(item.status == ItemStatus.RUNNING) }
+    var open by rememberSaveable(item.id) { mutableStateOf(false) }
     var expandFullCommand by remember(item.id) { mutableStateOf(false) }
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
@@ -1484,6 +1512,7 @@ private fun FileEditCard(item: TimelineItem.FileEdit) {
     }
     val names = item.changes.joinToString("，") { it.path.substringAfterLast('/') }
     ActivityCard(
+        itemId = item.id,
         title = if (item.changes.size == 1) names else "${item.changes.size} 个文件 · $names",
         status = item.status,
         trailing = "+${totals.first} -${totals.second}",
@@ -1552,13 +1581,14 @@ fun StatusMark(status: ItemStatus) {
 
 @Composable
 private fun ActivityCard(
+    itemId: String,
     title: String,
     status: ItemStatus,
     trailing: String?,
     icon: ImageVector? = null,
     content: @Composable () -> Unit,
 ) {
-    var open by remember { mutableStateOf(status == ItemStatus.RUNNING) }
+    var open by rememberSaveable(itemId) { mutableStateOf(false) }
     Surface(
         Modifier.fillMaxWidth(),
         shape = D.shape(12.dp),

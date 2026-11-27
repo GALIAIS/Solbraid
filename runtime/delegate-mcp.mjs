@@ -42,12 +42,22 @@ const tools = [
 
 function send(packet) { process.stdout.write(JSON.stringify(packet) + "\n"); }
 
+const DELEGATE_TIMEOUT_MS = Math.max(30_000, Number(process.env.GALIAIS_DELEGATE_TIMEOUT_MS) || 30 * 60_000);
+
 function delegate(targetAgent, task) {
   return new Promise((resolve) => {
     const connection = net.createConnection(socketPath);
     let buffer = "";
     let settled = false;
-    const finish = (value) => { if (!settled) { settled = true; connection.destroy(); resolve(value); } };
+    const finish = (value) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        connection.destroy();
+        resolve(value);
+      }
+    };
+    const timer = setTimeout(() => finish({ok: false, text: "委派等待超时，已中止本次等待"}), DELEGATE_TIMEOUT_MS);
     connection.setEncoding("utf8");
     connection.once("connect", () => connection.write(JSON.stringify({token, targetAgent, task}) + "\n"));
     connection.on("data", (chunk) => {

@@ -407,7 +407,7 @@ export function spawnIsolatedPluginWorker({pluginId, entryUrl, hostInfo, granted
     }
   });
   worker.on("error", err => failAll(`插件隔离线程异常：${err?.message || err}`));
-  worker.on("exit", code => { if (!dead && code !== 0) failAll(`插件隔离线程异常退出（code=${code}）`); });
+  worker.on("exit", code => { if (!dead) failAll(`插件隔离线程意外退出（code=${code}）`); });
 
   function invoke(op, payload = {}, timeoutMs = DEFAULT_CALL_TIMEOUT_MS, onEvent = null, signal = null) {
     if (dead) return Promise.reject(new Error("插件隔离工作线程已终止"));
@@ -443,7 +443,13 @@ export function spawnIsolatedPluginWorker({pluginId, entryUrl, hostInfo, granted
         timer,
         onEvent,
       });
-      worker.postMessage({type: "invoke", id, op, payload});
+      try {
+        worker.postMessage({type: "invoke", id, op, payload});
+      } catch (postErr) {
+        pending.delete(id);
+        cleanup();
+        reject(postErr instanceof Error ? postErr : new Error(String(postErr)));
+      }
     });
   }
 

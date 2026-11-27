@@ -363,7 +363,7 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
         SectionLabel("诊断与快捷维护")
         CrispCard {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("支持一键诊断网关、通道与存储健康状态，或全量同步服务商、扩展与环境变量。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                Text("支持快速诊断网关、通道与存储健康状态，或全量同步服务商、扩展与环境变量。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     PrimaryPillButton(
                         text = if (diagnosing) "自检中…" else "运行环境自检",
@@ -371,93 +371,100 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
                         onClick = {
                             diagnosing = true
                             scope.launch {
-                                val checks = mutableListOf<Triple<String, Boolean, String>>()
-                                app.runtime.refreshEnvironment(activeMode)
-                                val curEnv = app.runtime.environment.value
-                                val modeOk = if (isProot) curEnv.prootBinariesReady else (rootAvailable == true)
-                                checks += Triple(
-                                    if (isProot) "PRoot 运行引擎" else "Root 授权能力",
-                                    modeOk,
-                                    if (modeOk) "正常可用" else if (isProot) "缺少内置 PRoot 组件" else (rootAccess?.message ?: "未确认 Root 权限"),
-                                )
-                                checks += Triple(
-                                    "环境组件完整度",
-                                    curEnv.fullyInstalled,
-                                    if (curEnv.fullyInstalled) "Ubuntu · Node · 3 大内置 CLI 完整" else "尚有组件未安装，启动环境将自动补齐",
-                                )
-                                val spaceOk = curEnv.freeSpaceBytes >= 1_000_000_000L
-                                checks += Triple(
-                                    "可用存储空间",
-                                    spaceOk,
-                                    "剩余 ${formatBytes(curEnv.freeSpaceBytes)}" + if (spaceOk) "（充裕）" else "（建议清理缓存或释放至 1 GB 以上）",
-                                )
-                                if (runtime.ready) {
-                                    val gwHealth = runCatching { app.conversations.fetchProviderHealth() }
-                                    gwHealth.onSuccess { map ->
-                                        healthMap = map
-                                        val cool = map.values.sumOf { it.coolingCount }
-                                        checks += Triple(
-                                            "本地协议网关",
-                                            cool == 0,
-                                            if (cool == 0) "响应正常 · ${map.size} 个服务商已挂载" else "响应正常，但有 $cool 个密钥冷却中",
-                                        )
-                                    }.onFailure { err ->
-                                        checks += Triple("本地协议网关", false, "通信异常：${err.message}")
-                                    }
-                                    val hubOk = app.runtime.hubAvailable
+                                try {
+                                    val checks = mutableListOf<Triple<String, Boolean, String>>()
+                                    app.runtime.refreshEnvironment(activeMode)
+                                    val curEnv = app.runtime.environment.value
+                                    val modeOk = if (isProot) curEnv.prootBinariesReady else (rootAvailable == true)
                                     checks += Triple(
-                                        "Agent Hub 与终端服务",
-                                        hubOk,
-                                        if (hubOk) "在线" else "通道异常，建议点击上方「重启环境」恢复",
+                                        if (isProot) "PRoot 运行引擎" else "Root 授权能力",
+                                        modeOk,
+                                        if (modeOk) "正常可用" else if (isProot) "缺少内置 PRoot 组件" else (rootAccess?.message ?: "未确认 Root 权限"),
                                     )
-                                    val claudeProbe = runCatching {
-                                        app.runtime.requestObject(EngineKind.CLAUDE, "session/list", jsonOf("limit" to 1, "offset" to 0))
-                                    }
-                                    claudeProbe.onSuccess { res ->
-                                        val activeCnt = res.arr("activeSessions").length()
-                                        checks += Triple(
-                                            "Claude Code 会话桥接",
-                                            true,
-                                            if (activeCnt > 0) "在线 · $activeCnt 个活跃 SDK 会话" else "在线 · 就绪",
-                                        )
-                                    }.onFailure { err ->
-                                        checks += Triple("Claude Code 会话桥接", false, "异常：${err.message}")
-                                    }
-                                    val codexProbe = runCatching {
-                                        app.runtime.requestObject(EngineKind.CODEX, "thread/list", jsonOf("limit" to 1))
-                                    }
-                                    codexProbe.onSuccess {
-                                        checks += Triple("Codex 会话通道", true, "在线 · 就绪")
-                                    }.onFailure { err ->
-                                        checks += Triple("Codex 会话通道", false, "异常：${err.message}")
-                                    }
-                                    if (hubOk) {
-                                        val agyProbe = runCatching {
-                                            app.runtime.hubRequest("agents/status", jsonOf("agentId" to "antigravity"), timeoutMs = 15_000)
-                                        }
-                                        agyProbe.onSuccess { res ->
-                                            val st = res.arr("statuses").optJSONObject(0)
-                                            val installed = st?.optBoolean("installed") == true
-                                            val errText = st?.str("error")
-                                            val ver = st?.str("version")
+                                    checks += Triple(
+                                        "环境组件完整度",
+                                        curEnv.fullyInstalled,
+                                        if (curEnv.fullyInstalled) "Ubuntu · Node · 3 大内置 CLI 完整" else "尚有组件未安装，启动环境将自动补齐",
+                                    )
+                                    val spaceOk = curEnv.freeSpaceBytes >= 1_000_000_000L
+                                    checks += Triple(
+                                        "可用存储空间",
+                                        spaceOk,
+                                        "剩余 ${formatBytes(curEnv.freeSpaceBytes)}" + if (spaceOk) "（充裕）" else "（建议清理缓存或释放至 1 GB 以上）",
+                                    )
+                                    if (runtime.ready) {
+                                        val gwHealth = runCatching { app.conversations.fetchProviderHealth() }
+                                        gwHealth.onSuccess { map ->
+                                            healthMap = map
+                                            val cool = map.values.sumOf { it.coolingCount }
                                             checks += Triple(
-                                                "Antigravity (ACP)",
-                                                installed && errText.isNullOrBlank(),
-                                                when {
-                                                    !errText.isNullOrBlank() -> "异常：$errText"
-                                                    installed -> "在线 · ${ver ?: "已就绪"}"
-                                                    else -> "未检测到内置 agy 可执行文件"
-                                                },
+                                                "本地协议网关",
+                                                cool == 0,
+                                                if (cool == 0) "响应正常 · ${map.size} 个服务商已挂载" else "响应正常，但有 $cool 个密钥冷却中",
                                             )
                                         }.onFailure { err ->
-                                            checks += Triple("Antigravity (ACP)", false, "异常：${err.message}")
+                                            checks += Triple("本地协议网关", false, "通信异常：${err.message}")
                                         }
+                                        val hubOk = app.runtime.hubAvailable
+                                        checks += Triple(
+                                            "Agent Hub 与终端服务",
+                                            hubOk,
+                                            if (hubOk) "在线" else "通道异常，建议点击上方「重启环境」恢复",
+                                        )
+                                        val claudeProbe = runCatching {
+                                            app.runtime.requestObject(EngineKind.CLAUDE, "session/list", jsonOf("limit" to 1, "offset" to 0))
+                                        }
+                                        claudeProbe.onSuccess { res ->
+                                            val activeCnt = res.arr("activeSessions").length()
+                                            checks += Triple(
+                                                "Claude Code 会话桥接",
+                                                true,
+                                                if (activeCnt > 0) "在线 · $activeCnt 个活跃 SDK 会话" else "在线 · 就绪",
+                                            )
+                                        }.onFailure { err ->
+                                            checks += Triple("Claude Code 会话桥接", false, "异常：${err.message}")
+                                        }
+                                        val codexProbe = runCatching {
+                                            app.runtime.requestObject(EngineKind.CODEX, "thread/list", jsonOf("limit" to 1))
+                                        }
+                                        codexProbe.onSuccess {
+                                            checks += Triple("Codex 会话通道", true, "在线 · 就绪")
+                                        }.onFailure { err ->
+                                            checks += Triple("Codex 会话通道", false, "异常：${err.message}")
+                                        }
+                                        if (hubOk) {
+                                            val agyProbe = runCatching {
+                                                app.runtime.hubRequest("agents/status", jsonOf("agentId" to "antigravity"), timeoutMs = 15_000)
+                                            }
+                                            agyProbe.onSuccess { res ->
+                                                val st = res.arr("statuses").optJSONObject(0)
+                                                val installed = st?.optBoolean("installed") == true
+                                                val errText = st?.str("error")
+                                                val ver = st?.str("version")
+                                                checks += Triple(
+                                                    "Antigravity (ACP)",
+                                                    installed && errText.isNullOrBlank(),
+                                                    when {
+                                                        !errText.isNullOrBlank() -> "异常：$errText"
+                                                        installed -> "在线 · ${ver ?: "已就绪"}"
+                                                        else -> "未检测到内置 agy 可执行文件"
+                                                    },
+                                                )
+                                            }.onFailure { err ->
+                                                checks += Triple("Antigravity (ACP)", false, "异常：${err.message}")
+                                            }
+                                        }
+                                    } else {
+                                        checks += Triple("后台引擎通道", false, "环境未启动，启动后可检测 RPC 与网关连通性")
                                     }
-                                } else {
-                                    checks += Triple("后台引擎通道", false, "环境未启动，启动后可检测 RPC 与网关连通性")
+                                    diagnosticItems = checks
+                                } catch (cancel: kotlinx.coroutines.CancellationException) {
+                                    throw cancel
+                                } catch (err: Exception) {
+                                    app.conversations.notify("环境自检异常：${err.message}")
+                                } finally {
+                                    diagnosing = false
                                 }
-                                diagnosticItems = checks
-                                diagnosing = false
                             }
                         },
                     )

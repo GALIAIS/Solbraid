@@ -262,9 +262,10 @@ class LinuxRuntime(private val context: Context, val mode: String = RUNTIME_MODE
         }
         val agyLogDir = File(root, "home/agent/.gemini/antigravity-cli/log")
         if (agyLogDir.isDirectory) {
+            val activeCutoff = System.currentTimeMillis() - 10L * 60_000L
             val logs = agyLogDir.listFiles()?.filter { it.isFile && it.name.endsWith(".log") }
                 ?.sortedByDescending { it.lastModified() }.orEmpty()
-            logs.drop(5).forEach { runCatching { it.delete() } }
+            logs.drop(5).filter { it.lastModified() < activeCutoff }.forEach { runCatching { it.delete() } }
         }
         val npmCache = File(root, "home/agent/.galiais/npm-cache")
         if (npmCache.isDirectory) {
@@ -292,7 +293,7 @@ class LinuxRuntime(private val context: Context, val mode: String = RUNTIME_MODE
         if (isProot) {
             log("正在重置免 Root 工作区与会话记录")
             val home = File(root, "home/agent")
-            listOf("workspace", ".codex", ".claude", ".galiais/agent-sessions", ".galiais/mux", ".galiais/vm")
+            listOf("workspace", ".codex", ".claude", ".gemini", ".galiais/agent-sessions", ".galiais/mux", ".galiais/vm")
                 .map { File(home, it) }.forEach { target ->
                     check(target.canonicalPath.startsWith(home.canonicalPath + File.separator)) { "重置路径指向环境之外：${target.name}" }
                     if (target.exists()) {
@@ -317,7 +318,7 @@ class LinuxRuntime(private val context: Context, val mode: String = RUNTIME_MODE
                 terminate_chroot_procs
                 unmount_chroot_paths
             fi
-            rm -rf -- "${'$'}target/home/agent/workspace" "${'$'}target/home/agent/.codex" "${'$'}target/home/agent/.claude" "${'$'}target/home/agent/.galiais/agent-sessions" "${'$'}target/home/agent/.galiais/mux" "${'$'}target/home/agent/.galiais/vm"
+            rm -rf -- "${'$'}target/home/agent/workspace" "${'$'}target/home/agent/.codex" "${'$'}target/home/agent/.claude" "${'$'}target/home/agent/.gemini" "${'$'}target/home/agent/.galiais/agent-sessions" "${'$'}target/home/agent/.galiais/mux" "${'$'}target/home/agent/.galiais/vm"
             mkdir -p "${'$'}target/home/agent/workspace"
             chown -R $uid:$uid "${'$'}target/home/agent"
         """.trimIndent()
@@ -500,8 +501,37 @@ class LinuxRuntime(private val context: Context, val mode: String = RUNTIME_MODE
         }
     }
 
+    /** 生成容器 `/etc/resolv.conf` 内容：优先注入 Android 当前活跃网络的真实 DNS，再追加可靠公共 DNS 兜底。 */
+    internal fun buildResolvConfContent(): String {
+        val dnsList = LinkedHashSet<String>()
+        runCatching {
+            val cm = context.getSystemService(android.net.ConnectivityManager::class.java)
+            val lp = cm?.getLinkProperties(cm.activeNetwork)
+            lp?.dnsServers?.forEach { addr ->
+                val host = addr.hostAddress?.substringBefore('%')?.trim().orEmpty()
+                if (host.isNotEmpty() && Regex("^[0-9a-fA-F.:]+$").matches(host)) {
+                    dnsList.add(host)
+                }
+            }
+        }
+        dnsList.addAll(listOf("223.5.5.5", "119.29.29.29", "1.1.1.1", "8.8.8.8"))
+        return dnsList.joinToString("\n") { "nameserver $it" } + "\n"
+    }
+
+    /** 刷新已安装 Linux 环境的 `/etc/resolv.conf`，避免切换 Wi-Fi / 5G / 内网 VPN 后域名解析失效。 */
+    fun syncResolvConf() {
+        if (!ready) return
+        runCatching {
+            val resolv = File(root, "etc/resolv.conf")
+            if (resolv.parentFile?.isDirectory == true && resolv.parentFile?.canWrite() == true) {
+                resolv.writeText(buildResolvConfContent(), Charsets.UTF_8)
+            }
+        }
+    }
+
     private fun installRootStage(archive: File, stage: File, control: RunControl, onProgress: (Float, String) -> Unit) {
         val uid = Process.myUid()
+        val resolvContent = buildResolvConfContent()
         onProgress(0.35f, "正在解压 Linux 系统文件")
         val setup = """
             set -eu
@@ -517,7 +547,7 @@ class LinuxRuntime(private val context: Context, val mode: String = RUNTIME_MODE
             printf 'agent:x:$uid:$uid:Agent:/home/agent:/bin/bash\n' >> "${'$'}stage/etc/passwd"
             printf 'agent:!:19000:0:99999:7:::\n' >> "${'$'}stage/etc/shadow"
             rm -f "${'$'}stage/etc/resolv.conf"
-            printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "${'$'}stage/etc/resolv.conf"
+            printf '%s' ${quote(resolvContent)} > "${'$'}stage/etc/resolv.conf"
             printf '127.0.0.1 localhost\n::1 localhost\n' > "${'$'}stage/etc/hosts"
             chmod 1777 "${'$'}stage/tmp"
             chown -R $uid:$uid "${'$'}stage/home/agent"
@@ -547,6 +577,7 @@ class LinuxRuntime(private val context: Context, val mode: String = RUNTIME_MODE
         onProgress(0.82f, "正在配置免 Root 环境")
         val nlib = context.applicationInfo.nativeLibraryDir
         val prootTmp = File(context.cacheDir, "proot-tmp").apply { mkdirs() }
+        val resolvContent = buildResolvConfContent()
         val setup = """
             set -eu
             nlib=${quote(nlib)}
@@ -562,7 +593,7 @@ class LinuxRuntime(private val context: Context, val mode: String = RUNTIME_MODE
             printf 'agent:x:60000:60000:Agent:/home/agent:/bin/bash\n' >> "${'$'}stage/etc/passwd"
             printf 'agent:!:19000:0:99999:7:::\n' >> "${'$'}stage/etc/shadow"
             rm -f "${'$'}stage/etc/resolv.conf"
-            printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "${'$'}stage/etc/resolv.conf"
+            printf '%s' ${quote(resolvContent)} > "${'$'}stage/etc/resolv.conf"
             printf '127.0.0.1 localhost\n::1 localhost\n' > "${'$'}stage/etc/hosts"
             chmod 1777 "${'$'}stage/tmp"
             export LD_LIBRARY_PATH="${'$'}nlib"

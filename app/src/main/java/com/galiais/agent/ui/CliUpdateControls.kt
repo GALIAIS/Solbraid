@@ -4,19 +4,27 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.galiais.agent.GaliaisApplication
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
 import java.util.Locale
 
 @Composable
@@ -31,11 +39,17 @@ fun CliUpdateControls(
     val states by updater.states.collectAsState()
     val runtime by app.runtime.snapshot.collectAsState()
     val restarting by updater.restarting.collectAsState()
+    val reloadingEngine by updater.reloadingEngine.collectAsState()
+    val isThisReloading = reloadingEngine == agentId
+    val supportsHotReload = agentId in setOf("codex", "claude")
     val state = states[agentId]
     val anyInstall = states.values.any { it.installing }
+    val scope = rememberCoroutineScope()
     var confirmInstall by remember { mutableStateOf(false) }
     var confirmRestore by remember { mutableStateOf(false) }
     var confirmRestart by remember { mutableStateOf(false) }
+    var changelogText by remember { mutableStateOf<String?>(null) }
+    var loadingChangelog by remember { mutableStateOf(false) }
     LaunchedEffect(runtime.ready, agentId) {
         if (runtime.ready && state == null) {
             try { updater.refresh() }
@@ -44,7 +58,7 @@ fun CliUpdateControls(
         }
     }
     val hasActionable = state != null && (
-        state.updateAvailable || state.pendingRestart || state.working || state.error != null || state.canRestore
+        state.updateAvailable || state.pendingRestart || state.working || state.error != null || state.canRestore || isThisReloading
     )
     if (onlyWhenActionable && !hasActionable && !showCheck) return
 
@@ -53,8 +67,15 @@ fun CliUpdateControls(
             if (showVersionLine) {
                 Text("当前版本 " + it.currentVersion, style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
             }
-            if (it.pendingRestart) Text("已安装 " + it.installedVersion + "，重启后生效", style = MaterialTheme.typography.bodySmall, color = G.accent)
-            else if (it.latestVersion != null && it.error == null) {
+            if (isThisReloading) {
+                Text("正在加载 ${it.installedVersion}…", style = MaterialTheme.typography.bodySmall, color = G.accent)
+            } else if (it.pendingRestart) {
+                Text(
+                    if (supportsHotReload) "已安装 ${it.installedVersion}，重新加载引擎后生效" else "已安装 ${it.installedVersion}，重启后生效",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = G.accent,
+                )
+            } else if (it.latestVersion != null && it.error == null) {
                 if (it.updateAvailable || showVersionLine) {
                     Text(
                         if (it.latestVersion == it.installedVersion) "已是最新版本" else "最新发布 " + it.latestVersion,
@@ -77,9 +98,9 @@ fun CliUpdateControls(
             it.error?.let { message -> Text(message, style = MaterialTheme.typography.bodySmall, color = G.danger) }
         }
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            if (showCheck) SecondaryPillButton("检查更新", enabled = runtime.ready && state?.working != true, onClick = { updater.check(agentId) })
+            if (showCheck) SecondaryPillButton("检查更新", enabled = runtime.ready && state?.working != true && !isThisReloading, onClick = { updater.check(agentId) })
             if (state?.updateAvailable == true && !state.pendingRestart) {
-                PrimaryPillButton("安装更新", enabled = runtime.ready && !anyInstall && !state.working, onClick = { confirmInstall = true })
+                PrimaryPillButton("安装更新", enabled = runtime.ready && !anyInstall && !state.working && !isThisReloading, onClick = { confirmInstall = true })
             }
             if (state?.installing == true && state.phase != "publishing") {
                 SecondaryPillButton(
@@ -89,16 +110,53 @@ fun CliUpdateControls(
                 )
             }
             if (state?.pendingRestart == true) {
-                PrimaryPillButton(
-                    if (restarting) "重启中…" else "重启生效",
-                    enabled = runtime.ready && !anyInstall && !restarting,
-                    onClick = { confirmRestart = true },
+                if (supportsHotReload) {
+                    PrimaryPillButton(
+                        if (isThisReloading) "热重载中…" else "立即热重载",
+                        enabled = runtime.ready && !anyInstall && !restarting && reloadingEngine == null,
+                        onClick = { updater.reloadEngine(agentId) },
+                    )
+                } else {
+                    PrimaryPillButton(
+                        if (restarting) "重启中…" else "重启生效",
+                        enabled = runtime.ready && !anyInstall && !restarting,
+                        onClick = { confirmRestart = true },
+                    )
+                }
+            }
+            if (state?.canRestore == true && !state.working && !isThisReloading) {
+                SecondaryPillButton("恢复内置", enabled = runtime.ready && !anyInstall && reloadingEngine == null, onClick = { confirmRestore = true })
+            }
+            if (showCheck && agentId == "antigravity" && runtime.ready) {
+                SecondaryPillButton(
+                    if (loadingChangelog) "读取日志…" else "更新日志",
+                    enabled = !loadingChangelog,
+                    onClick = {
+                        loadingChangelog = true
+                        scope.launch {
+                            runCatching { app.conversations.hub.fetchAgyChangelog() }
+                                .onSuccess { changelogText = it.ifBlank { "暂无更新日志输出" } }
+                                .onFailure { app.conversations.notify("读取更新日志失败：${it.message}") }
+                            loadingChangelog = false
+                        }
+                    },
                 )
             }
-            if (state?.canRestore == true && !state.working) {
-                SecondaryPillButton("恢复内置", enabled = runtime.ready && !anyInstall, onClick = { confirmRestore = true })
-            }
         }
+    }
+    changelogText?.let { logBody ->
+        AlertDialog(
+            onDismissRequest = { changelogText = null },
+            containerColor = G.surface,
+            shape = D.dialogShape,
+            title = { Text("Antigravity CLI 更新日志", color = G.ink) },
+            text = {
+                Column(Modifier.fillMaxWidth().heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
+                    Text(logBody.take(12_000), fontFamily = Mono, fontSize = 11.5.sp, lineHeight = 16.sp, color = G.inkMuted)
+                }
+            },
+            confirmButton = { TextButton(onClick = { changelogText = null }) { Text("关闭", color = G.accent) } },
+        )
     }
     if (confirmInstall) {
         GaliaisConfirmDialog(

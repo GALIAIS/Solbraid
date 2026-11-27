@@ -77,12 +77,17 @@ class ManagedRootProcess(context: Context, script: File, arguments: List<String>
             try { process.outputStream.close() } catch (error: java.io.IOException) { if (process.isAlive) failure = error }
             process.waitFor(graceSeconds, TimeUnit.SECONDS)
             val group = if (ownership.isDone && !ownership.isCompletedExceptionally) ownership.getNow(null) else null
-            // 仅在进程尚未退出或仍需清理进程组时调用 su，并支持 TERM -> KILL 升级，避免已正常退出的短命令空起 su 进程
+            // 仅在进程尚未退出或仍需清理进程组/进程树时调用 su，兼容 Android 9-10 (API 28-29 无 setsid -w) 与 Android 11+
             if (group != null && process.isAlive) {
+                val usePgrp = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R
+                val killTree = if (usePgrp) {
+                    "kill -TERM -- -$group 2>/dev/null || true; sleep 1; test -d /proc/$group && kill -KILL -- -$group 2>/dev/null || true;"
+                } else {
+                    "kill_tree() { local p=\"\$1\" s=\"\$2\" c; for f in /proc/[0-9]*/stat; do test -r \"\$f\" || continue; read -r pid _ _ ppid _ < \"\$f\" 2>/dev/null || continue; if test \"\$ppid\" = \"\$p\"; then kill_tree \"\$pid\" \"\$s\"; fi; done; kill -\"\$s\" \"\$p\" 2>/dev/null || true; }; kill_tree $group TERM; sleep 1; test -d /proc/$group && kill_tree $group KILL;"
+                }
                 val verify = "if test -d /proc/$group; then " +
                     "if /system/bin/tr '\\000' '\\n' < /proc/$group/environ 2>/dev/null | /system/bin/grep -qFx ${quote("GALIAIS_LAUNCH_ID=$key")}; then " +
-                    "kill -TERM -- -$group 2>/dev/null || true; sleep 1; " +
-                    "test -d /proc/$group && kill -KILL -- -$group 2>/dev/null || true; " +
+                    killTree +
                     "fi; fi"
                 val stop = RootShell.process(RootShell.cleanCommand(verify)).start()
                 try {
@@ -97,19 +102,24 @@ class ManagedRootProcess(context: Context, script: File, arguments: List<String>
     }
 }
 
-/** 免 Root 模式的受管理子进程：直接以应用自身 UID 运行 PRoot 脚本，不调用 su。 */
+/** 免 Root 模式的受管理子进程：直接以应用自身 UID 运行 PRoot 脚本，兼容 API 28-29（无 setsid -w）与 API 30+。 */
 class ManagedLocalProcess(context: Context, script: File, arguments: List<String> = emptyList()) : ManagedProcess {
     private val key = UUID.randomUUID().toString()
     private val ownership = CompletableFuture<Long>()
     private val closed = AtomicBoolean(false)
     private val timer = Executors.newSingleThreadScheduledExecutor()
+    private val hasOwnProcessGroup = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R
     override val process: Process
 
     init {
         val metadata = "{\"galiaisLocalGroup\":%s,\"launchKey\":\"$key\"}\\n"
         val body = "printf ${quote(metadata)} \"${'$'}${'$'}\"; IFS= read -r ack; test \"${'$'}ack\" = ${quote(key)} || exit 125; " +
             "exec /system/bin/sh ${quote(script.absolutePath)} " + arguments.joinToString(" ", transform = ::quote)
-        val builder = ProcessBuilder("/system/bin/setsid", "-w", "/system/bin/sh", "-c", body)
+        val builder = if (hasOwnProcessGroup) {
+            ProcessBuilder("/system/bin/setsid", "-w", "/system/bin/sh", "-c", body)
+        } else {
+            ProcessBuilder("/system/bin/sh", "-c", body)
+        }
         builder.environment().apply {
             put("GALIAIS_APP_FILES", context.filesDir.absolutePath)
             put("GALIAIS_APP_CACHE", context.cacheDir.absolutePath)
@@ -148,6 +158,31 @@ class ManagedLocalProcess(context: Context, script: File, arguments: List<String
         process.outputStream.flush()
     }
 
+    private fun signalLocalProcessTree(rootPid: Int, signal: Int) {
+        val procDir = File("/proc")
+        val parentOf = HashMap<Int, Int>()
+        procDir.listFiles()?.forEach { entry ->
+            val pid = entry.name.toIntOrNull() ?: return@forEach
+            val stat = runCatching { File(entry, "stat").readText(Charsets.US_ASCII) }.getOrNull() ?: return@forEach
+            val closeParen = stat.lastIndexOf(')')
+            if (closeParen <= 0 || closeParen + 2 >= stat.length) return@forEach
+            val fields = stat.substring(closeParen + 2).trim().split(' ')
+            val ppid = fields.getOrNull(1)?.toIntOrNull() ?: return@forEach
+            parentOf[pid] = ppid
+        }
+        val targets = mutableListOf<Int>()
+        val queue = ArrayDeque<Int>().apply { add(rootPid) }
+        val seen = HashSet<Int>().apply { add(rootPid) }
+        while (queue.isNotEmpty()) {
+            val cur = queue.removeFirst()
+            targets += cur
+            for ((pid, ppid) in parentOf) {
+                if (ppid == cur && seen.add(pid)) queue.add(pid)
+            }
+        }
+        targets.asReversed().forEach { pid -> runCatching { Os.kill(pid, signal) } }
+    }
+
     override fun close(graceSeconds: Long) {
         if (!closed.compareAndSet(false, true)) return
         timer.shutdownNow()
@@ -157,10 +192,18 @@ class ManagedLocalProcess(context: Context, script: File, arguments: List<String
             process.waitFor(graceSeconds, TimeUnit.SECONDS)
             val group = if (ownership.isDone && !ownership.isCompletedExceptionally) ownership.getNow(null) else null
             if (group != null && process.isAlive) {
-                try { Os.kill(-group.toInt(), OsConstants.SIGTERM) } catch (_: Exception) { }
-                if (!process.waitFor(3, TimeUnit.SECONDS)) {
-                    try { Os.kill(-group.toInt(), OsConstants.SIGKILL) } catch (_: Exception) { }
-                    process.destroyForcibly()
+                if (hasOwnProcessGroup) {
+                    try { Os.kill(-group.toInt(), OsConstants.SIGTERM) } catch (_: Exception) { }
+                    if (!process.waitFor(3, TimeUnit.SECONDS)) {
+                        try { Os.kill(-group.toInt(), OsConstants.SIGKILL) } catch (_: Exception) { }
+                        process.destroyForcibly()
+                    }
+                } else {
+                    signalLocalProcessTree(group.toInt(), OsConstants.SIGTERM)
+                    if (!process.waitFor(3, TimeUnit.SECONDS)) {
+                        signalLocalProcessTree(group.toInt(), OsConstants.SIGKILL)
+                        process.destroyForcibly()
+                    }
                 }
             }
             if (!process.waitFor(5, TimeUnit.SECONDS)) { process.destroyForcibly(); failure = IllegalStateException("无法确认 PRoot 进程已经退出") }

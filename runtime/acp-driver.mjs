@@ -64,6 +64,23 @@ export class AcpStreamStallError extends Error {
   }
 }
 
+export function isAgyModelCatalogError(text) {
+  const clean = String(text || "").trim();
+  if (!clean) return false;
+  return /failed\s+to\s+construct\s+executor[\s\S]*unknown\s+model\s+key|unknown\s+model\s+key\s+MODEL_[A-Z0-9_]+|failed\s+to\s+get\s+model\s+(?:config|infos)|failed\s+to\s+get\s+load\s+code\s+assist\s+response|ACP_MODEL_CATALOG_UNAVAILABLE|模型目录初始化失败|模型配置未加载/i.test(clean);
+}
+
+export function isSocketPermissionOrNetworkBlocked(errorOrMessage) {
+  if (!errorOrMessage) return false;
+  if (typeof errorOrMessage === "object") {
+    if (errorOrMessage.needsNetworkWait === true || errorOrMessage.code === "ACP_MODEL_CATALOG_UNAVAILABLE") return true;
+  }
+  const msg = String(typeof errorOrMessage === "string" ? errorOrMessage : (errorOrMessage.message || errorOrMessage)).trim();
+  if (!msg) return false;
+  if (isAgyModelCatalogError(msg)) return true;
+  return /operation\s+not\s+permitted|\bEPERM\b|software\s+caused\s+connection\s+abort|\bECONNABORTED\b|\bENETUNREACH\b|\bEHOSTUNREACH\b|\bEAI_AGAIN\b|\bENOTFOUND\b|lookup\s+[^\s]+:\s*no\s+such\s+host/i.test(msg);
+}
+
 export function isSoftNetworkReply(text) {
   const clean = String(text || "").trim();
   if (!clean || clean.length > 420) return false;
@@ -75,13 +92,18 @@ export function isSoftNetworkReply(text) {
   if (/^(?:⚠\s*)?(?:network\s+(?:error|issue)|connection\s+(?:reset|aborted|refused|closed|lost|error)|stream\s+reading\s+error|unexpected\s+eof|service\s+unavailable|bad\s+gateway|gateway\s+timeout)/i.test(clean)) {
     return true;
   }
+  // Antigravity 在锁屏/后台断网期间冷启动会丢失内存模型表，并将以下单行错误以软回复形式输出；
+  // 必须用行首锚定，避免误拦截正常解释该报错的对话回复。
+  if (/^(?:⚠\s*)?(?:(?:error|rpc\s+error|internal\s+error)\s*[:：]\s*)?(?:failed\s+to\s+construct\s+executor\b[\s\S]*unknown\s+model\s+key|unknown\s+model\s+key\s+MODEL_[A-Z0-9_]+|failed\s+to\s+get\s+model\s+(?:config|infos)|failed\s+to\s+get\s+load\s+code\s+assist\s+response)/i.test(clean)) {
+    return true;
+  }
   return false;
 }
 
 export function isRetryableAcpError(errorOrMessage) {
   if (!errorOrMessage) return false;
   if (typeof errorOrMessage === "object") {
-    if (errorOrMessage.code === "ACP_STREAM_STALL" || errorOrMessage.code === "ACP_INTERNAL_RETRY_LOOP") return true;
+    if (errorOrMessage.code === "ACP_STREAM_STALL" || errorOrMessage.code === "ACP_INTERNAL_RETRY_LOOP" || errorOrMessage.code === "ACP_MODEL_CATALOG_UNAVAILABLE") return true;
     if (errorOrMessage.retryable === true) return true;
     if (errorOrMessage.retryable === false) return false;
   }
@@ -90,12 +112,14 @@ export function isRetryableAcpError(errorOrMessage) {
   if (/not\s+logged\s+in|unauthenticated|unauthorized|\b401\b|\b403\b|invalid\s+api\s+key|用户中断|cancelled|canceled|会话已停止|会话已删除|invalid\s+argument|context\s+length|token\s+limit|prompt\s+is\s+too\s+long/i.test(msg)) {
     return false;
   }
+  if (isAgyModelCatalogError(msg)) return true;
   return /ACP_STREAM_STALL|ECONNRESET|ECONNABORTED|ECONNREFUSED|ETIMEDOUT|EPIPE|EAI_AGAIN|ENOTFOUND|ENETUNREACH|EHOSTUNREACH|unexpected\s+eof|\beof\b|socket\s+hang\s+up|software\s+caused\s+connection\s+abort|write:\s*operation\s+not\s+permitted|i\/o\s+timeout|context\s+deadline\s+exceeded|deadline\s+exceeded|broken\s+pipe|ACP\s*请求超时|已退出|进程未运行|stream\s+reading\s+error|network\s+issue|temporarily\s+unavailable|overloaded|resource\s+exhausted|\b429\b|\b500\b|\b502\b|\b503\b|\b504\b|bad\s+gateway|service\s+unavailable|gateway\s+timeout|响应超过\s*\d+\s*秒无输出|连接可能已中断/i.test(msg);
 }
 
 export function formatAcpNetworkReason(raw) {
   const s = String(raw || "").trim();
   if (!s) return "网络波动";
+  if (isAgyModelCatalogError(s)) return "后台断网导致模型配置未加载";
   if (/operation\s+not\s+permitted/i.test(s)) return "后台网络受限";
   if (/software\s+caused\s+connection\s+abort|ECONNABORTED/i.test(s)) return "网络连接被系统中断";
   if (/unexpected\s+eof|\beof\b|stream\s+reading\s+error/i.test(s)) return "流式连接意外断开";
@@ -137,6 +161,83 @@ export function filterDuplicateAcpMcpServers(managedServers, globalConfigNames) 
     const name = String(srv?.name || "").trim();
     return !name || !skip.has(name);
   });
+}
+
+const ACP_MENTION_RE = /(?:^|\s)@([^\s@,;:!?()[\]{}"'`]+)/g;
+const ACP_MIME_BY_EXT = {
+  ".ts": "text/typescript",
+  ".tsx": "text/typescript",
+  ".js": "text/javascript",
+  ".mjs": "text/javascript",
+  ".cjs": "text/javascript",
+  ".kt": "text/x-kotlin",
+  ".kts": "text/x-kotlin",
+  ".java": "text/x-java-source",
+  ".py": "text/x-python",
+  ".go": "text/x-go",
+  ".rs": "text/x-rust",
+  ".c": "text/x-c",
+  ".h": "text/x-c",
+  ".cpp": "text/x-c++",
+  ".json": "application/json",
+  ".yaml": "text/yaml",
+  ".yml": "text/yaml",
+  ".toml": "text/plain",
+  ".md": "text/markdown",
+  ".xml": "application/xml",
+  ".html": "text/html",
+  ".css": "text/css",
+  ".sh": "text/x-shellscript",
+};
+
+/**
+ * 将用户提示词中的 `@relative/path` 文件引用解析为标准 ACP `resource`（embeddedContext）内容块，
+ * 仅限用户 home 目录内的可读文本文件，自动去重并限制体积，减少纯文本拼接污染。
+ */
+export async function buildAcpEmbeddedContextBlocks(text, cwd, {
+  allowedRoot = "/home/agent",
+  maxFiles = 6,
+  maxBytesPerFile = 64 * 1024,
+} = {}) {
+  if (typeof text !== "string" || !text.includes("@") || !cwd) return [];
+  const candidates = [];
+  const seen = new Set();
+  for (const m of text.matchAll(ACP_MENTION_RE)) {
+    const raw = String(m[1] || "").trim().replace(/[.,;:!?]+$/, "");
+    if (!raw || raw.endsWith("/") || raw.includes("..") || raw.includes("\0")) continue;
+    if (seen.has(raw)) continue;
+    seen.add(raw);
+    candidates.push(raw);
+    if (candidates.length >= maxFiles * 2) break;
+  }
+  if (!candidates.length) return [];
+  const blocks = [];
+  const rootReal = await fs.realpath(allowedRoot).catch(() => path.resolve(allowedRoot));
+  const baseCwd = await fs.realpath(cwd).catch(() => path.resolve(cwd));
+  for (const rel of candidates) {
+    if (blocks.length >= maxFiles) break;
+    const joined = path.isAbsolute(rel) ? path.resolve(rel) : path.resolve(baseCwd, rel);
+    const real = await fs.realpath(joined).catch(() => null);
+    if (!real) continue;
+    if (real !== rootReal && !real.startsWith(rootReal + path.sep)) continue;
+    const st = await fs.stat(real).catch(() => null);
+    if (!st || !st.isFile() || st.size === 0 || st.size > maxBytesPerFile) continue;
+    try {
+      const readRes = await safeReadTextFile(real, {maxBytes: maxBytesPerFile});
+      const content = String(readRes?.content ?? "");
+      if (!content || content.includes("\u0000")) continue;
+      const ext = path.extname(real).toLowerCase();
+      blocks.push({
+        type: "resource",
+        resource: {
+          uri: `file://${real.replaceAll("\\", "/")}`,
+          mimeType: ACP_MIME_BY_EXT[ext] || "text/plain",
+          text: content,
+        },
+      });
+    } catch {}
+  }
+  return blocks;
 }
 
 function distributeIntegerProportionally(total, weights, caps = null) {
@@ -677,27 +778,71 @@ export class AcpDriver {
     return await this.request("authenticate", {methodId}, 30_000);
   }
 
-  async newSession(cwd, mcpServers = []) {
+  async logout() {
     await this.start();
-    return await this.request("session/new", {cwd: cwd || this.cwd, mcpServers}, 60_000);
+    if (this.agentCapabilities?.auth?.logout) {
+      return await this.request("auth/logout", {}, 30_000);
+    }
+    return {ok: false, unsupported: true};
   }
 
-  async resumeSession(sessionId, cwd, mcpServers = []) {
+  async listSessions(cwd = null) {
     await this.start();
+    if (this.agentCapabilities?.sessionCapabilities?.list) {
+      return await this.request("session/list", cwd ? {cwd} : {}, 30_000);
+    }
+    return {sessions: []};
+  }
+
+  async closeSession(sessionId) {
+    if (!this.child || this.closed || !sessionId) return;
+    if (this.agentCapabilities?.sessionCapabilities?.close) {
+      try { await this.request("session/close", {sessionId}, 10_000); } catch {}
+    }
+  }
+
+  async newSession(cwd, mcpServers = [], additionalDirectories = []) {
+    await this.start();
+    const extraDirs = Array.isArray(additionalDirectories) ? additionalDirectories.filter(Boolean) : [];
+    const params = {
+      cwd: cwd || this.cwd,
+      mcpServers,
+      ...(extraDirs.length && this.agentCapabilities?.sessionCapabilities?.additionalDirectories ? {additionalDirectories: extraDirs} : {}),
+    };
+    return await this.request("session/new", params, 60_000);
+  }
+
+  async resumeSession(sessionId, cwd, mcpServers = [], additionalDirectories = []) {
+    await this.start();
+    const extraDirs = Array.isArray(additionalDirectories) ? additionalDirectories.filter(Boolean) : [];
+    const params = {
+      sessionId,
+      cwd: cwd || this.cwd,
+      mcpServers,
+      ...(extraDirs.length && this.agentCapabilities?.sessionCapabilities?.additionalDirectories ? {additionalDirectories: extraDirs} : {}),
+    };
     if (this.agentCapabilities?.sessionCapabilities?.resume) {
       try {
-        return await this.request("session/resume", {sessionId, cwd: cwd || this.cwd, mcpServers}, 60_000);
-      } catch {
-        // 回退到 session/load
+        return await this.request("session/resume", params, 60_000);
+      } catch (resumeErr) {
+        // 仅当 Agent 声明支持 session/load 时才回退，避免静默吞错留下未挂载的无效会话
+        if (!this.agentCapabilities?.loadSession) throw resumeErr;
       }
     }
-    return await this.loadSession(sessionId, cwd, mcpServers);
+    return await this.loadSession(sessionId, cwd, mcpServers, extraDirs);
   }
 
-  async loadSession(sessionId, cwd, mcpServers = []) {
+  async loadSession(sessionId, cwd, mcpServers = [], additionalDirectories = []) {
     await this.start();
     if (this.agentCapabilities?.loadSession) {
-      return await this.request("session/load", {sessionId, cwd: cwd || this.cwd, mcpServers}, 60_000);
+      const extraDirs = Array.isArray(additionalDirectories) ? additionalDirectories.filter(Boolean) : [];
+      const params = {
+        sessionId,
+        cwd: cwd || this.cwd,
+        mcpServers,
+        ...(extraDirs.length && this.agentCapabilities?.sessionCapabilities?.additionalDirectories ? {additionalDirectories: extraDirs} : {}),
+      };
+      return await this.request("session/load", params, 60_000);
     }
     return null;
   }

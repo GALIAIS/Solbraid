@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {execFile} from "node:child_process";
 import {promisify} from "node:util";
-import {createHash} from "node:crypto";
+import {createHash, randomUUID} from "node:crypto";
 
 const execFileAsync = promisify(execFile);
 const HOME = process.env.HOME || "/home/agent";
@@ -135,58 +135,69 @@ export async function prepareWorktree({repoCwd, ticketId}) {
     throw new Error("该目录不是 Git 仓库，无法创建隔离工单");
   }
   const repoRoot = await fs.realpath(top.stdout.trim());
-  const head = await git(["rev-parse", "HEAD"], repoRoot, 8_000);
-  if (!head.ok || !head.stdout.trim()) {
-    throw new Error("仓库尚无初始提交，无法创建隔离工单");
-  }
-  const baseCommit = head.stdout.trim();
-  const curBranch = (await checkedGit(["rev-parse", "--abbrev-ref", "HEAD"], repoRoot)).trim();
-  const worktreePath = managedPath(repoRoot, id);
-  const branch = `solbraid/ticket-${id}`;
-  await fs.mkdir(path.dirname(worktreePath), {recursive: true});
-  const managedRoot = await fs.realpath(WORKTREES_ROOT);
-  if (await fs.realpath(path.dirname(worktreePath)) !== path.join(managedRoot, path.basename(path.dirname(worktreePath)))) {
-    throw new Error("隔离目录指向托管范围外，已停止创建");
-  }
-
-  if (await exists(worktreePath)) throw new Error("该工单已有隔离目录，请检查后重新派发");
-  const branchExists = await git(["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], repoRoot, 8_000);
-  if (branchExists.ok) throw new Error("该工单已有分支，请检查后重新派发");
-  if (branchExists.code !== 1) throw new Error(branchExists.stderr.trim() || "无法检查工单分支");
-
-  const added = await git(["worktree", "add", "-b", branch, worktreePath, baseCommit], repoRoot, 45_000);
-  if (!added.ok) {
-    throw new Error(`创建隔离目录失败：${added.stderr.trim()}`);
-  }
-  const rollbackWorktree = async () => {
-    await git(["worktree", "remove", "--force", worktreePath], repoRoot, 15_000).catch(() => {});
-    await git(["branch", "-D", branch], repoRoot, 8_000).catch(() => {});
-  };
-  try {
-    const relSub = path.relative(repoRoot, absCwd);
-    const targetCwd = relSub ? path.join(worktreePath, relSub) : worktreePath;
-    if (!(await fs.stat(targetCwd).catch(() => null))?.isDirectory()) {
-      throw new Error("项目子目录不在基线提交中，请先提交该目录后再派发隔离工单");
+  return await withRepositoryLock(repoRoot, async () => {
+    const head = await git(["rev-parse", "HEAD"], repoRoot, 8_000);
+    if (!head.ok || !head.stdout.trim()) {
+      throw new Error("仓库尚无初始提交，无法创建隔离工单");
     }
-    const targetRelative = path.relative(await fs.realpath(worktreePath), await fs.realpath(targetCwd));
-    if (targetRelative === ".." || targetRelative.startsWith(`..${path.sep}`) || path.isAbsolute(targetRelative)) {
-      throw new Error("项目子目录指向隔离范围外，工单已停止");
+    const baseCommit = head.stdout.trim();
+    const curBranch = (await checkedGit(["rev-parse", "--abbrev-ref", "HEAD"], repoRoot)).trim();
+    const worktreePath = managedPath(repoRoot, id);
+    const branch = `solbraid/ticket-${id}`;
+    await fs.mkdir(path.dirname(worktreePath), {recursive: true});
+    const managedRoot = await fs.realpath(WORKTREES_ROOT);
+    if (await fs.realpath(path.dirname(worktreePath)) !== path.join(managedRoot, path.basename(path.dirname(worktreePath)))) {
+      throw new Error("隔离目录指向托管范围外，已停止创建");
     }
-    return {isolated: true, repoRoot, worktreePath, targetCwd, branch, baseBranch: curBranch, baseCommit};
-  } catch (err) {
-    await rollbackWorktree();
-    throw err;
-  }
+
+    if (await exists(worktreePath)) throw new Error("该工单已有隔离目录，请检查后重新派发");
+    const branchExists = await git(["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], repoRoot, 8_000);
+    if (branchExists.ok) throw new Error("该工单已有分支，请检查后重新派发");
+    if (branchExists.code !== 1) throw new Error(branchExists.stderr.trim() || "无法检查工单分支");
+
+    const added = await git(["worktree", "add", "-b", branch, worktreePath, baseCommit], repoRoot, 45_000);
+    if (!added.ok) {
+      throw new Error(`创建隔离目录失败：${added.stderr.trim()}`);
+    }
+    const rollbackWorktree = async () => {
+      await git(["worktree", "remove", "--force", worktreePath], repoRoot, 15_000).catch(() => {});
+      await git(["branch", "-D", branch], repoRoot, 8_000).catch(() => {});
+    };
+    try {
+      const relSub = path.relative(repoRoot, absCwd);
+      const targetCwd = relSub ? path.join(worktreePath, relSub) : worktreePath;
+      if (!(await fs.stat(targetCwd).catch(() => null))?.isDirectory()) {
+        throw new Error("项目子目录不在基线提交中，请先提交该目录后再派发隔离工单");
+      }
+      const targetRelative = path.relative(await fs.realpath(worktreePath), await fs.realpath(targetCwd));
+      if (targetRelative === ".." || targetRelative.startsWith(`..${path.sep}`) || path.isAbsolute(targetRelative)) {
+        throw new Error("项目子目录指向隔离范围外，工单已停止");
+      }
+      return {isolated: true, repoRoot, worktreePath, targetCwd, branch, baseBranch: curBranch, baseCommit};
+    } catch (err) {
+      await rollbackWorktree();
+      throw err;
+    }
+  });
 }
 
 /** 返回完整文件清单；超出预览上限或无法读取的内容必须明确报告。 */
 export async function diffWorktree({worktreePath, baseCommit}) {
   if (!worktreePath) throw new Error("缺少工单工作目录");
-  const ref = baseCommit || "HEAD";
+  const managedRoot = await fs.realpath(WORKTREES_ROOT).catch(() => path.resolve(WORKTREES_ROOT));
+  const actualWt = await fs.realpath(worktreePath);
+  const relWt = path.relative(managedRoot, actualWt);
+  if (!relWt || relWt === "." || relWt.startsWith("..") || path.isAbsolute(relWt)) {
+    throw new Error("工单工作目录超出托管范围，已拒绝读取 Diff");
+  }
+  const ref = String(baseCommit || "HEAD").trim();
+  if (!ref || ref.startsWith("-") || !/^[A-Za-z0-9._/@^~-]+$/.test(ref)) {
+    throw new Error(`无效的基线提交引用：${ref}`);
+  }
   const [tracked, trackedNames, untrackedNames] = await Promise.all([
-    checkedGit(["diff", "--no-color", "--no-ext-diff", ref, "--"], worktreePath, 20_000),
-    checkedGit(["diff", "--name-only", "-z", ref, "--"], worktreePath, 10_000),
-    checkedGit(["ls-files", "--others", "--exclude-standard", "-z"], worktreePath, 10_000),
+    checkedGit(["diff", "--no-color", "--no-ext-diff", ref, "--"], actualWt, 20_000),
+    checkedGit(["diff", "--name-only", "-z", ref, "--"], actualWt, 10_000),
+    checkedGit(["ls-files", "--others", "--exclude-standard", "-z"], actualWt, 10_000),
   ]);
   let diffText = tracked;
   let incomplete = false;
@@ -258,7 +269,10 @@ export async function mergeWorktree({repoRoot, worktreePath, branch, baseBranch,
       const hasStaged = (await checkedGit(["diff", "--cached", "--name-only"], repoRoot)).trim();
       if (hasStaged) {
         const c = await git(["commit", "-m", msg], repoRoot, 20_000);
-        if (!c.ok) return {ok: false, conflicts: [], message: `合并改动尚未提交，已保留暂存区与工单分支：${c.stderr.trim()}`};
+        if (!c.ok) {
+          await git(["reset", "--merge"], repoRoot, 15_000);
+          return {ok: false, conflicts: [], message: `合并提交失败，已自动回滚主工作区并保留工单分支（${branch}）：${c.stderr.trim()}`};
+        }
       }
     }
     try {
@@ -297,9 +311,13 @@ export async function saveTicketRecord(ticket) {
   const id = cleanTicketId(ticket?.id);
   await fs.mkdir(TICKETS_ROOT, {recursive: true});
   const file = path.join(TICKETS_ROOT, `${id}.json`);
-  const tmp = `${file}.${Date.now()}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(ticket, null, 2) + "\n", {mode: 0o600});
-  await fs.rename(tmp, file);
+  const tmp = `${file}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(tmp, JSON.stringify(ticket, null, 2) + "\n", {mode: 0o600});
+    await fs.rename(tmp, file);
+  } finally {
+    await fs.rm(tmp, {force: true}).catch(() => {});
+  }
   return {ok: true};
 }
 

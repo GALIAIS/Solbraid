@@ -6,7 +6,9 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.net.wifi.WifiManager
 import android.os.Binder
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -88,6 +90,7 @@ class VmRuntimeService : Service() {
     private val stopping = AtomicBoolean(false)
     private val destroyed = AtomicBoolean(false)
     private val observers = CopyOnWriteArraySet<(RuntimePacket) -> Unit>()
+    private val reloadingChannels = CopyOnWriteArraySet<String>()
     private val events = ArrayDeque<RuntimePacket>()
     private val serverRequests = linkedMapOf<String, Pair<String, JSONObject>>()
     private var serverRequestBytes = 0
@@ -127,6 +130,7 @@ class VmRuntimeService : Service() {
         private set
     private var wakeLock: PowerManager.WakeLock? = null
     private var turnWakeLock: PowerManager.WakeLock? = null
+    private var turnWifiLock: WifiManager.WifiLock? = null
     @Volatile private var activeTurnRunning = false
     private var installControl = RunControl()
     private val processLock = Any()
@@ -176,6 +180,11 @@ class VmRuntimeService : Service() {
     }
     override fun onBind(intent: Intent?): IBinder = LocalBinder()
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Android 12+ 要求 startForegroundService 启动后 5 秒内必须调用 startForeground()，避免任何提前返回触发 ForegroundServiceDidNotStartInTimeException
+        val needsForeground = intent?.action in setOf(START, RESTART, MAINTAIN) || intent == null
+        if (needsForeground) {
+            startForeground(NOTIFICATION, notification(if (busy) message else "正在准备本地运行环境"))
+        }
         when (intent?.action) {
             STOP -> { requestStop(); return START_NOT_STICKY }
             RESTART -> { requestRestart(intent.getStringExtra(EXTRA_MODE) ?: settings.effectiveRuntimeMode); return START_NOT_STICKY }
@@ -190,9 +199,14 @@ class VmRuntimeService : Service() {
                 return START_NOT_STICKY
             }
         }
-        if (intent == null) { if (!busy) stopSelf(); return START_NOT_STICKY }
+        if (intent == null) {
+            if (!busy) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+            return START_NOT_STICKY
+        }
         if (busy) {
-            startForeground(NOTIFICATION, notification(message))
             return START_NOT_STICKY
         }
         beginRun(intent.getStringExtra(EXTRA_MODE) ?: settings.effectiveRuntimeMode)
@@ -239,6 +253,7 @@ class VmRuntimeService : Service() {
             progress = if (firstTimeSetup) 0.05f else 0.18f, step = 1, label = if (firstTimeSetup) "安装 Linux 系统" else "检查运行环境")
         copyRuntimeAssets()
         val linux = LinuxRuntime(this, mode)
+        linux.syncResolvConf()
         if (linux.ready && linux.vmProvisioned && (daemonPresent(mode) || linux.hasAnyMuxArtifacts())) {
             syncHotRuntimeScripts(mode)
             if (daemonPresent(mode) && linux.daemonGenerationMatches(applicationInfo.nativeLibraryDir)) {
@@ -276,6 +291,7 @@ class VmRuntimeService : Service() {
     }
     fun request(method: String, params: JSONObject? = null, engineName: String = "codex", timeoutMs: Long = 120_000): CompletableFuture<Any?> {
         check(state == "ready") { "引擎尚未连接，请先启动运行环境" }
+        check(engineName !in reloadingChannels) { "引擎正在重新加载，请稍后重试" }
         return connection(engineName).request(method, params, timeoutMs)
     }
     fun respond(id: Any, result: Any?, engineName: String = "codex") {
@@ -482,11 +498,15 @@ class VmRuntimeService : Service() {
                 }
             } catch (e: java.io.IOException) {
                 val msg = e.message.orEmpty()
-                // Root 模式下 0600 套接字由 agent UID 持有，App UID 探活会报 EACCES；仅当明确 ECONNREFUSED/ENOENT 才认定为假死残留
+                // Root 模式下 0600 套接字由 agent UID 持有，App UID 探活会报 EACCES；核验 /proc/<pid>/cmdline 确认真实存活
                 if (msg.contains("ECONNREFUSED", true) || msg.contains("ENOENT", true) || msg.contains("Connection refused", true)) {
                     false
                 } else {
-                    File(linuxRoot(mode), "home/agent/.galiais/mux/$channel.pid").isFile
+                    val pidFile = File(linuxRoot(mode), "home/agent/.galiais/mux/$channel.pid")
+                    val pid = runCatching { pidFile.readText(Charsets.US_ASCII).trim().toIntOrNull() }.getOrNull()
+                    if (pid == null || pid <= 1) return@any false
+                    val cmdline = runCatching { File("/proc/$pid/cmdline").readText(Charsets.UTF_8) }.getOrNull()
+                    cmdline != null && (cmdline.contains("guest-mux") || cmdline.contains("node"))
                 }
             }
         }
@@ -504,6 +524,121 @@ class VmRuntimeService : Service() {
         check(result.code == 0) { "未能停止后台引擎：${result.diagnostic.ifBlank { result.output }}" }
     }
 
+    private fun stopSingleMuxDaemon(mode: String, channel: String) {
+        require(channel in setOf("codex", "claude")) { "不支持单通道停止：$channel" }
+        writeNativeLibMarker()
+        if (!File(filesDir, "vm-runtime/${runScript(mode)}").isFile) copyRuntimeAssets()
+        val result = runPlatform(mode, runScript(mode), listOf(GUEST_NODE, GUEST_MUX, "--stop", channel), 30)
+        check(result.code == 0) { "未能停止 $channel 后台引擎：${result.diagnostic.ifBlank { result.output }}" }
+    }
+
+    /**
+     * 单引擎进程级热重载：仅重启 codex 或 claude 守护通道，完全保留运行中的本地终端 PTY、SSH、SFTP、Gateway 与 Agent Hub。
+     * 若新版本启动握手失败，自动清除覆写配置并无缝回退至内置稳定版本。
+     */
+    fun reloadSingleEngine(channel: String): CompletableFuture<JSONObject> {
+        val future = CompletableFuture<JSONObject>()
+        if (channel !in setOf("codex", "claude")) {
+            future.completeExceptionally(IllegalArgumentException("仅支持 Codex 与 Claude Code 单引擎热重载"))
+            return future
+        }
+        if (state != "ready" || stopping.get() || maintaining) {
+            future.completeExceptionally(IllegalStateException("当前运行环境状态不允许热重载（$state）"))
+            return future
+        }
+        if (!reloadingChannels.add(channel)) {
+            future.completeExceptionally(IllegalStateException("$channel 正在热重载中，请稍候"))
+            return future
+        }
+        val mode = activeMode
+        val proot = mode == RUNTIME_MODE_PROOT
+        worker.execute {
+            try {
+                // 1. 仅关闭目标通道连接并清理其挂起审批，不触碰其他通道
+                if (channel == "codex") {
+                    runCatching { engine?.close() }
+                    engine = null
+                } else {
+                    runCatching { claude?.close() }
+                    claude = null
+                }
+                synchronized(serverRequests) {
+                    serverRequests.keys.filter { it.startsWith("$channel:") }.toList().forEach { key ->
+                        serverRequests.remove(key)?.let { (_, data) ->
+                            serverRequestBytes = (serverRequestBytes - data.toString().length).coerceAtLeast(0)
+                        }
+                    }
+                }
+                // 2. 仅停止目标通道守护进程
+                stopSingleMuxDaemon(mode, channel)
+
+                fun connectChannel(): JSONObject {
+                    val launcher = when (channel) {
+                        "codex" -> if (proot) "launch-engine-proot.sh" else "launch-engine.sh"
+                        else -> if (proot) "launch-claude-proot.sh" else "launch-claude.sh"
+                    }
+                    val label = if (channel == "codex") "Codex" else "Claude Code"
+                    val conn = synchronized(processLock) {
+                        check(!stopping.get()) { "运行环境正在停止" }
+                        CliRpcConnection(
+                            this,
+                            { engineEvent(channel, it) },
+                            { reason -> if (channel !in reloadingChannels) fail("$label：$reason") },
+                            launcher,
+                            mode,
+                        ).also {
+                            if (channel == "codex") engine = it else claude = it
+                        }
+                    }
+                    return conn.start()
+                }
+
+                // 3. 启动新进程；若在线更新版异常则自动回退内置稳定版
+                var rolledBack = false
+                var rollbackWarning: String? = null
+                val info = try {
+                    connectChannel()
+                } catch (firstErr: Exception) {
+                    val overrideActive = File(linuxRoot(mode), "home/agent/.galiais/cli/$channel/active.json")
+                    if (!stopping.get() && overrideActive.isFile && overrideActive.delete()) {
+                        if (channel == "codex") { runCatching { engine?.close() }; engine = null }
+                        else { runCatching { claude?.close() }; claude = null }
+                        runCatching { stopSingleMuxDaemon(mode, channel) }
+                        rolledBack = true
+                        rollbackWarning = "${if (channel == "codex") "Codex" else "Claude Code"} 新版本启动失败，已自动回退内置稳定版：${firstErr.message}"
+                        connectChannel()
+                    } else {
+                        throw firstErr
+                    }
+                }
+
+                if (channel == "codex") {
+                    codexVersion = info.optString("userAgent").substringAfter('/', "").substringBefore(' ').ifBlank { "0.171.0-alpha.13" }
+                }
+                val merged = runCatching { JSONObject(engineInfo ?: "{}") }.getOrDefault(JSONObject())
+                merged.put(channel, info)
+                engineInfo = merged.toString()
+                emit(snapshot())
+                future.complete(
+                    JSONObject()
+                        .put("channel", channel)
+                        .put("info", info)
+                        .put("rolledBack", rolledBack)
+                        .apply { rollbackWarning?.let { put("warning", it) } },
+                )
+            } catch (error: Exception) {
+                future.completeExceptionally(error)
+                if (!stopping.get()) {
+                    fail("${if (channel == "codex") "Codex" else "Claude Code"} 热重载失败：${error.message}")
+                }
+            } finally {
+                reloadingChannels.remove(channel)
+            }
+        }
+        return future
+    }
+
+    @Suppress("DEPRECATION")
     fun setActiveTurnRunning(active: Boolean) {
         main.post {
             if (destroyed.get()) return@post
@@ -516,10 +651,26 @@ class VmRuntimeService : Service() {
                     // 单次上限 25 分钟，防止异常泄露；任务活跃期间保护后台网络不被 Android Doze/netd 阻断（EPERM）
                     wl.acquire(25 * 60 * 1000L)
                 } catch (_: Exception) {}
+                try {
+                    val wifi = turnWifiLock ?: applicationContext.getSystemService(WifiManager::class.java)?.let { wm ->
+                        val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                        } else {
+                            WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                        }
+                        wm.createWifiLock(lockMode, "GALIAIS:active-turn-wifi").also {
+                            it.setReferenceCounted(false)
+                            turnWifiLock = it
+                        }
+                    }
+                    if (wifi != null && !wifi.isHeld) wifi.acquire()
+                } catch (_: Exception) {}
                 getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification("Agent 任务执行中（后台网络保活）"))
             } else {
                 try { turnWakeLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
                 turnWakeLock = null
+                try { turnWifiLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
+                turnWifiLock = null
                 if (state == "ready") {
                     getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification(message))
                 }
@@ -577,7 +728,7 @@ class VmRuntimeService : Service() {
             update("starting-engine", "正在连接 Codex", progress = if (firstTimeSetup) 0.87f else 0.82f, step = engStep, label = "连接引擎")
             val connection = synchronized(processLock) {
                 if (stopping.get()) return
-                CliRpcConnection(this, { engineEvent("codex", it) }, { fail("Codex：$it") },
+                CliRpcConnection(this, { engineEvent("codex", it) }, { if ("codex" !in reloadingChannels) fail("Codex：$it") },
                     if (proot) "launch-engine-proot.sh" else "launch-engine.sh", mode).also { engine = it }
             }
             val codexInfo = connection.start()
@@ -587,7 +738,7 @@ class VmRuntimeService : Service() {
             update("starting-engine", "正在连接 Claude Code", progress = if (firstTimeSetup) 0.94f else 0.92f, step = engStep, label = "连接引擎")
             val claudeConnection = synchronized(processLock) {
                 if (stopping.get()) return
-                CliRpcConnection(this, { engineEvent("claude", it) }, { fail("Claude Code：$it") },
+                CliRpcConnection(this, { engineEvent("claude", it) }, { if ("claude" !in reloadingChannels) fail("Claude Code：$it") },
                     if (proot) "launch-claude-proot.sh" else "launch-claude.sh", mode).also { claude = it }
             }
             val claudeInfo = claudeConnection.start()
@@ -640,11 +791,13 @@ class VmRuntimeService : Service() {
             engineInfo = engineInfo?.let { JSONObject(it).put("agentHub", JSONObject().put("error", reason)).toString() }
             synchronized(serverRequests) {
                 serverRequests.keys.filter { it.startsWith("agent-hub:") }.toList().forEach { key ->
-                    serverRequests.remove(key)?.let { serverRequestBytes -= it.toString().toByteArray(Charsets.UTF_8).size }
+                    serverRequests.remove(key)?.let { (_, data) ->
+                        serverRequestBytes = (serverRequestBytes - data.toString().length).coerceAtLeast(0)
+                    }
                 }
             }
             engineEvent("agent-hub", JSONObject().put("method", "hub/disconnected").put("params", JSONObject().put("message", reason)))
-            update(state, "外部 Agent 服务已断开：$reason（可点击「重启环境」一键恢复）", progress = progress)
+            update(state, "外部 Agent 服务已断开：$reason（可点击「重启环境」恢复）", progress = progress)
         }
     }
 
@@ -757,6 +910,8 @@ class VmRuntimeService : Service() {
         }
         wakeLock?.let { if (it.isHeld) it.release() }; wakeLock = null
         turnWakeLock?.let { if (it.isHeld) it.release() }; turnWakeLock = null
+        try { turnWifiLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
+        turnWifiLock = null
         activeTurnRunning = false
         update(if (finalFailure == null) "stopped" else "error", finalFailure ?: "运行环境已停止", progress = null, step = 0, label = "")
         stopForeground(if (finalFailure == null) STOP_FOREGROUND_REMOVE else STOP_FOREGROUND_DETACH)
@@ -879,7 +1034,12 @@ class VmRuntimeService : Service() {
     private fun notification(text: String): Notification {
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val stop = PendingIntent.getService(this, 2, Intent(this, VmRuntimeService::class.java).setAction(STOP), PendingIntent.FLAG_IMMUTABLE)
+        val stop = PendingIntent.getBroadcast(
+            this,
+            2,
+            Intent(this, VmRuntimeActionReceiver::class.java).setAction(STOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
         val builder = Notification.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_notif_runtime)
             .setContentTitle(if (state == "ready") "Solbraid · 本地环境运行中" else "Solbraid 本地运行环境")
             .setContentText(text).setStyle(Notification.BigTextStyle().bigText(text))
@@ -895,10 +1055,29 @@ class VmRuntimeService : Service() {
         destroyed.set(true)
         wakeLock?.let { if (it.isHeld) it.release() }; wakeLock = null
         turnWakeLock?.let { if (it.isHeld) it.release() }; turnWakeLock = null
+        try { turnWifiLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
+        turnWifiLock = null
         activeTurnRunning = false
         if (busy && !stopping.get() && !maintaining) stopRuntime("运行服务已结束，任务未自动重试", killDaemons = !settings.keepRuntimeOnExit)
         else if (!busy) { worker.shutdown() }
         observers.clear()
         super.onDestroy()
+    }
+}
+
+/** 通知栏操作非导出广播接收器：规避 Android 12+ 后台点击通知 PendingIntent.getService() 触发 BackgroundServiceStartNotAllowedException。 */
+class VmRuntimeActionReceiver : android.content.BroadcastReceiver() {
+    override fun onReceive(context: android.content.Context, intent: Intent?) {
+        val app = context.applicationContext as? GaliaisApplication ?: return
+        when (intent?.action) {
+            VmRuntimeService.STOP -> app.runtime.stop()
+            VmRuntimeService.APPROVE_REQ, VmRuntimeService.DENY_REQ -> {
+                val eng = intent.getStringExtra(VmRuntimeService.EXTRA_ENGINE)
+                val reqId = intent.getStringExtra(VmRuntimeService.EXTRA_REQ_ID)
+                if (!eng.isNullOrBlank() && !reqId.isNullOrBlank()) {
+                    app.conversations.resolveFromNotification(eng, reqId, intent.action == VmRuntimeService.APPROVE_REQ)
+                }
+            }
+        }
     }
 }

@@ -1,7 +1,10 @@
 import fs from "node:fs";
 import http from "node:http";
+import https from "node:https";
+import tls from "node:tls";
 import net, {isIP} from "node:net";
 import path from "node:path";
+import {Readable} from "node:stream";
 import {randomBytes, timingSafeEqual} from "node:crypto";
 import {
   responsesToChatRequest, responsesToAnthropicRequest, responsesToGeminiRequest,
@@ -273,19 +276,281 @@ async function syncGatewayProxyEnv() {
   }
 }
 
-/** 安全上游请求：禁止盲目跟随跨源/非法重定向（防 SSRF 与鉴权头泄露），并同步代理配置。 */
+function resolveEffectiveProxyUrl(targetUrl, cfg) {
+  if (cfg?.proxyMode === "none") return "";
+  if (isPrivateHost(targetUrl.hostname)) return "";
+  const raw = String(
+    cfg?.proxyUrl ||
+    (targetUrl.protocol === "https:" ? (process.env.HTTPS_PROXY || process.env.https_proxy) : (process.env.HTTP_PROXY || process.env.http_proxy)) ||
+    process.env.ALL_PROXY || process.env.all_proxy || "",
+  ).trim();
+  if (!raw) return "";
+  const noProxy = String(process.env.NO_PROXY || process.env.no_proxy || "").trim();
+  if (noProxy) {
+    const host = targetUrl.hostname.toLowerCase();
+    for (const rule of noProxy.split(",").map(s => s.trim().toLowerCase()).filter(Boolean)) {
+      if (rule === "*" || host === rule || (rule.startsWith(".") && host.endsWith(rule)) || host.endsWith("." + rule)) {
+        return "";
+      }
+    }
+  }
+  return raw;
+}
+
+function readSocketBytes(sock, count, signal) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let got = 0;
+    const onAbort = () => { cleanup(); sock.destroy(); reject(signal?.reason || Object.assign(new Error("Aborted"), {name: "AbortError"})); };
+    const onData = chunk => {
+      chunks.push(chunk);
+      got += chunk.length;
+      if (got >= count) {
+        const buf = Buffer.concat(chunks);
+        cleanup();
+        if (buf.length > count) sock.unshift(buf.subarray(count));
+        resolve(buf.subarray(0, count));
+      }
+    };
+    const onErr = err => { cleanup(); reject(err); };
+    const onClose = () => { cleanup(); reject(new Error("Proxy connection closed unexpectedly")); };
+    const cleanup = () => {
+      sock.off("data", onData);
+      sock.off("error", onErr);
+      sock.off("close", onClose);
+      signal?.removeEventListener?.("abort", onAbort);
+    };
+    if (signal?.aborted) { onAbort(); return; }
+    signal?.addEventListener?.("abort", onAbort, {once: true});
+    sock.on("data", onData);
+    sock.once("error", onErr);
+    sock.once("close", onClose);
+  });
+}
+
+async function openSocks5Tunnel(proxyUrl, targetHost, targetPort, signal) {
+  const pHost = proxyUrl.hostname;
+  const pPort = Number(proxyUrl.port) || 1080;
+  const sock = await new Promise((resolve, reject) => {
+    const s = net.connect({host: pHost, port: pPort});
+    const onAbort = () => { s.destroy(); reject(signal?.reason || Object.assign(new Error("Aborted"), {name: "AbortError"})); };
+    const cleanup = () => { s.off("error", onErr); signal?.removeEventListener?.("abort", onAbort); };
+    const onErr = err => { cleanup(); reject(err); };
+    if (signal?.aborted) { onAbort(); return; }
+    signal?.addEventListener?.("abort", onAbort, {once: true});
+    s.once("error", onErr);
+    s.once("connect", () => { cleanup(); resolve(s); });
+  });
+  try {
+    const user = proxyUrl.username ? decodeURIComponent(proxyUrl.username) : "";
+    const pass = proxyUrl.password ? decodeURIComponent(proxyUrl.password) : "";
+    const hasAuth = Boolean(user || pass);
+    sock.write(Buffer.from(hasAuth ? [0x05, 0x02, 0x00, 0x02] : [0x05, 0x01, 0x00]));
+    const greet = await readSocketBytes(sock, 2, signal);
+    if (greet[0] !== 0x05) throw new Error("SOCKS5 代理协议响应无效");
+    if (greet[1] === 0x02) {
+      const uBuf = Buffer.from(user, "utf8").subarray(0, 255);
+      const pBuf = Buffer.from(pass, "utf8").subarray(0, 255);
+      sock.write(Buffer.concat([Buffer.from([0x01, uBuf.length]), uBuf, Buffer.from([pBuf.length]), pBuf]));
+      const authRep = await readSocketBytes(sock, 2, signal);
+      if (authRep[1] !== 0x00) throw new Error("SOCKS5 代理鉴权失败");
+    } else if (greet[1] !== 0x00) {
+      throw new Error(`SOCKS5 代理拒绝认证方式 (0x${greet[1].toString(16)})`);
+    }
+    const hostBuf = Buffer.from(targetHost, "utf8");
+    if (hostBuf.length > 255) throw new Error("目标域名过长");
+    const reqBuf = Buffer.alloc(7 + hostBuf.length);
+    reqBuf[0] = 0x05; reqBuf[1] = 0x01; reqBuf[2] = 0x00; reqBuf[3] = 0x03;
+    reqBuf[4] = hostBuf.length;
+    hostBuf.copy(reqBuf, 5);
+    reqBuf.writeUInt16BE(targetPort, 5 + hostBuf.length);
+    sock.write(reqBuf);
+    const repHead = await readSocketBytes(sock, 4, signal);
+    if (repHead[0] !== 0x05 || repHead[1] !== 0x00) {
+      throw new Error(`SOCKS5 代理建连失败 (code=${repHead[1]})`);
+    }
+    if (repHead[3] === 0x01) await readSocketBytes(sock, 6, signal);
+    else if (repHead[3] === 0x04) await readSocketBytes(sock, 18, signal);
+    else if (repHead[3] === 0x03) {
+      const lenB = await readSocketBytes(sock, 1, signal);
+      await readSocketBytes(sock, lenB[0] + 2, signal);
+    }
+    return sock;
+  } catch (err) {
+    sock.destroy();
+    throw err;
+  }
+}
+
+async function openHttpConnectTunnel(proxyUrl, targetHost, targetPort, signal) {
+  const isHttpsProxy = proxyUrl.protocol === "https:";
+  const pHost = proxyUrl.hostname;
+  const pPort = Number(proxyUrl.port) || (isHttpsProxy ? 443 : 8080);
+  const proxyAuth = (proxyUrl.username || proxyUrl.password)
+    ? "Basic " + Buffer.from(`${decodeURIComponent(proxyUrl.username)}:${decodeURIComponent(proxyUrl.password)}`, "utf8").toString("base64")
+    : "";
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (err, sock) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener?.("abort", onAbort);
+      if (err) reject(err); else resolve(sock);
+    };
+    const mod = isHttpsProxy ? https : http;
+    const headers = {Host: `${targetHost}:${targetPort}`};
+    if (proxyAuth) headers["Proxy-Authorization"] = proxyAuth;
+    const req = mod.request({host: pHost, port: pPort, method: "CONNECT", path: `${targetHost}:${targetPort}`, headers, agent: false});
+    const onAbort = () => { req.destroy(); finish(signal?.reason || Object.assign(new Error("Aborted"), {name: "AbortError"})); };
+    if (signal?.aborted) { onAbort(); return; }
+    signal?.addEventListener?.("abort", onAbort, {once: true});
+    req.on("connect", (res, socket, head) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        finish(new Error(`HTTP 代理 CONNECT 失败 (HTTP ${res.statusCode})`));
+        return;
+      }
+      if (head && head.length > 0) socket.unshift(head);
+      finish(null, socket);
+    });
+    req.on("error", err => finish(err));
+    req.end();
+  });
+}
+
+async function proxiedFetch(urlStr, init, proxyRaw) {
+  const target = new URL(urlStr);
+  const proxy = new URL(proxyRaw);
+  const proto = proxy.protocol.toLowerCase();
+  const isTargetHttps = target.protocol === "https:";
+  const targetPort = Number(target.port) || (isTargetHttps ? 443 : 80);
+  const method = String(init.method || "GET").toUpperCase();
+  const headers = {...(init.headers || {})};
+  const bodyBuf = init.body == null ? null : (Buffer.isBuffer(init.body) ? init.body : Buffer.from(String(init.body), "utf8"));
+  if (bodyBuf && !Object.keys(headers).some(k => k.toLowerCase() === "content-length")) {
+    headers["Content-Length"] = String(bodyBuf.length);
+  }
+  const signal = init.signal;
+  if (signal?.aborted) throw (signal.reason || Object.assign(new Error("Aborted"), {name: "AbortError"}));
+
+  let reqMod;
+  let reqOpts;
+  if (proto === "socks5:" || proto === "socks5h:" || proto === "socks:") {
+    const rawSock = await openSocks5Tunnel(proxy, target.hostname, targetPort, signal);
+    const transportSock = isTargetHttps
+      ? tls.connect({socket: rawSock, servername: isIP(target.hostname) ? undefined : target.hostname})
+      : rawSock;
+    reqMod = isTargetHttps ? https : http;
+    reqOpts = {
+      method,
+      hostname: target.hostname,
+      port: targetPort,
+      path: `${target.pathname}${target.search}`,
+      headers,
+      agent: false,
+      createConnection: () => transportSock,
+    };
+  } else if (proto === "http:" || proto === "https:") {
+    if (isTargetHttps) {
+      const rawSock = await openHttpConnectTunnel(proxy, target.hostname, targetPort, signal);
+      const tlsSock = tls.connect({socket: rawSock, servername: isIP(target.hostname) ? undefined : target.hostname});
+      reqMod = https;
+      reqOpts = {
+        method,
+        hostname: target.hostname,
+        port: targetPort,
+        path: `${target.pathname}${target.search}`,
+        headers,
+        agent: false,
+        createConnection: () => tlsSock,
+      };
+    } else {
+      const isHttpsProxy = proto === "https:";
+      reqMod = isHttpsProxy ? https : http;
+      const pHeaders = {...headers, Host: target.host};
+      if (proxy.username || proxy.password) {
+        pHeaders["Proxy-Authorization"] = "Basic " + Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`, "utf8").toString("base64");
+      }
+      reqOpts = {
+        method,
+        hostname: proxy.hostname,
+        port: Number(proxy.port) || (isHttpsProxy ? 443 : 8080),
+        path: target.toString(),
+        headers: pHeaders,
+        agent: false,
+      };
+    }
+  } else {
+    throw new Error(`不支持的代理协议：${proxy.protocol}`);
+  }
+
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const req = reqMod.request(reqOpts, res => {
+      if (settled) return;
+      settled = true;
+      const status = res.statusCode || 502;
+      const respHeaders = new Headers();
+      for (const [k, v] of Object.entries(res.headers)) {
+        if (Array.isArray(v)) {
+          for (const item of v) respHeaders.append(k, item);
+        } else if (v !== undefined) {
+          respHeaders.set(k, String(v));
+        }
+      }
+      const noBody = status === 204 || status === 205 || status === 304 || method === "HEAD";
+      if (noBody) res.resume();
+      const onAbortStream = () => { res.destroy(signal?.reason || Object.assign(new Error("Aborted"), {name: "AbortError"})); };
+      signal?.addEventListener?.("abort", onAbortStream, {once: true});
+      res.once("close", () => signal?.removeEventListener?.("abort", onAbortStream));
+      resolve(new Response(noBody ? null : Readable.toWeb(res), {status, statusText: res.statusMessage || "", headers: respHeaders}));
+    });
+    const onAbortReq = () => {
+      if (settled) return;
+      settled = true;
+      req.destroy();
+      reject(signal?.reason || Object.assign(new Error("Aborted"), {name: "AbortError"}));
+    };
+    signal?.addEventListener?.("abort", onAbortReq, {once: true});
+    req.once("error", err => {
+      signal?.removeEventListener?.("abort", onAbortReq);
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+    if (bodyBuf && bodyBuf.length > 0) req.write(bodyBuf);
+    req.end();
+  });
+}
+
+/** 安全上游请求：支持 HTTP/HTTPS/SOCKS5 代理隧道，禁止跨源/降级/内网重定向（防 SSRF 与鉴权头泄露）。 */
 async function safeFetch(url, init = {}, maxRedirects = 3) {
-  await syncGatewayProxyEnv();
+  const netCfg = await syncGatewayProxyEnv();
   let currentUrl = String(url);
+  const initialParsed = new URL(currentUrl);
+  const initialWasPrivate = isPrivateHost(initialParsed.hostname);
   let headers = {...(init.headers || {})};
   for (let hop = 0; hop <= maxRedirects; hop++) {
-    const resp = await fetch(currentUrl, {...init, headers, redirect: "manual"});
+    const parsedNow = new URL(currentUrl);
+    const proxyUrl = resolveEffectiveProxyUrl(parsedNow, netCfg);
+    const resp = proxyUrl
+      ? await proxiedFetch(currentUrl, {...init, headers}, proxyUrl)
+      : await fetch(currentUrl, {...init, headers, redirect: "manual"});
     if (resp.status >= 300 && resp.status < 400) {
       const loc = resp.headers.get("location");
       resp.body?.cancel?.().catch(() => {});
       if (!loc || hop === maxRedirects) return resp;
       const prev = new URL(currentUrl);
       const next = new URL(loc, prev);
+      if (next.username || next.password) {
+        throw new Error("Upstream redirect must not contain credentials");
+      }
+      if (prev.protocol === "https:" && next.protocol !== "https:") {
+        throw new Error("Upstream redirect must not downgrade HTTPS to HTTP");
+      }
+      if (!initialWasPrivate && isPrivateHost(next.hostname)) {
+        throw new Error("Upstream redirect to private/loopback host is blocked");
+      }
       validateUrl(next.origin + next.pathname, true);
       if (next.origin !== prev.origin) {
         const stripped = {};
@@ -307,6 +572,7 @@ const routingGroups = new Map();
 const keyCooldowns = new Map();       // `${providerId}:${keyIdx}` -> untilMs
 const keyCursors = new Map();         // providerId -> next index
 const groupCursors = new Map();       // groupId -> next index
+const sessionRouteAffinity = new Map(); // `${groupId}:${sessionId}` -> pinned target index (LRU <= 512)
 const learnedAnthropicAuth = new Map(); // providerId -> "bearer" | "x-api-key"
 
 const localToken = randomBytes(32).toString("hex");
@@ -571,30 +837,70 @@ async function readErrorText(upstream) {
   } catch { return `HTTP ${upstream.status}`; }
 }
 
+function stripCacheControlFields(payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  const out = {...payload};
+  if (Array.isArray(out.system)) {
+    out.system = out.system.map(b => (b && typeof b === "object" && "cache_control" in b ? (({cache_control, ...rest}) => rest)(b) : b));
+  }
+  if (Array.isArray(out.tools)) {
+    out.tools = out.tools.map(t => (t && typeof t === "object" && "cache_control" in t ? (({cache_control, ...rest}) => rest)(t) : t));
+  }
+  if (Array.isArray(out.messages)) {
+    out.messages = out.messages.map(m => {
+      if (!m || !Array.isArray(m.content)) return m;
+      return {
+        ...m,
+        content: m.content.map(b => (b && typeof b === "object" && "cache_control" in b ? (({cache_control, ...rest}) => rest)(b) : b)),
+      };
+    });
+  }
+  return out;
+}
+
 /** 带多密钥池自动故障转移与 Anthropic 双认证头自适应重放的上游请求。 */
-async function fetchWithKeyPool(provider, url, payloadObj, extraHeaders, signal, {isAnthropic = false, stripStreamOptions = false} = {}) {
+async function fetchWithKeyPool(provider, url, payloadObj, extraHeaders, signal, {isAnthropic = false, stripStreamOptions = false, stripCacheControl = false, method = "POST"} = {}) {
   const entries = orderedKeyEntries(provider);
   let lastResp = null;
   let lastErr = null;
-  const bodyJson = JSON.stringify(applyExtraBody(payloadObj, provider));
+  const hasBody = payloadObj != null && method !== "GET" && method !== "DELETE";
+  const bodyJson = hasBody ? JSON.stringify(applyExtraBody(payloadObj, provider)) : undefined;
+  const makeHeaders = (key, authMode) => {
+    const h = buildHeaders(provider, extraHeaders, key, authMode);
+    if (!hasBody) delete h["Content-Type"];
+    return h;
+  };
   for (let attempt = 0; attempt < entries.length; attempt++) {
     const {idx, key} = entries[attempt];
     const preferredAuth = isAnthropic ? (learnedAnthropicAuth.get(provider.id) || provider.authMode) : provider.authMode;
+    let activeAuth = preferredAuth;
     try {
-      let resp = await safeFetch(url, {method: "POST", headers: buildHeaders(provider, extraHeaders, key, preferredAuth), body: bodyJson, signal});
+      let resp = await safeFetch(url, {method, headers: makeHeaders(key, activeAuth), ...(hasBody ? {body: bodyJson} : {}), signal});
       // Magpie RetryOneAuth：第三方 Anthropic 兼容端点常只认 Bearer 或只认 x-api-key，401/403 自动切换一次
-      if (isAnthropic && provider.anthropicAuthFallback && (resp.status === 401 || resp.status === 403) && key && preferredAuth !== "none") {
+      if (isAnthropic && provider.anthropicAuthFallback && (resp.status === 401 || resp.status === 403) && key && activeAuth !== "none") {
         resp.body?.cancel?.().catch(() => {});
-        const alt = preferredAuth === "x-api-key" ? "bearer" : "x-api-key";
-        const retry = await safeFetch(url, {method: "POST", headers: buildHeaders(provider, extraHeaders, key, alt), body: bodyJson, signal});
+        const alt = activeAuth === "x-api-key" ? "bearer" : "x-api-key";
+        const retry = await safeFetch(url, {method, headers: makeHeaders(key, alt), ...(hasBody ? {body: bodyJson} : {}), signal});
         if (retry.ok) { learnedAnthropicAuth.set(provider.id, alt); return retry; }
+        if (retry.status !== 401 && retry.status !== 403) {
+          activeAuth = alt;
+          learnedAnthropicAuth.set(provider.id, alt);
+        }
         resp = retry;
       }
-      if (stripStreamOptions && resp.status === 400 && payloadObj?.stream_options) {
+      if (hasBody && stripStreamOptions && resp.status === 400 && payloadObj?.stream_options) {
         resp.body?.cancel?.().catch(() => {});
         const clone = applyExtraBody({...payloadObj}, provider);
         delete clone.stream_options;
-        resp = await safeFetch(url, {method: "POST", headers: buildHeaders(provider, extraHeaders, key, preferredAuth), body: JSON.stringify(clone), signal});
+        resp = await safeFetch(url, {method, headers: makeHeaders(key, activeAuth), body: JSON.stringify(clone), signal});
+      }
+      if (hasBody && stripCacheControl && resp.status === 400) {
+        const errPreview = await resp.clone().text().catch(() => "");
+        if (/cache_control|ephemeral/i.test(errPreview)) {
+          resp.body?.cancel?.().catch(() => {});
+          const stripped = applyExtraBody(stripCacheControlFields(payloadObj), provider);
+          resp = await safeFetch(url, {method, headers: makeHeaders(key, activeAuth), body: JSON.stringify(stripped), signal});
+        }
       }
       if (resp.ok) return resp;
       lastResp = resp;
@@ -692,12 +998,37 @@ function extractUsageFromObject(obj, acc) {
   }
   const inTok = u.input_tokens ?? u.prompt_tokens;
   const outTok = u.output_tokens ?? u.completion_tokens;
-  const cacheRead = u.input_tokens_details?.cached_tokens ?? u.prompt_tokens_details?.cached_tokens;
+  const cacheRead = u.input_tokens_details?.cached_tokens ?? u.prompt_tokens_details?.cached_tokens ?? u.prompt_cache_hit_tokens;
+  const cacheWrite = u.input_tokens_details?.cache_write_tokens ?? u.prompt_tokens_details?.cache_write_tokens;
   const reasoning = u.output_tokens_details?.reasoning_tokens ?? u.completion_tokens_details?.reasoning_tokens;
   if (typeof inTok === "number" && inTok > acc.in) acc.in = inTok;
   if (typeof outTok === "number" && outTok > acc.out) acc.out = outTok;
   if (typeof cacheRead === "number" && cacheRead > acc.cacheRead) acc.cacheRead = cacheRead;
+  if (typeof cacheWrite === "number" && cacheWrite > acc.cacheWrite) acc.cacheWrite = cacheWrite;
   if (typeof reasoning === "number" && reasoning > acc.reasoning) acc.reasoning = reasoning;
+}
+
+const FORWARDED_RESPONSE_HEADERS = [
+  "x-codex-turn-state",
+  "x-reasoning-included",
+  "openai-model",
+  "x-request-id",
+  "request-id",
+  "x-codex-safety-buffering-faster-model",
+  "anthropic-ratelimit-requests-remaining",
+  "anthropic-ratelimit-tokens-remaining",
+  "retry-after",
+];
+
+function buildPassthroughResponseHeaders(upstream, contentType) {
+  const headers = {"Content-Type": contentType, "Cache-Control": "no-cache"};
+  if (upstream?.headers?.get) {
+    for (const h of FORWARDED_RESPONSE_HEADERS) {
+      const val = upstream.headers.get(h);
+      if (val) headers[h] = val;
+    }
+  }
+  return headers;
 }
 
 /** 透明直通并实时嗅探 SSE / JSON 中的 Token 用量、真实首字延迟（TTFT）与纯生成窗口，写入用量账本。 */
@@ -721,13 +1052,13 @@ async function passthroughWithUsage(upstream, res, meta, allowFailover = false) 
       void recordUsageEvent({...meta, ...finalized, ms: Date.now() - meta.startedAt, status, err: errText});
       throw new FailoverError(status, errText, meta.providerName);
     }
-    res.writeHead(status, {"Content-Type": ct, "Cache-Control": "no-cache"});
+    res.writeHead(status, buildPassthroughResponseHeaders(upstream, ct));
     res.end(raw);
     void recordUsageEvent({...meta, ...finalized, ms: Date.now() - meta.startedAt, status, err: errText});
     return;
   }
   usage.streamed = true;
-  res.writeHead(upstream.status, {"Content-Type": ct, "Cache-Control": "no-cache"});
+  res.writeHead(upstream.status, buildPassthroughResponseHeaders(upstream, ct));
   if (!upstream.body) {
     res.end();
     void recordUsageEvent({...meta, ...finalizeUsageAccumulator(usage, meta.startedAt), ms: Date.now() - meta.startedAt, status: upstream.status});
@@ -857,7 +1188,18 @@ function wrapUpstreamForUsage(upstream, startedAt) {
   return {wrapped, usage};
 }
 
-function resolveRouteCandidates(targetId, requestedModel) {
+function setSessionRouteAffinity(gid, sessionId, providerId) {
+  if (!gid || !sessionId || !providerId) return;
+  const key = `${gid}:${sessionId}`;
+  sessionRouteAffinity.delete(key);
+  sessionRouteAffinity.set(key, providerId);
+  if (sessionRouteAffinity.size > 512) {
+    const oldest = sessionRouteAffinity.keys().next().value;
+    if (oldest !== undefined) sessionRouteAffinity.delete(oldest);
+  }
+}
+
+function resolveRouteCandidates(targetId, requestedModel, sessionId = "") {
   if (targetId.startsWith("group_")) {
     const gid = targetId.slice("group_".length);
     const group = routingGroups.get(gid);
@@ -867,13 +1209,23 @@ function resolveRouteCandidates(targetId, requestedModel) {
       .filter(x => x.provider && x.provider.enabled);
     if (!ordered.length) return [];
     if (group.strategy === "round_robin" && ordered.length > 1) {
-      // 按权重展开轮询池，避免忽略 RoutingGroupTarget.weight
-      const expanded = [];
-      ordered.forEach((item, idx) => { for (let w = 0; w < item.weight; w++) expanded.push(idx); });
-      const cursor = groupCursors.get(gid) || 0;
-      groupCursors.set(gid, cursor + 1);
-      const startIdx = expanded[cursor % expanded.length];
-      ordered = [...ordered.slice(startIdx), ...ordered.slice(0, startIdx)];
+      // 同会话优先粘滞到已命中的上游节点，避免 round_robin 逐轮切换服务商导致服务端 Prompt Cache 归零；新会话仍按权重轮询。
+      const stickyKey = sessionId ? `${gid}:${sessionId}` : "";
+      const stickyPid = stickyKey ? sessionRouteAffinity.get(stickyKey) : null;
+      const stickyIdx = stickyPid ? ordered.findIndex(x => x.provider.id === stickyPid) : -1;
+      if (stickyIdx >= 0) {
+        setSessionRouteAffinity(gid, sessionId, ordered[stickyIdx].provider.id);
+        ordered = [...ordered.slice(stickyIdx), ...ordered.slice(0, stickyIdx)];
+      } else {
+        // 按权重展开轮询池，避免忽略 RoutingGroupTarget.weight
+        const expanded = [];
+        ordered.forEach((item, idx) => { for (let w = 0; w < item.weight; w++) expanded.push(idx); });
+        const cursor = groupCursors.get(gid) || 0;
+        groupCursors.set(gid, cursor + 1);
+        const startIdx = expanded[cursor % expanded.length];
+        ordered = [...ordered.slice(startIdx), ...ordered.slice(0, startIdx)];
+        if (sessionId) setSessionRouteAffinity(gid, sessionId, ordered[0].provider.id);
+      }
     } else if (group.strategy === "cheapest") {
       const rank = (p) => p.billingKind === "free" ? -2 : (p.billingKind === "plan" ? -1 : p.priceRate);
       ordered.sort((a, b) => rank(a.provider) - rank(b.provider));
@@ -885,11 +1237,12 @@ function resolveRouteCandidates(targetId, requestedModel) {
         provider: x.provider,
         model: reqMatchesTarget ? requestedModel : (x.model || requestedModel),
         fromGroup: true,
+        groupId: gid,
       };
     });
   }
   const p = providers.get(targetId);
-  return (p && p.enabled) ? [{provider: p, model: requestedModel, fromGroup: false}] : [];
+  return (p && p.enabled) ? [{provider: p, model: requestedModel, fromGroup: false, groupId: ""}] : [];
 }
 
 class FailoverError extends Error {
@@ -914,6 +1267,41 @@ function failOrSend(res, protocol, status, errText, meta, startedAt, allowFailov
 async function handleCompatibleIngress(provider, route, subPath, body, req, res, signal, agentLabel, reqMetaExtra = {}) {
   const allowFailover = Boolean(reqMetaExtra.allowFailover);
   const cleanPath = subPath.replace(/^\/(v1|v1beta)(?=\/)/, "");
+  if (route === "gemini" && /^\/cachedContents(?:\/[^/]+)?$/.test(cleanPath)) {
+    const target = resolveNativeTarget(provider, "google_gemini");
+    if (target.protocol !== "google_gemini") {
+      sendError(res, route, 501, "Gemini Context Caching requires a native Google Gemini upstream provider");
+      return;
+    }
+    const query = {...provider.queryParams};
+    if (reqMetaExtra.searchParams) {
+      for (const [k, v] of reqMetaExtra.searchParams.entries()) {
+        if (k === "key" || k === "solbraid_sid") continue;
+        if (!(k in query)) query[k] = v;
+      }
+    }
+    const extraHeaders = {};
+    if (req.headers["x-goog-api-client"]) extraHeaders["x-goog-api-client"] = String(req.headers["x-goog-api-client"]);
+    let cachePayload = (req.method === "POST" || req.method === "PATCH") ? {...body} : null;
+    if (cachePayload && typeof cachePayload.model === "string" && cachePayload.model.trim()) {
+      const rawM = cachePayload.model.replace(/^models\//, "");
+      const mappedM = resolveMappedModel(provider, rawM, "google_gemini");
+      cachePayload.model = mappedM.startsWith("models/") ? mappedM : `models/${mappedM}`;
+    }
+    const upstream = await fetchWithKeyPool(
+      provider,
+      joinUrl(target.baseUrl, cleanPath, query),
+      cachePayload,
+      extraHeaders,
+      signal,
+      {method: req.method},
+    );
+    if (!upstream.ok) { const err = await readErrorText(upstream); sendError(res, route, upstream.status, err); return; }
+    const raw = await upstream.text();
+    res.writeHead(upstream.status, {"Content-Type": upstream.headers.get("content-type") || "application/json"});
+    res.end(raw);
+    return;
+  }
   let model = body.model;
   let stream = body.stream === true;
   let action = null;
@@ -927,7 +1315,7 @@ async function handleCompatibleIngress(provider, route, subPath, body, req, res,
     sendError(res, route, 404, "Unknown Chat endpoint"); return;
   }
   if (typeof model !== "string" || !model.trim()) { sendError(res, route, 400, "A model is required"); return; }
-  const mappedGemini = route === "gemini" ? resolveMappedModel(provider, model) : model;
+  const mappedGemini = (route === "gemini" && !reqMetaExtra.modelAlreadyMapped) ? resolveMappedModel(provider, model, "google_gemini") : model;
   const effectiveRequested = reqMetaExtra.requestedModel || (mappedGemini !== model ? model : "");
   model = mappedGemini;
   const startedAt = Date.now();
@@ -946,9 +1334,18 @@ async function handleCompatibleIngress(provider, route, subPath, body, req, res,
       response: parsedUp,
       context: {route, model, stream},
     });
-    void recordUsageEvent({...meta, ms: Date.now() - startedAt, status: 200});
-    res.writeHead(200, {"Content-Type": "application/json"});
-    res.end(typeof out === "string" ? out : JSON.stringify(out));
+    const parsedOut = extractTranslatedPayload(out);
+    void recordUsageEvent({...meta, in: parsedOut.usage.inputTokens, out: parsedOut.usage.outputTokens, ms: Date.now() - startedAt, status: 200});
+    if (stream) {
+      const writer = new CompatibleResponseWriter(res, model, route, true);
+      if (parsedOut.text) writer.textDelta(parsedOut.text);
+      parsedOut.toolCalls.forEach((tc, idx) => writer.toolDelta(idx, tc.id, tc.name, tc.arguments));
+      writer.setUsage(parsedOut.usage.inputTokens, parsedOut.usage.outputTokens);
+      writer.finish(parsedOut.stopReason === "max_tokens" ? "length" : "stop");
+    } else {
+      res.writeHead(200, {"Content-Type": "application/json"});
+      res.end(typeof out === "string" ? out : JSON.stringify(out));
+    }
     return;
   }
 
@@ -962,9 +1359,17 @@ async function handleCompatibleIngress(provider, route, subPath, body, req, res,
   }
   if (route === "gemini" && target.protocol === "google_gemini") {
     const query = {...provider.queryParams, ...(stream ? {alt: "sse"} : {})};
+    if (reqMetaExtra.searchParams) {
+      for (const [k, v] of reqMetaExtra.searchParams.entries()) {
+        if (k === "key" || k === "solbraid_sid") continue;
+        if (!(k in query)) query[k] = v;
+      }
+    }
+    const extraHeaders = {};
+    if (req.headers["x-goog-api-client"]) extraHeaders["x-goog-api-client"] = String(req.headers["x-goog-api-client"]);
     const geminiPayload = {...body};
     delete geminiPayload.model;
-    upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, `/models/${encodeURIComponent(model)}:${action}`, query), geminiPayload, {}, signal);
+    upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, `/models/${encodeURIComponent(model)}:${action}`, query), geminiPayload, extraHeaders, signal);
     if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, route, upstream.status, err, meta, startedAt, allowFailover); return; }
     await passthroughWithUsage(upstream, res, meta, allowFailover);
     return;
@@ -972,7 +1377,11 @@ async function handleCompatibleIngress(provider, route, subPath, body, req, res,
   if (action === "countTokens") { sendError(res, route, 501, "Exact Gemini token counting requires a Gemini upstream provider"); return; }
 
   let normalized;
-  try { normalized = route === "gemini" ? geminiToResponsesRequest(body, model) : chatToResponsesRequest(body); }
+  try {
+    normalized = route === "gemini"
+      ? geminiToResponsesRequest(body, model, {sessionId: reqMetaExtra.sessionId})
+      : chatToResponsesRequest(body, {sessionId: reqMetaExtra.sessionId});
+  }
   catch (error) { sendError(res, route, 400, error.message); return; }
   const writer = new CompatibleResponseWriter(res, model, route, stream);
   if (target.protocol === "openai_responses") {
@@ -980,7 +1389,7 @@ async function handleCompatibleIngress(provider, route, subPath, body, req, res,
   } else if (target.protocol === "openai_chat") {
     upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/chat/completions", provider.queryParams), responsesToChatRequest(normalized).req, {Accept: "text/event-stream"}, signal, {stripStreamOptions: true});
   } else if (target.protocol === "anthropic_messages") {
-    upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/v1/messages", provider.queryParams), responsesToAnthropicRequest(normalized).req, {"anthropic-version": "2023-06-01", Accept: "text/event-stream"}, signal, {isAnthropic: true});
+    upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/v1/messages", provider.queryParams), responsesToAnthropicRequest(normalized).req, {"anthropic-version": "2023-06-01", Accept: "text/event-stream"}, signal, {isAnthropic: true, stripCacheControl: true});
   } else {
     upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, `/models/${encodeURIComponent(model.replace(/^models\//, ""))}:streamGenerateContent`, {...provider.queryParams, alt: "sse"}), responsesToGeminiRequest(normalized).req, {Accept: "text/event-stream"}, signal);
   }
@@ -1045,7 +1454,7 @@ async function handleCompatibleResponsesCompact(provider, target, body, res, sig
     antReq.stream = false;
     delete antReq.tools;
     delete antReq.tool_choice;
-    upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/v1/messages", provider.queryParams), antReq, {"anthropic-version": "2023-06-01"}, signal, {isAnthropic: true});
+    upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/v1/messages", provider.queryParams), antReq, {"anthropic-version": "2023-06-01"}, signal, {isAnthropic: true, stripCacheControl: true});
     if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, "openai", upstream.status, err, meta, startedAt, allowFailover); return; }
     const data = await upstream.json();
     summaryText = Array.isArray(data.content) ? data.content.filter(b => b?.type === "text").map(b => b.text).join("\n") : "";
@@ -1148,8 +1557,26 @@ async function handleCodexIngress(provider, subPath, body, req, res, signal, req
     return;
   }
 
+  const wantStream = body.stream !== false;
   if (target.protocol === "openai_responses") {
-    const upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/responses", provider.queryParams), body, {Accept: "text/event-stream"}, signal);
+    const extra = {Accept: wantStream ? "text/event-stream" : "application/json"};
+    // 透传 Codex 0.172 粘滞路由与会话亲和请求头（含 x-codex-turn-state / x-codex-window-id 等）
+    for (const h of [
+      "session_id",
+      "openai-beta",
+      "x-client-request-id",
+      "x-codex-turn-state",
+      "x-codex-window-id",
+      "x-codex-turn-metadata",
+      "x-codex-installation-id",
+      "x-codex-parent-thread-id",
+      "x-codex-beta-features",
+      "x-openai-subagent",
+      "x-openai-internal-codex-responses-lite",
+    ]) {
+      if (req.headers[h]) extra[h] = String(req.headers[h]);
+    }
+    const upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/responses", provider.queryParams), body, extra, signal);
     if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, "openai", upstream.status, err, meta, startedAt, allowFailover); return; }
     await passthroughWithUsage(upstream, res, meta, allowFailover);
     return;
@@ -1159,15 +1586,15 @@ async function handleCodexIngress(provider, subPath, body, req, res, signal, req
     const upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/chat/completions", provider.queryParams), chatReq, {Accept: "text/event-stream"}, signal, {stripStreamOptions: true});
     if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, "openai", upstream.status, err, meta, startedAt, allowFailover); return; }
     const {wrapped, usage} = wrapUpstreamForUsage(upstream, startedAt);
-    await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeChatToResponses(wrapped, res, body.model, namespaceMap, customSet));
+    await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeChatToResponses(wrapped, res, body.model, namespaceMap, customSet, undefined, wantStream));
     return;
   }
   if (target.protocol === "anthropic_messages") {
     const {req: antReq, namespaceMap, customSet} = responsesToAnthropicRequest(body);
-    const upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/v1/messages", provider.queryParams), antReq, {"anthropic-version": "2023-06-01", Accept: "text/event-stream"}, signal, {isAnthropic: true});
+    const upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/v1/messages", provider.queryParams), antReq, {"anthropic-version": "2023-06-01", Accept: "text/event-stream"}, signal, {isAnthropic: true, stripCacheControl: true});
     if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, "openai", upstream.status, err, meta, startedAt, allowFailover); return; }
     const {wrapped, usage} = wrapUpstreamForUsage(upstream, startedAt);
-    await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeAnthropicToResponses(wrapped, res, body.model, namespaceMap, customSet));
+    await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeAnthropicToResponses(wrapped, res, body.model, namespaceMap, customSet, undefined, wantStream));
     return;
   }
   const {req: gemReq, namespaceMap, customSet} = responsesToGeminiRequest(body);
@@ -1175,7 +1602,7 @@ async function handleCodexIngress(provider, subPath, body, req, res, signal, req
   const upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, `/models/${encodeURIComponent(modelName)}:streamGenerateContent`, {alt: "sse", ...provider.queryParams}), gemReq, {Accept: "text/event-stream"}, signal);
   if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, "openai", upstream.status, err, meta, startedAt, allowFailover); return; }
   const {wrapped, usage} = wrapUpstreamForUsage(upstream, startedAt);
-  await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeGeminiToResponses(wrapped, res, body.model, namespaceMap, customSet));
+  await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeGeminiToResponses(wrapped, res, body.model, namespaceMap, customSet, undefined, wantStream));
 }
 
 async function handleClaudeIngress(provider, subPath, query, body, req, res, signal, reqMetaExtra = {}) {
@@ -1238,8 +1665,9 @@ async function handleClaudeIngress(provider, subPath, query, body, req, res, sig
     return;
   }
 
+  const wantStream = body.stream === true;
   if (target.protocol === "anthropic_messages") {
-    const extra = {"anthropic-version": req.headers["anthropic-version"] || "2023-06-01", Accept: "text/event-stream"};
+    const extra = {"anthropic-version": req.headers["anthropic-version"] || "2023-06-01", Accept: wantStream ? "text/event-stream" : "application/json"};
     if (req.headers["anthropic-beta"]) extra["anthropic-beta"] = req.headers["anthropic-beta"];
     const mergedQuery = {...provider.queryParams};
     for (const [k, v] of query.entries()) if (!(k in mergedQuery)) mergedQuery[k] = v;
@@ -1253,15 +1681,15 @@ async function handleClaudeIngress(provider, subPath, query, body, req, res, sig
     const upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/chat/completions", provider.queryParams), chatReq, {Accept: "text/event-stream"}, signal, {stripStreamOptions: true});
     if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, "anthropic", upstream.status, err, meta, startedAt, allowFailover); return; }
     const {wrapped, usage} = wrapUpstreamForUsage(upstream, startedAt);
-    await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeChatToAnthropic(wrapped, res, body.model));
+    await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeChatToAnthropic(wrapped, res, body.model, wantStream));
     return;
   }
   if (target.protocol === "openai_responses") {
-    const respReq = anthropicToResponsesRequest(body);
+    const respReq = anthropicToResponsesRequest(body, {sessionId: reqMetaExtra.sessionId});
     const upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, "/responses", provider.queryParams), respReq, {Accept: "text/event-stream"}, signal);
     if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, "anthropic", upstream.status, err, meta, startedAt, allowFailover); return; }
     const {wrapped, usage} = wrapUpstreamForUsage(upstream, startedAt);
-    await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeResponsesToAnthropic(wrapped, res, body.model));
+    await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeResponsesToAnthropic(wrapped, res, body.model, wantStream));
     return;
   }
   const gemReq = anthropicToGeminiRequest(body);
@@ -1269,7 +1697,7 @@ async function handleClaudeIngress(provider, subPath, query, body, req, res, sig
   const upstream = await fetchWithKeyPool(provider, joinUrl(target.baseUrl, `/models/${encodeURIComponent(modelName)}:streamGenerateContent`, {alt: "sse", ...provider.queryParams}), gemReq, {Accept: "text/event-stream"}, signal);
   if (!upstream.ok) { const err = await readErrorText(upstream); failOrSend(res, "anthropic", upstream.status, err, meta, startedAt, allowFailover); return; }
   const {wrapped, usage} = wrapUpstreamForUsage(upstream, startedAt);
-  await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeGeminiToAnthropic(wrapped, res, body.model));
+  await runPipeWithUsage(meta, usage, startedAt, res, signal, () => pipeGeminiToAnthropic(wrapped, res, body.model, wantStream));
 }
 
 async function handleHttp(req, res) {
@@ -1286,26 +1714,42 @@ async function handleHttp(req, res) {
 
   if (req.method === "GET") {
     const cleanPath = subPath.replace(/^\/(v1|v1beta)(?=\/)/, "");
-    if (cleanPath !== "/models") { sendError(res, route, 404, "Not found"); return; }
-    const cands = resolveRouteCandidates(targetId, null);
-    if (!cands.length) { sendError(res, route, 404, "该服务商或路由组已删除或未同步"); return; }
-    const models = targetId.startsWith("group_")
-      ? ["auto", ...new Set(cands.map(c => c.model).filter(Boolean))]
-      : await fetchModels(cands[0].provider);
-    res.writeHead(200, {"Content-Type": "application/json"});
-    res.end(JSON.stringify(route === "gemini"
-      ? {models: models.map(id => ({name: "models/" + id, displayName: id, supportedGenerationMethods: ["generateContent", "streamGenerateContent"]}))}
-      : {object: "list", data: models.map(id => ({id, object: "model", owned_by: cands[0].provider.name}))}));
-    return;
+    if (cleanPath === "/models") {
+      const cands = resolveRouteCandidates(targetId, null, urlSessionId);
+      if (!cands.length) { sendError(res, route, 404, "该服务商或路由组已删除或未同步"); return; }
+      const models = targetId.startsWith("group_")
+        ? ["auto", ...new Set(cands.map(c => c.model).filter(Boolean))]
+        : await fetchModels(cands[0].provider);
+      res.writeHead(200, {"Content-Type": "application/json"});
+      res.end(JSON.stringify(route === "gemini"
+        ? {models: models.map(id => ({name: "models/" + id, displayName: id, supportedGenerationMethods: ["generateContent", "streamGenerateContent"]}))}
+        : {object: "list", data: models.map(id => ({id, object: "model", owned_by: cands[0].provider.name}))}));
+      return;
+    }
+    if (!(route === "gemini" && /^\/cachedContents(?:\/[^/]+)?$/.test(cleanPath))) {
+      sendError(res, route, 404, "Not found");
+      return;
+    }
+  } else if (req.method !== "POST") {
+    const cleanPath = subPath.replace(/^\/(v1|v1beta)(?=\/)/, "");
+    if (!(route === "gemini" && ["PATCH", "DELETE"].includes(req.method) && /^\/cachedContents\/[^/]+$/.test(cleanPath))) {
+      sendError(res, ingress, 405, "Method not allowed");
+      return;
+    }
   }
 
-  let body;
-  try { body = await readJsonBody(req); } catch (e) { sendError(res, ingress, 400, e.message); return; }
+  let body = {};
+  if (req.method === "POST" || req.method === "PATCH") {
+    try { body = await readJsonBody(req); } catch (e) { sendError(res, ingress, 400, e.message); return; }
+  }
   const geminiPathModel = route === "gemini"
     ? (/^\/(?:v1|v1beta)\/models\/([^/]+):|^\/models\/([^/]+):/.exec(subPath)?.[1] || /^\/(?:v1|v1beta)\/models\/([^/]+):|^\/models\/([^/]+):/.exec(subPath)?.[2] || "")
     : "";
   const initialRequestedModel = body.model || (geminiPathModel ? decodeURIComponent(geminiPathModel) : "");
-  const candidates = resolveRouteCandidates(targetId, initialRequestedModel);
+  const inferredSessionId = urlSessionId
+    || String(req.headers["x-solbraid-session-id"] || req.headers["session_id"] || "")
+    || (typeof body?.prompt_cache_key === "string" ? body.prompt_cache_key : "");
+  const candidates = resolveRouteCandidates(targetId, initialRequestedModel, inferredSessionId);
   if (!candidates.length) { sendError(res, ingress, 404, "该服务商或路由组已删除、已停用或未同步，请在服务商设置中检查"); return; }
 
   const controller = new AbortController();
@@ -1320,13 +1764,12 @@ async function handleHttp(req, res) {
       const targetProto = resolveNativeTarget(picked.provider, desiredProto).protocol;
       const mappedModel = resolveMappedModel(picked.provider, requestedModel, targetProto);
       const effectiveBody = (route !== "gemini" && mappedModel) ? {...body, model: mappedModel} : body;
-      const inferredSessionId = urlSessionId
-        || String(req.headers["x-solbraid-session-id"] || req.headers["session_id"] || "")
-        || (typeof body?.prompt_cache_key === "string" ? body.prompt_cache_key : "");
       const reqMetaExtra = {
         allowFailover,
         sessionId: inferredSessionId,
-        ...(picked.fromGroup && mappedModel ? {targetModel: mappedModel} : {}),
+        searchParams: url.searchParams,
+        modelAlreadyMapped: Boolean(mappedModel),
+        ...((picked.fromGroup || route === "gemini") && mappedModel ? {targetModel: mappedModel} : {}),
         ...(initialRequestedModel && mappedModel && initialRequestedModel !== mappedModel ? {requestedModel: initialRequestedModel} : {}),
       };
       const attemptStarted = Date.now();
@@ -1334,6 +1777,9 @@ async function handleHttp(req, res) {
         if (route === "openai-responses") await handleCodexIngress(picked.provider, subPath, effectiveBody, req, res, controller.signal, reqMetaExtra);
         else if (route === "anthropic") await handleClaudeIngress(picked.provider, subPath, url.searchParams, effectiveBody, req, res, controller.signal, reqMetaExtra);
         else await handleCompatibleIngress(picked.provider, route, subPath, effectiveBody, req, res, controller.signal, route === "gemini" ? "antigravity" : "chat", reqMetaExtra);
+        if (picked.fromGroup && picked.groupId && inferredSessionId) {
+          setSessionRouteAffinity(picked.groupId, inferredSessionId, picked.provider.id);
+        }
         return;
       } catch (err) {
         // 无论是否配置故障转移，非 FailoverError 且尚未记账的异常/取消都必须落盘，彻底杜绝单服务商失败请求在用量中心凭空消失
@@ -1598,6 +2044,10 @@ async function dispatch(method, params) {
       }
     }
     for (const gid of [...groupCursors.keys()]) if (!routingGroups.has(gid)) groupCursors.delete(gid);
+    for (const [k, pid] of [...sessionRouteAffinity.entries()]) {
+      const gid = k.split(":")[0];
+      if (!routingGroups.has(gid) || !providers.has(pid)) sessionRouteAffinity.delete(k);
+    }
     return {count: providers.size, groupCount: routingGroups.size};
   }
   if (method === "providers/health") {

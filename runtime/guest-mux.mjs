@@ -488,6 +488,14 @@ async function stopAllDaemons() {
 const args = process.argv.slice(2);
 if (args[0] === "--stop-all") {
   stopAllDaemons().catch(error => { process.stderr.write(error.message + "\n"); process.exitCode = 1; });
+} else if (args[0] === "--stop" && args[1]) {
+  const ch = args[1];
+  if (!Object.hasOwn(CHANNELS, ch)) {
+    process.stderr.write(`Unsupported mux channel: ${ch}\n`);
+    process.exitCode = 1;
+  } else {
+    stopChannelDaemon(ch).catch(error => { process.stderr.write(error.message + "\n"); process.exitCode = 1; });
+  }
 } else if (args[0] === "--daemon") {
   runDaemon(args[1]).catch(err => {
     process.stderr.write((err?.message || String(err)) + "\n");

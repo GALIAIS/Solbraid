@@ -231,10 +231,20 @@ fun SessionInfoSheet(
                     state?.effort?.let { MetaRow("推理强度", it) }
                     if (key.engine == EngineKind.CLAUDE) {
                         MetaRow("权限模式", claudePermissionModeLabel(state?.permissionMode))
+                        state?.claudeAccountSummary?.takeIf { it.isNotBlank() }?.let { MetaRow("账号", it) }
+                        state?.outputStyle?.takeIf { it.isNotBlank() }?.let { MetaRow("输出风格", it) }
+                        state?.claudeCodeVersion?.takeIf { it.isNotBlank() }?.let { MetaRow("Claude 版本", it) }
+                        state?.fastModeDisabledReason?.takeIf { it.isNotBlank() }?.let { MetaRow("Fast Mode", "不可用：$it") }
+                        state?.summary?.tag?.takeIf { it.isNotBlank() }?.let { MetaRow("会话标签", it) }
+                        state?.summary?.gitBranch?.takeIf { it.isNotBlank() }?.let { MetaRow("Git 分支", it) }
                     } else if (key.engine == EngineKind.CODEX) {
                         MetaRow("审批策略", codexPermissionModeLabel(state?.approvalPolicy ?: app.settings.state.value.approvalPolicy, state?.approvalsReviewer ?: app.settings.state.value.approvalsReviewer))
+                        state?.collaborationMode?.takeIf { it.isNotBlank() }?.let { MetaRow("协作模式", it) }
                     } else if (key.engine.id == "antigravity") {
                         MetaRow("执行模式", antigravityPermissionModeLabel(state?.permissionMode))
+                    }
+                    if (state != null && state.additionalDirectories.isNotEmpty()) {
+                        MetaRow("附加目录", state.additionalDirectories.joinToString(", "))
                     }
                     if (key.engine == EngineKind.CODEX || key.engine == EngineKind.CLAUDE) {
                         val summary = state?.reasoningSummary ?: app.settings.state.value.defaultReasoningSummaryFor(key.engine)
@@ -246,18 +256,42 @@ fun SessionInfoSheet(
             }
 
             if (key.engine == EngineKind.CLAUDE && claudeMcp.isNotEmpty()) {
+                val mcpScope = rememberCoroutineScope()
                 CrispCard(padding = PaddingValues(14.dp)) {
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("会话 MCP 服务器 (${claudeMcp.size})", style = MaterialTheme.typography.titleSmall, color = G.ink)
                         claudeMcp.forEach { srv ->
                             val ok = srv.status.equals("connected", ignoreCase = true)
-                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Text(srv.name, style = MaterialTheme.typography.bodySmall, color = G.ink, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                TagPill(
-                                    text = srv.status.ifBlank { "未知" },
-                                    fg = if (ok) G.success else G.inkMuted,
-                                    bg = if (ok) G.successTint else G.surfaceSubtle,
-                                )
+                            var overrideMode by remember(srv.name) { mutableStateOf<String?>(null) }
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text(srv.name, style = MaterialTheme.typography.bodySmall, color = G.ink, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    TagPill(
+                                        text = srv.status.ifBlank { "未知" },
+                                        fg = if (ok) G.success else G.inkMuted,
+                                        bg = if (ok) G.successTint else G.surfaceSubtle,
+                                    )
+                                }
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    listOf(null to "默认", "default" to "逐次确认", "auto" to "AI 审校").forEach { (mode, label) ->
+                                        val active = overrideMode == mode
+                                        TagPill(
+                                            text = label,
+                                            fg = if (active) G.onAccent else G.inkMuted,
+                                            bg = if (active) G.claude else G.surfaceSubtle,
+                                            onClick = {
+                                                mcpScope.launch {
+                                                    runCatching { app.conversations.claude.setMcpPermissionOverride(srv.name, mode, key) }
+                                                        .onSuccess { warn ->
+                                                            overrideMode = mode
+                                                            app.conversations.notify(warn?.takeIf { it.isNotBlank() } ?: "${srv.name} 权限已设为：$label")
+                                                        }
+                                                        .onFailure { app.conversations.notify("设置失败：${it.message}") }
+                                                }
+                                            },
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -408,17 +442,39 @@ fun ConversationModelOptions(app: GaliaisApplication, key: ConversationKey, stat
             }
         }
         if (key.engine == EngineKind.CODEX) {
+            var dynamicModes by remember(key) { mutableStateOf<List<Pair<String?, String>>>(listOf("default" to "执行", "plan" to "计划")) }
+            LaunchedEffect(key) {
+                val fetched = runCatching { repo.codex.collaborationModes() }.getOrDefault(emptyList())
+                if (fetched.isNotEmpty()) {
+                    val mapped = fetched.map { item ->
+                        val label = when (item.id.lowercase()) {
+                            "default" -> "执行"
+                            "plan" -> "计划"
+                            else -> item.name
+                        }
+                        item.id to label
+                    }.distinctBy { it.first }
+                    dynamicModes = mapped
+                }
+            }
             if (model?.serviceTiers?.isNotEmpty() == true) {
                 AgentOptionChips("服务档位", listOf(null to "默认") + model.serviceTiers.map { it.id to it.name }, state?.serviceTier) {
                     repo.setServiceTier(key, it)
                 }
             }
-            AgentOptionChips("工作模式", listOf("default" to "执行", "plan" to "计划"), state?.collaborationMode ?: "default") {
+            AgentOptionChips("协作模式", dynamicModes, state?.collaborationMode ?: "default") {
                 if (it != null) repo.setCollaborationMode(key, it)
             }
-        } else if (key.engine == EngineKind.CLAUDE && model?.supportsFastMode == true) {
-            AgentOptionChips("快速模式", listOf(null to "默认", "true" to "开启", "false" to "关闭"), state?.fastMode?.toString()) {
-                repo.setFastMode(key, it?.toBooleanStrict())
+        } else if (key.engine == EngineKind.CLAUDE && (model?.supportsFastMode == true || !state?.fastModeDisabledReason.isNullOrBlank())) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (model?.supportsFastMode == true) {
+                    AgentOptionChips("快速模式", listOf(null to "默认", "true" to "开启", "false" to "关闭"), state?.fastMode?.toString()) {
+                        repo.setFastMode(key, it?.toBooleanStrict())
+                    }
+                }
+                state?.fastModeDisabledReason?.takeIf { it.isNotBlank() }?.let { reason ->
+                    Text("Fast Mode 不可用原因：$reason", style = MaterialTheme.typography.labelSmall, color = G.warning)
+                }
             }
         } else if (!builtin) {
             if (!isAgy && thoughtOpt != null && thoughtOpt.options.isNotEmpty()) {
@@ -624,10 +680,25 @@ fun FileMentionSheet(files: WorkspaceFiles, cwd: String, onSelect: (String) -> U
 
 fun builtInSlashCommands(engine: EngineKind): List<SlashCommand> = buildList {
     val caps = AgentCatalog.capabilitiesOf(engine)
+    add(SlashCommand("usage", "查看实时配额窗口、订阅状态与会话费用", localAction = "usage"))
+    add(SlashCommand("context", "查看上下文窗口分类拆解与 Token 占比", localAction = "context"))
     add(SlashCommand("compact", "压缩上下文，总结早期记录释放空间", localAction = "compact"))
-    if (caps.fork) add(SlashCommand("fork", "沿用当前上下文创建新会话", localAction = "fork"))
-    if (engine == EngineKind.CLAUDE || engine.id == "antigravity") {
-        add(SlashCommand("plan", "切换计划模式", localAction = "plan"))
+    if (caps.fork) add(SlashCommand("fork", "沿用当前上下文创建新分支会话", localAction = "fork"))
+    if (engine == EngineKind.CODEX) {
+        add(SlashCommand("queue", "管理 Codex 原生消息队列与顺延指令", localAction = "queue"))
+        add(SlashCommand("tasks", "管理 Codex 后台终端进程", localAction = "tasks"))
+        add(SlashCommand("memory", "查看与管理长期记忆和会话目标锚点", localAction = "memory"))
+    }
+    if (engine == EngineKind.CLAUDE) {
+        add(SlashCommand("tasks", "将阻塞前景任务转入后台 (Ctrl+B) 或停止任务", localAction = "tasks"))
+        add(SlashCommand("agents", "查看子代理独立思考与工具执行记录", localAction = "agents"))
+        add(SlashCommand("reload", "会话内热重载插件/技能、切换输出风格与 Ultracode", localAction = "reload"))
+    }
+    if (engine == EngineKind.CLAUDE || engine.id == "antigravity" || engine == EngineKind.CODEX) {
+        add(SlashCommand("plan", "切换计划 / 协作模式", localAction = "plan"))
+        add(SlashCommand("add-dir", "为当前会话附加额外工作区目录", localAction = "add-dir"))
+        add(SlashCommand("doctor", "执行官方环境与协议健康诊断", localAction = "doctor"))
+        add(SlashCommand("tui", "同会话 ID 无缝切入原生 CLI 终端模式", localAction = "tui"))
     }
     if (caps.archive) {
         add(SlashCommand("archive", "将当前会话归档，可随时恢复", localAction = "archive"))
@@ -639,8 +710,17 @@ fun builtInSlashCommands(engine: EngineKind): List<SlashCommand> = buildList {
 }
 
 fun slashCommandIcon(cmd: SlashCommand): ImageVector = when {
+    cmd.localAction == "usage" -> GaliaisIcons.BarChart
+    cmd.localAction == "context" -> GaliaisIcons.Layers
     cmd.localAction == "compact" -> GaliaisIcons.Compress
     cmd.localAction == "fork" -> GaliaisIcons.GitBranch
+    cmd.localAction == "queue" || cmd.localAction == "tasks" -> GaliaisIcons.Terminal
+    cmd.localAction == "memory" -> GaliaisIcons.Sparkles
+    cmd.localAction == "agents" -> GaliaisIcons.Layers
+    cmd.localAction == "reload" -> GaliaisIcons.Refresh
+    cmd.localAction == "add-dir" -> GaliaisIcons.Folder
+    cmd.localAction == "doctor" -> GaliaisIcons.ShieldCheck
+    cmd.localAction == "tui" -> GaliaisIcons.Terminal
     cmd.localAction == "plan" -> GaliaisIcons.ListCheck
     cmd.localAction == "archive" -> GaliaisIcons.Archive
     cmd.localAction == "review" -> GaliaisIcons.ShieldCheck
@@ -1060,7 +1140,7 @@ private fun ModelOptionRow(
     }
 }
 
-/** Codex 已归档会话列表抽屉：支持一键恢复。 */
+/** 三端统一已归档会话列表抽屉：支持 Codex / Claude / Antigravity 一键恢复。 */
 @Composable
 fun ArchivedThreadsSheet(
     app: GaliaisApplication,
@@ -1074,7 +1154,7 @@ fun ArchivedThreadsSheet(
 
     LaunchedEffect(Unit) {
         loading = true
-        archived = try { app.conversations.codex.listArchived() } catch (_: Exception) { emptyList() }
+        archived = try { app.conversations.listAllArchived() } catch (_: Exception) { emptyList() }
         loading = false
     }
 
@@ -1095,7 +1175,7 @@ fun ArchivedThreadsSheet(
                 GaliaisProgressBar()
             } else if (archived.isEmpty()) {
                 CrispCard(padding = PaddingValues(16.dp)) {
-                    Text("当前没有已归档的 Codex 会话。", style = MaterialTheme.typography.bodyMedium, color = G.inkMuted)
+                    Text("当前没有已归档的会话。", style = MaterialTheme.typography.bodyMedium, color = G.inkMuted)
                     Spacer(Modifier.height(4.dp))
                     Text("可在会话操作菜单中归档，或使用 /archive 指令。", style = MaterialTheme.typography.bodySmall, color = G.inkSubtle)
                 }
@@ -1105,11 +1185,14 @@ fun ArchivedThreadsSheet(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     archived.forEach { s ->
-                        val busy = restoringId == s.key.id
+                        val busy = restoringId == s.key.route
                         CrispCard(padding = PaddingValues(12.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                                    Text(s.title, style = MaterialTheme.typography.titleSmall, color = G.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        EngineLabel(s.key.engine)
+                                        Text(s.title, style = MaterialTheme.typography.titleSmall, color = G.ink, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                                    }
                                     s.cwd?.let {
                                         Text(it, fontFamily = Mono, fontSize = 11.sp, color = G.inkSubtle, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                     }
@@ -1119,7 +1202,7 @@ fun ArchivedThreadsSheet(
                                     text = if (busy) "恢复中…" else "恢复",
                                     enabled = restoringId == null,
                                     onClick = {
-                                        restoringId = s.key.id
+                                        restoringId = s.key.route
                                         scope.launch {
                                             try {
                                                 app.conversations.unarchive(s.key)

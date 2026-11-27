@@ -197,6 +197,27 @@ private val OPEN_SOURCE_ENTRIES = listOf(
         notice = "Node.js is licensed under the MIT License; Ubuntu 24.04 base userland packages are governed by their respective open-source licenses included in /usr/share/doc/*/copyright.",
     ),
     OpenSourceEntry(
+        name = "ripgrep (rg)",
+        license = "MIT / Unlicense",
+        copyright = "Copyright (C) Andrew Gallant (BurntSushi)",
+        url = "https://github.com/BurntSushi/ripgrep",
+        notice = MIT_NOTICE,
+    ),
+    OpenSourceEntry(
+        name = "Go Standard Library & golang.org/x/sys",
+        license = "BSD-3-Clause",
+        copyright = "Copyright (C) The Go Authors",
+        url = "https://go.dev",
+        notice = BSD_NOTICE,
+    ),
+    OpenSourceEntry(
+        name = "android-shmem (libandroid-shmem)",
+        license = "Apache-2.0",
+        copyright = "Copyright (C) Termux & pelya contributors",
+        url = "https://github.com/termux/libandroid-shmem",
+        notice = APACHE_2_SHORT,
+    ),
+    OpenSourceEntry(
         name = "JUnit 4 & JSON-java (Test Dependencies)",
         license = "EPL-1.0 / Public Domain",
         copyright = "Copyright (C) JUnit Team & JSON.org contributors",

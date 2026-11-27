@@ -21,6 +21,8 @@ data class ConversationSummary(
     val running: Boolean = false,
     val parent: ConversationKey? = null,
     val archived: Boolean = false,
+    val tag: String? = null,
+    val gitBranch: String? = null,
 )
 
 enum class ItemStatus { RUNNING, COMPLETED, FAILED, DECLINED }
@@ -202,6 +204,136 @@ data class RateLimitSummary(
     val label: String,
     val usedPercent: Int,
     val resetsAt: String? = null,
+)
+
+/** 三端统一的 `/usage` 实时配额与会话用量报告。 */
+data class EngineUsageReport(
+    val engine: EngineKind,
+    val planLabel: String? = null,
+    val accountLabel: String? = null,
+    val rateLimitsAvailable: Boolean = false,
+    val ordinaryUsageAllowed: Boolean? = null,
+    val windows: List<RateLimitSummary> = emptyList(),
+    val sessionCostUsd: Double? = null,
+    val sessionTokens: Long? = null,
+    val linesAdded: Int = 0,
+    val linesRemoved: Int = 0,
+    val apiDurationMs: Long = 0L,
+    val totalDurationMs: Long = 0L,
+    val modelBreakdown: List<Pair<String, String>> = emptyList(),
+    val note: String? = null,
+    val tuiHint: String? = null,
+)
+
+/** `/context` 单分类上下文占用条目。 */
+data class ContextCategoryRow(
+    val id: String,
+    val name: String,
+    val tokens: Long,
+    val kind: String, // used | free | buffer | deferred
+    val colorHex: String? = null,
+)
+
+/** `/context` 网格色块单元（对应 Claude Code 原生 `gridRows`）。 */
+data class ContextGridCell(
+    val categoryId: String,
+    val colorHex: String? = null,
+    val kind: String = "used",
+)
+
+/** 三端统一的 `/context` 上下文窗口精细拆解。 */
+data class ContextUsageBreakdown(
+    val engine: EngineKind,
+    val model: String? = null,
+    val totalTokens: Long,
+    val maxTokens: Long,
+    val percentage: Double,
+    val categories: List<ContextCategoryRow> = emptyList(),
+    val gridRows: List<List<ContextGridCell>> = emptyList(),
+    val memoryFiles: List<Triple<String, String, Long>> = emptyList(), // path, type, tokens
+    val mcpTools: List<Triple<String, String, Long>> = emptyList(),    // serverName, toolName, tokens
+    val note: String? = null,
+)
+
+/** Codex Guardian 自动审校拦截记录（支持一键单次放行）。 */
+@androidx.compose.runtime.Immutable
+data class GuardianDeniedAction(
+    val reviewId: String,
+    val summary: String,
+    val riskLevel: String? = null,
+    val rationale: String? = null,
+)
+
+/** 三端统一的 `/doctor` 运行环境与协议健康体检报告。 */
+data class EngineDiagnosticsReport(
+    val engine: EngineKind,
+    val ok: Boolean,
+    val version: String? = null,
+    val summary: String,
+    val metrics: List<Pair<String, String>> = emptyList(),
+    val rawOutput: String = "",
+)
+
+/** Codex 原生线程消息队列项（thread/queue）。 */
+@androidx.compose.runtime.Immutable
+data class QueuedSubmission(
+    val id: String,
+    val text: String,
+    val createdAt: Long = 0L,
+)
+
+/** Codex 后台终端 / Claude 后台任务统一模型。 */
+data class BackgroundTaskEntry(
+    val id: String,
+    val label: String,
+    val command: String = "",
+    val status: String = "running",
+    val cwd: String? = null,
+)
+
+/** Codex 协作模式选项（`collaborationMode/list`）。 */
+data class CollaborationModeItem(
+    val id: String,
+    val name: String,
+    val description: String = "",
+)
+
+/** Codex 长期记忆状态与内容（`memory/status` + `thread/memory/read`）。 */
+data class MemoryStatusSummary(
+    val ready: Boolean,
+    val consolidatedThreads: Int = 0,
+    val mode: String? = null,
+    val content: String = "",
+)
+
+/** Codex 多账号会话摘要（`accountSession/list`）。 */
+data class CodexAccountSessionItem(
+    val id: String,
+    val label: String,
+    val email: String? = null,
+    val active: Boolean = false,
+)
+
+/** Codex Hook / 原生插件摘要。 */
+data class CodexHookSummary(val name: String, val event: String, val command: String = "", val enabled: Boolean = true)
+data class CodexPluginSummary(val id: String, val name: String, val description: String = "", val installed: Boolean = false, val version: String = "")
+
+/** Claude Code 会话内插件热重载结果（`reloadPlugins`）。 */
+data class PluginReloadResult(
+    val held: Boolean = false,
+    val errorCount: Int = 0,
+    val pluginCount: Int = 0,
+    val commandCount: Int = 0,
+    val addedMcps: List<String> = emptyList(),
+    val removedMcps: List<String> = emptyList(),
+    val lspChange: String? = null,
+)
+
+/** Claude Code 子代理独立消息记录（`listSubagents` / `getSubagentMessages`）。 */
+data class SubagentMessageEntry(
+    val role: String,
+    val title: String,
+    val body: String,
 )
 
 data class FuzzyMatch(val path: String, val fileName: String)
@@ -635,6 +767,20 @@ data class ConversationState(
     val unsentMessage: UnsentMessage? = null,
     val reverting: Boolean = false,
     val revertedMessage: TimelineItem.UserMessage? = null,
+    val queuedSubmissions: List<QueuedSubmission> = emptyList(),
+    val backgroundTasks: List<BackgroundTaskEntry> = emptyList(),
+    val guardianDenied: GuardianDeniedAction? = null,
+    val activeGoal: String? = null,
+    val nextPromptPrediction: String? = null,
+    val outputStyle: String? = null,
+    val availableOutputStyles: List<String> = emptyList(),
+    val additionalDirectories: List<String> = emptyList(),
+    val ultracode: Boolean = false,
+    val remoteSessionId: String? = null,
+    val claudeAccountSummary: String? = null,
+    val fastModeState: String? = null,
+    val fastModeDisabledReason: String? = null,
+    val claudeCodeVersion: String? = null,
 )
 
 data class ModelOption(
@@ -692,7 +838,7 @@ internal data class ConversationOptions(
             val policy = text("approvalPolicy")?.also { require(it in CODEX_APPROVAL_POLICIES) }
             val reviewer = text("approvalsReviewer")?.also { require(it in CODEX_APPROVAL_REVIEWERS) }
             val summary = text("reasoningSummary")?.also { require(it in REASONING_SUMMARIES) }
-            val mode = text("collaborationMode")?.also { require(it in CODEX_COLLABORATION_MODES) }
+            val mode = text("collaborationMode", 64)?.takeIf { it.isNotBlank() }
             val search = text("webSearch")?.also { require(it in CODEX_WEB_SEARCH_MODES) }
             val fast = data.opt("fastMode").takeUnless { it == JSONObject.NULL }
             require(fast == null || fast is Boolean) { "会话快速模式设置无效" }

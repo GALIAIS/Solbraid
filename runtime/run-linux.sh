@@ -87,19 +87,42 @@ setup_mounts() {
     fi
 }
 
-# 用原子目录锁串行化并发挂载，消除多通道同时启动时的 mount/mknod 竞态
+# 用原子目录锁串行化并发挂载，并具备死进程/超时锁自愈能力，消除多通道同时启动时的 mount/mknod 竞态与残留锁死锁
 lock_dir="$base/.linux-mount.lock"
 lock_acquired=0
 for _try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     if mkdir "$lock_dir" 2>/dev/null; then
+        printf '%s\n' "$$" > "$lock_dir/pid" 2>/dev/null || true
         lock_acquired=1
         break
+    fi
+    # 检测陈旧锁：持锁进程已退出或锁目录存在超过 30 秒则自动回收
+    if test -d "$lock_dir"; then
+        owner_pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
+        lock_mtime=$(stat -c %Y "$lock_dir" 2>/dev/null || echo 0)
+        now_sec=$(date +%s 2>/dev/null || echo 0)
+        stale=0
+        case "$owner_pid" in
+            ''|*[!0-9]*)
+                if test "$now_sec" -gt 0 && test "$lock_mtime" -gt 0 && test $((now_sec - lock_mtime)) -ge 15; then stale=1; fi
+                ;;
+            *)
+                if ! kill -0 "$owner_pid" 2>/dev/null; then stale=1; fi
+                if test "$now_sec" -gt 0 && test "$lock_mtime" -gt 0 && test $((now_sec - lock_mtime)) -ge 30; then stale=1; fi
+                ;;
+        esac
+        if test "$stale" = 1; then
+            rm -f "$lock_dir/pid" 2>/dev/null || true
+            rmdir "$lock_dir" 2>/dev/null || true
+            continue
+        fi
     fi
     sleep 0.1 2>/dev/null || sleep 1
 done
 if test "$lock_acquired" = 1; then
-    trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
+    trap 'rm -f "$lock_dir/pid" 2>/dev/null || true; rmdir "$lock_dir" 2>/dev/null || true' EXIT
     setup_mounts
+    rm -f "$lock_dir/pid" 2>/dev/null || true
     rmdir "$lock_dir" 2>/dev/null || true
     trap - EXIT
 else

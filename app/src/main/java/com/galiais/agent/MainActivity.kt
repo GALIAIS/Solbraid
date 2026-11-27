@@ -92,6 +92,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        // 锁屏解锁或从后台切回前台时，立即唤醒因后台 EPERM 网络受限而等待重连的会话
+        (application as GaliaisApplication).conversations.hub.notifyNetworkRecovered()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)

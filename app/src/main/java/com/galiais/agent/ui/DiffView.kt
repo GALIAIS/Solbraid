@@ -298,7 +298,7 @@ fun DiffView(
                         modifier = Modifier.weight(1f),
                     )
                     if (isRealFilePath && diffActions?.onRevertFile != null) {
-                        TagPill("一键回滚", fg = G.warning, bg = G.surface, border = G.warning.copy(alpha = 0.45f), onClick = {
+                        TagPill("回滚此文件", fg = G.warning, bg = G.surface, border = G.warning.copy(alpha = 0.45f), onClick = {
                             diffActions.onRevertFile.invoke(change.path)
                         })
                     }

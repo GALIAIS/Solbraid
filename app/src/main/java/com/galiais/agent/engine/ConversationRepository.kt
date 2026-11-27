@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 
 import org.json.JSONArray
 import org.json.JSONObject
@@ -139,6 +140,8 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
     private var lastReadyMode: String? = null
     private var startupSyncJob: Job? = null
     private var refreshJob: Job? = null
+    private val providerSyncMutex = kotlinx.coroutines.sync.Mutex()
+    private var syncedProvidersFingerprint: String? = null
 
     fun adapter(kind: EngineKind): EngineAdapter = when (kind.id) {
         "codex" -> codex
@@ -218,6 +221,7 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
                     loadingFlow.value = false
                     initialSyncDoneFlow.value = false
                     deltaFlushJob?.cancel(); pendingDeltas.clear()
+                    syncedProvidersFingerprint = null
                     delegation.reset(); superAgent.resetActiveJobs(); envSsh.resetRuntimeState(); cliUpdates.disconnected(); codex.reset(); claude.reset(); hub.reset()
                     requestsFlow.value = emptyList()
                     val modeChanged = lastReadyMode != null && settings.state.value.effectiveRuntimeMode != lastReadyMode
@@ -286,16 +290,16 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
 
         if (first !is PendingRequest.UserInput && first !is PendingRequest.Elicitation) {
             val reqKey = first.requestId.toString()
-            val approvePi = PendingIntent.getService(
+            val approvePi = PendingIntent.getBroadcast(
                 ctx, 31,
-                Intent(ctx, VmRuntimeService::class.java).setAction(VmRuntimeService.APPROVE_REQ)
+                Intent(ctx, com.galiais.agent.VmRuntimeActionReceiver::class.java).setAction(VmRuntimeService.APPROVE_REQ)
                     .putExtra(VmRuntimeService.EXTRA_ENGINE, first.engine.id)
                     .putExtra(VmRuntimeService.EXTRA_REQ_ID, reqKey),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
-            val denyPi = PendingIntent.getService(
+            val denyPi = PendingIntent.getBroadcast(
                 ctx, 32,
-                Intent(ctx, VmRuntimeService::class.java).setAction(VmRuntimeService.DENY_REQ)
+                Intent(ctx, com.galiais.agent.VmRuntimeActionReceiver::class.java).setAction(VmRuntimeService.DENY_REQ)
                     .putExtra(VmRuntimeService.EXTRA_ENGINE, first.engine.id)
                     .putExtra(VmRuntimeService.EXTRA_REQ_ID, reqKey),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
@@ -684,7 +688,7 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
         if (loadingJobs[key]?.isActive == true) return
         val job = launchOperation("打开会话失败") {
             try {
-                adapter(key.engine).load(key)
+                withEngineOperation(key.engine.id) { adapter(key.engine).load(key) }
             } finally {
                 loadingJobs.remove(key)
             }
@@ -697,6 +701,13 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
     fun consumeInitialDraft(key: ConversationKey): String? = initialDrafts.remove(key)
 
     private val sending = mutableSetOf<ConversationKey>()
+    private val engineOperationLocks = listOf(EngineKind.CODEX, EngineKind.CLAUDE)
+        .associate { it.id to kotlinx.coroutines.sync.Mutex() }
+
+    internal suspend fun <T> withEngineOperation(id: String, block: suspend () -> T): T {
+        val lock = engineOperationLocks[id] ?: return block()
+        return lock.withLock { block() }
+    }
 
     private suspend fun sendRecoverably(key: ConversationKey, text: String, attachments: List<ImageAttachment>, steer: Boolean) {
         var acquired = false
@@ -921,17 +932,136 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
         }
     }
     fun archive(key: ConversationKey) = launchOperation("归档失败") {
-        if (key.engine == EngineKind.CODEX) {
-            codex.archive(key)
-            remove(key)
-            notify("会话已归档")
+        when (key.engine) {
+            EngineKind.CODEX -> {
+                codex.archive(key)
+                remove(key)
+                notify("会话已归档")
+            }
+            EngineKind.CLAUDE -> {
+                claude.archive(key)
+                remove(key)
+                notify("Claude 会话已归档")
+            }
+            else -> {
+                runtime.hubRequest("sessions/archive", jsonOf("agentId" to key.engine.id, "sessionId" to key.id, "archived" to true))
+                remove(key)
+                notify("会话已归档")
+            }
         }
     }
     fun unarchive(key: ConversationKey) = launchOperation("取消归档失败") {
-        if (key.engine == EngineKind.CODEX) {
-            codex.unarchive(key)
-            refresh()
-            notify("已从归档恢复会话")
+        when (key.engine) {
+            EngineKind.CODEX -> {
+                codex.unarchive(key)
+                refresh()
+                notify("已从归档恢复会话")
+            }
+            EngineKind.CLAUDE -> {
+                claude.unarchive(key)
+                refresh()
+                notify("已从归档恢复 Claude 会话")
+            }
+            else -> {
+                runtime.hubRequest("sessions/archive", jsonOf("agentId" to key.engine.id, "sessionId" to key.id, "archived" to false))
+                refresh()
+                notify("已从归档恢复会话")
+            }
+        }
+    }
+
+    /** 三端统一 `/usage` 实时配额与会话用量报告。 */
+    suspend fun usageReport(key: ConversationKey): EngineUsageReport = when (key.engine) {
+        EngineKind.CODEX -> codex.usageReport(key)
+        EngineKind.CLAUDE -> claude.usageReport(key)
+        else -> hub.usageReport(key)
+    }
+
+    /** 三端统一 `/context` 上下文窗口精细拆解。 */
+    suspend fun contextBreakdown(key: ConversationKey): ContextUsageBreakdown = when (key.engine) {
+        EngineKind.CLAUDE -> claude.contextBreakdown(key, detail = "full")
+        EngineKind.CODEX -> {
+            val st = state(key)
+            val u = st?.tokenUsage
+            val used = u?.totalTokens ?: 0L
+            val max = u?.contextWindow ?: inferModelContextWindow(st?.model) ?: 272_000L
+            val pct = if (max > 0) (used * 100.0 / max).coerceIn(0.0, 100.0) else 0.0
+            val rows = buildList {
+                if (u != null) {
+                    if (u.cachedInputTokens > 0) add(ContextCategoryRow("cached_input", "缓存命中输入", u.cachedInputTokens, "used"))
+                    if (u.uncachedInputTokens > 0) add(ContextCategoryRow("uncached_input", "新增输入", u.uncachedInputTokens, "used"))
+                    if (u.outputTokens > 0) add(ContextCategoryRow("output", "模型输出", u.outputTokens, "used"))
+                    if (u.reasoningTokens > 0) add(ContextCategoryRow("reasoning", "推理思考", u.reasoningTokens, "used"))
+                }
+                add(ContextCategoryRow("free_space", "剩余可用窗口", (max - used).coerceAtLeast(0L), "free"))
+            }
+            ContextUsageBreakdown(EngineKind.CODEX, st?.model, used, max, pct, rows)
+        }
+        else -> {
+            val st = state(key)
+            val u = st?.tokenUsage
+            val used = u?.totalTokens ?: 0L
+            val max = u?.contextWindow ?: inferModelContextWindow(st?.model) ?: 1_048_576L
+            val pct = if (max > 0) (used * 100.0 / max).coerceIn(0.0, 100.0) else 0.0
+            val rows = buildList {
+                if (used > 0) add(ContextCategoryRow("messages", "当前上下文占用", used, "used"))
+                add(ContextCategoryRow("free_space", "剩余可用窗口", (max - used).coerceAtLeast(0L), "free"))
+            }
+            ContextUsageBreakdown(
+                engine = key.engine,
+                model = st?.model,
+                totalTokens = used,
+                maxTokens = max,
+                percentage = pct,
+                categories = rows,
+                note = if (key.engine.id == "antigravity") "ACP 实时上报总上下文；如需分项视图可一键切入原生 TUI 执行 /context。" else null,
+            )
+        }
+    }
+
+    /** 三端统一 `/doctor` 健康体检。 */
+    suspend fun diagnosticsReport(key: ConversationKey): EngineDiagnosticsReport = when (key.engine) {
+        EngineKind.CODEX -> codex.diagnosticsReport()
+        EngineKind.CLAUDE -> claude.diagnosticsReport(state(key)?.summary?.cwd)
+        else -> hub.diagnosticsReport(key)
+    }
+
+    /** 指定消息节点分叉会话（Claude 原生支持 upToMessageId；Codex/Antigravity 支持整会话分叉）。 */
+    suspend fun forkAtMessage(key: ConversationKey, upToMessageId: String? = null): ConversationKey? = when (key.engine) {
+        EngineKind.CLAUDE -> claude.forkUpTo(key, upToMessageId)
+        EngineKind.CODEX -> codex.fork(key)
+        else -> hub.forkSession(key, upToMessageId)
+    }
+
+    /** 为会话动态附加工作区目录（`/add-dir`）。 */
+    suspend fun addAdditionalDirectory(key: ConversationKey, dir: String) {
+        val clean = dir.trim().trimEnd('/').ifEmpty { "/" }
+        require(clean.startsWith("/")) { "附加目录必须是绝对路径" }
+        when (key.engine) {
+            EngineKind.CLAUDE -> claude.addAdditionalDirectory(key, clean)
+            EngineKind.CODEX -> {
+                update(key) { st -> st.copy(additionalDirectories = (st.additionalDirectories + clean).distinct()) }
+                notify("已记录附加目录 $clean")
+            }
+            else -> hub.addAdditionalDirectory(key, clean)
+        }
+    }
+
+    /** 构建无缝切入原生 TUI 终端的命令（复用当前会话 ID）。 */
+    fun buildNativeTuiCommand(key: ConversationKey): String {
+        val st = state(key)
+        val cwd = st?.summary?.cwd ?: settings.state.value.defaultCwd
+        fun shQ(s: String) = "'" + s.replace("'", "'\\''") + "'"
+        val cdPrefix = "cd ${shQ(cwd)} 2>/dev/null; "
+        return when (key.engine.id) {
+            "codex" -> "${cdPrefix}codex resume ${shQ(key.id)}"
+            "claude" -> "${cdPrefix}claude --resume ${shQ(key.id)}"
+            "antigravity" -> {
+                val remoteId = st?.remoteSessionId?.takeIf { it.isNotBlank() }
+                if (remoteId != null) "${cdPrefix}agy --conversation ${shQ(remoteId)}"
+                else "${cdPrefix}agy --continue"
+            }
+            else -> "${cdPrefix}${key.engine.id}"
         }
     }
     fun setCodexApproval(key: ConversationKey, policy: String, reviewer: String = "user") {
@@ -963,9 +1093,40 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
     }
 
     fun setCollaborationMode(key: ConversationKey, mode: String) {
-        require(key.engine == EngineKind.CODEX && mode in CODEX_COLLABORATION_MODES)
-        update(key) { it.copy(collaborationMode = mode) }
+        val clean = mode.trim()
+        require(key.engine == EngineKind.CODEX && clean.isNotBlank() && clean.length <= 64)
+        update(key) { it.copy(collaborationMode = clean) }
         persistOptions(key)
+    }
+
+    /** 列举全部三大引擎的已归档会话（Codex / Claude / Antigravity）。 */
+    suspend fun listAllArchived(): List<ConversationSummary> {
+        val out = mutableListOf<ConversationSummary>()
+        runCatching { out += codex.listArchived() }
+        runCatching { out += claude.listArchived() }
+        runCatching {
+            val res = runtime.hubRequest("sessions/list", jsonOf("includeArchived" to true))
+            val arr = res.optJSONArray("sessions")
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val s = arr.optJSONObject(i) ?: continue
+                    if (!s.optBoolean("archived", false)) continue
+                    val agentId = s.str("agentId")?.takeIf { it.isNotBlank() } ?: continue
+                    val id = s.str("id")?.takeIf { it.isNotBlank() } ?: continue
+                    val known = AgentCatalog.find(agentId)
+                    val label = known?.name ?: s.str("driverName") ?: agentId
+                    out += ConversationSummary(
+                        key = ConversationKey(EngineKind(agentId, label), id),
+                        title = s.str("title") ?: "新会话",
+                        preview = s.optString("preview"),
+                        cwd = s.str("cwd"),
+                        updatedAt = normalizeTime(s.optLong("updatedAt", System.currentTimeMillis())),
+                        archived = true,
+                    )
+                }
+            }
+        }
+        return out.sortedByDescending { it.updatedAt }
     }
 
     fun setFastMode(key: ConversationKey, enabled: Boolean?) = launchOperation("切换快速模式失败") {
@@ -1016,20 +1177,24 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
     }
     fun cancelDelegation(parent: ConversationKey) = launchOperation("取消委派失败") { delegation.cancel(parent) }
     /** 将所有自定义服务商与路由组同步到虚拟机内本地网关（仅驻留内存）与 Codex 配置。 */
-    suspend fun syncProvidersNow() {
-        if (!runtime.snapshot.value.ready) return
+    suspend fun syncProvidersNow(force: Boolean = false) = providerSyncMutex.withLock {
+        if (!runtime.snapshot.value.ready) return@withLock
         val st = settings.state.value
         val list = st.providers
         val payload = JSONArray().apply {
             list.forEach { p -> put(p.toGatewayJson(settings.providerApiKey(p.id), settings.providerApiKeys(p.id))) }
         }
         val groupsPayload = JSONArray().apply { st.routingGroups.forEach { put(it.toJson()) } }
+        val endpointTag = runtime.gatewayEndpoint?.let { "${it.first}:${it.second}" }.orEmpty()
+        val fp = "$endpointTag|$payload|$groupsPayload"
+        if (!force && fp == syncedProvidersFingerprint) return@withLock
         runtime.gatewayRequest("providers/sync", jsonOf("providers" to payload, "routingGroups" to groupsPayload))
         val codexProviders = list + st.routingGroups.filter { it.targets.isNotEmpty() }.mapNotNull { st.provider(it.virtualProviderId) }
         codex.syncProviders(codexProviders)
+        syncedProvidersFingerprint = fp
     }
 
-    fun syncProviders() = launchOperation("同步自定义服务商失败") { syncProvidersNow() }
+    fun syncProviders(force: Boolean = false) = launchOperation("同步自定义服务商失败") { syncProvidersNow(force) }
 
     suspend fun fetchRemoteModels(provider: CustomProvider, apiKeyOverride: String?): List<String> {
         val key = apiKeyOverride?.trim()?.takeIf { it.isNotEmpty() } ?: settings.providerApiKey(provider.id)
