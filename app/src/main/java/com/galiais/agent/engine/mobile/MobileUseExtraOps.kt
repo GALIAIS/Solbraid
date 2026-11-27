@@ -46,18 +46,8 @@ internal object MobileUseExtraOps {
                 .put("connected", SolbraidNotificationListenerService.instance != null)
         }
 
-        var svc = SolbraidNotificationListenerService.instance
-        if (svc == null && hasPriv && !SolbraidNotificationListenerService.isEnabledInSystemSettings(app)) {
-            // Root / Shizuku 下自动授予通知监听权，零弹窗立即可用
-            privilegedExec("cmd notification allow_listener ${shQuote(listenerComp)}", 10)
-            repeat(8) {
-                delay(250)
-                svc = SolbraidNotificationListenerService.instance
-                if (svc != null) return@repeat
-            }
-        }
-        val activeSvc = svc
-            ?: throw IllegalStateException("通知监听服务尚未启用：请前往「设置 → 手机操控（Mobile-Use）」开启「Solbraid 通知读取与回复」")
+        val activeSvc = SolbraidNotificationListenerService.instance
+            ?: throw IllegalStateException("通知监听服务尚未启用：请前往「设置 → 手机操控（Mobile-Use）」手动开启「Solbraid 通知读取与回复」")
 
         return when (op) {
             "list" -> {
@@ -124,7 +114,12 @@ internal object MobileUseExtraOps {
             require(clean.startsWith("/") && !clean.contains("..") && !clean.contains('\u0000')) {
                 "容器路径必须是合法绝对路径（如 /home/agent/workspace/a.png）：$raw"
             }
-            return File(activeLinuxRootDir, clean.removePrefix("/"))
+            val rootCanon = activeLinuxRootDir.canonicalFile
+            val candidate = File(rootCanon, clean.removePrefix("/")).canonicalFile
+            require(candidate.path == rootCanon.path || candidate.path.startsWith(rootCanon.path + File.separator)) {
+                "拒绝访问容器目录之外的路径：$raw"
+            }
+            return candidate
         }
 
         return when (op) {
@@ -291,9 +286,11 @@ internal object MobileUseExtraOps {
             "dumpsys" -> {
                 val service = params.optString("service").trim()
                 require(Regex("^[a-zA-Z0-9._-]+$").matches(service)) { "请提供合法 dumpsys 服务名（如 battery / window / meminfo / package）" }
-                val extra = params.optString("args").trim()
-                if (extra.isEmpty()) "dumpsys $service | head -c 36000"
-                else "dumpsys $service $extra | head -c 36000"
+                val extraTokens = params.optString("args").trim()
+                    .split(Regex("\\s+"))
+                    .filter { it.isNotEmpty() }
+                if (extraTokens.isEmpty()) "dumpsys $service | head -c 36000"
+                else "dumpsys $service ${extraTokens.joinToString(" ") { shQuote(it) }} | head -c 36000"
             }
             "ps" -> {
                 val q = params.optString("query").trim()

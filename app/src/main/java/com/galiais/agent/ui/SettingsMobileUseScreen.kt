@@ -178,7 +178,7 @@ fun MobileUseSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                         status.notificationListenerConnected,
                         when {
                             status.notificationListenerConnected -> "已连接 · 支持读取全部通知、提取验证码、点击按钮与免切屏回复"
-                            status.rootAvailable || (status.shizukuAlive && status.shizukuGranted) -> "未开启 · 可点下方「一键自动授权通知」或前往系统通知使用权开启"
+                            status.rootAvailable || (status.shizukuAlive && status.shizukuGranted) -> "未开启 · 可点下方「授权通知监听」或前往系统通知使用权开启"
                             else -> "未开启 · 前往系统设置授予「Solbraid 通知读取与回复」即可启用"
                         },
                     ),
@@ -232,7 +232,7 @@ fun MobileUseSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                     }
                     if (!status.notificationListenerConnected) {
                         SecondaryPillButton(
-                            text = if (status.rootAvailable || (status.shizukuAlive && status.shizukuGranted)) "一键授权通知监听" else "开启通知使用权",
+                            text = if (status.rootAvailable || (status.shizukuAlive && status.shizukuGranted)) "授权通知监听" else "开启通知使用权",
                             onClick = {
                                 if (status.rootAvailable || (status.shizukuAlive && status.shizukuGranted)) {
                                     scope.launch {

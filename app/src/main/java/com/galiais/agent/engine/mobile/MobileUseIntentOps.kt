@@ -149,14 +149,24 @@ internal object MobileUseIntentOps {
 
     private suspend fun shareFile(app: Application, activeLinuxRootDir: File, params: JSONObject): JSONObject {
         val rawPath = params.optString("path").trim()
-        require(rawPath.isNotEmpty() && !rawPath.contains("..")) { "请提供合法文件路径" }
-        val hostCandidate = if (rawPath.startsWith("/sdcard/") || rawPath.startsWith("/storage/")) {
-            File(rawPath)
+        require(rawPath.isNotEmpty() && !rawPath.contains("..") && !rawPath.contains('\u0000')) { "请提供合法文件路径" }
+        val sdcardCanon = android.os.Environment.getExternalStorageDirectory().canonicalFile
+        val linuxCanon = activeLinuxRootDir.canonicalFile
+        val src = if (rawPath.startsWith("/sdcard/") || rawPath.startsWith("/storage/")) {
+            val normalized = rawPath.replace(Regex("^/sdcard(?=/|$)"), sdcardCanon.path)
+            val candidate = File(normalized).canonicalFile
+            require(candidate.path == sdcardCanon.path || candidate.path.startsWith(sdcardCanon.path + File.separator)) {
+                "拒绝访问共享存储目录之外的文件：$rawPath"
+            }
+            candidate
         } else {
-            File(activeLinuxRootDir, rawPath.removePrefix("/"))
+            val candidate = File(linuxCanon, rawPath.removePrefix("/")).canonicalFile
+            require(candidate.path == linuxCanon.path || candidate.path.startsWith(linuxCanon.path + File.separator)) {
+                "拒绝访问容器目录之外的文件：$rawPath"
+            }
+            candidate
         }
-        val src = if (hostCandidate.isFile) hostCandidate else File(rawPath)
-        require(src.isFile) { "未找到要分享/打开的文件：$rawPath" }
+        require(src.isFile && src.canRead()) { "未找到要分享/打开的文件：$rawPath" }
         val stageDir = File(app.cacheDir, "exports").apply { mkdirs() }
         val staged = File(stageDir, src.name)
         src.copyTo(staged, overwrite = true)

@@ -103,17 +103,20 @@ class SolbraidAccessibilityService : AccessibilityService() {
         return suspendCancellableCoroutine { cont ->
             takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
                 override fun onSuccess(screenshot: ScreenshotResult) {
+                    val buffer = screenshot.hardwareBuffer
+                    var hwBitmap: Bitmap? = null
                     try {
-                        val buffer = screenshot.hardwareBuffer
                         val colorSpace = screenshot.colorSpace
-                        val hwBitmap = Bitmap.wrapHardwareBuffer(buffer, colorSpace)
+                        hwBitmap = Bitmap.wrapHardwareBuffer(buffer, colorSpace)
                             ?: throw IllegalStateException("无法解码系统截屏帧缓冲")
                         val softBitmap = hwBitmap.copy(Bitmap.Config.ARGB_8888, false)
-                        hwBitmap.recycle()
-                        buffer.close()
+                            ?: throw IllegalStateException("无法转换系统截屏位图")
                         if (cont.isActive) cont.resume(softBitmap) else softBitmap.recycle()
                     } catch (e: Exception) {
                         if (cont.isActive) cont.resumeWithException(e)
+                    } finally {
+                        runCatching { hwBitmap?.recycle() }
+                        runCatching { buffer.close() }
                     }
                 }
 

@@ -158,9 +158,68 @@ internal class ShizukuBridge(private val app: Application) {
             withTimeout(8_000L) { deferred.await() }
         } catch (e: Exception) {
             pendingBind = null
+            runCatching {
+                withContext(Dispatchers.Main) {
+                    Shizuku.unbindUserService(userServiceArgs, serviceConnection, true)
+                }
+            }
             throw IllegalStateException("连接 Shizuku UserService 超时：${e.message}", e)
         }
     }
+
+    fun cancelCurrent() {
+        runCatching { service?.cancelCurrent() }
+    }
+
+    /** 通过 ParcelFileDescriptor 管道直接流式接收 Shizuku 命令原始二进制输出（彻底规避 Binder 1MB 限制，适用于 screencap -p 等）。 */
+    suspend fun execToFile(command: String, destFile: java.io.File, timeoutSec: Int = 25, maxBytes: Long = 32L * 1024 * 1024): Int =
+        withContext(Dispatchers.IO) {
+            val svc = ensureService()
+            destFile.parentFile?.mkdirs()
+            val pipe = android.os.ParcelFileDescriptor.createPipe()
+            val readFd = pipe[0]
+            val writeFd = pipe[1]
+            var readErr: Exception? = null
+            val readerThread = Thread({
+                try {
+                    android.os.ParcelFileDescriptor.AutoCloseInputStream(readFd).use { ins ->
+                        destFile.outputStream().use { out ->
+                            val buf = ByteArray(32_768)
+                            var total = 0L
+                            while (true) {
+                                val n = ins.read(buf)
+                                if (n < 0) break
+                                total += n
+                                if (total > maxBytes) {
+                                    throw IllegalStateException("Shizuku 流式输出超过安全上限（${maxBytes / (1024 * 1024)} MB）")
+                                }
+                                out.write(buf, 0, n)
+                            }
+                            out.flush()
+                        }
+                    }
+                } catch (e: Exception) {
+                    readErr = e
+                }
+            }, "shizuku-fd-reader").apply { isDaemon = true; start() }
+            try {
+                val exitCode = try {
+                    svc.execToFd(command, timeoutSec, writeFd)
+                } catch (e: Exception) {
+                    service = null
+                    refreshStatus()
+                    throw IllegalStateException("Shizuku 流式执行失败：${e.message}", e)
+                } finally {
+                    runCatching { writeFd.close() }
+                }
+                readerThread.join(10_000L)
+                readErr?.let { throw it }
+                exitCode
+            } finally {
+                runCatching { writeFd.close() }
+                runCatching { readFd.close() }
+            }
+        }
 
     suspend fun exec(command: String, timeoutSec: Int = 25): RootFsDaemon.ExecOutput = withContext(Dispatchers.IO) {
         val svc = ensureService()

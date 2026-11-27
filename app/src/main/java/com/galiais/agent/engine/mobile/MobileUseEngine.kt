@@ -141,6 +141,7 @@ class MobileUseEngine(
     fun triggerEmergencyStop() {
         emergencyStoppedFlag.set(true)
         stopGeneration.incrementAndGet()
+        shizuku.cancelCurrent()
         activeJob?.cancel(CancellationException("用户已紧急停止手机操控"))
         approvalDecision?.complete(false)
         activeActionLabel = null
@@ -162,7 +163,7 @@ class MobileUseEngine(
         val decision = CompletableDeferred<Boolean>()
         approvalDecision = decision
         approvalFlow.value = request
-        guardUi.showActive("等待操作确认，请打开 Solbraid", showPill = config.showOverlayPill, autoHideDelayMs = 0)
+        guardUi.showActive("等待操作确认，请打开 Solbraid", showPill = config.showOverlayPill, autoHideDelayMs = 0L, isApproval = true)
         try {
             val allowed = withTimeoutOrNull(120_000) { decision.await() }
             check(allowed == true) { if (allowed == null) "操作确认已超时" else "用户拒绝了本次操作" }
@@ -193,8 +194,9 @@ class MobileUseEngine(
     /** 统一执行入口：供 Agent Hub 反向 RPC 与设置页现场烟测复用。 */
     suspend fun execute(action: String, params: JSONObject = JSONObject()): JSONObject = withContext(Dispatchers.IO) {
         val act = action.trim().lowercase()
-        if (act == "app" || act == "clipboard") {
-            params.put("operation", params.optString("operation", if (act == "app") "list" else "read").trim().lowercase())
+        if (act in setOf("app", "clipboard", "host")) {
+            val defaultOperation = when (act) { "app" -> "list"; "host" -> "shell"; else -> "read" }
+            params.put("operation", params.optString("operation", defaultOperation).trim().lowercase())
         }
         if (act == "status") {
             if (!isRootEffectivelyAvailable() && runtime.rootAvailable.value == null) {
@@ -227,10 +229,15 @@ class MobileUseEngine(
             (act == "app" && opLower !in setOf("", "list", "foreground", "info", "extract_apk")) ||
             (act == "clipboard" && opLower == "write") ||
             (act == "device" && opLower !in setOf("", "telemetry", "info")) ||
-            (act == "notification" && opLower in setOf("reply", "action", "dismiss")) ||
+            (act == "notification" && opLower in setOf("reply", "action", "dismiss", "auto_grant")) ||
             (act == "files" && opLower in setOf("push", "delete")) ||
-            (act == "host" && opLower in setOf("shell", "settings_put", "setprop"))
+            (act == "host" && (opLower in setOf("shell", "settings_put", "setprop") || (opLower == "logcat" && params.optBoolean("clear"))))
 
+        val isHighRiskConfirm = (act == "host" && isMutating) ||
+            (act == "files" && opLower == "delete") ||
+            (act == "app" && opLower in setOf("install", "uninstall", "clear_data", "freeze", "grant"))
+
+        val isSensitiveRead = act in setOf("screenshot", "ui_tree") || (act == "clipboard" && opLower == "read")
         val requireUiBackend = act in setOf("screenshot", "ui_tree", "tap", "swipe", "type", "key")
 
         return@withContext opMutex.withLock {
@@ -240,12 +247,37 @@ class MobileUseEngine(
             operationGeneration = generation
             activeJob = currentCoroutineContext()[Job]
             guardedForeground = null
+            var showedGuard = false
             try {
                 ensureOperationActive()
                 val liveConfig = config
                 val backend = resolveActiveBackend(liveConfig, requireUiBackend = requireUiBackend)
-                if (isMutating && act != "host" && act != "files" && !(act == "device" && opLower in setOf("volume", "torch", "vibrate", "media"))) {
+                if (isHighRiskConfirm && liveConfig.safetyMode != MOBILE_SAFETY_UNRESTRICTED) {
+                    val targetPkg = params.optString("packageName").trim().ifEmpty { app.packageName }
+                    requestUserConfirmation(
+                        Approval(
+                            id = UUID.randomUUID().toString(),
+                            action = actionDisplayLabel(act, params),
+                            packageName = targetPkg,
+                            details = JSONObject(params.toString()).apply { remove("confirmSensitive") }.toString(2),
+                            returnToApp = false,
+                        ),
+                    )
+                } else if (isMutating && act != "host" && act != "files" && !(act == "device" && opLower in setOf("volume", "torch", "vibrate", "media"))) {
                     checkSensitiveGuard(liveConfig, backend, act, params)
+                } else if (isSensitiveRead && liveConfig.safetyMode != MOBILE_SAFETY_UNRESTRICTED) {
+                    val fgPkg = runCatching { detectForegroundPackage(backend) }.getOrDefault("")
+                    if (MobileUseLogic.isSensitivePackage(fgPkg, liveConfig.customSensitivePackages)) {
+                        requestUserConfirmation(
+                            Approval(
+                                id = UUID.randomUUID().toString(),
+                                action = actionDisplayLabel(act, params),
+                                packageName = fgPkg,
+                                details = "前台为敏感应用（$fgPkg），是否允许读取屏幕/剪贴板？",
+                                returnToApp = true,
+                            ),
+                        )
+                    }
                 }
                 ensureOperationActive()
                 val label = actionDisplayLabel(act, params)
@@ -253,7 +285,10 @@ class MobileUseEngine(
                 lastActionAtMs = System.currentTimeMillis()
                 actionCounter.incrementAndGet()
                 refreshStatus()
-                if (isMutating || act == "screenshot") guardUi.showActive(label, showPill = liveConfig.showOverlayPill)
+                if (isMutating || act == "screenshot") {
+                    showedGuard = true
+                    guardUi.showActive(label, showPill = liveConfig.showOverlayPill, autoHideDelayMs = 0L)
+                }
                 when (act) {
                     "screenshot" -> doScreenshot(backend, liveConfig, params)
                     "ui_tree" -> doUiTree(backend, params)
@@ -279,7 +314,7 @@ class MobileUseEngine(
                         privilegedExec(backend, cmd, timeoutSec, mutating = opLower in setOf("push", "delete"))
                     }
                     "host" -> MobileUseExtraOps.executeHost(liveConfig, backend, params) { cmd, timeoutSec ->
-                        privilegedExec(backend, cmd, timeoutSec, mutating = false)
+                        privilegedExec(backend, cmd, timeoutSec, mutating = isMutating)
                     }
                     else -> throw IllegalArgumentException("不支持的 Mobile-Use 动作：$act")
                 }
@@ -288,6 +323,7 @@ class MobileUseEngine(
                 guardedForeground = null
                 activeActionLabel = null
                 lastActionAtMs = System.currentTimeMillis()
+                if (showedGuard && !emergencyStoppedFlag.get()) guardUi.hideAll()
                 refreshStatus()
             }
         }
@@ -394,7 +430,8 @@ class MobileUseEngine(
             guestDir.mkdirs()
             val out = File(guestDir, shotName)
             out.writeBytes(jpegBytes)
-            out.setReadable(true, false)
+            out.setReadable(false, false)
+            out.setReadable(true, true)
             // 仅保留最近 30 张截屏，防止容器空间膨胀
             guestDir.listFiles { f -> f.isFile && f.name.endsWith(".jpg") }
                 ?.sortedByDescending { it.lastModified() }
@@ -591,36 +628,29 @@ class MobileUseEngine(
     }
 
     private suspend fun captureScreenshotBitmapViaPriv(backend: MobileBackendKind): Bitmap {
-        val rawPath = if (backend == MobileBackendKind.SHIZUKU) {
-            "/data/local/tmp/solbraid-shot-${System.currentTimeMillis()}.png"
-        } else {
-            File(File(app.cacheDir, "mobile-shots").apply { mkdirs() }, "raw-${System.currentTimeMillis()}.png").absolutePath
-        }
-        val localCopy = File(File(app.cacheDir, "mobile-shots").apply { mkdirs() }, "dec-${System.currentTimeMillis()}.png")
+        val shotDir = File(app.cacheDir, "mobile-shots").apply { mkdirs() }
+        val rawPath = File(shotDir, "raw-${System.currentTimeMillis()}.png").absolutePath
+        val localCopy = File(shotDir, "dec-${System.currentTimeMillis()}.png")
         try {
-            val qPath = shQuote(rawPath)
-            val res = privilegedExec(backend, "screencap -p $qPath && chmod 644 $qPath", timeoutSec = 20)
-            if (res == null || res.exitCode != 0) {
-                throw IllegalStateException("${backend.label} 截屏失败：${res?.stdout?.ifBlank { "screencap exit=${res.exitCode}" }}")
-            }
             val readFile = if (backend == MobileBackendKind.SHIZUKU) {
-                val b64Res = privilegedExec(backend, "base64 -w 0 $qPath 2>/dev/null || base64 $qPath | tr -d '\\n'", timeoutSec = 20)
-                if (b64Res == null || b64Res.exitCode != 0 || b64Res.stdout.isBlank()) {
-                    throw IllegalStateException("Shizuku 读取截屏流失败")
+                // 通过 AIDL ParcelFileDescriptor 管道直接流式接收 screencap PNG，彻底消除 Binder 1MB 事务上限与 OOM 风险
+                val exitCode = shizuku.execToFile("screencap -p", localCopy, timeoutSec = 20)
+                if (exitCode != 0 || !localCopy.isFile || localCopy.length() == 0L) {
+                    throw IllegalStateException("Shizuku 流式截屏失败（exit=$exitCode）")
                 }
-                localCopy.writeBytes(Base64.decode(b64Res.stdout.trim(), Base64.DEFAULT))
                 localCopy
             } else {
+                val qPath = shQuote(rawPath)
+                val res = privilegedExec(backend, "screencap -p $qPath && chmod 600 $qPath", timeoutSec = 20)
+                if (res == null || res.exitCode != 0) {
+                    throw IllegalStateException("${backend.label} 截屏失败：${res?.stdout?.ifBlank { "screencap exit=${res.exitCode}" }}")
+                }
                 File(rawPath)
             }
             return BitmapFactory.decodeFile(readFile.absolutePath)
                 ?: throw IllegalStateException("无法解码 screencap 输出图像")
         } finally {
-            if (backend == MobileBackendKind.SHIZUKU) {
-                runCatching { privilegedExec(backend, "rm -f ${shQuote(rawPath)}", timeoutSec = 5) }
-            } else {
-                runCatching { File(rawPath).delete() }
-            }
+            runCatching { File(rawPath).delete() }
             runCatching { localCopy.delete() }
         }
     }
@@ -1107,11 +1137,24 @@ class MobileUseEngine(
             }
             "install" -> {
                 val apkPath = params.optString("apkPath").trim()
-                require(apkPath.isNotEmpty() && apkPath.endsWith(".apk") && !apkPath.contains("..")) { "请提供有效的 .apk 路径" }
-                val hostFile = if (apkPath.startsWith("/sdcard/") || apkPath.startsWith("/storage/")) File(apkPath)
-                else File(activeLinuxRootDir(), apkPath.removePrefix("/"))
-                val src = if (hostFile.isFile) hostFile else File(apkPath)
-                require(src.isFile) { "未找到 APK 文件：$apkPath" }
+                require(apkPath.isNotEmpty() && apkPath.endsWith(".apk") && !apkPath.contains("..") && !apkPath.contains('\u0000')) { "请提供有效的 .apk 路径" }
+                val sdcardCanon = android.os.Environment.getExternalStorageDirectory().canonicalFile
+                val linuxCanon = activeLinuxRootDir().canonicalFile
+                val src = if (apkPath.startsWith("/sdcard/") || apkPath.startsWith("/storage/")) {
+                    val norm = apkPath.replace(Regex("^/sdcard(?=/|$)"), sdcardCanon.path)
+                    val cand = File(norm).canonicalFile
+                    require(cand.path == sdcardCanon.path || cand.path.startsWith(sdcardCanon.path + File.separator)) {
+                        "拒绝访问共享存储之外的 APK：$apkPath"
+                    }
+                    cand
+                } else {
+                    val cand = File(linuxCanon, apkPath.removePrefix("/")).canonicalFile
+                    require(cand.path == linuxCanon.path || cand.path.startsWith(linuxCanon.path + File.separator)) {
+                        "拒绝访问容器目录之外的 APK：$apkPath"
+                    }
+                    cand
+                }
+                require(src.isFile && src.canRead()) { "未找到 APK 文件：$apkPath" }
                 val hasPriv = backend == MobileBackendKind.ROOT || backend == MobileBackendKind.SHIZUKU
                 if (hasPriv && params.optBoolean("silent", true)) {
                     val tmpApk = "/data/local/tmp/solbraid-inst-${System.currentTimeMillis()}.apk"
@@ -1119,7 +1162,8 @@ class MobileUseEngine(
                     src.copyTo(staged, overwrite = true)
                     staged.setReadable(true, false)
                     try {
-                        val cmd = "cp -f ${shQuote(staged.absolutePath)} ${shQuote(tmpApk)} && pm install -r -g ${shQuote(tmpApk)}; __rc=\$?; rm -f ${shQuote(tmpApk)}; (exit \$__rc)"
+                        // 移除 -g，防止静默安装时自动授予全部危险运行时权限
+                        val cmd = "cp -f ${shQuote(staged.absolutePath)} ${shQuote(tmpApk)} && pm install -r ${shQuote(tmpApk)}; __rc=\$?; rm -f ${shQuote(tmpApk)}; (exit \$__rc)"
                         val res = privilegedExec(backend, cmd, timeoutSec = 90, mutating = true)
                         if (res == null || res.exitCode != 0 || !res.stdout.contains("Success", ignoreCase = true)) {
                             throw IllegalStateException("静默安装失败：${res?.stdout}")

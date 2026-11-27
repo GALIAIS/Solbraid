@@ -32,7 +32,7 @@ data class MobileUseConfig(
     val screenshotQuality: Int = 78,
     val customSensitivePackages: List<String> = emptyList(),
     val allowHostShell: Boolean = false,
-    val allowNotifications: Boolean = true,
+    val allowNotifications: Boolean = false,
 ) {
     fun validated(): MobileUseConfig {
         require(preferredBackend in MOBILE_BACKEND_OPTIONS) { "请选择有效的手机操控驱动模式" }
@@ -83,7 +83,7 @@ data class MobileUseConfig(
                     screenshotQuality = obj.optInt("screenshotQuality", 78).coerceIn(40, 95),
                     customSensitivePackages = pkgs,
                     allowHostShell = obj.optBoolean("allowHostShell", false),
-                    allowNotifications = obj.optBoolean("allowNotifications", true),
+                    allowNotifications = obj.optBoolean("allowNotifications", false),
                 )
             } catch (_: Exception) {
                 MobileUseConfig()
@@ -152,7 +152,7 @@ data class MobileUseStatus(
     val writeSettingsGranted: Boolean = false,
     val overlayPermissionGranted: Boolean = false,
     val allowHostShell: Boolean = false,
-    val allowNotifications: Boolean = true,
+    val allowNotifications: Boolean = false,
     val emergencyStopped: Boolean = false,
     val activeActionLabel: String? = null,
     val lastActionAtMs: Long = 0L,
