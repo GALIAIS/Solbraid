@@ -32,6 +32,8 @@ import {createCliUpdater, resolveCliInstallation, bundledCliInstallation, cliPat
 import * as extSync from "./extension-sync.mjs";
 import * as worktreeMgr from "./worktree-manager.mjs";
 import * as envSsh from "./env-ssh-hub.mjs";
+import * as toolchainHub from "./toolchain-hub.mjs";
+import * as projectDeps from "./project-deps-hub.mjs";
 import * as usageLedger from "./usage-ledger.mjs";
 import {PluginKernel, startPluginControlServer} from "./plugin-kernel.mjs";
 import {registerBuiltinHostPlugins} from "./plugin-builtins.mjs";
@@ -2604,6 +2606,33 @@ async function dispatchRequest(method, params = {}) {
         const ctlOpts = {
           ...(process.env.SOLBRAID_PLUGIN_CTL_SOCKET ? {socketPath: process.env.SOLBRAID_PLUGIN_CTL_SOCKET} : {}),
           onMobileUse: (action, actionParams = {}) => askClient("mobileUse/execute", {action, params: actionParams}),
+          onToolchain: async (action, p = {}) => {
+            const onProgress = evt => notify("toolchains/progress", evt);
+            const onAptExec = req => askClient("toolchains/aptExec", req);
+            const hostCanApt = () => askClient("toolchains/aptStatus", {}).then(r => Boolean(r?.aptWritable)).catch(() => false);
+            if (action === "toolchains") {
+              const sub = String(p.action || "list").toLowerCase();
+              if (sub === "versions") return await toolchainHub.fetchAvailableVersions({home: HOME, id: p.id, refresh: p.refresh === true});
+              if (sub === "install") return await toolchainHub.installToolchain({home: HOME, id: p.id, version: p.version || "", setDefault: p.setDefault !== false, extraTargets: p.extraTargets, aptComponents: p.aptComponents, onProgress, onAptExec});
+              if (sub === "use") return await toolchainHub.useToolchainVersion({home: HOME, id: p.id, version: p.version, hasHostAptBridge: await hostCanApt()});
+              if (sub === "uninstall") return await toolchainHub.uninstallToolchain({home: HOME, id: p.id, version: p.version || "", hasHostAptBridge: await hostCanApt()});
+              if (sub === "cancel") { notify("toolchains/cancelApt", {}); return toolchainHub.cancelActiveOperations(); }
+              if (sub === "mirror_preset") return await toolchainHub.applyMirrorPreset({home: HOME, preset: p.preset || "cn"});
+              if (sub === "caches") return await toolchainHub.getCacheStats(HOME);
+              if (sub === "clean_caches") return await toolchainHub.cleanCaches({home: HOME, ids: p.ids || [], onAptExec});
+              return await toolchainHub.listToolchains(HOME, {hasHostAptBridge: await hostCanApt()});
+            }
+            if (action === "deps") {
+              const sub = String(p.action || "scan").toLowerCase();
+              if (sub === "scan") return await projectDeps.scanProjectDeps({home: HOME, cwd: p.cwd});
+              if (sub.startsWith("apt_")) return await projectDeps.runAptAction({home: HOME, action: sub.slice(4), query: p.query, packages: p.packages, onProgress, onAptExec});
+              return await projectDeps.runProjectDepAction({home: HOME, cwd: p.cwd, ecosystem: p.ecosystem, action: sub, packages: p.packages, dev: p.dev === true, onProgress});
+            }
+            if (action === "compile") {
+              return await projectDeps.runCompile({home: HOME, ...p, onProgress});
+            }
+            throw new Error(`未知工具链控制动作：${action}`);
+          },
           onHostInstallApk: apkPath => askClient("selfBuild/installApk", {apkPath}),
           onHostStatus: () => askClient("selfBuild/hostStatus", {}),
           onHostRollbackRequest: () => askClient("selfBuild/requestRollback", {}),
@@ -4476,6 +4505,71 @@ async function dispatchRequest(method, params = {}) {
         }
       }
     }
+
+    case "toolchains/list": {
+      const hostCanApt = await askClient("toolchains/aptStatus", {}).then(r => Boolean(r?.aptWritable)).catch(() => false);
+      return await toolchainHub.listToolchains(HOME, {hasHostAptBridge: hostCanApt});
+    }
+
+    case "toolchains/versions":
+      return await toolchainHub.fetchAvailableVersions({home: HOME, id: String(params?.id || ""), refresh: params?.refresh === true});
+
+    case "toolchains/install":
+      return await toolchainHub.installToolchain({
+        home: HOME, id: String(params?.id || ""), version: String(params?.version || ""),
+        setDefault: params?.setDefault !== false, extraTargets: params?.extraTargets || [],
+        aptComponents: params?.aptComponents || [],
+        onProgress: evt => notify("toolchains/progress", evt),
+        onAptExec: req => askClient("toolchains/aptExec", req),
+      });
+
+    case "toolchains/use": {
+      const hostCanApt = await askClient("toolchains/aptStatus", {}).then(r => Boolean(r?.aptWritable)).catch(() => false);
+      return await toolchainHub.useToolchainVersion({home: HOME, id: String(params?.id || ""), version: String(params?.version || ""), hasHostAptBridge: hostCanApt});
+    }
+
+    case "toolchains/uninstall": {
+      const hostCanApt = await askClient("toolchains/aptStatus", {}).then(r => Boolean(r?.aptWritable)).catch(() => false);
+      return await toolchainHub.uninstallToolchain({home: HOME, id: String(params?.id || ""), version: String(params?.version || ""), hasHostAptBridge: hostCanApt});
+    }
+
+    case "toolchains/cancel":
+      notify("toolchains/cancelApt", {});
+      return toolchainHub.cancelActiveOperations();
+
+    case "toolchains/mirrorPreset":
+      return await toolchainHub.applyMirrorPreset({home: HOME, preset: String(params?.preset || "cn")});
+
+    case "toolchains/caches":
+      return await toolchainHub.getCacheStats(HOME);
+
+    case "toolchains/cleanCaches":
+      return await toolchainHub.cleanCaches({home: HOME, ids: Array.isArray(params?.ids) ? params.ids : [], onAptExec: req => askClient("toolchains/aptExec", req)});
+
+    case "deps/scan":
+      return await projectDeps.scanProjectDeps({home: HOME, cwd: params?.cwd});
+
+    case "deps/run":
+      return await projectDeps.runProjectDepAction({
+        home: HOME, cwd: params?.cwd, ecosystem: params?.ecosystem,
+        action: params?.action || "install", packages: params?.packages || [], dev: params?.dev === true,
+        onProgress: evt => notify("toolchains/progress", evt),
+      });
+
+    case "deps/apt":
+      return await projectDeps.runAptAction({
+        home: HOME, action: params?.action || "list", query: params?.query || "", packages: params?.packages || [],
+        onProgress: evt => notify("toolchains/progress", evt),
+        onAptExec: req => askClient("toolchains/aptExec", req),
+      });
+
+    case "compile/run":
+      return await projectDeps.runCompile({
+        home: HOME, cwd: params?.cwd, ecosystem: params?.ecosystem, command: params?.command,
+        args: params?.args, targetOs: params?.targetOs, targetArch: params?.targetArch,
+        outputPath: params?.outputPath, file: params?.file,
+        onProgress: evt => notify("toolchains/progress", evt),
+      });
 
     default: {
       if (method.startsWith("plugin.")) {

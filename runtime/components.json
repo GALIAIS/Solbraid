@@ -70,6 +70,9 @@
     "ai-reviewer.mjs",
     "download-network.mjs",
     "env-ssh-hub.mjs",
+    "toolchain-hub.mjs",
+    "toolchain-versions.mjs",
+    "project-deps-hub.mjs",
     "worktree-manager.mjs",
     "guest-mux.mjs"
   ],

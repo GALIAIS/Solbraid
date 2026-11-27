@@ -586,6 +586,61 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "solbraid_toolchains",
+    description: "工具链中心：管理多版本编译器、运行时与 7 大 SDK（Go / Zig / Rust / C&C++ / Python+uv / Node / pnpm / Bun / OpenJDK / Android SDK / Gradle / Kotlin / Maven / .NET / Dart / WASI SDK），支持官方历史版本发现、SHA-256/SHA-512 校验、多版本原子切换/卸载、终止任务、切换镜像源及缓存清理。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {type: "string", enum: ["list", "versions", "install", "use", "uninstall", "cancel", "mirror_preset", "caches", "clean_caches"], description: "操作类型"},
+        id: {type: "string", enum: ["go", "zig", "rust", "cpp-apt", "python", "node", "pnpm", "bun", "java", "android-sdk", "gradle", "kotlin", "maven", "dotnet", "dart", "wasi-sdk"], description: "目标编译器或 SDK ID"},
+        version: {type: "string", description: "指定安装/切换/卸载的版本号（如 1.23.6、android-36、8.14.8、9.0.321、3.14.1；留空取推荐稳定版）"},
+        setDefault: {type: "boolean", description: "安装完成后是否设为默认激活版本（默认 true）"},
+        refresh: {type: "boolean", description: "versions 时是否强制跳过缓存刷新官方索引"},
+        extraTargets: {type: "array", items: {type: "string"}, description: "可选：Rust 交叉编译 Target 或 Android SDK 附加组件列表（如 platform-tools / build-tools / arm64-aapt2 / ndk;...）"},
+        aptComponents: {type: "array", items: {type: "string"}, description: "可选：cpp-apt 细选安装的 Ubuntu 软件包列表"},
+        preset: {type: "string", enum: ["cn", "official"], description: "mirror_preset 预设（cn 国内镜像 / official 官方直连）"},
+        ids: {type: "array", items: {type: "string"}, description: "clean_caches 要清理的缓存项 ID 列表"},
+      },
+      required: ["action"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "solbraid_deps",
+    description: "多生态项目依赖与 Ubuntu 系统包管理：扫描项目清单（Node/Go/Rust/Python/Gradle/Maven/Dart/.NET/CMake/Zig）与版本约束、执行依赖安装/添加/移除/过期检查，以及 Ubuntu APT 系统库搜索/更新/安装/卸载。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {type: "string", enum: ["scan", "install", "add", "remove", "outdated", "tidy", "apt_list", "apt_search", "apt_update", "apt_install", "apt_remove"], description: "操作类型"},
+        cwd: {type: "string", description: "目标项目目录"},
+        ecosystem: {type: "string", enum: ["node", "go", "rust", "python", "maven", "dart", "dotnet"], description: "项目语言生态"},
+        packages: {type: "array", items: {type: "string"}, description: "要安装/添加/卸载的包名列表"},
+        dev: {type: "boolean", description: "添加为开发依赖（devDependencies）"},
+        query: {type: "string", description: "APT 搜索或过滤关键词"},
+      },
+      required: ["action"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "solbraid_compile",
+    description: "在手机端直接编译/测试工程或单文件（支持 Go / Zig / Rust 跨平台交叉编译及 C/C++/Java/Kotlin/Dart/.NET/Gradle/Maven/Node/WASI 构建）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cwd: {type: "string", description: "项目或源文件目录"},
+        ecosystem: {type: "string", enum: ["auto", "go", "rust", "node", "gradle", "maven", "dotnet", "dart", "cpp", "zig"], description: "构建生态（默认 auto 自动识别）"},
+        file: {type: "string", description: "单文件编译目标（如 main.c / main.cpp / main.go / main.rs / Main.java / Main.kt / main.dart）"},
+        targetOs: {type: "string", enum: ["linux", "windows", "darwin"], description: "交叉编译目标操作系统"},
+        targetArch: {type: "string", enum: ["amd64", "arm64"], description: "交叉编译目标架构"},
+        outputPath: {type: "string", description: "自定义产物输出路径"},
+        command: {type: "string", description: "显式覆盖编译命令（可选）"},
+        args: {type: "array", items: {type: "string"}, description: "显式编译参数（可选）"},
+      },
+      additionalProperties: false,
+    },
+  },
 ];
 
 function send(packet) {
@@ -610,6 +665,9 @@ const ACTION_TIMEOUT_MS = Object.freeze({
   mobileNotification: 180_000,
   mobileFiles: 90_000,
   mobileHost: 120_000,
+  toolchains: 600_000,
+  deps: 300_000,
+  compile: 300_000,
 });
 
 function callPluginCtl(action, params = {}) {
@@ -682,6 +740,9 @@ const TOOL_ACTION_MAP = Object.freeze({
   solbraid_mobile_notification: "mobileNotification",
   solbraid_mobile_files: "mobileFiles",
   solbraid_mobile_host: "mobileHost",
+  solbraid_toolchains: "toolchains",
+  solbraid_deps: "deps",
+  solbraid_compile: "compile",
 });
 
 async function handle(message) {

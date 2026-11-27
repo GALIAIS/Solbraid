@@ -4,6 +4,7 @@ import {randomUUID, createHash} from "node:crypto";
 import {constants} from "node:fs";
 import {execFile, spawn} from "node:child_process";
 import {promisify} from "node:util";
+import {buildManagedToolchainEnv} from "./toolchain-hub.mjs";
 
 const execFileAsync = promisify(execFile);
 const HOME = process.env.HOME || "/home/agent";
@@ -47,6 +48,7 @@ async function exists(file) {
 
 const activeTunnels = new Map(); // tunnelId -> { spec, child, status, startedAt, error }
 const transfers = new Map();
+let inMemoryEnvSecrets = {};
 let tunnelNotify = () => {};
 
 export function setSshNotifier(fn) {
@@ -123,27 +125,27 @@ async function syncEnvironmentNow({config = {}, secrets = {}}) {
   if (Object.values(gitCfg).some(v => typeof v !== "string" || /[\r\n\0]/.test(v)) || !["", "true", "false", "input"].includes(gitCfg.autoCrlf || "")) throw new Error("Git 配置无效");
   const previous = await readJsonSafe(ENV_CONFIG_FILE, {});
 
-  const normalized = {vars, extraPaths, aliases, shellSnippet, git: gitCfg, secrets};
+  // 密钥类环境变量仅驻留进程内存并由启动器定向注入子进程，严禁明文落盘至 config.json / secrets.json / profile.sh
+  inMemoryEnvSecrets = (secrets && typeof secrets === "object") ? {...secrets} : {};
+  const persistedVars = vars.map(v => (v.secret ? {...v, value: ""} : v));
+  const normalized = {vars: persistedVars, extraPaths, aliases, shellSnippet, git: gitCfg};
 
-  // 生成 POSIX 兼容 profile.sh 供终端、Codex 及所有登录 Shell 自动加载（同一 Shell PID 内幂等防重入，且对 PATH 去重）
+  // 生成 POSIX 兼容 profile.sh 供终端、Codex 及所有登录 Shell 自动加载（仅写入非密钥变量，同一 Shell PID 内幂等防重入）
   const lines = [
     "# Managed by Solbraid Environment Hub",
     `if [ "\${_SOLBRAID_PROFILE_PID:-}" = "$$" ]; then return 0 2>/dev/null || true; fi`,
     `_SOLBRAID_PROFILE_PID="$$"`,
+    `[ -f "${path.join(HOME, ".galiais", "env", "toolchain-profile.sh")}" ] && . "${path.join(HOME, ".galiais", "env", "toolchain-profile.sh")}"`,
   ];
-  for (const v of vars) {
-    if (v.enabled === false) continue;
+  for (const v of persistedVars) {
+    if (v.enabled === false || v.secret) continue;
     if (v.scope && v.scope !== "global") continue;
-    const val = v.secret ? (secrets[v.id] ?? secrets[v.key] ?? "") : String(v.value ?? "");
-    if (v.secret && !val) continue;
-    lines.push(`export ${v.key}=${shellQuote(val)}`);
+    lines.push(`export ${v.key}=${shellQuote(String(v.value ?? ""))}`);
   }
-  for (const v of vars.slice().sort((a, b) => a.scope.length - b.scope.length)) {
-    if (v.enabled === false || typeof v.scope !== "string" || !v.scope.startsWith("project:")) continue;
+  for (const v of persistedVars.slice().sort((a, b) => a.scope.length - b.scope.length)) {
+    if (v.enabled === false || v.secret || typeof v.scope !== "string" || !v.scope.startsWith("project:")) continue;
     const target = path.resolve(v.scope.slice("project:".length));
-    const value = v.secret ? (secrets[v.id] ?? secrets[v.key] ?? "") : String(v.value ?? "");
-    if (v.secret && !value) continue;
-    lines.push(`case "$PWD/" in ${shellQuote(target.replace(/\/+$/, "") + "/")}*) export ${v.key}=${shellQuote(value)} ;; esac`);
+    lines.push(`case "$PWD/" in ${shellQuote(target.replace(/\/+$/, "") + "/")}*) export ${v.key}=${shellQuote(String(v.value ?? ""))} ;; esac`);
   }
   if (extraPaths.length > 0) {
     for (let i = extraPaths.length - 1; i >= 0; i--) {
@@ -182,9 +184,10 @@ async function syncEnvironmentNow({config = {}, secrets = {}}) {
       } catch (error) { if (error.code !== 1 && error.code !== 5) throw error; }
     }
   }
-  // 变量与密钥放在同一个原子快照中，跨进程读取不会混用两个版本。
+  // 仅持久化非密钥配置，清理历史明文 secrets.json 防止泄露
+  await fs.rm(ENV_SECRETS_FILE, {force: true}).catch(() => {});
   await atomicWrite(ENV_CONFIG_FILE, JSON.stringify(normalized, null, 2), 0o600);
-  return {ok: true, globalVarCount: vars.filter(v => v.enabled !== false && (!v.scope || v.scope === "global")).length, pathCount: extraPaths.length, aliasCount: aliases.length};
+  return {ok: true, globalVarCount: persistedVars.filter(v => v.enabled !== false && (!v.scope || v.scope === "global")).length, pathCount: extraPaths.length, aliasCount: aliases.length};
 }
 
 export async function validateShellSnippet({shellSnippet = ""}) {
@@ -206,9 +209,17 @@ export async function validateShellSnippet({shellSnippet = ""}) {
 export async function loadEffectiveUserEnv(cwd = null, basePath = "") {
   await mutations.get("environment");
   const cfg = await readJsonSafe(ENV_CONFIG_FILE, null);
-  if (!cfg) return {};
-  const secrets = cfg.secrets ?? await readJsonSafe(ENV_SECRETS_FILE, {});
+  const mirrorCfg = await readJsonSafe(path.join(HOME, ".galiais", "toolchains", "mirrors.json"), {});
+  const {env: tcEnv, extraBins: tcBins} = buildManagedToolchainEnv(HOME, {PATH: basePath || process.env.PATH || ""}, mirrorCfg);
   const out = {};
+  for (const [k, v] of Object.entries(tcEnv)) {
+    if (k !== "PATH" && v) out[k] = v;
+  }
+  if (!cfg) {
+    if (tcBins.length > 0 && tcEnv.PATH) out.PATH = tcEnv.PATH;
+    return out;
+  }
+  const secrets = inMemoryEnvSecrets;
   const normCwd = cwd ? path.resolve(cwd) : null;
   const applyVar = (v) => {
     if (!v || v.enabled === false || !VALID_ENV_KEY.test(String(v.key || "")) || PROTECTED_ENV_KEYS.has(v.key)) return;
@@ -227,9 +238,11 @@ export async function loadEffectiveUserEnv(cwd = null, basePath = "") {
       }
     }
   }
-  if (Array.isArray(cfg.extraPaths) && cfg.extraPaths.length > 0) {
-    const expanded = cfg.extraPaths.map(p => String(p).replace(/^~(?=\/|$)/, HOME).replaceAll("$HOME", HOME)).filter(Boolean);
-    const merged = [...expanded, ...(out.PATH || basePath || process.env.PATH || "").split(":")].filter(Boolean);
+  const userPaths = Array.isArray(cfg.extraPaths)
+    ? cfg.extraPaths.map(p => String(p).replace(/^~(?=\/|$)/, HOME).replaceAll("$HOME", HOME)).filter(Boolean)
+    : [];
+  if (userPaths.length > 0 || tcBins.length > 0) {
+    const merged = [...userPaths, ...tcBins, ...(out.PATH || basePath || process.env.PATH || "").split(":")].filter(Boolean);
     out.PATH = [...new Set(merged)].join(":");
   }
   return out;

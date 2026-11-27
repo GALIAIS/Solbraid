@@ -3084,6 +3084,14 @@ export async function startPluginControlServer(kernel, options = {}) {
         const call = () => options.onMobileUse(mobileAction, params || {});
         return mobileAction === "status" ? await call() : await serialize("mobile", call);
       }
+      case "toolchains":
+      case "deps":
+      case "compile": {
+        if (typeof options.onToolchain !== "function") {
+          throw new Error("编译器与依赖控制通道未就绪");
+        }
+        return await options.onToolchain(action, params || {});
+      }
       default:
         throw new Error(`未知插件控制动作：${action}`);
     }

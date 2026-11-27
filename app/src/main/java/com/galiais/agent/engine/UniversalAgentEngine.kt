@@ -32,6 +32,14 @@ import org.json.JSONObject
 private val MULTI_NL_RE = Regex("\n{3,}")
 private val ACP_META_RUN_PREFIX_RE = Regex("^(?:run|call|tool)_+")
 private val ACP_META_TOOL_NAMES = setOf("update_steps", "update_focus", "task_boundary", "update_plan", "todowrite", "todo_write", "set_plan")
+private val PROTECTED_APT_PKGS = setOf(
+    "base-files", "bash", "libc6", "libc-bin", "coreutils", "dpkg", "apt", "apt-utils",
+    "dash", "util-linux", "mount", "login", "passwd", "findutils", "grep", "sed", "tar",
+    "gzip", "ca-certificates", "openssl", "libssl3", "libssl3t64", "openssh-client",
+    "curl", "git", "nodejs", "npm", "python3", "python3-minimal", "init", "systemd",
+    "sysvinit-utils", "ncurses-base", "ncurses-bin", "debianutils", "diffutils",
+    "perl-base", "zlib1g", "libstdc++6", "libgcc-s1",
+)
 
 internal fun normalizeAcpMetaToolName(title: String): String =
     title.trim().lowercase().replace("-", "_").replace(Regex("\\s+"), "_").replace(ACP_META_RUN_PREFIX_RE, "")
@@ -81,6 +89,8 @@ class AgentHubController(val repo: ConversationRepository) {
     private val commandStartedAt = mutableMapOf<String, Long>()
     private val adapters = mutableMapOf<String, UniversalAgentAdapter>()
     private val networkMutex = Mutex()
+    private val aptMutex = Mutex()
+    private val activeAptProcess = java.util.concurrent.atomic.AtomicReference<Process?>(null)
     private val systemProxyFlow = MutableStateFlow(detectSystemProxy(runtime.app))
     val systemProxy: StateFlow<String?> = systemProxyFlow.asStateFlow()
     private var syncedNetwork: String? = null
@@ -940,6 +950,130 @@ class AgentHubController(val repo: ConversationRepository) {
                     throw cancel
                 } catch (err: Exception) {
                     runCatching { runtime.hubReject(reqId, -32000, err.message ?: "手机操控执行失败") }
+                }
+            }
+            return
+        }
+        if (method == "toolchains/progress") {
+            (runtime.app as? com.galiais.agent.GaliaisApplication)?.toolchains?.onProgressEvent(params)
+            return
+        }
+        if (packet.has("id") && method == "toolchains/aptStatus") {
+            val reqId = packet.get("id")
+            val isRootChroot = runtime.snapshot.value.mode != RUNTIME_MODE_PROOT &&
+                java.io.File(runtime.app.filesDir, "linux/.galiais-ready").isFile
+            runCatching { runtime.hubRespond(reqId, JSONObject().put("aptWritable", isRootChroot)) }
+            return
+        }
+        if (method == "toolchains/cancelApt") {
+            activeAptProcess.getAndSet(null)?.destroyForcibly()
+            return
+        }
+        if (packet.has("id") && method == "toolchains/aptExec") {
+            val reqId = packet.get("id")
+            repo.scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                try {
+                    val isRootChroot = runtime.snapshot.value.mode != RUNTIME_MODE_PROOT &&
+                        java.io.File(runtime.app.filesDir, "linux/.galiais-ready").isFile
+                    if (!isRootChroot) {
+                        runCatching { runtime.hubRespond(reqId, JSONObject().put("ok", false).put("error", "当前为免 Root 模式，无系统 APT 写入权限")) }
+                        return@launch
+                    }
+                    val act = params.optString("action").lowercase()
+                    if (act !in setOf("update", "install", "remove", "clean")) {
+                        runCatching { runtime.hubRespond(reqId, JSONObject().put("ok", false).put("error", "不允许的 APT 动作：$act")) }
+                        return@launch
+                    }
+                    val pkgRe = Regex("^[a-z0-9][a-z0-9.+-]{0,80}$", RegexOption.IGNORE_CASE)
+                    val pkgArr = params.optJSONArray("packages")
+                    val pkgs = buildList {
+                        if (pkgArr != null) {
+                            for (i in 0 until pkgArr.length()) {
+                                val p = pkgArr.optString(i).trim()
+                                if (pkgRe.matches(p)) add(p)
+                            }
+                        }
+                    }
+                    if (act in setOf("install", "remove") && pkgs.isEmpty()) {
+                        runCatching { runtime.hubRespond(reqId, JSONObject().put("ok", false).put("error", "缺少合法软件包名")) }
+                        return@launch
+                    }
+                    if (act == "remove") {
+                        val blocked = pkgs.filter { it.lowercase() in PROTECTED_APT_PKGS }
+                        if (blocked.isNotEmpty()) {
+                            runCatching {
+                                runtime.hubRespond(
+                                    reqId,
+                                    JSONObject().put("ok", false).put("error", "安全拦截：禁止卸载核心系统包（${blocked.joinToString(", ")}）"),
+                                )
+                            }
+                            return@launch
+                        }
+                    }
+                    val linuxRoot = java.io.File(runtime.app.filesDir, "linux").absolutePath
+                    val qRoot = "'" + linuxRoot.replace("'", "'\"'\"'") + "'"
+                    val aptCmd = when (act) {
+                        "update" -> "apt-get update -qq"
+                        "clean" -> "apt-get clean"
+                        "install" -> "apt-get install -y --no-install-recommends ${pkgs.joinToString(" ")}"
+                        else -> "apt-get remove -y ${pkgs.joinToString(" ")}"
+                    }
+                    val res = aptMutex.withLock {
+                        val started = System.currentTimeMillis()
+                        val body = "chroot $qRoot /usr/bin/env DEBIAN_FRONTEND=noninteractive PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin $aptCmd"
+                        val proc = com.galiais.agent.RootShell.process(com.galiais.agent.RootShell.cleanCommand(body))
+                            .redirectErrorStream(true)
+                            .start()
+                        activeAptProcess.set(proc)
+                        try {
+                            val ring = StringBuilder()
+                            val maxKeep = 65_536
+                            val readerThread = Thread({
+                                runCatching {
+                                    proc.inputStream.bufferedReader(Charsets.UTF_8).use { br ->
+                                        val buf = CharArray(4096)
+                                        while (true) {
+                                            val n = br.read(buf)
+                                            if (n <= 0) break
+                                            synchronized(ring) {
+                                                ring.append(buf, 0, n)
+                                                if (ring.length > maxKeep) {
+                                                    ring.delete(0, ring.length - maxKeep)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }, "solbraid-apt-reader").apply { isDaemon = true; start() }
+                            val finished = proc.waitFor(300L, java.util.concurrent.TimeUnit.SECONDS)
+                            if (!finished) {
+                                proc.destroyForcibly()
+                                runCatching { readerThread.join(1500L) }
+                                JSONObject()
+                                    .put("ok", false)
+                                    .put("exitCode", -1)
+                                    .put("ms", System.currentTimeMillis() - started)
+                                    .put("error", "APT 执行超时（超过 300 秒），已自动中止")
+                                    .put("stderr", "APT 执行超时（超过 300 秒），已自动中止")
+                            } else {
+                                runCatching { readerThread.join(1500L) }
+                                val code = proc.exitValue()
+                                val out = synchronized(ring) { ring.toString().takeLast(16_000) }
+                                JSONObject()
+                                    .put("ok", code == 0)
+                                    .put("exitCode", code)
+                                    .put("ms", System.currentTimeMillis() - started)
+                                    .put("stdout", out)
+                                    .put("stderr", if (code == 0) "" else out)
+                            }
+                        } finally {
+                            activeAptProcess.compareAndSet(proc, null)
+                            if (proc.isAlive) proc.destroyForcibly()
+                        }
+                    }
+                    runCatching { runtime.hubRespond(reqId, res) }
+                } catch (err: Exception) {
+                    runCatching { runtime.hubRespond(reqId, JSONObject().put("ok", false).put("error", err.message ?: "Root APT 执行失败")) }
                 }
             }
             return

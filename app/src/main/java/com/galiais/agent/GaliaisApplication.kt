@@ -11,6 +11,7 @@ import com.galiais.agent.engine.EnvSshRepository
 import com.galiais.agent.engine.ExtensionRepository
 import com.galiais.agent.engine.RuntimeClient
 import com.galiais.agent.engine.SuperAgentCoordinator
+import com.galiais.agent.engine.ToolchainRepository
 import com.galiais.agent.engine.fs.UnifiedFileRepository
 import com.galiais.agent.engine.mobile.MobileUseEngine
 import java.io.File
@@ -21,6 +22,7 @@ class GaliaisApplication : Application() {
     val conversations: ConversationRepository by lazy { ConversationRepository(runtime, settings) }
     val fileManager: UnifiedFileRepository by lazy { UnifiedFileRepository(this, runtime, settings) }
     val mobileUse: MobileUseEngine by lazy { MobileUseEngine(this, runtime, settings, fileManager) }
+    val toolchains: ToolchainRepository by lazy { ToolchainRepository(runtime) { conversations.notify(it) } }
     val extensions: ExtensionRepository by lazy { conversations.extensions }
     val envSsh: EnvSshRepository by lazy { conversations.envSsh }
     val superAgent: SuperAgentCoordinator by lazy { conversations.superAgent }

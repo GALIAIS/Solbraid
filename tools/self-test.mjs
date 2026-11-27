@@ -1168,16 +1168,19 @@ async function testSelfEvolvingPluginPipeline() {
   };
 
   try {
-    // 1. MCP initialize & tools/list 必须完整暴露 34 个工具（15 插件运维 + 5 安全文件 + 14 Mobile-Use 手机操控）
+    // 1. MCP initialize & tools/list 必须完整暴露 37 个工具（15 插件运维 + 5 安全文件 + 14 Mobile-Use + 3 工具链/依赖/编译）
     const initResp = await rpc("initialize", {protocolVersion: "2025-06-18"});
     assert.equal(initResp.result.serverInfo.name, "solbraid-plugin-ctl");
     const listTools = await rpc("tools/list");
-    assert.equal(listTools.result.tools.length, 34);
+    assert.equal(listTools.result.tools.length, 37);
     assert.ok(listTools.result.tools.some(t => t.name === "solbraid_self_build"));
     assert.ok(listTools.result.tools.some(t => t.name === "solbraid_file_edit"));
     assert.ok(listTools.result.tools.some(t => t.name === "solbraid_mobile_screenshot"));
     assert.ok(listTools.result.tools.some(t => t.name === "solbraid_mobile_device"));
     assert.ok(listTools.result.tools.some(t => t.name === "solbraid_mobile_host"));
+    assert.ok(listTools.result.tools.some(t => t.name === "solbraid_toolchains"));
+    assert.ok(listTools.result.tools.some(t => t.name === "solbraid_deps"));
+    assert.ok(listTools.result.tools.some(t => t.name === "solbraid_compile"));
 
     const sbStatus = await callTool("solbraid_self_build", {action: "status"});
     assert.equal(sbStatus.isError, false);
@@ -3943,6 +3946,148 @@ async function testCacheStabilityAndTelemetryFixes() {
   }
 }
 
+async function testToolchainAndDepsHub() {
+  for (const rel of ["runtime/toolchain-hub.mjs", "runtime/toolchain-versions.mjs", "runtime/project-deps-hub.mjs"]) {
+    const chk = spawnSync(process.execPath, ["--check", path.join(rootDir, rel)], {encoding: "utf8"});
+    assert.equal(chk.status, 0, `${rel} syntax error: ${chk.stderr}`);
+  }
+  const tcMod = await import(pathToFileURL(path.join(rootDir, "runtime", "toolchain-hub.mjs")).href);
+  const tvMod = await import(pathToFileURL(path.join(rootDir, "runtime", "toolchain-versions.mjs")).href);
+  const depMod = await import(pathToFileURL(path.join(rootDir, "runtime", "project-deps-hub.mjs")).href);
+
+  // 版本号与包名防注入校验
+  assert.throws(() => tvMod.assertSafeVersion("../evil"), /版本号格式无效/);
+  assert.throws(() => tvMod.assertSafeVersion("--flag"), /版本号格式无效/);
+  assert.equal(tvMod.assertSafeVersion("1.23.6"), "1.23.6");
+
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "galiais-tc-"));
+  const tmpProj = path.join(tmpHome, "workspace", "polyglot-app");
+  fs.mkdirSync(tmpProj, {recursive: true});
+  try {
+    // 1. 多版本 versions/<ver> 并存、原子切换 current、单版本移除自动回退（POSIX/支持软链环境）
+    const v1Bin = path.join(tmpHome, ".galiais", "toolchains", "go", "versions", "1.22.12", "bin");
+    const v2Bin = path.join(tmpHome, ".galiais", "toolchains", "go", "versions", "1.24.1", "bin");
+    fs.mkdirSync(v1Bin, {recursive: true});
+    fs.mkdirSync(v2Bin, {recursive: true});
+    if (process.platform !== "win32") {
+      await tcMod.useToolchainVersion({home: tmpHome, id: "go", version: "1.22.12"});
+      let listedV = await tcMod.listToolchains(tmpHome);
+      let goItem = listedV.toolchains.find(t => t.id === "go");
+      assert.equal(goItem.activeVersion, "1.22.12");
+      assert.deepEqual(goItem.installedVersions, ["1.24.1", "1.22.12"]);
+      await tcMod.useToolchainVersion({home: tmpHome, id: "go", version: "1.24.1"});
+      listedV = await tcMod.listToolchains(tmpHome);
+      assert.equal(listedV.toolchains.find(t => t.id === "go").activeVersion, "1.24.1");
+      await tcMod.uninstallToolchain({home: tmpHome, id: "go", version: "1.24.1"});
+      listedV = await tcMod.listToolchains(tmpHome);
+      assert.equal(listedV.toolchains.find(t => t.id === "go").activeVersion, "1.22.12");
+    }
+    const fakeGoBin = path.join(tmpHome, ".galiais", "toolchains", "go", "bin");
+    fs.mkdirSync(fakeGoBin, {recursive: true});
+    const prof = await tcMod.writeToolchainProfile(tmpHome);
+    assert.ok(fs.existsSync(prof.profilePath));
+    const profText = fs.readFileSync(prof.profilePath, "utf8");
+    assert.ok(profText.includes("GOROOT="), "toolchain-profile.sh must export GOROOT");
+
+    // 2. 全量工具链与 7 大 SDK 检测（16 套元数据）、Android SDK 自动接管与包名参数注入拦截
+    const fakeAndroidSdk = path.join(tmpHome, "android-sdk");
+    fs.mkdirSync(path.join(fakeAndroidSdk, "platforms", "android-36"), {recursive: true});
+    fs.mkdirSync(path.join(fakeAndroidSdk, "build-tools", "36.0.0"), {recursive: true});
+    const listed = await tcMod.listToolchains(tmpHome);
+    assert.equal(listed.ok, true);
+    assert.equal(listed.toolchains.length, 16);
+    assert.equal(listed.toolchains.filter(t => t.category === "sdk").length, 7);
+    const androidSdkItem = listed.toolchains.find(t => t.id === "android-sdk");
+    assert.equal(androidSdkItem?.installed, true);
+    assert.deepEqual(androidSdkItem?.installedVersions, ["android-36"]);
+    assert.equal(androidSdkItem?.activeVersion, "android-36");
+    await assert.rejects(() => tcMod.uninstallToolchain({home: tmpHome, id: "android-sdk", version: ""}), /避免误删/);
+    const {env: sdkEnv} = tcMod.buildManagedToolchainEnv(tmpHome, {PATH: ""});
+    assert.equal(sdkEnv.ANDROID_HOME, fakeAndroidSdk);
+    const nodeItem = listed.toolchains.find(t => t.id === "node");
+    assert.equal(nodeItem?.installed, true);
+    await assert.rejects(() => depMod.runProjectDepAction({home: tmpHome, cwd: tmpProj, ecosystem: "node", action: "add", packages: ["--evil-flag"]}), /包名格式非法/);
+
+    // 3. 多语言与多 SDK 项目依赖深度扫描 + 版本约束文件（含 global.json / gradle-wrapper / compileSdk）+ 锁文件识别
+    fs.writeFileSync(path.join(tmpProj, ".tool-versions"), "golang 1.23.6\nzig 0.13.0\ndart 3.14.1\n", "utf8");
+    fs.writeFileSync(path.join(tmpProj, ".nvmrc"), "v20.18.1\n", "utf8");
+    fs.writeFileSync(path.join(tmpProj, ".python-version"), "3.11.11\n", "utf8");
+    fs.writeFileSync(path.join(tmpProj, "rust-toolchain.toml"), "[toolchain]\nchannel = \"1.84.1\"\n", "utf8");
+    fs.writeFileSync(path.join(tmpProj, "global.json"), JSON.stringify({sdk: {version: "10.0.404"}}), "utf8");
+    fs.mkdirSync(path.join(tmpProj, "gradle", "wrapper"), {recursive: true});
+    fs.writeFileSync(path.join(tmpProj, "gradle", "wrapper", "gradle-wrapper.properties"), "distributionUrl=https\\://services.gradle.org/distributions/gradle-9.1.0-bin.zip\n", "utf8");
+    fs.mkdirSync(path.join(tmpProj, "app"), {recursive: true});
+    fs.writeFileSync(path.join(tmpProj, "app", "build.gradle.kts"), "android { compileSdk = 36 }\n", "utf8");
+    fs.writeFileSync(path.join(tmpProj, "pom.xml"), "<project></project>\n", "utf8");
+    fs.writeFileSync(path.join(tmpProj, "pubspec.yaml"), "name: demo\n", "utf8");
+    fs.writeFileSync(path.join(tmpProj, "Demo.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>\n", "utf8");
+    fs.writeFileSync(path.join(tmpProj, "package-lock.json"), "{}\n", "utf8");
+    fs.writeFileSync(path.join(tmpProj, "go.sum"), "", "utf8");
+    fs.writeFileSync(path.join(tmpProj, "package.json"), JSON.stringify({
+      name: "demo", scripts: {build: "echo ok", test: "echo test"},
+      dependencies: {zod: "^3.23.0"}, devDependencies: {typescript: "^5.6.0"},
+    }), "utf8");
+    fs.writeFileSync(path.join(tmpProj, "go.mod"), "module example.com/demo\n\ngo 1.22\n\nrequire (\n\tgolang.org/x/sys v0.30.0\n)\n", "utf8");
+    fs.writeFileSync(path.join(tmpProj, "Cargo.toml"), "[package]\nname = \"demo\"\n[dependencies]\nserde = \"1.0\"\n[dev-dependencies]\npretty_assertions = \"1.4\"\n", "utf8");
+    fs.writeFileSync(path.join(tmpProj, "requirements.txt"), "fastapi>=0.115.0\nuvicorn==0.30.0\n", "utf8");
+    fs.writeFileSync(path.join(tmpProj, "CMakeLists.txt"), "cmake_minimum_required(VERSION 3.20)\nproject(demo)\n", "utf8");
+    fs.writeFileSync(path.join(tmpProj, "build.zig"), "const std = @import(\"std\");\n", "utf8");
+
+    const scanned = await depMod.scanProjectDeps({home: tmpHome, cwd: tmpProj});
+    assert.equal(scanned.ok, true);
+    assert.ok(scanned.versionHints.some(h => h.toolchainId === "go" && h.required === "1.23.6"));
+    assert.ok(scanned.versionHints.some(h => h.toolchainId === "node" && h.required === "20.18.1"));
+    assert.ok(scanned.versionHints.some(h => h.toolchainId === "python" && h.required === "3.11.11"));
+    assert.ok(scanned.versionHints.some(h => h.toolchainId === "rust" && h.required === "1.84.1"));
+    assert.ok(scanned.versionHints.some(h => h.toolchainId === "dotnet" && h.required === "10.0.404"));
+    assert.ok(scanned.versionHints.some(h => h.toolchainId === "gradle" && h.required === "9.1.0"));
+    assert.ok(scanned.versionHints.some(h => h.toolchainId === "android-sdk" && h.required === "android-36"));
+    assert.ok(scanned.versionHints.some(h => h.toolchainId === "dart" && h.required === "3.14.1"));
+    assert.equal(scanned.ecosystems.find(e => e.ecosystem === "node").lockfile, "package-lock.json");
+    assert.equal(scanned.ecosystems.find(e => e.ecosystem === "go").lockfile, "go.sum");
+    const ecoNames = new Set(scanned.ecosystems.map(e => e.ecosystem));
+    for (const expected of ["node", "go", "rust", "python", "cpp", "zig", "maven", "dart", "dotnet"]) {
+      assert.ok(ecoNames.has(expected), `Missing scanned ecosystem: ${expected}`);
+    }
+    assert.equal(scanned.ecosystems.find(e => e.ecosystem === "node").depCount, 2);
+    assert.equal(scanned.ecosystems.find(e => e.ecosystem === "go").depCount, 1);
+    assert.equal(scanned.ecosystems.find(e => e.ecosystem === "rust").depCount, 2);
+    assert.equal(scanned.ecosystems.find(e => e.ecosystem === "python").depCount, 2);
+    assert.ok(scanned.compileTargets.some(t => t.ecosystem === "go" && t.crossCompile));
+
+    // 4. 真实单文件 Go 交叉编译验证（若宿主机装有 Go，移除假 go/bin 避免遮蔽真实 go）
+    fs.rmSync(path.join(tmpHome, ".galiais", "toolchains", "go"), {recursive: true, force: true});
+    const hostTc = await tcMod.listToolchains(tmpHome);
+    if (hostTc.toolchains.find(t => t.id === "go")?.installed) {
+      const goProj = path.join(tmpHome, "workspace", "hello-go");
+      fs.mkdirSync(goProj, {recursive: true});
+      fs.writeFileSync(path.join(goProj, "go.mod"), "module hello\n\ngo 1.22\n", "utf8");
+      fs.writeFileSync(path.join(goProj, "main.go"), "package main\nimport \"fmt\"\nfunc main(){ fmt.Println(\"HI\") }\n", "utf8");
+      const compiled = await depMod.runCompile({home: tmpHome, cwd: goProj, ecosystem: "go", targetOs: "linux", targetArch: "arm64"});
+      assert.equal(compiled.ok, true, `Go cross-compile failed: ${compiled.stderr}`);
+      assert.ok(compiled.artifactSize > 100_000, "Expected real compiled ELF binary");
+    }
+
+    // 5. 缓存统计与清理
+    const dummyCache = path.join(tmpHome, ".npm", "blob.bin");
+    fs.mkdirSync(path.dirname(dummyCache), {recursive: true});
+    fs.writeFileSync(dummyCache, Buffer.alloc(16384, 1));
+    const before = await tcMod.getCacheStats(tmpHome);
+    assert.ok(before.totalBytes >= 16384);
+    const cleaned = await tcMod.cleanCaches({home: tmpHome, ids: ["npm"]});
+    assert.ok(cleaned.freedBytes >= 16384);
+    assert.equal(cleaned.after.entries.find(e => e.id === "npm").bytes, 0);
+
+    // 6. MCP 工具清单验证（含 3 个新工具）
+    const mcpSrc = fs.readFileSync(path.join(rootDir, "runtime", "plugin-mcp.mjs"), "utf8");
+    for (const toolName of ["solbraid_toolchains", "solbraid_deps", "solbraid_compile"]) {
+      assert.ok(mcpSrc.includes(`name: "${toolName}"`), `Missing MCP tool ${toolName}`);
+    }
+  } finally {
+    fs.rmSync(tmpHome, {recursive: true, force: true});
+  }
+}
+
 async function testThreeAgentProtocolParity() {
   // 1. 验证 guest-mux.mjs 单通道 --stop 支持与安全校验
   const muxSrc = fs.readFileSync(path.join(rootDir, "runtime", "guest-mux.mjs"), "utf8");
@@ -4020,6 +4165,7 @@ await testProviderTranslators();
 await testUsageLedger();
 await testProviderGatewayE2E();
 await testCacheStabilityAndTelemetryFixes();
+await testToolchainAndDepsHub();
 await testMermaidCycleAndShapes();
 await testExtensionSyncClaudeHooks();
 await testAcpDriver();

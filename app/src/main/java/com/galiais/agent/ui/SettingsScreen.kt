@@ -45,7 +45,13 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
     val sshHosts by app.envSsh.sshHosts.collectAsState()
     val activeTunnels by app.envSsh.activeTunnels.collectAsState()
     val mobileStatus by app.mobileUse.status.collectAsState()
-    androidx.compose.runtime.LaunchedEffect(runtime.ready, runtime.mode) { app.mobileUse.refreshStatus() }
+    val tcSnap by app.toolchains.snapshot.collectAsState()
+    androidx.compose.runtime.LaunchedEffect(runtime.ready, runtime.mode) {
+        app.mobileUse.refreshStatus()
+        if (runtime.ready) {
+            app.toolchains.refreshToolchainsAsync()
+        }
+    }
     var openingPluginSurface by remember { mutableStateOf<Pair<String, String>?>(null) }
     var openingPluginPanel by remember { mutableStateOf<Pair<String, com.galiais.agent.engine.ChatArtifact>?>(null) }
 
@@ -235,6 +241,24 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                     iconTint = G.accent,
                     iconBg = G.accentContainer,
                     onClick = { onNavigate("settings/env") },
+                )
+                Hairline(Modifier.padding(start = 66.dp))
+                val readyToolchains = tcSnap.toolchains.filter { it.installed }
+                val tcSummary = if (readyToolchains.isEmpty()) {
+                    "编译器 / SDK · 项目依赖 · Ubuntu APT · 交叉编译"
+                } else {
+                    val names = readyToolchains.take(4).joinToString(" · ") { it.id.uppercase() }
+                    val more = if (readyToolchains.size > 4) " 等" else ""
+                    "已就绪 $names$more · 编译器 / SDK 与依赖"
+                }
+                SettingsNavRow(
+                    icon = GaliaisIcons.Cpu,
+                    title = "工具链中心",
+                    subtitle = tcSummary,
+                    badge = if (readyToolchains.isNotEmpty()) "${readyToolchains.size} 已装" else null,
+                    iconTint = G.artifact,
+                    iconBg = G.artifactTint,
+                    onClick = { onNavigate("settings/toolchains") },
                 )
                 Hairline(Modifier.padding(start = 66.dp))
                 SettingsNavRow(
