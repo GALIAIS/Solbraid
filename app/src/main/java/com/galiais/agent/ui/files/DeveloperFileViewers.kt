@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -97,7 +98,19 @@ internal fun JsonTreeViewer(app: GaliaisApplication, file: File) {
     val parsedState by produceState<Pair<Boolean, Any?>>(initialValue = false to null, key1 = file) {
         val result = withContext(Dispatchers.IO) {
             runCatching {
-                val raw = file.readText(Charsets.UTF_8).take(1_500_000)
+                val maxBytes = 1_500_000
+                val raw = file.inputStream().use { inp ->
+                    val out = java.io.ByteArrayOutputStream()
+                    val buf = ByteArray(32_768)
+                    var total = 0
+                    while (total < maxBytes) {
+                        val n = inp.read(buf, 0, minOf(buf.size, maxBytes - total))
+                        if (n <= 0) break
+                        out.write(buf, 0, n)
+                        total += n
+                    }
+                    out.toByteArray().toString(Charsets.UTF_8)
+                }
                 JSONTokener(raw).nextValue()
             }.getOrNull()
         }
@@ -393,7 +406,7 @@ internal fun ArchiveInspectorViewer(app: GaliaisApplication, fileRef: FileRef, f
         }
         error?.let { Text(it, color = G.danger, style = MaterialTheme.typography.bodySmall) }
         LazyColumn(Modifier.weight(1f).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            items(items, key = { it.path }) { entry ->
+            itemsIndexed(items, key = { idx, entry -> "${entry.path}#$idx" }) { _, entry ->
                 Surface(
                     onClick = {
                         if (!entry.isDirectory) {

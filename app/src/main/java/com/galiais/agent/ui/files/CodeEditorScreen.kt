@@ -334,7 +334,10 @@ fun CodeEditorDialog(
                 kotlin.math.abs(next.text.length - field.text.length) > 12 || next.text.endsWith("\n")
             ) {
                 undoStack.add(field)
-                if (undoStack.size > 180) undoStack.removeAt(0)
+                var undoChars = undoStack.sumOf { it.text.length }
+                while (undoStack.size > 1 && (undoStack.size > 180 || undoChars > 8_000_000)) {
+                    undoChars -= undoStack.removeAt(0).text.length
+                }
             }
             redoStack.clear()
             lastEditMs = now
@@ -441,18 +444,19 @@ fun CodeEditorDialog(
             try {
                 val node = runCatching { fm.stat(fileRef) }.getOrNull()
                 totalFileBytes = node?.size ?: 0L
-                if (totalFileBytes > LARGE_FILE_THRESHOLD_BYTES && encodingOverride == null) {
-                    val staged = fm.stageReadableFile(fileRef)
+                if (totalFileBytes > LARGE_FILE_THRESHOLD_BYTES) {
+                    val staged = largeStagedFile ?: fm.stageReadableFile(fileRef)
                     val headSample = runCatching { fm.readHeaderBytes(fileRef, 65_536) }.getOrDefault(ByteArray(0))
-                    val detectedEnc = if (headSample.isNotEmpty()) TextCodec.detectEncoding(headSample) else TextEncoding.UTF_8
+                    val detectedEnc = encodingOverride ?: if (headSample.isNotEmpty()) TextCodec.detectEncoding(headSample) else TextEncoding.UTF_8
                     encoding = detectedEnc
                     lineEnding = TextCodec.decodeBytes(headSample, encodingOverride = detectedEnc).lineEnding
                     largeStagedFile = staged
                     largeFileMtimeMs = node?.lastModifiedMs ?: staged.lastModified()
                     largeFileMode = true
                     editingLargePage = false
-                    largePageIdx = 0
-                    largePage = withContext(Dispatchers.IO) { TextCodec.readTextPage(staged, 0, encoding = detectedEnc) }
+                    val targetPageIdx = if (encodingOverride != null) largePageIdx else 0
+                    largePageIdx = targetPageIdx
+                    largePage = withContext(Dispatchers.IO) { TextCodec.readTextPage(staged, targetPageIdx, encoding = detectedEnc) }
                     // 后台流式构建稀疏行号索引，支持真实行号显示与精准跳行
                     scope.launch {
                         val idx = withContext(Dispatchers.IO) { TextCodec.buildSparseLineIndex(staged, encoding = detectedEnc) }
@@ -463,7 +467,7 @@ fun CodeEditorDialog(
                                 TextCodec.readTextPage(staged, cur.pageIndex, encoding = encoding, lineIndex = idx)
                             }
                         }
-                        if (initialLine != null && initialLine > 1) jumpToLine(initialLine)
+                        if (encodingOverride == null && initialLine != null && initialLine > 1) jumpToLine(initialLine)
                     }
                 } else {
                     largeFileMode = false

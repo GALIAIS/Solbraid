@@ -146,7 +146,21 @@ fun UniversalFileViewerDialog(
                 val head = f.inputStream().use { inp -> ByteArray(512).let { b -> b.copyOf(inp.read(b).coerceAtLeast(0)) } }
                 val cat = TextCodec.classifyFile(fileRef.name, head)
                 val txt = if (cat in setOf(ViewerCategory.SVG, ViewerCategory.MARKDOWN, ViewerCategory.HTML)) {
-                    runCatching { f.readText(Charsets.UTF_8) }.getOrDefault("")
+                    runCatching {
+                        val cap = 4 * 1024 * 1024
+                        f.inputStream().use { inp ->
+                            val out = java.io.ByteArrayOutputStream()
+                            val buf = ByteArray(32_768)
+                            var total = 0
+                            while (total < cap) {
+                                val n = inp.read(buf, 0, minOf(buf.size, cap - total))
+                                if (n <= 0) break
+                                out.write(buf, 0, n)
+                                total += n
+                            }
+                            out.toByteArray().toString(Charsets.UTF_8)
+                        }
+                    }.getOrDefault("")
                 } else null
                 cat to txt
             }
@@ -382,30 +396,46 @@ private fun ImageGalleryViewer(
                 if (file != null) {
                     val ext = ref.name.substringAfterLast('.', "").lowercase()
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && ext in setOf("gif", "webp")) {
-                        AndroidView(
-                            factory = { ctx ->
-                                ImageView(ctx).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
-                            },
-                            update = { iv ->
-                                if (iv.tag != file.absolutePath) {
-                                    iv.tag = file.absolutePath
-                                    runCatching {
-                                        val drawable = ImageDecoder.decodeDrawable(ImageDecoder.createSource(file))
-                                        iv.setImageDrawable(drawable)
-                                        if (drawable is AnimatedImageDrawable) drawable.start()
-                                    }.onFailure {
-                                        BitmapFactory.decodeFile(file.absolutePath)?.let { iv.setImageBitmap(it) }
+                        val animDrawable by produceState<Pair<Boolean, android.graphics.drawable.Drawable?>>(initialValue = false to null, key1 = file) {
+                            val dr = withContext(Dispatchers.IO) {
+                                runCatching {
+                                    ImageDecoder.decodeDrawable(ImageDecoder.createSource(file)) { decoder, info, _ ->
+                                        val maxDim = maxOf(info.size.width, info.size.height)
+                                        if (maxDim > 2048) {
+                                            var sample = 1
+                                            while (maxDim / sample > 2048) sample *= 2
+                                            decoder.setTargetSampleSize(sample)
+                                        }
                                     }
-                                }
-                            },
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .graphicsLayer {
-                                    scaleX = scale; scaleY = scale
-                                    translationX = offset.x; translationY = offset.y
-                                    rotationZ = rotation
+                                }.getOrNull()
+                            }
+                            value = true to dr
+                        }
+                        DisposableEffect(animDrawable.second) {
+                            val dr = animDrawable.second
+                            if (dr is AnimatedImageDrawable) dr.start()
+                            onDispose { if (dr is AnimatedImageDrawable) dr.stop() }
+                        }
+                        val dr = animDrawable.second
+                        if (dr != null) {
+                            AndroidView(
+                                factory = { ctx ->
+                                    ImageView(ctx).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
                                 },
-                        )
+                                update = { iv ->
+                                    if (iv.drawable !== dr) iv.setImageDrawable(dr)
+                                },
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .graphicsLayer {
+                                        scaleX = scale; scaleY = scale
+                                        translationX = offset.x; translationY = offset.y
+                                        rotationZ = rotation
+                                    },
+                            )
+                        } else if (animDrawable.first) {
+                            Text("动图解码失败", color = Color.White)
+                        }
                     } else {
                         val decoded by produceState<Pair<Boolean, Bitmap?>>(initialValue = false to null, key1 = file) {
                             val bm = withContext(Dispatchers.IO) {
@@ -536,20 +566,31 @@ private fun NativePdfViewer(file: File) {
             val basePageWidth = (maxWidth - 24.dp).coerceAtLeast(240.dp)
             val scaledWidth = basePageWidth * scale
             val hScroll = rememberScrollState()
+            val pageCache = remember(file, scale) { android.util.LruCache<Int, Bitmap>(4) }
+            DisposableEffect(pageCache) {
+                onDispose { pageCache.evictAll() }
+            }
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(12.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 items(pageCount) { idx ->
-                    var bmp by remember(file, idx) { mutableStateOf<Bitmap?>(null) }
+                    var bmp by remember(file, idx, scale) { mutableStateOf<Bitmap?>(pageCache.get(idx)) }
+                    DisposableEffect(file, idx, scale) {
+                        onDispose { bmp = null }
+                    }
                     LaunchedEffect(file, idx, scale) {
+                        pageCache.get(idx)?.let { cached ->
+                            bmp = cached
+                            return@LaunchedEffect
+                        }
                         val rendered = withContext(Dispatchers.IO) {
                             synchronized(renderer) {
                                 runCatching {
                                     renderer.openPage(idx).use { page ->
-                                        val w = (page.width * 2 * scale).toInt().coerceIn(320, 2400)
-                                        val h = (page.height * 2 * scale).toInt().coerceIn(320, 3200)
+                                        val w = (page.width * 2 * scale).toInt().coerceIn(320, 1800)
+                                        val h = (page.height * 2 * scale).toInt().coerceIn(320, 2400)
                                         Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { bitmap ->
                                             bitmap.eraseColor(android.graphics.Color.WHITE)
                                             page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
@@ -558,7 +599,10 @@ private fun NativePdfViewer(file: File) {
                                 }.getOrNull()
                             }
                         }
-                        if (rendered != null) bmp = rendered
+                        if (rendered != null) {
+                            pageCache.put(idx, rendered)
+                            bmp = rendered
+                        }
                     }
                     Surface(shape = D.shape(8.dp), color = Color.White, border = BorderStroke(0.5.dp, G.border), modifier = Modifier.fillMaxWidth()) {
                         Column {
