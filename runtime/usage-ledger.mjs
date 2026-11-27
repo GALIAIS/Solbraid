@@ -2,6 +2,8 @@
 // 以只追加 JSONL (~/.galiais/usage/ledger.jsonl) 记录网关与直连 CLI 的 Token、缓存、思维链、TTFT、吞吐率与估算费用，
 // 支持 12 周热力图、多维筛选（周期/日期/Agent/服务商/模型/仅异常/关键词）、明细追踪、CSV 导出与按维度清空。
 import fs from "node:fs/promises";
+import {createInterface} from "node:readline";
+import {Worker, parentPort, workerData} from "node:worker_threads";
 import path from "node:path";
 import {randomUUID} from "node:crypto";
 
@@ -206,51 +208,63 @@ export function recordUsageEvent(entry) {
   return appendTail;
 }
 
-export async function readAllUsageRecords(sinceMs = 0) {
-  let raw = "";
-  try { raw = await fs.readFile(LEDGER_FILE, "utf8"); }
-  catch (e) { if (e.code === "ENOENT") return []; throw e; }
-  const out = [];
-  for (const line of raw.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const r = JSON.parse(line);
-      if (r && typeof r.t === "number" && r.t >= sinceMs) {
-        if (!r.source) r.source = String(r.providerId || "").startsWith("official_") ? "direct" : "gateway";
-        const wasLegacyRow = r.streamed === undefined;
-        r.cacheRead = Math.max(0, Math.round(Number(r.cacheRead || 0)));
-        r.cacheWrite = Math.max(0, Math.round(Number(r.cacheWrite || 0)));
-        const rawIn = Math.max(0, Math.round(Number(r.in || 0)));
-        const cacheSum = r.cacheRead + r.cacheWrite;
-        // 兼容历史旧账本：旧版 Antigravity 直连记录把未命中缓存输入直接写入 in 字段（未含 cacheRead/cacheWrite），按统一总输入口径还原
-        if (!r.inNormalized && cacheSum > 0 && ((rawIn > 0 && rawIn < cacheSum) || (wasLegacyRow && r.agent === "antigravity" && r.source === "direct" && rawIn > 0))) {
-          r.in = rawIn + cacheSum;
-        } else {
-          r.in = Math.max(rawIn, cacheSum);
-        }
-        r.out = Math.max(0, Math.round(Number(r.out || 0)));
-        r.reasoning = Math.max(0, Math.round(Number(r.reasoning || 0)));
-        r.ms = Math.max(0, Math.round(Number(r.ms || 0)));
-        // 订阅/免费账本行统一将实际账单费用归零，避免早期版本残留的估算金额与按量计费混淆
-        if (r.billingKind === "plan" || r.billingKind === "free") {
-          r.cost = 0;
-        }
-        // 兼容历史旧账本：旧版本非流式响应曾把 ttftMs 误置等于 ms，统一归零以免污染首字与吞吐统计
-        if (wasLegacyRow) {
-          r.streamed = r.ttftMs > 0 && r.ms > r.ttftMs + 50;
-          if (!r.streamed && r.ttftMs > 0 && r.ttftMs >= r.ms) r.ttftMs = 0;
-        }
-        r.ttftMs = r.streamed ? Math.max(0, Math.round(Number(r.ttftMs || 0))) : 0;
-        r.genMs = resolveGenMs(r);
-        r.exact = r.exact !== false;
-        r.tps = calcDecodeTps(r.out, r.genMs);
-        r.e2eTps = calcE2eTps(r.out, r.ms);
-        r.contextUsed = Math.max(0, Math.round(Number(r.contextUsed || 0)));
-        r.contextWindow = Math.max(0, Math.round(Number(r.contextWindow || 0)));
-        out.push(r);
-      }
-    } catch {}
+function normalizeUsageRecord(r) {
+  if (!r.source) r.source = String(r.providerId || "").startsWith("official_") ? "direct" : "gateway";
+  const wasLegacyRow = r.streamed === undefined;
+  r.cacheRead = Math.max(0, Math.round(Number(r.cacheRead || 0)));
+  r.cacheWrite = Math.max(0, Math.round(Number(r.cacheWrite || 0)));
+  const rawIn = Math.max(0, Math.round(Number(r.in || 0)));
+  const cacheSum = r.cacheRead + r.cacheWrite;
+  // 兼容历史旧账本：旧版 Antigravity 直连记录把未命中缓存输入直接写入 in 字段（未含 cacheRead/cacheWrite），按统一总输入口径还原
+  if (!r.inNormalized && cacheSum > 0 && ((rawIn > 0 && rawIn < cacheSum) || (wasLegacyRow && r.agent === "antigravity" && r.source === "direct" && rawIn > 0))) {
+    r.in = rawIn + cacheSum;
+  } else {
+    r.in = Math.max(rawIn, cacheSum);
   }
+  r.out = Math.max(0, Math.round(Number(r.out || 0)));
+  r.reasoning = Math.max(0, Math.round(Number(r.reasoning || 0)));
+  r.ms = Math.max(0, Math.round(Number(r.ms || 0)));
+  // 订阅/免费账本行统一将实际账单费用归零，避免早期版本残留的估算金额与按量计费混淆
+  if (r.billingKind === "plan" || r.billingKind === "free") {
+    r.cost = 0;
+  }
+  // 兼容历史旧账本：旧版本非流式响应曾把 ttftMs 误置等于 ms，统一归零以免污染首字与吞吐统计
+  if (wasLegacyRow) {
+    r.streamed = r.ttftMs > 0 && r.ms > r.ttftMs + 50;
+    if (!r.streamed && r.ttftMs > 0 && r.ttftMs >= r.ms) r.ttftMs = 0;
+  }
+  r.ttftMs = r.streamed ? Math.max(0, Math.round(Number(r.ttftMs || 0))) : 0;
+  r.genMs = resolveGenMs(r);
+  r.exact = r.exact !== false;
+  r.tps = calcDecodeTps(r.out, r.genMs);
+  r.e2eTps = calcE2eTps(r.out, r.ms);
+  r.contextUsed = Math.max(0, Math.round(Number(r.contextUsed || 0)));
+  r.contextWindow = Math.max(0, Math.round(Number(r.contextWindow || 0)));
+  return r;
+}
+async function* usageRecords(sinceMs = 0) {
+  let file;
+  try { file = await fs.open(LEDGER_FILE, "r"); }
+  catch (err) { if (err.code === "ENOENT") return; throw err; }
+  try {
+    const {size} = await file.stat();
+    if (!size) return;
+    // 固定读取边界，本次查询不追赶其他进程新追加的记录。
+    const stream = file.createReadStream({encoding: "utf8", end: size - 1, autoClose: false});
+    const lines = createInterface({input: stream, crlfDelay: Infinity});
+    try {
+      for await (const line of lines) {
+        let record;
+        try { record = JSON.parse(line); } catch { continue; }
+        if (record && typeof record.t === "number" && record.t >= sinceMs) yield normalizeUsageRecord(record);
+      }
+    } finally { lines.close(); stream.destroy(); }
+  } finally { await file.close(); }
+}
+
+export async function readAllUsageRecords(sinceMs = 0) {
+  const out = [];
+  for await (const r of usageRecords(sinceMs)) out.push(r);
   return out;
 }
 
@@ -296,30 +310,22 @@ function matchesFilters(r, filters = {}) {
   return true;
 }
 
-function percentile(values, p) {
+function sortedPercentile(values, p) {
   if (!values.length) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
-  return sorted[idx];
+  const idx = Math.min(values.length - 1, Math.max(0, Math.ceil((p / 100) * values.length) - 1));
+  return values[idx];
 }
 
-function buildHeatmap(allRecords, days = 84) {
-  const byDay = new Map();
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  // 使用日历日加减而非固定 86400_000ms 乘法，彻底消除跨夏令时日期漂移
-  const start = new Date(today.getFullYear(), today.getMonth(), today.getDate() - (days - 1));
-  const startMs = start.getTime();
-  for (const r of allRecords) {
-    if (r.t < startMs) continue;
-    const dk = dayKey(r.t);
-    let cell = byDay.get(dk);
-    if (!cell) { cell = {day: dk, requests: 0, tokens: 0, costUsd: 0, errors: 0}; byDay.set(dk, cell); }
-    cell.requests++;
-    if (isFailed(r)) cell.errors++;
-    cell.tokens += (r.in || 0) + (r.out || 0);
-    cell.costUsd = Number((cell.costUsd + (r.cost || 0)).toFixed(6));
-  }
+function addHeatmapRecord(byDay, r) {
+  const dk = dayKey(r.t);
+  let cell = byDay.get(dk);
+  if (!cell) { cell = {day: dk, requests: 0, tokens: 0, costUsd: 0, errors: 0}; byDay.set(dk, cell); }
+  cell.requests++;
+  if (isFailed(r)) cell.errors++;
+  cell.tokens += (r.in || 0) + (r.out || 0);
+  cell.costUsd = Number((cell.costUsd + (r.cost || 0)).toFixed(6));
+}
+function buildHeatmap(byDay, today, days = 84) {
   let maxTok = 0;
   for (const c of byDay.values()) if (c.tokens > maxTok) maxTok = c.tokens;
   const cells = [];
@@ -337,7 +343,9 @@ function buildHeatmap(allRecords, days = 84) {
   return cells;
 }
 
-function aggregate(records) {
+async function aggregate(records, view) {
+  const includeGroups = view === "overview" || view === "full";
+  const includeSessions = view === "sessions" || view === "context" || view === "full";
   const sum = {
     requests: 0, succeeded: 0, errors: 0, cancelled: 0, successRate: 100,
     inputTokens: 0, uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalTokens: 0,
@@ -390,8 +398,9 @@ function aggregate(records) {
     }
   };
 
-  for (const r of records) {
+  for await (const r of records) {
     sum.requests++;
+    if (view === "requests") continue;
     const failed = isFailed(r);
     const cancelled = isCancelled(r);
     if (failed) sum.errors++;
@@ -428,13 +437,17 @@ function aggregate(records) {
       e2eMsTotal += r.ms;
     }
 
-    bump(byAgent, r.agent || "other", r.agent || "other", r);
-    bump(byProvider, r.providerId || "official", r.providerName || r.providerId || "官方直连", r);
-    bump(byModel, r.model || "unknown", r.model || "unknown", r);
-    bump(byDay, dayKey(r.t), dayKey(r.t), r);
+    if (includeGroups) {
+      bump(byAgent, r.agent || "other", r.agent || "other", r);
+      bump(byProvider, r.providerId || "official", r.providerName || r.providerId || "官方直连", r);
+      bump(byModel, r.model || "unknown", r.model || "unknown", r);
+      const day = dayKey(r.t);
+      bump(byDay, day, day, r);
+    }
 
     const sid = r.sessionId ? String(r.sessionId) : "";
     if (sid) sessionIds.add(sid);
+    if (!includeSessions) continue;
     const sKey = sid || "_unassigned";
     let sg = bySession.get(sKey);
     if (!sg) {
@@ -480,15 +493,18 @@ function aggregate(records) {
   sum.totalTokens = sum.inputTokens + sum.outputTokens;
   sum.cacheHitRate = sum.inputTokens > 0 ? Number(((sum.cacheReadTokens * 100) / sum.inputTokens).toFixed(1)) : 0;
   sum.avgLatencyMs = latSamples.length > 0 ? Math.round(latTotal / latSamples.length) : 0;
-  sum.p50LatencyMs = Math.round(percentile(latSamples, 50));
-  sum.p95LatencyMs = Math.round(percentile(latSamples, 95));
+  latSamples.sort((a, b) => a - b);
+  sum.p50LatencyMs = Math.round(sortedPercentile(latSamples, 50));
+  sum.p95LatencyMs = Math.round(sortedPercentile(latSamples, 95));
   sum.avgTtftMs = ttftSamples.length > 0 ? Math.round(ttftTotal / ttftSamples.length) : 0;
-  sum.p50TtftMs = Math.round(percentile(ttftSamples, 50));
-  sum.p95TtftMs = Math.round(percentile(ttftSamples, 95));
+  ttftSamples.sort((a, b) => a - b);
+  sum.p50TtftMs = Math.round(sortedPercentile(ttftSamples, 50));
+  sum.p95TtftMs = Math.round(sortedPercentile(ttftSamples, 95));
   sum.ttftSampleCount = ttftSamples.length;
   sum.avgTps = decodeGenMsTotal > 0 ? Number(((decodeOutTotal * 1000) / decodeGenMsTotal).toFixed(1)) : 0;
-  sum.medianTps = Number(percentile(tpsSamples, 50).toFixed(1));
-  sum.peakTps = tpsSamples.length > 0 ? Number(Math.max(...tpsSamples).toFixed(1)) : 0;
+  tpsSamples.sort((a, b) => a - b);
+  sum.medianTps = Number(sortedPercentile(tpsSamples, 50).toFixed(1));
+  sum.peakTps = tpsSamples.at(-1) || 0;
   sum.tpsSampleCount = tpsSamples.length;
   sum.e2eAvgTps = e2eMsTotal > 0 ? Number(((e2eOutTotal * 1000) / e2eMsTotal).toFixed(1)) : 0;
   const completedCount = sum.requests - sum.cancelled;
@@ -501,7 +517,7 @@ function aggregate(records) {
       totalTokens: rest.inputTokens + rest.outputTokens,
       cacheHitRate: rest.inputTokens > 0 ? Number(((rest.cacheReadTokens * 100) / rest.inputTokens).toFixed(1)) : 0,
       avgLatencyMs: _lats.length > 0 ? Math.round(_lats.reduce((a, b) => a + b, 0) / _lats.length) : 0,
-      p95LatencyMs: Math.round(percentile(_lats, 95)),
+      p95LatencyMs: Math.round(sortedPercentile(_lats.sort((a, b) => a - b), 95)),
       avgTtftMs: _ttftN > 0 ? Math.round(_ttft / _ttftN) : 0,
       avgTps: _decMs > 0 ? Number(((_decOut * 1000) / _decMs).toFixed(1)) : 0,
       e2eAvgTps: _e2eMs > 0 ? Number(((_e2eOut * 1000) / _e2eMs).toFixed(1)) : 0,
@@ -533,41 +549,85 @@ function aggregate(records) {
   };
 }
 
-export async function queryUsageSummary(params = {}) {
+async function computeUsageSummary(params) {
   const period = params.period || "7d";
-  const allRecords = await readAllUsageRecords(0);
-  const sinceMs = periodSinceMs(period);
-  const inPeriod = sinceMs > 0 ? allRecords.filter(r => r.t >= sinceMs) : allRecords;
-
-  // Facets computed from inPeriod so filter pills stay switchable even after narrowing!
-  const facetAgents = [...new Set(inPeriod.map(r => r.agent).filter(Boolean))];
-  const facetProviderMap = new Map();
-  for (const r of inPeriod) {
-    if (r.providerId && !facetProviderMap.has(r.providerId)) {
-      facetProviderMap.set(r.providerId, {id: r.providerId, name: r.providerName || r.providerId});
+  const view = params.view || "full";
+  const today = new Date();
+  const midnight = (dayOffset) => new Date(today.getFullYear(), today.getMonth(), today.getDate() + dayOffset).getTime();
+  const since = periodSinceMs(period);
+  const heatStart = midnight(-83);
+  const showHeat = view === "full" || view === "overview";
+  const showRequests = view === "full" || view === "requests";
+  const limit = Math.min(500, Math.max(20, Number(params.limit) || 200));
+  const agents = new Set(), providers = new Map(), models = new Set(), heat = new Map();
+  const heatFilters = {...params, day: ""};
+  const recent = [];
+  let count = 0;
+  let expires = midnight(1);
+  const window = {"24h": 24, "7d": 168, "30d": 720}[period] * 3600_000;
+  async function* matching() {
+    for await (const r of usageRecords(showHeat ? Math.min(heatStart, since) : since)) {
+      if (showHeat && r.t >= heatStart && matchesFilters(r, heatFilters)) addHeatmapRecord(heat, r);
+      if (r.t < since) continue;
+      if (window) expires = Math.min(expires, r.t + window + 1);
+      if (showRequests) {
+        if (r.agent) agents.add(r.agent);
+        if (r.providerId && !providers.has(r.providerId)) providers.set(r.providerId, {id: r.providerId, name: r.providerName || r.providerId});
+        if (r.model && models.size < 40) models.add(r.model);
+      }
+      if (!matchesFilters(r, params)) continue;
+      if (showRequests) recent[count % limit] = r;
+      count++;
+      yield r;
     }
   }
-  const facetModels = [...new Set(inPeriod.map(r => r.model).filter(Boolean))].slice(0, 40);
-
-  // Heatmap respects agent/provider/model filters (ignoring single-day filter so user can click between days!)
-  const heatmapRecords = allRecords.filter(r => matchesFilters(r, {...params, day: ""}));
-  const filtered = inPeriod.filter(r => matchesFilters(r, params));
-  const limit = Math.min(500, Math.max(20, Number(params.limit || 200)));
-
-  return {
-    period,
-    ...aggregate(filtered),
-    heatmap: buildHeatmap(heatmapRecords, 84),
-    facets: {
-      agents: facetAgents,
-      providers: [...facetProviderMap.values()],
-      models: facetModels,
-    },
-    totalMatched: filtered.length,
-    recent: filtered.slice(-limit).reverse(),
-  };
+  const stats = await aggregate(matching(), view);
+  const newest = Array.from({length: recent.length}, (_, i) => recent[(count - 1 - i) % limit]);
+  return {expires, value: {period, ...stats, totalMatched: count, recent: newest,
+    heatmap: showHeat ? buildHeatmap(heat, today) : [],
+    facets: {agents: [...agents], providers: [...providers.values()], models: [...models]},
+  }};
 }
 
+const summaryCache = new Map();
+let summaryQueue = Promise.resolve();
+
+function computeLargeSummary(params) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL(import.meta.url), {workerData: {task: "usage-summary", params}, execArgv: []});
+    worker.once("message", resolve);
+    worker.once("error", reject);
+    worker.once("exit", code => reject(new Error(`用量读取进程已结束（${code}）`)));
+  });
+}
+
+if (parentPort && workerData?.task === "usage-summary") {
+  parentPort.postMessage(await computeUsageSummary(workerData.params));
+}
+
+export async function queryUsageSummary(params = {}) {
+  await appendTail;
+  const stat = await fs.stat(LEDGER_FILE, {bigint: true}).catch(err => {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  });
+  const version = stat ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}` : "empty";
+  const key = JSON.stringify([version, dayKey(Date.now()), params]);
+  const cached = summaryCache.get(key);
+  if (cached && Date.now() < cached.expires) return cached.promise;
+  // 同一查询共享在途扫描，大账本在独立线程汇总，避免阻塞 Agent Hub 的会话和终端请求。
+  const entry = {expires: Infinity, promise: null};
+  const run = async () => {
+    const result = stat && stat.size >= 1024n * 1024n ? await computeLargeSummary(params) : await computeUsageSummary(params);
+    entry.expires = result.expires;
+    return result.value;
+  };
+  entry.promise = summaryQueue.then(run);
+  summaryQueue = entry.promise.catch(() => { if (summaryCache.get(key) === entry) summaryCache.delete(key); });
+  summaryCache.set(key, entry);
+  if (summaryCache.size > 8) summaryCache.delete(summaryCache.keys().next().value);
+  return entry.promise;
+}
 function csvCell(v) {
   const s = String(v ?? "");
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;

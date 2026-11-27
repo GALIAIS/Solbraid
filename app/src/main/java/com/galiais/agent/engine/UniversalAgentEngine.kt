@@ -706,11 +706,13 @@ class AgentHubController(val repo: ConversationRepository) {
         source: String? = null,
         failedOnly: Boolean = false,
         search: String? = null,
+        view: String = "full",
     ): JSONObject {
-        if (!runtime.hubAvailable) return JSONObject()
+        check(runtime.hubAvailable) { "运行环境未就绪" }
         return runtime.hubRequest(
             "usage/summary",
             jsonOf(
+                "view" to view,
                 "period" to period,
                 "agent" to agent?.takeIf { it.isNotBlank() },
                 "providerId" to providerId?.takeIf { it.isNotBlank() },
@@ -722,7 +724,7 @@ class AgentHubController(val repo: ConversationRepository) {
                 "search" to search?.trim()?.takeIf { it.isNotEmpty() },
                 "limit" to 200,
             ),
-            15_000,
+            60_000,
         )
     }
 
