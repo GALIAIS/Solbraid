@@ -438,7 +438,7 @@ async function proxiedFetch(urlStr, init, proxyRaw) {
   if (proto === "socks5:" || proto === "socks5h:" || proto === "socks:") {
     const rawSock = await openSocks5Tunnel(proxy, target.hostname, targetPort, signal);
     const transportSock = isTargetHttps
-      ? tls.connect({socket: rawSock, servername: isIP(target.hostname) ? undefined : target.hostname})
+      ? tls.connect({socket: rawSock, host: target.hostname, servername: isIP(target.hostname) ? undefined : target.hostname})
       : rawSock;
     reqMod = isTargetHttps ? https : http;
     reqOpts = {
@@ -447,13 +447,12 @@ async function proxiedFetch(urlStr, init, proxyRaw) {
       port: targetPort,
       path: `${target.pathname}${target.search}`,
       headers,
-      agent: false,
       createConnection: () => transportSock,
     };
   } else if (proto === "http:" || proto === "https:") {
     if (isTargetHttps) {
       const rawSock = await openHttpConnectTunnel(proxy, target.hostname, targetPort, signal);
-      const tlsSock = tls.connect({socket: rawSock, servername: isIP(target.hostname) ? undefined : target.hostname});
+      const tlsSock = tls.connect({socket: rawSock, host: target.hostname, servername: isIP(target.hostname) ? undefined : target.hostname});
       reqMod = https;
       reqOpts = {
         method,
@@ -461,7 +460,6 @@ async function proxiedFetch(urlStr, init, proxyRaw) {
         port: targetPort,
         path: `${target.pathname}${target.search}`,
         headers,
-        agent: false,
         createConnection: () => tlsSock,
       };
     } else {
