@@ -14,8 +14,6 @@ test -f "$nlib/libbin_antigravity.so"
 
 mkdir -p "$root/home/agent/.galiais/vm" "$root/home/agent/workspace" "$root/opt/galiais-native" "$root/tmp"
 chmod 1777 "$root/tmp"
-rm -f "$root/etc/resolv.conf"
-printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$root/etc/resolv.conf"
 printf '127.0.0.1 localhost\n::1 localhost\n' > "$root/etc/hosts"
 
 echo "GALIAIS_PROGRESS 30 正在配置 Codex 和 Node.js"

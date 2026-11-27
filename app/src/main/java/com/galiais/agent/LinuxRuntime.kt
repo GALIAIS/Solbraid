@@ -501,7 +501,7 @@ class LinuxRuntime(private val context: Context, val mode: String = RUNTIME_MODE
         }
     }
 
-    /** 生成容器 `/etc/resolv.conf` 内容：优先注入 Android 当前活跃网络的真实 DNS，再追加可靠公共 DNS 兜底。 */
+    /** 沿用当前网络的 DNS，仅在 Android 没有提供地址时使用备用 DNS。 */
     internal fun buildResolvConfContent(): String {
         val dnsList = LinkedHashSet<String>()
         runCatching {
@@ -514,19 +514,33 @@ class LinuxRuntime(private val context: Context, val mode: String = RUNTIME_MODE
                 }
             }
         }
-        dnsList.addAll(listOf("223.5.5.5", "119.29.29.29", "1.1.1.1", "8.8.8.8"))
+        if (dnsList.isEmpty()) dnsList.addAll(listOf("223.5.5.5", "119.29.29.29", "1.1.1.1", "8.8.8.8"))
         return dnsList.joinToString("\n") { "nameserver $it" } + "\n"
     }
 
     /** 刷新已安装 Linux 环境的 `/etc/resolv.conf`，避免切换 Wi-Fi / 5G / 内网 VPN 后域名解析失效。 */
-    fun syncResolvConf() {
+    fun syncResolvConf(control: RunControl) {
         if (!ready) return
-        runCatching {
-            val resolv = File(root, "etc/resolv.conf")
-            if (resolv.parentFile?.isDirectory == true && resolv.parentFile?.canWrite() == true) {
-                resolv.writeText(buildResolvConfContent(), Charsets.UTF_8)
-            }
-        }
+        val etc = File(context.filesDir.canonicalFile, "${root.name}/etc")
+        val target = File(etc, "resolv.conf")
+        val content = buildResolvConfContent()
+        if (target.canonicalFile == target && target.isFile && target.length() == content.length.toLong() &&
+            runCatching { target.readText(Charsets.US_ASCII) }.getOrNull() == content
+        ) return
+        // Root 环境的 /etc 归 root 所有；在已核对的目录内替换文件，不跟随原有的 DNS 软链接。
+        val script = """
+            set -eu
+            cd ${quote(etc.absolutePath)}
+            test "${'$'}(pwd -P)" = ${quote(etc.absolutePath)}
+            test ! -d resolv.conf
+            tmp=${'$'}(mktemp .resolv.XXXXXXXX)
+            trap 'rm -f -- "${'$'}tmp"' EXIT
+            printf '%s' ${quote(content)} > "${'$'}tmp"
+            chmod 644 "${'$'}tmp"
+            mv -f -- "${'$'}tmp" resolv.conf
+        """.trimIndent()
+        val result = runCommand(script, control, 15)
+        check(result.code == 0) { "无法更新 Linux 环境的 DNS：${result.text}" }
     }
 
     private fun installRootStage(archive: File, stage: File, control: RunControl, onProgress: (Float, String) -> Unit) {

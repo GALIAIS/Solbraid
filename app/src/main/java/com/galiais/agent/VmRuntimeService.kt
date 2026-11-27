@@ -253,7 +253,7 @@ class VmRuntimeService : Service() {
             progress = if (firstTimeSetup) 0.05f else 0.18f, step = 1, label = if (firstTimeSetup) "安装 Linux 系统" else "检查运行环境")
         copyRuntimeAssets()
         val linux = LinuxRuntime(this, mode)
-        linux.syncResolvConf()
+        linux.syncResolvConf(installControl)
         if (linux.ready && linux.vmProvisioned && (daemonPresent(mode) || linux.hasAnyMuxArtifacts())) {
             syncHotRuntimeScripts(mode)
             if (daemonPresent(mode) && linux.daemonGenerationMatches(applicationInfo.nativeLibraryDir)) {

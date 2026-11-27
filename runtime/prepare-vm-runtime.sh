@@ -28,8 +28,6 @@ else
 fi
 grep -q "^appdata:x:$uid:" "$root/etc/group" || printf 'appdata:x:%s:\n' "$uid" >> "$root/etc/group"
 grep -q '^inet:' "$root/etc/group" || printf 'inet:x:3003:agent\n' >> "$root/etc/group"
-rm -f "$root/etc/resolv.conf"
-printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$root/etc/resolv.conf"
 printf '127.0.0.1 localhost\n::1 localhost\n' > "$root/etc/hosts"
 
 echo "GALIAIS_PROGRESS 30 正在配置 Codex 和 Node.js"
