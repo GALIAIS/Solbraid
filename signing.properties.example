@@ -1,0 +1,10 @@
+# Solbraid 统一应用签名凭证配置模板（请复制为项目根目录 signing.properties 或 ~/.galiais/self-build-signing.properties，切勿提交到 Git）
+# 电脑端 Gradle（Debug/Release）与手机端自迭代构建（Root chroot / PRoot）均自动读取此配置，确保签名证书 100% 一致可无缝覆盖安装。
+#
+# 一键从电脑端同步当前签名凭证到手机双模式环境：
+#   node tools/sync-signing-credentials.mjs --device <adb-serial>
+
+storeFile=/home/agent/.galiais/solbraid-signing.keystore
+storePassword=android
+keyAlias=androiddebugkey
+keyPassword=android

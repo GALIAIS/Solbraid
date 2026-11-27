@@ -7,3 +7,9 @@
 /.agent-notes/
 *.iml
 /.idea/
+/signing.properties
+/release-signing.properties
+*-signing.properties
+self-build-signing.properties
+*.keystore
+*.jks

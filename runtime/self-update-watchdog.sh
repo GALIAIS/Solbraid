@@ -15,8 +15,18 @@ HEARTBEAT_FILE="${SOLBRAID_APP_FILES:-/data/user/0/$PKG/files}/self-update-healt
 LOCK_DIR="$WORK_DIR/update.lock"
 TIMEOUT_SEC="${SOLBRAID_WATCHDOG_TIMEOUT:-20}"
 
+if [ -L "$WORK_DIR" ]; then
+    echo "ERROR: 不安全的符号链接工作目录：$WORK_DIR" >&2
+    exit 1
+fi
 mkdir -p "$WORK_DIR"
-chmod 755 "$WORK_DIR" 2>/dev/null || true
+if [ "$(id -u)" = "0" ]; then
+    dir_uid=$(stat -c '%u' "$WORK_DIR" 2>/dev/null || echo -1)
+    if [ "$dir_uid" != "0" ]; then
+        chown 0:0 "$WORK_DIR" 2>/dev/null || { echo "ERROR: 无法校正工作目录属主：$WORK_DIR" >&2; exit 1; }
+    fi
+    chmod 711 "$WORK_DIR" 2>/dev/null || true
+fi
 
 acquire_update_lock() {
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -62,13 +72,20 @@ backup_current_apk() {
     cur_path=$(pm path "$PKG" 2>/dev/null | head -n 1 | sed 's/^package://')
     if [ -n "$cur_path" ] && [ -f "$cur_path" ]; then
         cp -f "$cur_path" "$BACKUP_APK.tmp" || return 1
-        chmod 644 "$BACKUP_APK.tmp" 2>/dev/null || true
+        chmod 600 "$BACKUP_APK.tmp" 2>/dev/null || true
         mv -f "$BACKUP_APK.tmp" "$BACKUP_APK" || return 1
         log_line "Backed up last-known-good APK from $cur_path"
         return 0
     fi
     log_line "No existing installed APK found to backup"
     return 1
+}
+
+pm_install_stream() {
+    apk_file="$1"
+    shift
+    apk_size=$(stat -c %s "$apk_file" 2>/dev/null || wc -c < "$apk_file")
+    pm install "$@" -S "$apk_size" < "$apk_file"
 }
 
 read_heartbeat_ts() {
@@ -89,7 +106,7 @@ do_rollback() {
     log_line "WATCHDOG TRIGGERED ROLLBACK: $reason"
     write_status "rolling_back" "false" "false" "$reason"
     if [ -f "$BACKUP_APK" ]; then
-        if pm install -r -d -t "$BACKUP_APK" >>"$LOG_FILE" 2>&1; then
+        if pm_install_stream "$BACKUP_APK" -r -d -t >>"$LOG_FILE" 2>&1; then
             am start -n "$ACTIVITY" >>"$LOG_FILE" 2>&1 || true
             write_status "rolled_back" "false" "true" "新版本启动异常（$reason），已自动回滚至上一稳定版本"
             log_line "Rollback succeeded and previous APK relaunched"
@@ -123,23 +140,25 @@ do_apply() {
     backup_current_apk || { write_status "backup_failed" "false" "false" "旧版本备份失败，已取消安装"; exit 1; }
 
     cp -f "$src_apk" "$CANDIDATE_APK.tmp"
-    chmod 644 "$CANDIDATE_APK.tmp" 2>/dev/null || true
+    chmod 600 "$CANDIDATE_APK.tmp" 2>/dev/null || true
     mv -f "$CANDIDATE_APK.tmp" "$CANDIDATE_APK"
 
     marker_ts=$(now_ms)
     rm -f "$HEARTBEAT_FILE" 2>/dev/null || true
     write_status "installing" "false" "false" "正在安装新版本 APK（markerTs=$marker_ts）"
 
-    install_out=$(pm install -r -t "$CANDIDATE_APK" 2>&1) || {
+    install_out=$(pm_install_stream "$CANDIDATE_APK" -r -t 2>&1) || {
+        rm -f "$CANDIDATE_APK" 2>/dev/null || true
         log_line "pm install failed: $install_out"
         write_status "install_failed" "false" "false" "pm install 失败：$install_out"
         am start -n "$ACTIVITY" >>"$LOG_FILE" 2>&1 || true
         exit 1
     }
+    rm -f "$CANDIDATE_APK" 2>/dev/null || true
     log_line "pm install output: $install_out"
 
     write_status "verifying" "false" "false" "已安装，等待新版本首帧健康心跳（超时 ${TIMEOUT_SEC}s）"
-    am start -W -n "$ACTIVITY" >>"$LOG_FILE" 2>&1 || true
+    am start -n "$ACTIVITY" >>"$LOG_FILE" 2>&1 || true
 
     elapsed=0
     while [ "$elapsed" -lt "$TIMEOUT_SEC" ]; do
@@ -173,17 +192,19 @@ do_install_direct() {
     write_status "preparing" "false" "false" "正在备份当前稳定版本并准备直接安装（看门狗已关闭）"
     backup_current_apk || { write_status "backup_failed" "false" "false" "旧版本备份失败，已取消安装"; exit 1; }
     cp -f "$src_apk" "$CANDIDATE_APK.tmp"
-    chmod 644 "$CANDIDATE_APK.tmp" 2>/dev/null || true
+    chmod 600 "$CANDIDATE_APK.tmp" 2>/dev/null || true
     mv -f "$CANDIDATE_APK.tmp" "$CANDIDATE_APK"
     write_status "installing" "false" "false" "正在直接安装新版本 APK（未启用自动回滚看门狗）"
-    install_out=$(pm install -r -t "$CANDIDATE_APK" 2>&1) || {
+    install_out=$(pm_install_stream "$CANDIDATE_APK" -r -t 2>&1) || {
+        rm -f "$CANDIDATE_APK" 2>/dev/null || true
         log_line "pm install failed: $install_out"
         write_status "install_failed" "false" "false" "pm install 失败：$install_out"
         am start -n "$ACTIVITY" >>"$LOG_FILE" 2>&1 || true
         exit 1
     }
+    rm -f "$CANDIDATE_APK" 2>/dev/null || true
     log_line "pm install direct output: $install_out"
-    am start -W -n "$ACTIVITY" >>"$LOG_FILE" 2>&1 || true
+    am start -n "$ACTIVITY" >>"$LOG_FILE" 2>&1 || true
     write_status "installed_no_watchdog" "true" "false" "已完成直接安装并拉起应用（看门狗心跳检测已关闭）"
     exit 0
 }

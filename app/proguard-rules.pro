@@ -8,8 +8,6 @@
 }
 -keep class com.galiais.agent.ui.RichInlineRendererKt$* { *; }
 -keep class com.galiais.agent.ui.ArtifactStudioSheetKt$* { *; }
--keep class com.galiais.agent.ui.TerminalSheetKt$* { *; }
--keep class com.galiais.agent.ui.LivePreviewSheetKt$* { *; }
 
 # 保留 org.commonmark 扩展与节点类
 -keep class org.commonmark.** { *; }
@@ -25,7 +23,9 @@
 -keep class com.galiais.agent.engine.mobile.ISolbraidShizukuService** { *; }
 -keep class com.galiais.agent.engine.mobile.MobileUseStopReceiver { *; }
 -keep class rikka.shizuku.** { *; }
+-keep class moe.shizuku.** { *; }
 -keep class com.jcraft.jsch.** { *; }
 -keep class org.bouncycastle.crypto.** { *; }
+-keep class org.bouncycastle.pqc.crypto.ntruprime.** { *; }
 -dontwarn org.bouncycastle.**
 -dontwarn com.jcraft.jsch.**

@@ -104,6 +104,60 @@ json_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\r\n' '  '
 }
 
+detect_signing_cert_sha256() {
+    local props="$1"
+    local java_home="$2"
+    [ -r "$props" ] || return 0
+    local kt=""
+    if [ -n "$java_home" ] && [ -x "$java_home/bin/keytool" ]; then
+        kt="$java_home/bin/keytool"
+    elif command -v keytool >/dev/null 2>&1; then
+        kt="$(command -v keytool)"
+    fi
+    [ -n "$kt" ] || return 0
+    local store_file store_pass key_alias
+    store_file="$(awk -F= '/^storeFile=/{sub(/^[^=]*=/,""); print; exit}' "$props" | tr -d '\r')"
+    store_pass="$(awk -F= '/^storePassword=/{sub(/^[^=]*=/,""); print; exit}' "$props" | tr -d '\r')"
+    key_alias="$(awk -F= '/^keyAlias=/{sub(/^[^=]*=/,""); print; exit}' "$props" | tr -d '\r')"
+    [ -n "$store_file" ] && [ -r "$store_file" ] || return 0
+    "$kt" -list -v -keystore "$store_file" -storepass "${store_pass:-android}" ${key_alias:+-alias "$key_alias"} 2>/dev/null \
+        | awk '/SHA256:/{print $2; exit}' | tr -d '\r'
+}
+
+cmd_init_signing() {
+    local ks="${HOME_DIR}/.galiais/solbraid-signing.keystore"
+    local alias_name="androiddebugkey"
+    local store_pass="android"
+    local key_pass="android"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --keystore) ks="${2:-}"; shift 2 ;;
+            --alias) alias_name="${2:-}"; shift 2 ;;
+            --store-pass) store_pass="${2:-}"; shift 2 ;;
+            --key-pass) key_pass="${2:-}"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    if [ ! -f "$ks" ] && [ -f "$HOME_DIR/.android/debug.keystore" ]; then
+        mkdir -p "$(dirname "$ks")"
+        cp -f "$HOME_DIR/.android/debug.keystore" "$ks"
+        chmod 600 "$ks"
+    fi
+    [ -f "$ks" ] || { echo "ERROR: 未找到可用 keystore 文件：$ks" >&2; exit 1; }
+    mkdir -p "$(dirname "$SIGNING_PROPERTIES")"
+    cat > "$SIGNING_PROPERTIES" <<EOF
+storeFile=$ks
+storePassword=$store_pass
+keyAlias=$alias_name
+keyPassword=$key_pass
+EOF
+    chmod 600 "$SIGNING_PROPERTIES"
+    local fp
+    fp="$(detect_signing_cert_sha256 "$SIGNING_PROPERTIES" "$(detect_java_home || true)" || true)"
+    printf '{"ok":true,"signingPropertiesPath":"%s","storeFile":"%s","signingCertSha256":"%s"}\n' \
+        "$(json_escape "$SIGNING_PROPERTIES")" "$(json_escape "$ks")" "$(json_escape "$fp")"
+}
+
 cmd_status() {
     local repo_arg="${1:-}"
     local arch java_home java_ver android_home aapt2_bin repo_dir
@@ -125,7 +179,15 @@ cmd_status() {
     local repo_ok="false"
     [ -n "$repo_dir" ] && repo_ok="true"
     local keystore_ok="false"
-    [ -r "$SIGNING_PROPERTIES" ] && keystore_ok="true"
+    local signing_cert_sha256=""
+    if [ -r "$SIGNING_PROPERTIES" ]; then
+        local sf
+        sf="$(awk -F= '/^storeFile=/{sub(/^[^=]*=/,""); print; exit}' "$SIGNING_PROPERTIES" | tr -d '\r')"
+        if [ -n "$sf" ] && [ -r "$sf" ]; then
+            keystore_ok="true"
+            signing_cert_sha256="$(detect_signing_cert_sha256 "$SIGNING_PROPERTIES" "$java_home" || true)"
+        fi
+    fi
     local native_ready="false"
     [ -f "/opt/galiais-native/libbin_node.so" ] && native_ready="true"
 
@@ -156,7 +218,7 @@ cmd_status() {
     local has_backup="false"
     [ -f "/data/local/tmp/solbraid-self-update/last-known-good.apk" ] && has_backup="true"
 
-    printf '{"arch":"%s","javaHome":"%s","javaVersion":"%s","javaOk":%s,"androidHome":"%s","platform36Ok":%s,"aapt2Bin":"%s","aapt2Ok":%s,"repoDir":"%s","repoOk":%s,"keystoreOk":%s,"nativeOfflineHydratable":%s,"readyForLocalBuild":%s,"hasBackup":%s,"missing":[%s],"heartbeat":%s,"watchdogStatus":%s}\n' \
+    printf '{"arch":"%s","javaHome":"%s","javaVersion":"%s","javaOk":%s,"androidHome":"%s","platform36Ok":%s,"aapt2Bin":"%s","aapt2Ok":%s,"repoDir":"%s","repoOk":%s,"keystoreOk":%s,"signingPropertiesPath":"%s","signingCertSha256":"%s","nativeOfflineHydratable":%s,"readyForLocalBuild":%s,"hasBackup":%s,"missing":[%s],"heartbeat":%s,"watchdogStatus":%s}\n' \
         "$(json_escape "$arch")" \
         "$(json_escape "$java_home")" \
         "$(json_escape "$java_ver")" \
@@ -168,6 +230,8 @@ cmd_status() {
         "$(json_escape "$repo_dir")" \
         "$repo_ok" \
         "$keystore_ok" \
+        "$(json_escape "$SIGNING_PROPERTIES")" \
+        "$(json_escape "$signing_cert_sha256")" \
         "$native_ready" \
         "$ready" \
         "$has_backup" \
@@ -193,11 +257,30 @@ cmd_bootstrap() {
         local aapt2_tag="${SOLBRAID_ARM64_BT_TAG:-platform-tools-36.1.0}"
         local aapt2_url="https://github.com/Commit451/android-arm-build-tools/releases/download/${aapt2_tag}/aapt2"
         mkdir -p "$android_home/arm64-tools"
-        if curl -fsSL "$aapt2_url" -o "$android_home/arm64-tools/aapt2.tmp"; then
-            chmod 755 "$android_home/arm64-tools/aapt2.tmp"
-            mv -f "$android_home/arm64-tools/aapt2.tmp" "$android_home/arm64-tools/aapt2"
+        local tmp_aapt2="$android_home/arm64-tools/aapt2.$$.tmp"
+        if curl -fsSL "$aapt2_url" -o "$tmp_aapt2"; then
+            local expected_sha="${SOLBRAID_AAPT2_SHA256:-}"
+            if [ -z "$expected_sha" ]; then
+                expected_sha="$(curl -fsSL "${aapt2_url}.sha256" 2>/dev/null | awk '{print $1}' | tr -d '\r\n' || true)"
+            fi
+            if [ -n "$expected_sha" ]; then
+                local actual_sha
+                actual_sha="$(sha256sum "$tmp_aapt2" | awk '{print $1}')"
+                if [ "$actual_sha" != "$expected_sha" ]; then
+                    echo "ERROR: 下载的 aapt2 SHA-256 校验失败（预期 $expected_sha，实际 $actual_sha）" >&2
+                    rm -f "$tmp_aapt2"
+                    exit 1
+                fi
+            fi
+            chmod 755 "$tmp_aapt2"
+            if ! "$tmp_aapt2" version >/dev/null 2>&1; then
+                echo "ERROR: 下载的 aapt2 冒烟校验失败（非可执行 ARM64 二进制）" >&2
+                rm -f "$tmp_aapt2"
+                exit 1
+            fi
+            mv -f "$tmp_aapt2" "$android_home/arm64-tools/aapt2"
         else
-            rm -f "$android_home/arm64-tools/aapt2.tmp"
+            rm -f "$tmp_aapt2"
         fi
     fi
 
@@ -288,13 +371,22 @@ cmd_build() {
     echo "[self-build] repo=$repo_dir arch=$arch abis=$abis heap=${heap_mb}m tasks=${tasks[*]}"
     (cd "$repo_dir" && chmod +x ./gradlew && ./gradlew "${tasks[@]}" "${gradle_args[@]}")
 
-    local out_apk="$repo_dir/app/build/outputs/apk/$variant/app-arm64-v8a-$variant.apk"
-    if [ ! -f "$out_apk" ] && [ -f "$repo_dir/app/build/outputs/apk/$variant/app-$variant.apk" ]; then
-        out_apk="$repo_dir/app/build/outputs/apk/$variant/app-$variant.apk"
+    local apk_dir="$repo_dir/app/build/outputs/apk/$variant"
+    local out_apk="$apk_dir/app-arm64-v8a-$variant.apk"
+    if [ -f "$apk_dir/output-metadata.json" ]; then
+        local meta_file
+        meta_file="$(awk -F'"' '/"outputFile"/{print $4; exit}' "$apk_dir/output-metadata.json" || true)"
+        if [ -n "$meta_file" ] && [ -f "$apk_dir/$meta_file" ]; then
+            out_apk="$apk_dir/$meta_file"
+        fi
+    fi
+    if [ ! -f "$out_apk" ] && [ -f "$apk_dir/app-$variant.apk" ]; then
+        out_apk="$apk_dir/app-$variant.apk"
     fi
     [ -f "$out_apk" ] || { echo "ERROR: 编译完成但未找到产物 APK：$out_apk" >&2; exit 1; }
     local size sha
     size="$(stat -c %s "$out_apk" 2>/dev/null || wc -c < "$out_apk")"
+    [ "${size:-0}" -gt 1024 ] || { echo "ERROR: 产物 APK 大小异常（${size:-0} B）：$out_apk" >&2; exit 1; }
     sha="$(sha256sum "$out_apk" | awk '{print $1}')"
     printf 'SOLBRAID_SELF_BUILD_RESULT:{"ok":true,"apkPath":"%s","size":%s,"sha256":"%s","variant":"%s","abis":"%s"}\n' \
         "$(json_escape "$out_apk")" "$size" "$sha" "$variant" "$abis"
@@ -332,12 +424,13 @@ sub="${1:-status}"
 shift || true
 case "$sub" in
     status) cmd_status "${1:-}" ;;
+    init-signing) cmd_init_signing "$@" ;;
     bootstrap) cmd_bootstrap "${1:-}" ;;
     build) cmd_build "$@" ;;
     apply) cmd_apply "$@" ;;
     rollback) cmd_rollback "$@" ;;
     *)
-        echo "Usage: $0 {status [repo] | bootstrap [repo] | build [--repo dir] [--skip-tests] [--variant debug|release] [--abis arm64-v8a] | apply <apk> --yes | rollback --yes}" >&2
+        echo "Usage: $0 {status [repo] | init-signing [--keystore path] | bootstrap [repo] | build [--repo dir] [--skip-tests] [--variant debug|release] [--abis arm64-v8a] | apply <apk> --yes | rollback --yes}" >&2
         exit 1
         ;;
 esac
