@@ -7,7 +7,7 @@ export function textOfContent(content) {
   if (!Array.isArray(content)) return content == null ? "" : String(content);
   return content.map((part) => {
     if (typeof part === "string") return part;
-    if (part?.type === "text" || part?.type === "input_text" || part?.type === "output_text") return part.text ?? "";
+    if (["text", "input_text", "output_text", "summary_text"].includes(part?.type)) return part.text ?? "";
     return "";
   }).filter(Boolean).join("\n");
 }
@@ -15,6 +15,87 @@ export function textOfContent(content) {
 function parseDataUrl(url) {
   const m = typeof url === "string" && /^data:([^;,]+);base64,(.+)$/s.exec(url);
   return m ? {mediaType: m[1], data: m[2]} : null;
+}
+
+function anthropicInputPart(block) {
+  if (typeof block === "string") return {type: "input_text", text: block};
+  if (block?.type === "text") return {type: "input_text", text: block.text ?? ""};
+  const source = block?.source;
+  if (block?.type === "document" && source?.type === "text") return {type: "input_text", text: source.data};
+  if (block?.type !== "image" && block?.type !== "document") throw new Error("当前协议不支持此工具结果类型");
+  if (source?.type === "url" && source.url) {
+    return block.type === "image" ? {type: "input_image", image_url: source.url} : {type: "input_file", file_url: source.url};
+  }
+  if (source?.type !== "base64" || !source.media_type || !source.data) throw new Error("附件缺少可转换的数据，请使用原生 Anthropic 服务商");
+  const data = `data:${source.media_type};base64,${source.data}`;
+  return block.type === "image" ? {type: "input_image", image_url: data}
+    : {type: "input_file", filename: block.title || (source.media_type === "application/pdf" ? "document.pdf" : "document"), file_data: data};
+}
+
+function chatInputPart(part) {
+  if (part.type === "input_image" && part.image_url) return {type: "image_url", image_url: {url: part.image_url}};
+  if (part.type === "input_file" && part.file_data) return {type: "file", file: {filename: part.filename, file_data: part.file_data}};
+  if (part.type === "input_text" || part.type === "output_text" || part.type === "text") return {type: "text", text: part.text};
+  throw new Error("Chat Completions 无法接收此附件，请改用支持该附件的服务商");
+}
+
+function anthropicToolOutput(block) {
+  const parts = (Array.isArray(block.content) ? block.content : [block.content ?? ""]).map(anthropicInputPart);
+  if (parts.every(p => p.type === "input_text")) {
+    const text = textOfContent(parts);
+    return block.is_error ? `[ERROR] ${text}` : text;
+  }
+  return block.is_error ? [{type: "input_text", text: "[ERROR]"}, ...parts] : parts;
+}
+
+// Chat 的 tool 消息只接受文本，不能把截图改作用户消息而丢失工具来源。
+function chatToolOutput(output) {
+  if (Array.isArray(output) && output.some(p => typeof p !== "string" && !["text", "input_text", "output_text"].includes(p?.type))) {
+    throw new Error("Chat Completions 无法传递此工具附件，请改用 Responses 或支持多媒体工具结果的服务商");
+  }
+  return textOfContent(output);
+}
+
+function anthropicPartFromInput(p) {
+  if (typeof p === "string") return {type: "text", text: p};
+  if (p?.type === "input_image" || p?.type === "input_file") {
+    const type = p.type === "input_image" ? "image" : "document";
+    const url = p.image_url || p.file_url;
+    const parsed = parseDataUrl(p.file_data || url);
+    if (parsed) return {type, source: {type: "base64", media_type: parsed.mediaType, data: parsed.data}};
+    if (url) return {type, source: {type: "url", url}};
+    throw new Error("Anthropic 无法读取此附件，请提供文件内容或 URL");
+  }
+  if (["input_text", "output_text", "text"].includes(p?.type)) return {type: "text", text: p.text};
+  throw new Error("Anthropic 无法转换此消息内容");
+}
+
+function geminiPartFromInput(p) {
+  if (typeof p === "string" || ["input_text", "output_text", "text"].includes(p?.type)) return {text: typeof p === "string" ? p : p.text};
+  const url = p?.image_url || p?.file_url;
+  const parsed = parseDataUrl(p?.file_data || url);
+  if (parsed) return {inlineData: {mimeType: parsed.mediaType, data: parsed.data}};
+  if (url) return {fileData: {fileUri: url}};
+  throw new Error("Gemini 无法读取此附件，请提供文件内容或 URL");
+}
+
+function geminiToolResponse(name, output, isError = false) {
+  const parts = Array.isArray(output) ? output.map(geminiPartFromInput) : [];
+  const media = parts.filter(p => !Object.hasOwn(p, "text"));
+  return {functionResponse: {name, response: {output: textOfContent(output), ...(isError ? {isError: true} : {})},
+    ...(media.length ? {parts: media} : {})}};
+}
+
+function inputFromGeminiMedia(part) {
+  const mime = part.inlineData?.mimeType || part.fileData?.mimeType || "";
+  const data = part.inlineData?.data;
+  const url = part.fileData?.fileUri;
+  if (url && !/^https?:\/\//i.test(url)) throw new Error("此附件地址仅适用于 Gemini 服务商");
+  if (!url && !(data && mime)) throw new Error("Gemini 附件缺少类型或内容");
+  const source = url || `data:${mime};base64,${data}`;
+  if (mime.startsWith("image/")) return {type: "input_image", image_url: source};
+  if (url) return {type: "input_file", file_url: url};
+  return {type: "input_file", filename: part.inlineData.displayName || (mime === "application/pdf" ? "document.pdf" : "attachment"), file_data: source};
 }
 
 export function sanitizeGeminiSchema(schema) {
@@ -100,9 +181,9 @@ export function responsesToChatRequest(body) {
       const role = item.role === "developer" ? "system" : (item.role ?? "user");
       if (role !== "assistant") flushAssistant();
       const parts = Array.isArray(item.content) ? item.content : [{type: "input_text", text: String(item.content ?? "")}];
-      const hasImage = parts.some((p) => p?.type === "input_image");
-      const content = hasImage
-        ? parts.map((p) => p?.type === "input_image" ? {type: "image_url", image_url: {url: p.image_url}} : {type: "text", text: p?.text ?? ""})
+      const hasMedia = parts.some(p => p?.type === "input_image" || p?.type === "input_file");
+      const content = hasMedia
+        ? parts.map(chatInputPart)
         : parts.map((p) => p?.text ?? "").join("\n");
       if (role === "assistant") {
         if (pendingAssistant) pendingAssistant.content = [pendingAssistant.content, content].filter(Boolean).join("\n");
@@ -127,7 +208,7 @@ export function responsesToChatRequest(body) {
       });
     } else if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
       flushAssistant();
-      messages.push({role: "tool", tool_call_id: item.call_id, content: textOfContent(item.output)});
+      messages.push({role: "tool", tool_call_id: item.call_id, content: chatToolOutput(item.output)});
     }
   }
   flushAssistant();
@@ -179,17 +260,7 @@ export function responsesToAnthropicRequest(body) {
       }
       const role = item.role === "assistant" ? "assistant" : "user";
       const parts = Array.isArray(item.content) ? item.content : [{type: "input_text", text: String(item.content ?? "")}];
-      const blocks = [];
-      for (const p of parts) {
-        if (p?.type === "input_image") {
-          const parsed = parseDataUrl(p.image_url);
-          if (parsed) blocks.push({type: "image", source: {type: "base64", media_type: parsed.mediaType, data: parsed.data}});
-          else if (p.image_url) blocks.push({type: "image", source: {type: "url", url: p.image_url}});
-        } else {
-          const text = p?.text ?? "";
-          if (text) blocks.push({type: "text", text});
-        }
-      }
+      const blocks = parts.map(anthropicPartFromInput).filter(p => p.type !== "text" || p.text);
       pushMsg(role, blocks);
     } else if (item.type === "function_call" || item.type === "custom_tool_call") {
       let parsedInput = {};
@@ -197,7 +268,8 @@ export function responsesToAnthropicRequest(body) {
       else { try { parsedInput = JSON.parse(item.arguments || "{}"); } catch { parsedInput = {}; } }
       pushMsg("assistant", [{type: "tool_use", id: item.call_id ?? item.id ?? ("toolu_ra_" + (++syntheticCallSeq)), name: encodeToolName(item.namespace, item.name), input: parsedInput}]);
     } else if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
-      pushMsg("user", [{type: "tool_result", tool_use_id: item.call_id, content: textOfContent(item.output)}]);
+      const content = Array.isArray(item.output) ? item.output.map(anthropicPartFromInput) : textOfContent(item.output);
+      pushMsg("user", [{type: "tool_result", tool_use_id: item.call_id, content}]);
     }
   }
   if (!messages.length) messages.push({role: "user", content: [{type: "text", text: "Continue"}]});
@@ -260,15 +332,7 @@ export function responsesToGeminiRequest(body) {
       }
       const role = item.role === "assistant" ? "model" : "user";
       const raw = Array.isArray(item.content) ? item.content : [{type: "input_text", text: String(item.content ?? "")}];
-      const parts = [];
-      for (const p of raw) {
-        if (p?.type === "input_image") {
-          const parsed = parseDataUrl(p.image_url);
-          if (parsed) parts.push({inlineData: {mimeType: parsed.mediaType, data: parsed.data}});
-        } else if (p?.text) {
-          parts.push({text: p.text});
-        }
-      }
+      const parts = raw.map(geminiPartFromInput);
       pushContent(role, parts);
     } else if (item.type === "function_call" || item.type === "custom_tool_call") {
       const name = encodeToolName(item.namespace, item.name);
@@ -279,7 +343,7 @@ export function responsesToGeminiRequest(body) {
       pushContent("model", [{functionCall: {name, args}}]);
     } else if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
       const name = callNames.get(item.call_id) ?? "tool";
-      pushContent("user", [{functionResponse: {name, response: {output: textOfContent(item.output)}}}]);
+      pushContent("user", [geminiToolResponse(name, item.output)]);
     }
   }
   if (!contents.length) contents.push({role: "user", parts: [{text: "Continue"}]});
@@ -319,21 +383,13 @@ export function anthropicToChatRequest(body) {
       const userParts = [];
       for (const b of blocks) {
         if (b?.type === "tool_result") {
-          const contentText = textOfContent(b.content);
-          messages.push({role: "tool", tool_call_id: b.tool_use_id, content: b.is_error ? `[ERROR] ${contentText}` : contentText});
-        } else if (b?.type === "text") {
-          userParts.push({type: "text", text: b.text ?? ""});
-        } else if (b?.type === "document" && b.source) {
-          const docText = b.source.type === "text" ? (b.source.data || "") : `[附带文档: ${b.title || b.source.media_type || "document"}]`;
-          userParts.push({type: "text", text: docText});
-        } else if (b?.type === "image" && b.source) {
-          const url = b.source.type === "base64" ? `data:${b.source.media_type};base64,${b.source.data}` : b.source.url;
-          if (url) userParts.push({type: "image_url", image_url: {url}});
+          messages.push({role: "tool", tool_call_id: b.tool_use_id, content: chatToolOutput(anthropicToolOutput(b))});
+        } else if (["text", "document", "image"].includes(b?.type)) {
+          userParts.push(chatInputPart(anthropicInputPart(b)));
         }
       }
       if (userParts.length) {
-        const hasImg = userParts.some((p) => p.type === "image_url");
-        messages.push({role: "user", content: hasImg ? userParts : userParts.map((p) => p.text).join("\n")});
+        messages.push({role: "user", content: userParts.some(p => p.type !== "text") ? userParts : textOfContent(userParts)});
       }
     } else if (msg.role === "assistant") {
       const texts = [];
@@ -386,16 +442,9 @@ export function anthropicToResponsesRequest(body, opts = {}) {
       const parts = [];
       for (const b of blocks) {
         if (b?.type === "tool_result") {
-          const contentText = textOfContent(b.content);
-          input.push({type: "function_call_output", call_id: b.tool_use_id, output: b.is_error ? `[ERROR] ${contentText}` : contentText});
-        } else if (b?.type === "text") {
-          parts.push({type: "input_text", text: b.text ?? ""});
-        } else if (b?.type === "document" && b.source) {
-          const docText = b.source.type === "text" ? (b.source.data || "") : `[附带文档: ${b.title || b.source.media_type || "document"}]`;
-          parts.push({type: "input_text", text: docText});
-        } else if (b?.type === "image" && b.source) {
-          const url = b.source.type === "base64" ? `data:${b.source.media_type};base64,${b.source.data}` : b.source.url;
-          if (url) parts.push({type: "input_image", image_url: url});
+          input.push({type: "function_call_output", call_id: b.tool_use_id, output: anthropicToolOutput(b)});
+        } else if (["text", "document", "image"].includes(b?.type)) {
+          parts.push(anthropicInputPart(b));
         }
       }
       if (parts.length) input.push({type: "message", role: "user", content: parts});
@@ -466,7 +515,7 @@ export function anthropicToGeminiRequest(body) {
         toolNames.set(b.id, b.name);
         parts.push({functionCall: {name: b.name, args: b.input ?? {}}});
       } else if (b?.type === "tool_result") {
-        parts.push({functionResponse: {name: toolNames.get(b.tool_use_id) ?? "tool", response: {output: textOfContent(b.content), ...(b.is_error ? {isError: true} : {})}}});
+        parts.push(geminiToolResponse(toolNames.get(b.tool_use_id) ?? "tool", anthropicToolOutput(b), b.is_error));
       }
     }
     push(role, parts);
@@ -1138,13 +1187,14 @@ export function chatToResponsesRequest(body, opts = {}) {
   const input = [];
   for (const message of body.messages) {
     if (message.role === "tool") {
-      input.push({type: "function_call_output", call_id: message.tool_call_id, output: textOfContent(message.content)});
+      input.push({type: "function_call_output", call_id: message.tool_call_id, output: chatToolOutput(message.content)});
       continue;
     }
     if (!["system", "developer", "user", "assistant"].includes(message.role)) throw new Error("Unsupported chat role");
     const parts = typeof message.content === "string" ? [{type: "text", text: message.content}] : (message.content ?? []);
     const content = parts.map(part => {
       if (part.type === "image_url") return {type: "input_image", image_url: part.image_url?.url};
+      if (part.type === "file" && part.file?.file_data) return {type: "input_file", filename: part.file.filename, file_data: part.file.file_data};
       if (part.type !== "text") throw new Error("Unsupported cross-protocol chat content: " + part.type);
       return {type: message.role === "assistant" ? "output_text" : "input_text", text: part.text};
     });
@@ -1191,11 +1241,16 @@ export function geminiToResponsesRequest(body, model, opts = {}) {
         input.push({type: "function_call", call_id: id, name: call.name, arguments: JSON.stringify(call.args ?? {})});
       } else if (part.functionResponse) {
         const response = part.functionResponse;
-        const id = response.id || calls.get(response.name)?.shift();
+        const pending = calls.get(response.name) || [];
+        const id = response.id || pending[0];
         if (!id) throw new Error("Gemini tool result has no matching tool call");
-        input.push({type: "function_call_output", call_id: id, output: JSON.stringify(response.response ?? {})});
-      } else if (part.inlineData?.mimeType?.startsWith("image/")) {
-        input.push({type: "message", role, content: [{type: "input_image", image_url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`}]});
+        const index = pending.indexOf(id);
+        if (index >= 0) pending.splice(index, 1);
+        const text = JSON.stringify(response.response ?? {});
+        const output = response.parts?.length ? [{type: "input_text", text}, ...response.parts.map(inputFromGeminiMedia)] : text;
+        input.push({type: "function_call_output", call_id: id, output});
+      } else if (part.inlineData || part.fileData) {
+        input.push({type: "message", role, content: [inputFromGeminiMedia(part)]});
       } else if (typeof part.text === "string") {
         if (!part.thought) input.push({type: "message", role, content: [{type: role === "assistant" ? "output_text" : "input_text", text: part.text}]});
       } else {
