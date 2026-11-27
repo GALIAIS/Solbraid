@@ -45,45 +45,12 @@ fun GeneralSettingsScreen(
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 SettingsToggleRow(
                     title = "启用纯文本编辑器",
-                    subtitle = "开启后输入框不渲染任何内容（关闭语法着色、实时预览、格式栏与自动配对），保持原始纯文本输入与最快 IME 响应；关闭则自动渲染。",
+                    subtitle = "关闭语法高亮、内容预览、格式工具栏和符号补全。",
                     checked = settings.plainTextEditor,
                     onCheckedChange = app.settings::setPlainTextEditor,
                 )
 
-                // 实时生效行为说明条 + 仅在非纯文本（自动渲染）模式下展示精细渲染选项（合并于无 spacedBy 容器内避免折叠跳变）
                 Column(Modifier.fillMaxWidth()) {
-                    val modeTint = if (settings.plainTextEditor) G.surfaceSubtle else G.accentContainer.copy(alpha = 0.72f)
-                    val modeFg = if (settings.plainTextEditor) G.inkMuted else G.onAccentContainer
-                    val modeBorder = if (settings.plainTextEditor) G.border else G.accent.copy(alpha = 0.28f)
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = D.shape(10.dp),
-                        color = modeTint,
-                        border = BorderStroke(0.75.dp, modeBorder),
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 11.dp, vertical = 9.dp),
-                            verticalAlignment = Alignment.Top,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            Icon(
-                                if (settings.plainTextEditor) GaliaisIcons.FileLines else GaliaisIcons.Sparkles,
-                                contentDescription = null,
-                                tint = if (settings.plainTextEditor) G.inkMuted else G.accent,
-                                modifier = Modifier.padding(top = 1.dp).size(15.dp),
-                            )
-                            Text(
-                                if (settings.plainTextEditor) {
-                                    "当前为纯文本模式：输入框零样式加工、不弹出预览条、不改写字符，适合长代码/日志粘贴与极致输入法兼容性。"
-                                } else {
-                                    "当前为自动渲染模式：输入框实时着色 Markdown / 代码 / 数学公式 / @文件 / /指令（严格保持光标偏移），检测到富内容时自动提供即时预览。"
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = modeFg,
-                            )
-                        }
-                    }
-
                     AnimatedExpandable(expanded = !settings.plainTextEditor) {
                         Column(
                             modifier = Modifier.padding(top = 12.dp),
@@ -91,15 +58,15 @@ fun GeneralSettingsScreen(
                         ) {
                             Hairline()
                             SettingsToggleRow(
-                                title = "输入实时语法着色",
-                                subtitle = "在输入框内高亮标题、粗斜体、代码块、数学公式、@文件与 /指令，零字符位移不干扰中文拼音输入。",
+                                title = "输入语法高亮",
+                                subtitle = "在输入时突出显示 Markdown、代码、公式、文件引用和命令。",
                                 checked = settings.editorSyntaxHighlight,
                                 onCheckedChange = app.settings::setEditorSyntaxHighlight,
                             )
                             Hairline()
                             SettingsToggleRow(
-                                title = "输入自动实时渲染预览",
-                                subtitle = "检测到输入框包含数学公式、Mermaid、图表、SVG 或结构化 Markdown 时，自动在输入框上方展示可折叠渲染预览。",
+                                title = "自动预览",
+                                subtitle = "输入公式、图表或 Markdown 时显示预览。",
                                 checked = settings.editorAutoPreview,
                                 onCheckedChange = app.settings::setEditorAutoPreview,
                             )
@@ -119,9 +86,9 @@ fun GeneralSettingsScreen(
                             )
                             Hairline()
                             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Text("大文本自动降级保护", style = MaterialTheme.typography.titleSmall, color = G.ink)
+                                Text("长文本切换为纯文本", style = MaterialTheme.typography.titleSmall, color = G.ink)
                                 Text(
-                                    "当单次输入或粘贴文本超过阈值时，临时降级为纯文本零渲染以防止卡顿。",
+                                    "输入内容超过所选长度时，暂时关闭格式渲染。",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = G.inkMuted,
                                 )

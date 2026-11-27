@@ -317,7 +317,7 @@ fun SshScreen(
 
                     if (hosts.isEmpty()) {
                         CrispCard(padding = PaddingValues(14.dp)) {
-                            Text("尚未添加远程主机。添加后不仅可在此一键连接交互终端、浏览 SFTP 文件和开端口隧道，本地终端与 Codex/Claude 也可直接执行 ssh <别名>。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                            Text("添加主机后即可连接终端、浏览远程文件或设置端口转发。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
                         }
                     } else {
                         val groups = hosts.mapNotNull { it.group.takeIf(String::isNotBlank) }.distinct()
@@ -679,7 +679,7 @@ fun SshScreen(
                     )
                     if (keys.isEmpty()) {
                         CrispCard(padding = PaddingValues(13.dp)) {
-                            Text("暂未检测到 SSH 密钥。点击「+ 生成」可一键创建 Ed25519 或 RSA 4096 密钥对，或导入已有私钥。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                            Text("暂无 SSH 密钥。可生成密钥对或导入已有私钥。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
                         }
                     } else {
                         keys.forEach { key ->

@@ -712,7 +712,7 @@ private fun RoutingGroupEditorDialog(
             when (strategy) {
                 "round_robin" -> "按节点权重轮询分发请求，点下方节点权重标签可循环切换 1x–5x。"
                 "cheapest" -> "优先路由到免费、订阅套餐与低倍率节点，故障时自动回退下一节点。"
-                else -> "严格按列表顺序请求主节点，遇到 429 / 5xx 自动无感切换至备选节点。"
+                else -> "按列表顺序请求服务商。遇到限流或服务端错误时尝试下一个。"
             },
             style = MaterialTheme.typography.labelSmall,
             color = G.inkMuted,

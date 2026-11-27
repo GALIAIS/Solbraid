@@ -144,7 +144,7 @@ fun AboutSettingsScreen(
                     TagPill("v${BuildConfig.VERSION_NAME}", fg = G.accent, bg = G.accentContainer)
                 }
                 Text(
-                    "面向 Android 的全栈多引擎 AI 编程工作台，集成原生 VT500/SSH 终端、本地 Linux 运行时、统一文件管理与 Mobile-Use 能力。",
+                    "在 Android 上使用编程助手、本地 Linux 环境和 SSH 终端。",
                     style = MaterialTheme.typography.bodyMedium,
                     color = G.inkMuted,
                 )

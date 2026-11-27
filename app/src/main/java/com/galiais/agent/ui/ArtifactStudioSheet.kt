@@ -873,7 +873,7 @@ fun VisualTemplatePickerSheet(
                 Icon(GaliaisIcons.Sparkles, contentDescription = null, tint = G.accent, modifier = Modifier.size(18.dp))
                 Column(Modifier.weight(1f)) {
                     Text("可视化与产物模板", style = MaterialTheme.typography.titleMedium, color = G.ink, fontWeight = FontWeight.SemiBold)
-                    Text("一键插入结构化视觉提示词，或直接打开离线 LaTeX 编译器", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                    Text("选择提示词模板，或打开离线 LaTeX 编译器。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
                 }
             }
 

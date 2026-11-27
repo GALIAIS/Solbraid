@@ -285,7 +285,7 @@ fun SettingsScreen(app: GaliaisApplication, modifier: Modifier, onNavigate: (Str
                 Hairline(Modifier.padding(start = 66.dp))
                 val mu = settings.mobileUse
                 val mobileSummary = when {
-                    mobileStatus.emergencyStopped -> "已紧急停止 · 点此解除熔断"
+                    mobileStatus.emergencyStopped -> "手机操控已暂停"
                     !mu.enabled -> "已关闭 · 支持 Root / Shizuku / 无障碍三级手机操控"
                     mobileStatus.activeBackend.id == "root" -> "已就绪 · Root 完全控机 · 14 项能力（GUI/硬件/通知/文件/宿主）"
                     mobileStatus.activeBackend.id == "shizuku" -> "已就绪 · Shizuku 免 Root 进阶 · GUI/硬件/通知/包管理"

@@ -754,7 +754,7 @@ fun QueueAndTasksSheet(
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("活跃后台任务 (${claudeTasks.size})", style = MaterialTheme.typography.titleSmall, color = G.ink)
                         if (claudeTasks.isEmpty()) {
-                            Text("当前未追踪到后台任务。将任务转入后台后会自动在此显示进度与一键停止按钮。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                            Text("暂无后台任务。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
                         } else {
                             claudeTasks.forEach { task ->
                                 val active = task.status == "running" || task.status == "in_progress"

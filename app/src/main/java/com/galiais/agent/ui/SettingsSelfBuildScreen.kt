@@ -124,7 +124,7 @@ fun SelfBuildSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                     )
                 }
                 SettingsToggleRow(
-                    title = "启用本机 ARM64 APK 自迭代闭环",
+                    title = "允许在本机构建和更新 APK",
                     subtitle = "默认关闭。开启后可在手机端直接用本地 JDK + Android SDK 编译 Solbraid APK，并通过独立 Root 看门狗校验首帧心跳（崩溃自动回滚）。",
                     checked = saved.enabled,
                     onCheckedChange = { enabled ->
@@ -167,7 +167,7 @@ fun SelfBuildSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                         Hairline()
                         SettingsToggleRow(
                             title = "安装后启用首帧心跳看门狗（崩溃自动回滚）",
-                            subtitle = "独立于 App 进程树监控新版本首帧渲染心跳；超时或启动崩溃将自动恢复 last-known-good.apk。",
+                            subtitle = "监控新版本启动。启动超时或崩溃时，尝试恢复上一个可用版本。",
                             checked = saved.watchdogEnabled,
                             onCheckedChange = { persistAndSync(saved.copy(watchdogEnabled = it)) },
                         )
@@ -354,7 +354,7 @@ fun SelfBuildSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                         Triple("原生 ARM64 aapt2", st.optBoolean("aapt2Ok"), st.optString("aapt2Bin").ifBlank { "未检测到" }),
                         Triple("源码仓库", st.optBoolean("repoOk"), st.optString("repoDir").ifBlank { "未检测到" }),
                         Triple("签名配置", st.optBoolean("keystoreOk"), if (st.optBoolean("keystoreOk")) "已配置，安装前校验证书" else "请配置原签名密钥"),
-                        Triple("离线 .so 零下载复用", st.optBoolean("nativeOfflineHydratable"), if (st.optBoolean("nativeOfflineHydratable")) "/opt/galiais-native 可用" else "不可用"),
+                        Triple("内置原生组件", st.optBoolean("nativeOfflineHydratable"), if (st.optBoolean("nativeOfflineHydratable")) "/opt/galiais-native 可用" else "不可用"),
                     )
                     Surface(Modifier.fillMaxWidth(), shape = D.shape(10.dp), color = G.surfaceSubtle) {
                         Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {

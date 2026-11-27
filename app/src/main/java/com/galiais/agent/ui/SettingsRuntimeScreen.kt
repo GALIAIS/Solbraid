@@ -203,7 +203,7 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
                     if (isProot)
                         "免 Root 模式使用 PRoot 用户态容器，无需 Root 权限，数据保存在独立工作区（与 Root 环境隔离）。"
                     else
-                        "Root 模式使用原生 Linux chroot，I/O 与编译性能接近原生设备，适合大型代码仓库与密集工具调用。",
+                        "Root 模式使用 Linux chroot，需要设备授权。",
                     style = MaterialTheme.typography.bodySmall,
                     color = G.inkMuted,
                 )
@@ -373,7 +373,7 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
         SectionLabel("诊断与快捷维护")
         CrispCard {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("支持快速诊断网关、通道与存储健康状态，或全量同步服务商、扩展与环境变量。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                Text("检查网关、引擎连接和存储，或同步运行配置。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     PrimaryPillButton(
                         text = if (diagnosing) "自检中…" else "运行环境自检",
@@ -479,7 +479,7 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
                         },
                     )
                     SecondaryPillButton(
-                        text = if (syncingAll) "同步中…" else "全量同步配置",
+                        text = if (syncingAll) "同步中…" else "同步全部配置",
                         enabled = runtime.ready && !syncingAll,
                         onClick = {
                             syncingAll = true
@@ -491,7 +491,7 @@ fun RuntimeSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState, 
                                     runCatching { app.extensions.syncNow() }
                                     app.conversations.refresh()
                                     healthMap = runCatching { app.conversations.fetchProviderHealth() }.getOrDefault(healthMap)
-                                    app.conversations.notify("已完成服务商、扩展、环境与会话全量同步")
+                                    app.conversations.notify("服务商、扩展、环境和会话配置已同步")
                                 } catch (cancel: CancellationException) {
                                     throw cancel
                                 } catch (e: Exception) {

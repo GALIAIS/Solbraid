@@ -102,7 +102,7 @@ fun MobileUseSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                 borderColor = G.danger.copy(alpha = 0.55f),
             ) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("AI 手机操控已紧急熔断", style = MaterialTheme.typography.titleSmall, color = G.danger, fontWeight = FontWeight.SemiBold)
+                    Text("手机操控已暂停", style = MaterialTheme.typography.titleSmall, color = G.danger, fontWeight = FontWeight.SemiBold)
                     Text(
                         "所有 Agent 的截屏、点击、滑动与文本输入请求当前都会被拦截，确认安全后可随时恢复。",
                         style = MaterialTheme.typography.bodySmall,
@@ -150,7 +150,7 @@ fun MobileUseSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 val items = listOf(
                     Triple(
-                        "Root 原生驱动（chroot 完全控机）",
+                        "Root 驱动",
                         status.rootAvailable,
                         if (status.rootAvailable) "已就绪 · 常驻 RootFsDaemon，全 GUI/硬件开关/包管理/宿主 Shell 与 Logcat" else "未检测到 Root 权限（免 Root 环境将自动使用 Shizuku 或无障碍）",
                     ),
@@ -323,7 +323,7 @@ fun MobileUseSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                 Text(
                     when (cfg.safetyMode) {
                         MOBILE_SAFETY_STRICT -> "每次点击、滑动、输入、按键、应用操作和剪贴板写入均需在手机上确认。"
-                        MOBILE_SAFETY_UNRESTRICTED -> "自由执行：放行所有界面操作（含系统安装器与权限框），仍随时支持悬浮胶囊一键急停。"
+                        MOBILE_SAFETY_UNRESTRICTED -> "允许操作系统安装器和权限对话框。可通过悬浮按钮紧急停止。"
                         else -> "平衡护栏（推荐）：普通应用流畅执行；遇到支付、银行、系统权限授权、应用安装器与 Root 管理器界面时自动拦截保护。"
                     },
                     style = MaterialTheme.typography.labelSmall,
@@ -370,7 +370,7 @@ fun MobileUseSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
         }
 
         // 5. 现场烟测与一键急停演练
-        SectionLabel("现场验证与紧急熔断")
+        SectionLabel("连接检查与急停")
         CrispCard {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -403,7 +403,7 @@ fun MobileUseSettingsScreen(app: GaliaisApplication, snackbar: SnackbarHostState
                     )
                     if (!status.emergencyStopped) {
                         SecondaryPillButton(
-                            text = "立即熔断急停",
+                            text = "立即停止操控",
                             danger = true,
                             onClick = {
                                 app.mobileUse.triggerEmergencyStop()

@@ -420,7 +420,7 @@ internal fun TerminalAppearanceSheet(
             }
 
             SettingsToggleRow(
-                title = "像素级矢量盒绘（Warp 算法）",
+                title = "绘制终端线框字符",
                 subtitle = "零重叠几何绘制制表符、圆角、块元素、Powerline 胶囊与斜三角，消除表格断缝",
                 checked = boxDrawingEnabled,
                 onCheckedChange = onToggleBoxDrawing,

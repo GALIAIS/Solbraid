@@ -262,7 +262,7 @@ fun EnvironmentHubScreen(
                 }
                 if (filtered.isEmpty()) {
                     CrispCard {
-                        Text("当前分组暂无环境变量。可点「+ 添加变量」、「.env 导入」，或从下方常用模板一键添加。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                        Text("此分组暂无变量。可手动添加、导入 .env 或选择模板。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
                     }
                 } else {
                     filtered.forEach { item ->
