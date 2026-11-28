@@ -39,7 +39,7 @@ APK 输出到 `app/build/outputs/apk/debug/app-arm64-v8a-debug.apk`。构建会�
 
 ## 自动构建
 
-推送以 `v` 开头的 SemVer 标签（如 `v1.0.0` 或 `v1.1.0-rc.1`）时，GitHub Actions 构建 arm64 调试 APK，并生成 SHA-256 校验文件。产物保留 7 天。
+推送以 `v` 开头的 SemVer 标签后，GitHub Actions 会用同一标签创建 [GitHub Release](https://github.com/GALIAIS/Solbraid/releases)。例如，`v1.0.0` 对应正式版，`v1.1.0-rc.1` 标记为预发布版。arm64 调试包构建成功后，Release 提供 APK 和 SHA-256 校验文件；构建失败时仍提供该标签的源码。
 
 首次构建前，在仓库 Actions 变量中设置 `SOLBRAID_COMPONENTS_URL`，指向包含 `offline/` 和 `runtime/` 的离线组件 HTTPS 根目录。[构建配置](.github/workflows/android.yml)
 
