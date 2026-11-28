@@ -1,0 +1,15 @@
+name: 功能建议
+description: 提出新功能或现有流程的改进建议
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 使用场景与当前限制
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: 期望结果
+    validations:
+      required: true

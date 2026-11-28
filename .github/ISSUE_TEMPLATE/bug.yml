@@ -1,0 +1,27 @@
+name: 故障报告
+description: 报告可复现的故障或兼容性问题
+body:
+  - type: input
+    id: environment
+    attributes:
+      label: 运行环境
+      description: 应用版本、Android 版本、设备型号和运行模式。涉及 Agent 时请附上其版本。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: 实际结果与预期结果
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: 相关错误
+      description: 可附上第一条相关错误或截图，请移除令牌、私钥和私人会话内容。
