@@ -103,7 +103,7 @@ fun ProjectGroupHeader(
             modifier = Modifier
                 .fillMaxWidth()
                 .clickable(onClick = onToggle)
-                .padding(start = 10.dp, end = 4.dp, top = 7.dp, bottom = 7.dp),
+                .padding(start = 10.dp, end = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
@@ -153,38 +153,35 @@ fun ProjectGroupHeader(
             if (runtimeReady && isRealDir) {
                 IconButton(
                     onClick = onNewChat,
-                    modifier = Modifier.size(34.dp),
+                    modifier = Modifier.size(48.dp),
                 ) {
                     Icon(GaliaisIcons.Add, contentDescription = "在 ${projectDisplayName(path)} 新建会话", tint = G.accent, modifier = Modifier.size(17.dp))
                 }
             }
             if (isRealDir) {
-                Box {
-                    IconButton(
-                        onClick = { menu = true },
-                        modifier = Modifier.size(34.dp),
-                    ) {
-                        Icon(GaliaisIcons.MoreHoriz, contentDescription = "项目操作", tint = G.inkMuted, modifier = Modifier.size(17.dp))
+                ConversationOverflowMenu("项目操作", menu, { menu = it }) {
+                    Text(
+                        path,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = G.inkMuted,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    )
+                    Hairline()
+                    if (runtimeReady) {
+                        GaliaisMenuRow(title = "在此项目新建会话", icon = GaliaisIcons.Add, onClick = { menu = false; onNewChat() })
                     }
-                    GaliaisDropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                        Column(Modifier.padding(horizontal = 6.dp, vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            if (runtimeReady) {
-                                GaliaisMenuRow(title = "在此项目新建会话", icon = GaliaisIcons.Add, onClick = { menu = false; onNewChat() })
-                            }
-                            if (onBrowseFiles != null) {
-                                GaliaisMenuRow(title = "在文件页浏览目录", icon = GaliaisIcons.Folder, onClick = { menu = false; onBrowseFiles() })
-                            }
-                            if (runtimeReady && onExportZip != null) {
-                                GaliaisMenuRow(title = "导出项目为 ZIP", icon = GaliaisIcons.Archive, onClick = { menu = false; onExportZip() })
-                            }
-                            if (!isDefault && onSetDefault != null) {
-                                GaliaisMenuRow(title = "设为默认工作目录", icon = GaliaisIcons.Check, onClick = { menu = false; onSetDefault() })
-                            }
-                            if (canRemove && onRemove != null) {
-                                Hairline(Modifier.padding(vertical = 2.dp))
-                                GaliaisMenuRow(title = "从项目列表移除", icon = GaliaisIcons.Close, danger = true, onClick = { menu = false; onRemove() })
-                            }
-                        }
+                    if (onBrowseFiles != null) {
+                        GaliaisMenuRow(title = "在文件页浏览目录", icon = GaliaisIcons.Folder, onClick = { menu = false; onBrowseFiles() })
+                    }
+                    if (runtimeReady && onExportZip != null) {
+                        GaliaisMenuRow(title = "导出项目为 ZIP", icon = GaliaisIcons.Archive, onClick = { menu = false; onExportZip() })
+                    }
+                    if (!isDefault && onSetDefault != null) {
+                        GaliaisMenuRow(title = "设为默认工作目录", icon = GaliaisIcons.Check, onClick = { menu = false; onSetDefault() })
+                    }
+                    if (canRemove && onRemove != null) {
+                        Hairline(Modifier.padding(vertical = 2.dp))
+                        GaliaisMenuRow(title = "从项目列表移除", icon = GaliaisIcons.Close, danger = true, onClick = { menu = false; onRemove() })
                     }
                 }
             }
