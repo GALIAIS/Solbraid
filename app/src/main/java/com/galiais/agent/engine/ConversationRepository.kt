@@ -10,6 +10,7 @@ import com.galiais.agent.MainActivity
 import com.galiais.agent.VmRuntimeService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -780,7 +781,7 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
     fun putInitialDraft(key: ConversationKey, text: String) { initialDrafts[key] = text }
     fun consumeInitialDraft(key: ConversationKey): String? = initialDrafts.remove(key)
 
-    private val sending = mutableSetOf<ConversationKey>()
+    private val sending = mutableMapOf<ConversationKey, CompletableDeferred<Unit>>()
     private val engineOperationLocks = listOf(EngineKind.CODEX, EngineKind.CLAUDE)
         .associate { it.id to kotlinx.coroutines.sync.Mutex() }
 
@@ -789,19 +790,41 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
         return lock.withLock { block() }
     }
 
-    private suspend fun sendRecoverably(key: ConversationKey, text: String, attachments: List<ImageAttachment>, steer: Boolean) {
-        var acquired = false
+    private suspend fun withSend(key: ConversationKey, waitForPrevious: Boolean, block: suspend () -> Unit) {
+        while (true) {
+            val previous = sending[key] ?: break
+            check(waitForPrevious) { "上一条消息仍在发送，请稍候" }
+            previous.await()
+        }
+        val done = CompletableDeferred<Unit>()
+        sending[key] = done
         try {
             check(state(key)?.reverting != true) { "会话正在回退，请稍候" }
-            check(sending.add(key)) { "上一条消息仍在发送，请稍候" }
-            acquired = true
-            require(attachments.size <= 4 && attachments.sumOf { it.base64.length.toLong() } + text.toByteArray(Charsets.UTF_8).size < 7 * 1024 * 1024) { "消息附件过大，请减少图片或降低图片大小" }
-            if (steer) codex.steer(key, text, attachments) else adapter(key.engine).send(key, text, attachments)
+            block()
+        } finally {
+            sending.remove(key)
+            done.complete(Unit)
+        }
+    }
+
+    private suspend fun sendRecoverably(
+        key: ConversationKey, text: String, attachments: List<ImageAttachment>, followUp: Boolean = false,
+        submit: suspend () -> Unit = { adapter(key.engine).send(key, text, attachments) },
+    ) {
+        try {
+            withSend(key, waitForPrevious = followUp) {
+                require(attachments.size <= 4 && attachments.sumOf { it.base64.length.toLong() } + text.toByteArray(Charsets.UTF_8).size < 7 * 1024 * 1024) { "消息附件过大，请减少图片或降低图片大小" }
+                submit()
+            }
         } catch (cancel: CancellationException) { throw cancel }
         catch (error: Exception) {
-            update(key) { it.copy(unsentMessage = UnsentMessage(com.galiais.agent.newId(), text, attachments)) }
+            update(key) { state ->
+                val pending = state.unsentMessage
+                val recovered = listOfNotNull(pending?.text, text).filter { it.isNotEmpty() }.joinToString("\n\n")
+                state.copy(unsentMessage = UnsentMessage(com.galiais.agent.newId(), recovered, pending?.attachments.orEmpty() + attachments))
+            }
             throw error
-        } finally { if (acquired) sending.remove(key) }
+        }
     }
 
     fun clearUnsentMessage(key: ConversationKey, id: String) = update(key) {
@@ -813,7 +836,7 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
     }
 
     fun send(key: ConversationKey, text: String, attachments: List<ImageAttachment> = emptyList()) =
-        launchOperation("发送失败") { sendRecoverably(key, text, attachments, steer = false) }
+        launchOperation("发送失败") { sendRecoverably(key, text, attachments) }
     suspend fun sendClaudeDocumentNow(
         key: ConversationKey,
         text: String,
@@ -822,15 +845,9 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
         base64OrPlain: String,
         isPdf: Boolean,
     ) {
-        var acquired = false
-        try {
-            check(state(key)?.reverting != true) { "会话正在回退，请稍候" }
-            check(sending.add(key)) { "上一条消息仍在发送，请稍候" }
-            acquired = true
+        withSend(key, waitForPrevious = false) {
             require(key.engine == EngineKind.CLAUDE) { "仅 Claude Code 支持原生文档块输入" }
             claude.sendWithDocument(key, text, docName, mimeType, base64OrPlain, isPdf)
-        } finally {
-            if (acquired) sending.remove(key)
         }
     }
     fun sendClaudeDocument(key: ConversationKey, text: String, docName: String, mimeType: String, base64OrPlain: String, isPdf: Boolean) =
@@ -850,9 +867,13 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
             hub.adapterFor(key.engine).setConfigOption(key, configId, value)
             notify("已更新设置：$value")
         }
-    fun steer(key: ConversationKey, text: String, attachments: List<ImageAttachment> = emptyList()) = launchOperation("插话失败") {
-        if (key.engine == EngineKind.CODEX) sendRecoverably(key, text, attachments, steer = true)
-        else error("当前引擎不支持运行中插话，请先中断后再发送")
+    fun steer(key: ConversationKey, expectedTurnId: String, text: String, attachments: List<ImageAttachment>) = launchOperation("插话失败") {
+        sendRecoverably(key, text, attachments, followUp = true) { codex.steer(key, expectedTurnId, text, attachments) }
+    }
+
+    fun enqueue(key: ConversationKey, text: String) = launchOperation("加入队列失败") {
+        sendRecoverably(key, text, emptyList(), followUp = true) { codex.enqueueMessage(key, text) }
+        notify("已加入队列")
     }
     fun isEditableUserMessage(item: TimelineItem.UserMessage): Boolean =
         !item.id.startsWith("steer-")
@@ -1005,7 +1026,7 @@ class ConversationRepository(val runtime: RuntimeClient, val settings: AppSettin
             )
             reverted = true
             if (targetKey != key) onMigrated(targetKey)
-            sendRecoverably(targetKey, cleanText, attachments, steer = false)
+            sendRecoverably(targetKey, cleanText, attachments)
         } catch (cancel: CancellationException) {
             throw cancel
         } catch (error: Exception) {

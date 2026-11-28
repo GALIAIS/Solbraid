@@ -11,6 +11,8 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -34,6 +36,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
     private val settings get() = repo.settings.state.value
     /** 当前 app-server 进程中已 resume/start 的线程；运行环境重启后清空。 */
     private val attached = mutableSetOf<String>()
+    private val queueReadLock = Mutex()
     private val newEmptyThreads = mutableSetOf<String>()
     private val titleJobs = mutableMapOf<String, Job>()
     private val emptyThreadNames = mutableMapOf<String, String>()
@@ -204,6 +207,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                 activeTurnId = if (turnChanged) state.activeTurnId else page.activeTurnId,
                 turnDurations = page.durations + state.turnDurations, providerId = providerId)
         }
+        if (key.id !in newEmptyThreads) repo.launchOperation("读取消息队列失败") { listQueue(key) }
     }
 
     override suspend fun loadEarlier(key: ConversationKey, cursor: String) = readHistoryPage(key, cursor)
@@ -383,11 +387,6 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
             if (firstTurn && preview.isNotBlank()) state.copy(summary = state.summary.copy(
                 title = emptyThreadNames[key.id] ?: preview, preview = preview)) else state
         }
-        val inputs = JSONArray()
-        if (text.isNotBlank()) inputs.put(jsonOf("type" to "text", "text" to text, "text_elements" to JSONArray()))
-        for (att in attachments) {
-            inputs.put(jsonOf("type" to "image", "url" to "data:${att.mimeType};base64,${att.base64}"))
-        }
         try {
             val params = jsonOf(
                 "threadId" to key.id,
@@ -398,7 +397,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                 "approvalPolicy" to effectivePolicy(key),
                 "approvalsReviewer" to effectiveReviewer(key),
                 "sandboxPolicy" to jsonOf("type" to "dangerFullAccess"),
-                "input" to inputs,
+                "input" to userInput(text, attachments),
             ).put("serviceTier", current?.serviceTier ?: JSONObject.NULL)
             current?.collaborationMode?.let { mode ->
                 params.put("collaborationMode", jsonOf("mode" to mode,
@@ -415,7 +414,6 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
             if (turnId != null) {
                 repo.mutateItem(key, clientId, { null }) { if (it is TimelineItem.UserMessage) it.copy(turnId = turnId) else it }
             }
-            repo.update(key) { it.copy(running = true, activeTurnId = turnId ?: it.activeTurnId, turnStartedAt = System.currentTimeMillis()) }
         } catch (error: Exception) {
             repo.update(key) { st -> st.copy(items = st.items.filterNot { it.id == clientId }) }
             repo.upsertItem(key, TimelineItem.Notice("send-error-$clientId", "消息未发送：${error.message}", error = true))
@@ -423,21 +421,24 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         }
     }
 
-    /** 运行中实时插话（官方 Codex turn/steer），不中断当前轮次即可注入新指导。 */
-    suspend fun steer(key: ConversationKey, text: String, attachments: List<ImageAttachment> = emptyList()) {
-        attach(key)
-        val expectedTurnId = repo.state(key)?.activeTurnId ?: error("当前没有正在进行的轮次")
-        val clientId = "steer-" + newId()
+    private fun userInput(text: String, attachments: List<ImageAttachment> = emptyList()): JSONArray {
         val inputs = JSONArray()
         if (text.isNotBlank()) inputs.put(jsonOf("type" to "text", "text" to text, "text_elements" to JSONArray()))
         for (att in attachments) inputs.put(jsonOf("type" to "image", "url" to "data:${att.mimeType};base64,${att.base64}"))
-        repo.upsertItem(key, TimelineItem.UserMessage(clientId, "↳ 插话：$text", imageCount = attachments.size, turnId = expectedTurnId))
+        return inputs
+    }
+
+    suspend fun steer(key: ConversationKey, expectedTurnId: String, text: String, attachments: List<ImageAttachment>) {
+        attach(key)
+        check(repo.state(key)?.activeTurnId == expectedTurnId) { "原轮次已结束" }
+        val clientId = "steer-" + newId()
+        repo.upsertItem(key, TimelineItem.UserMessage(clientId, text, imageCount = attachments.size, turnId = expectedTurnId))
         try {
             call("turn/steer", jsonOf(
                 "threadId" to key.id,
                 "expectedTurnId" to expectedTurnId,
                 "clientUserMessageId" to clientId,
-                "input" to inputs,
+                "input" to userInput(text, attachments),
             ))
         } catch (error: Exception) {
             repo.update(key) { st -> st.copy(items = st.items.filterNot { it.id == clientId }) }
@@ -788,44 +789,50 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         }.getOrDefault(emptyList())
 
     /** 原生消息队列（`thread/queue/...`）。 */
-    suspend fun listQueue(key: ConversationKey): List<QueuedSubmission> {
-        val list = call("thread/queue/list", jsonOf("threadId" to key.id)).arr("data").objects().mapNotNull { item ->
-            val id = item.str("id") ?: item.str("submissionId") ?: return@mapNotNull null
-            val text = item.str("text") ?: item.optJSONArray("input")?.objects()?.mapNotNull { it.str("text") }?.joinToString("\n") ?: item.toString()
-            QueuedSubmission(id, text, normalizeTime(item.optLong("createdAt", 0L)))
-        }
-        repo.update(key) { it.copy(queuedSubmissions = list) }
-        return list
+    suspend fun listQueue(key: ConversationKey) = queueReadLock.withLock {
+        val items = linkedMapOf<String, QueuedSubmission>()
+        val seen = mutableSetOf<String>()
+        var cursor: String? = null
+        do {
+            val page = call("thread/queue/list", jsonOf("threadId" to key.id, "cursor" to cursor))
+            for (item in page.getJSONArray("data").objects()) {
+                val id = item.getString("id")
+                val input = item.getJSONArray("input").objects()
+                items[id] = QueuedSubmission(id, input.joinToString("\n") { part ->
+                    part.str("text") ?: part.str("name") ?: "[${part.getString("type")}]"
+                }, editable = input.size == 1 && input.single().let {
+                    it.str("type") == "text" && it.arr("text_elements").length() == 0
+                })
+            }
+            cursor = page.str("nextCursor")
+            check(cursor == null || seen.add(cursor)) { "队列分页标识重复" }
+        } while (cursor != null)
+        if (repo.state(key) != null) repo.update(key) { it.copy(queuedSubmissions = items.values.toList()) }
     }
 
     suspend fun enqueueMessage(key: ConversationKey, text: String) {
         attach(key)
-        val input = JSONArray().put(jsonOf("type" to "text", "text" to text))
-        call("thread/queue/add", jsonOf("threadId" to key.id, "input" to input))
-        runCatching { listQueue(key) }
+        call("thread/queue/add", jsonOf("threadId" to key.id, "clientUserMessageId" to newId(), "input" to userInput(text)))
     }
 
     suspend fun updateQueuedMessage(key: ConversationKey, submissionId: String, newText: String) {
         attach(key)
-        val input = JSONArray().put(jsonOf("type" to "text", "text" to newText.trim()))
-        call("thread/queue/update", jsonOf("threadId" to key.id, "submissionId" to submissionId, "input" to input))
-        runCatching { listQueue(key) }
+        call("thread/queue/update", jsonOf("threadId" to key.id, "queuedSubmissionId" to submissionId, "input" to userInput(newText.trim())))
     }
 
     suspend fun reorderQueuedMessages(key: ConversationKey, orderedIds: List<String>) {
         attach(key)
-        call("thread/queue/reorder", jsonOf("threadId" to key.id, "submissionIds" to JSONArray(orderedIds)))
-        runCatching { listQueue(key) }
+        call("thread/queue/reorder", jsonOf("threadId" to key.id, "queuedSubmissionIds" to JSONArray(orderedIds)))
     }
 
     suspend fun deleteQueuedMessage(key: ConversationKey, submissionId: String) {
-        call("thread/queue/delete", jsonOf("threadId" to key.id, "submissionId" to submissionId))
-        runCatching { listQueue(key) }
+        val result = call("thread/queue/delete", jsonOf("threadId" to key.id, "queuedSubmissionId" to submissionId))
+        check(result.getBoolean("deleted")) { "该消息已离开队列" }
     }
 
-    suspend fun startQueuedNow(key: ConversationKey) {
-        call("thread/queue/start", jsonOf("threadId" to key.id))
-        runCatching { listQueue(key) }
+    suspend fun startQueuedNow(key: ConversationKey, submissionId: String) {
+        attach(key)
+        call("thread/queue/start", jsonOf("threadId" to key.id, "queuedSubmissionId" to submissionId))
     }
 
     /** 审批通过 Plan 后通知 Codex app-server 切换执行准备状态（`thread/prepareApprovedPlan`）。 */
@@ -1643,16 +1650,9 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                 }
             }
             "thread/queue/changed" -> threadKey?.let { key ->
-                val rawItems = params.optJSONArray("data")?.objects()
-                    ?: params.optJSONArray("queue")?.objects()
-                    ?: params.optJSONArray("submissions")?.objects()
-                    ?: emptyList()
-                val mapped = rawItems.mapNotNull { item ->
-                    val id = item.str("id") ?: item.str("submissionId") ?: return@mapNotNull null
-                    val text = item.str("text") ?: item.optJSONArray("input")?.objects()?.mapNotNull { it.str("text") }?.joinToString("\n") ?: ""
-                    QueuedSubmission(id, text, normalizeTime(item.optLong("createdAt", 0L)))
+                if (repo.state(key) != null) {
+                    repo.launchOperation("刷新消息队列失败") { listQueue(key) }
                 }
-                repo.update(key) { it.copy(queuedSubmissions = mapped) }
             }
             "thread/goal/updated" -> threadKey?.let { key ->
                 val g = params.str("goal") ?: params.obj("goal")?.str("text")

@@ -557,6 +557,9 @@ fun QueueAndTasksSheet(
 ) {
     val scope = rememberCoroutineScope()
     var newQueuedText by remember { mutableStateOf("") }
+    var addingQueued by remember { mutableStateOf(false) }
+    var updatingQueued by remember { mutableStateOf(false) }
+    var queueError by remember { mutableStateOf<String?>(null) }
     var editingQueued by remember { mutableStateOf<QueuedSubmission?>(null) }
     var editingQueuedText by remember { mutableStateOf("") }
     var bgTasks by remember { mutableStateOf<List<BackgroundTaskEntry>>(emptyList()) }
@@ -568,7 +571,14 @@ fun QueueAndTasksSheet(
             loadingTasks = true
             try {
                 if (key.engine == EngineKind.CODEX) {
-                    runCatching { app.conversations.codex.listQueue(key) }
+                    queueError = null
+                    try {
+                        app.conversations.codex.listQueue(key)
+                    } catch (cancel: kotlinx.coroutines.CancellationException) {
+                        throw cancel
+                    } catch (error: Exception) {
+                        queueError = "读取队列失败：${error.message}"
+                    }
                     bgTasks = runCatching { app.conversations.codex.listBackgroundTerminals(key) }.getOrDefault(emptyList())
                 }
             } finally {
@@ -609,14 +619,15 @@ fun QueueAndTasksSheet(
                             if (queued.isNotEmpty() && !running) {
                                 TagPill("立即执行队首", fg = G.onAccent, bg = G.accent, onClick = {
                                     scope.launch {
-                                        runCatching { app.conversations.codex.startQueuedNow(key) }
+                                        runCatching { app.conversations.codex.startQueuedNow(key, queued.first().id) }
                                             .onFailure { app.conversations.notify("启动队列失败：${it.message}") }
                                     }
                                 })
                             }
                         }
+                        queueError?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = G.danger) }
                         if (queued.isEmpty()) {
-                            Text("队列为空。任务执行期间可先将后续指令加入队列，按顺序自动接力执行。", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
+                            if (!loadingTasks && queueError == null) Text("队列为空", style = MaterialTheme.typography.bodySmall, color = G.inkMuted)
                         } else {
                             queued.forEachIndexed { idx, item ->
                                 Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -645,7 +656,7 @@ fun QueueAndTasksSheet(
                                                 }
                                             })
                                         }
-                                        TagPill("编辑", fg = G.accent, bg = G.accentContainer, onClick = {
+                                        if (item.editable) TagPill("编辑", fg = G.accent, bg = G.accentContainer, onClick = {
                                             editingQueued = item
                                             editingQueuedText = item.text
                                         })
@@ -667,13 +678,14 @@ fun QueueAndTasksSheet(
                                     GaliaisTextField(value = editingQueuedText, onValueChange = { editingQueuedText = it }, placeholder = "修改队列指令内容…")
                                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                         SecondaryPillButton("取消", onClick = { editingQueued = null })
-                                        PrimaryPillButton("保存修改", enabled = editingQueuedText.isNotBlank(), onClick = {
+                                        PrimaryPillButton("保存修改", enabled = !updatingQueued && editingQueuedText.isNotBlank(), onClick = {
                                             val updatedText = editingQueuedText.trim()
-                                            editingQueued = null
-                                            scope.launch {
-                                                runCatching { app.conversations.codex.updateQueuedMessage(key, target.id, updatedText) }
-                                                    .onSuccess { app.conversations.notify("已更新队列指令") }
-                                                    .onFailure { app.conversations.notify("更新队列失败：${it.message}") }
+                                            updatingQueued = true
+                                            app.conversations.launchOperation("更新队列失败") {
+                                                try {
+                                                    app.conversations.codex.updateQueuedMessage(key, target.id, updatedText)
+                                                    if (editingQueued?.id == target.id && editingQueuedText.trim() == updatedText) editingQueued = null
+                                                } finally { updatingQueued = false }
                                             }
                                         })
                                     }
@@ -683,14 +695,15 @@ fun QueueAndTasksSheet(
                         GaliaisTextField(value = newQueuedText, onValueChange = { newQueuedText = it }, placeholder = "输入要排队执行的后续指令…")
                         PrimaryPillButton(
                             "加入队列",
-                            enabled = newQueuedText.isNotBlank(),
+                            enabled = !addingQueued && newQueuedText.isNotBlank(),
                             onClick = {
                                 val text = newQueuedText.trim()
-                                newQueuedText = ""
-                                scope.launch {
-                                    runCatching { app.conversations.codex.enqueueMessage(key, text) }
-                                        .onSuccess { app.conversations.notify("已加入 Codex 原生队列") }
-                                        .onFailure { app.conversations.notify("入队失败：${it.message}") }
+                                addingQueued = true
+                                app.conversations.launchOperation("加入队列失败") {
+                                    try {
+                                        app.conversations.codex.enqueueMessage(key, text)
+                                        if (newQueuedText.trim() == text) newQueuedText = ""
+                                    } finally { addingQueued = false }
                                 }
                             },
                         )

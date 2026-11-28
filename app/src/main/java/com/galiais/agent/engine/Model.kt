@@ -279,7 +279,7 @@ data class EngineDiagnosticsReport(
 data class QueuedSubmission(
     val id: String,
     val text: String,
-    val createdAt: Long = 0L,
+    val editable: Boolean,
 )
 
 /** Codex 后台终端 / Claude 后台任务统一模型。 */

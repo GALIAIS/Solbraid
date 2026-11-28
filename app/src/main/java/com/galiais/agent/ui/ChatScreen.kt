@@ -1006,14 +1006,15 @@ fun ChatScreen(
     }
 
     fun submitSteer() {
-        val text = draft.trim()
+        val expectedTurnId = state?.activeTurnId ?: return
+        val text = draftValue.text.trim()
         if (text.isEmpty() && attachments.isEmpty()) return
         val pics = attachments.toList()
         followLatest = true
         replaceDraft("")
         app.settings.setConversationDraft(key.route, "")
         attachments.clear()
-        app.conversations.steer(key, text, pics)
+        app.conversations.steer(key, expectedTurnId, text, pics)
     }
 
     fun copyMarkdownArchive() {
@@ -2684,17 +2685,11 @@ fun ChatScreen(
                                         fg = G.codex,
                                         bg = G.codexTint,
                                         onClick = {
-                                            val queuedText = draft.trim()
+                                            val queuedText = draftValue.text.trim()
+                                            if (queuedText.isEmpty() || attachments.isNotEmpty()) return@TagPill
                                             replaceDraft("")
                                             app.settings.setConversationDraft(key.route, "")
-                                            scope.launch {
-                                                runCatching { app.conversations.codex.enqueueMessage(key, queuedText) }
-                                                    .onSuccess { app.conversations.notify("已加入 Codex 顺延队列") }
-                                                    .onFailure {
-                                                        restoreDraft(queuedText)
-                                                        app.conversations.notify("加入队列失败：${it.message}")
-                                                    }
-                                            }
+                                            app.conversations.enqueue(key, queuedText)
                                         },
                                     )
                                 }
