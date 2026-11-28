@@ -1,0 +1,53 @@
+{
+  "manifestSha256": "71186368371dbb6b8fb270b2b2dab5c6d4ef3319fa6f881f914259017494e168",
+  "arm64-v8a": {
+    "libbin_antigravity.so": {
+      "engine": "antigravity",
+      "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/{version}-5514532022517760/linux-arm/cli_linux_arm64.tar.gz",
+      "member": "antigravity",
+      "sha512hex": "d64ad759781b50dfacfa7d9826c0ad469959d01bdf5a170acd4c83472eba31c677baf0052ac8ab48eef40f0d3f0e26057e752aabd24331c79f4c881d4b872125"
+    },
+    "libbin_claude.so": {
+      "engine": "claude",
+      "url": "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/{version}/linux-arm64/claude"
+    },
+    "libbin_node.so": {
+      "version": "22.14.0",
+      "url": "https://nodejs.org/dist/v{version}/node-v{version}-linux-arm64.tar.xz",
+      "member": "node-v{version}-linux-arm64/bin/node",
+      "sha256": "08bfbf538bad0e8cbb0269f0173cca28d705874a67a22f60b57d99dc99e30050"
+    },
+    "libbin_rg.so": {
+      "version": "15.2.0",
+      "url": "https://github.com/BurntSushi/ripgrep/releases/download/{version}/ripgrep-{version}-aarch64-unknown-linux-gnu.tar.gz",
+      "member": "ripgrep-{version}-aarch64-unknown-linux-gnu/rg",
+      "sha256": "a740b91c82eaf9914cfedd353572f2791cbe0162c84101ee0951058f4dcbc90d"
+    },
+    "libpayload_rootfs.so": {
+      "version": "24.04.5"
+    },
+    "libpayload_npm.so": {
+      "version": "10.9.2"
+    },
+    "libpayload_tools.so": {
+      "packages": {
+        "curl": "8.5.0-2ubuntu10.16",
+        "libcurl4t64": "8.5.0-2ubuntu10.16",
+        "bzip2": "1.0.8-5.1ubuntu0.1",
+        "libbz2-1.0": "1.0.8-5.1ubuntu0.1"
+      }
+    },
+    "libbin_codex.so": {
+      "engine": "codex",
+      "url": "https://github.com/openai/codex/releases/download/rust-v{version}/codex-aarch64-unknown-linux-musl.tar.gz",
+      "member": "codex-aarch64-unknown-linux-musl",
+      "sha256": "6a1c5450cda493f3d316e7ffa6de98d24e9f03992efa6fd8884c057c0b13a4f0"
+    },
+    "libbin_codex_code_mode_host.so": {
+      "engine": "codex",
+      "url": "https://github.com/openai/codex/releases/download/rust-v{version}/codex-code-mode-host-aarch64-unknown-linux-musl.tar.gz",
+      "member": "codex-code-mode-host-aarch64-unknown-linux-musl",
+      "sha256": "29161c3ed52c8ddc9b77575fe755d36760b85207e944c8fe1970acc55ea1527b"
+    }
+  }
+}

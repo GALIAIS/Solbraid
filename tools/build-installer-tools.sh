@@ -22,7 +22,18 @@ for architecture in arm64 amd64; do
         -o 'Acquire::https::Timeout=30'
     )
     APT_CONFIG="$project/tools/installer-tools.conf" apt-get "${apt_options[@]}" update
-    APT_CONFIG="$project/tools/installer-tools.conf" apt-get "${apt_options[@]}" --download-only --no-install-recommends --reinstall --assume-yes install curl libcurl4t64 bzip2 libbz2-1.0
+    packages_to_install=(curl libcurl4t64 bzip2 libbz2-1.0)
+    if [[ "$abi" == arm64-v8a ]]; then
+        package_specs=$(node -e '
+            const {packages} = require(process.argv[1]).buildComponents["arm64-v8a"]["libpayload_tools.so"];
+            for (const [name, version] of Object.entries(packages)) {
+                if (!/^[a-z0-9][a-z0-9+.-]*$/.test(name) || !/^[0-9][A-Za-z0-9.+:~-]*$/.test(version)) throw Error("Invalid package: " + name);
+                console.log(name + "=" + version);
+            }
+        ' "$project/runtime/components.json")
+        mapfile -t packages_to_install <<< "$package_specs"
+    fi
+    APT_CONFIG="$project/tools/installer-tools.conf" apt-get "${apt_options[@]}" --download-only --no-install-recommends --reinstall --assume-yes install "${packages_to_install[@]}"
     packages=("$work/cache/archives/"*.deb)
     test -f "${packages[0]}"
     for package in "${packages[@]}"; do

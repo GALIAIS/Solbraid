@@ -3,6 +3,31 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
 
+function resolveNativeSource(manifest, abi, name) {
+  const spec = manifest.buildComponents?.[abi]?.[name];
+  if (!spec) throw new Error(`Missing build component: ${abi}/${name}`);
+  if (spec.url === undefined) {
+    if (spec.member || spec.sha256 || spec.sha512hex) throw new Error('Missing component URL: ' + name);
+    return undefined;
+  }
+  const version = spec.engine ? manifest.engines[spec.engine] : spec.version;
+  if (typeof version !== 'string' || !/^[0-9][0-9a-zA-Z.+-]*$/.test(version) || (spec.engine && spec.version !== undefined)) {
+    throw new Error('Invalid component version: ' + name);
+  }
+  const url = spec.url.replaceAll('{version}', version);
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password || /[{}]/.test(url)) throw new Error('Invalid component URL: ' + name);
+  if (spec.member === undefined) {
+    if (spec.sha256 || spec.sha512hex) throw new Error('Missing archive member: ' + name);
+    return {url};
+  }
+  const member = spec.member.replaceAll('{version}', version);
+  if (!member.split('/').every(part => /^[a-zA-Z0-9_][a-zA-Z0-9_.+-]*$/.test(part)) ||
+      !(spec.sha512hex === undefined && /^[a-f0-9]{64}$/.test(spec.sha256) ||
+        spec.sha256 === undefined && /^[a-f0-9]{128}$/.test(spec.sha512hex))) throw new Error('Invalid component archive: ' + name);
+  return {url, member, sha256: spec.sha256, sha512hex: spec.sha512hex};
+}
+
 function readManifest(file) {
   const data = JSON.parse(fs.readFileSync(file, 'utf8'));
   const version = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.-]+)?$/;
@@ -26,6 +51,9 @@ function readManifest(file) {
       if (typeof entry.name !== 'string' || !/^lib[a-zA-Z0-9_-]+\.so$/.test(entry.name) || !['offline', 'jniLibs'].includes(entry.source) ||
           !Number.isSafeInteger(entry.size) || entry.size <= 0 || !/^[a-f0-9]{64}$/.test(entry.sha256))
         throw new Error(`Invalid native component: ${abi}/${entry.name}`);
+      if (data.buildComponents && entry.source === 'offline' && (abi === 'arm64-v8a' || data.buildComponents[abi]?.[entry.name])) {
+        resolveNativeSource(data, abi, entry.name);
+      }
     }
   }
   return data;
@@ -105,4 +133,4 @@ function terminalFiles(archive, spec) {
   });
 }
 
-module.exports = {readManifest, digestFile, sdkFiles, planFiles, terminalFiles};
+module.exports = {readManifest, resolveNativeSource, digestFile, sdkFiles, planFiles, terminalFiles};
