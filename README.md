@@ -39,7 +39,9 @@ APK 输出到 `app/build/outputs/apk/debug/app-arm64-v8a-debug.apk`。构建会�
 
 ## 自动构建
 
-推送以 `v` 开头的 SemVer 标签后，GitHub Actions 会用同一标签创建 [GitHub Release](https://github.com/GALIAIS/Solbraid/releases)。例如，`v1.0.0` 对应正式版，`v1.1.0-rc.1` 标记为预发布版。arm64 调试包构建成功后，Release 提供 APK 和 SHA-256 校验文件；构建失败时仍提供该标签的源码。
+推送以 `v` 开头的 SemVer 标签后，GitHub Actions 使用 `:app:assembleRelease` 构建正式签名的 arm64 安装包。下载文件按版本和架构命名，例如 `Solbraid-v1.0.0-arm64-v8a.apk` 和 `Solbraid-v1.0.0-arm64-v8a.apk.sha256`。`v1.1.0-rc.1` 等预发布标签会标记为预发布版。[GitHub Releases](https://github.com/GALIAIS/Solbraid/releases)
+
+云端签名使用 Actions Secrets：`SOLBRAID_RELEASE_KEYSTORE_BASE64` 保存正式密钥库的 Base64 内容，`SOLBRAID_RELEASE_SIGNING_PROPERTIES` 保存 Java properties 格式的 `keyAlias`、`keyPassword` 和 `storePassword`。
 
 Actions 按版本从上游下载 CLI、SDK、Node.js、ripgrep 和终端组件，并校验最终文件。项目封装的 Ubuntu 根文件系统、安装工具、npm 和 Plan 归档由维护者运行 `node .github/scripts/fetch-components.cjs --pack` 打包，按原名上传到 `ci-components` Release 草稿。[构建配置](.github/workflows/android.yml)
 
