@@ -1,0 +1,63 @@
+name: Android
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    if: github.event.deleted == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: 校验 SemVer 标签
+        shell: bash
+        run: |
+          export LC_ALL=C
+          number='(0|[1-9][0-9]*)'
+          pre_id="($number|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+          build_id='[0-9A-Za-z-]+'
+          pattern="^v$number\.$number\.$number(-$pre_id(\.$pre_id)*)?(\+$build_id(\.$build_id)*)?$"
+          if ! [[ "$GITHUB_REF_NAME" =~ $pattern ]]; then
+            echo '::error::标签须为 v 开头的 SemVer 版本号，例如 v1.0.0 或 v1.0.0-rc.1。'
+            exit 1
+          fi
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: 安装 Android SDK
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+      - name: 下载 arm64 构建输入
+        env:
+          COMPONENTS_URL: ${{ vars.SOLBRAID_COMPONENTS_URL }}
+        run: node .github/scripts/fetch-components.cjs
+      - name: 构建并校验 arm64 APK
+        run: |
+          bash gradlew :app:assembleDebug -PsolbraidAbis=arm64-v8a --console=plain
+          cd app/build/outputs/apk/debug
+          sha256sum app-arm64-v8a-debug.apk > SHA256SUMS
+      - name: 保存 arm64 APK 和 SHA-256
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: solbraid-arm64-debug-${{ github.ref_name }}
+          path: |
+            app/build/outputs/apk/debug/app-arm64-v8a-debug.apk
+            app/build/outputs/apk/debug/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
