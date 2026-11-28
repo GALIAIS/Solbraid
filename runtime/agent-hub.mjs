@@ -1765,7 +1765,7 @@ class AgyStreamJsonDriver {
     this.lastActivity = Date.now();
   }
 
-  async prompt(sessionId, text, {cwd, model, effort, mode, remoteSessionId, availableModels} = {}) {
+  async prompt(sessionId, text, {cwd, model, effort, mode, remoteSessionId, availableModels, allowDelegation = false} = {}) {
     this.lastActivity = Date.now();
     const args = ["--output-format", "stream-json"];
     // 自定义服务商模型名不走官方 agy 变体后缀拼接，避免给第三方模型名错误追加 -high 等后缀
@@ -1788,10 +1788,19 @@ class AgyStreamJsonDriver {
     if (remoteSessionId) args.push("--conversation", remoteSessionId);
     args.push("-p", text);
 
+    const env = {...this.env};
+    delete env.GALIAIS_DELEGATE_TOKEN;
+    delete env.GALIAIS_DELEGATE_SOCKET;
+    if (allowDelegation) {
+      await extSync.ensureAgyDelegateServer(process.execPath, DELEGATE_MCP_SCRIPT);
+      env.GALIAIS_DELEGATE_SOCKET = await ensureHubDelegateServer();
+      env.GALIAIS_DELEGATE_TOKEN = randomBytes(24).toString("hex");
+      hubDelegateTokenMap.set(env.GALIAIS_DELEGATE_TOKEN, {agentId:this.agentId, sessionId, cwd});
+    }
     return await new Promise((resolve, reject) => {
       const child = spawn(this.binary, args, {
         cwd: cwd || this.cwd || path.join(HOME, "workspace"),
-        env: this.env,
+        env,
         detached: process.platform === "linux",
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -1939,7 +1948,7 @@ class AgyStreamJsonDriver {
       };
       rl.once("close", () => { rlClosed = true; maybeFinish(); });
       child.once("close", (code, signal) => { exitCode = code; exitSignal = signal; procClosed = true; maybeFinish(); });
-    });
+    }).finally(() => hubDelegateTokenMap.delete(env.GALIAIS_DELEGATE_TOKEN));
   }
 
   async cancel() {
@@ -3300,6 +3309,7 @@ async function dispatchRequest(method, params = {}) {
                 : {stop() {}};
               if (isAgyStreamJson) {
                 const res = await drv.prompt(record.id, activePromptText, {
+                  allowDelegation: record.allowDelegation === true,
                   cwd: record.cwd,
                   model: record.model,
                   effort: record.effort,

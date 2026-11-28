@@ -312,6 +312,30 @@ async function syncSkillSymlinkDir(targetDir, entries) {
   }
 }
 
+let agyMcpUpdate = Promise.resolve();
+function updateAgyMcpServers(edit) {
+  const update = agyMcpUpdate.then(async () => {
+    const config = await readJsonSafe(AGY_MCP_CONFIG_FILE, {});
+    if (!config || typeof config !== "object" || Array.isArray(config) ||
+        (config.mcpServers !== undefined && (!config.mcpServers || typeof config.mcpServers !== "object" || Array.isArray(config.mcpServers)))) {
+      throw new Error("Antigravity MCP 配置格式无效");
+    }
+    const servers = {...config.mcpServers};
+    if (edit(servers) !== false) await writeJsonAtomic(AGY_MCP_CONFIG_FILE, {...config, mcpServers:servers}, 0o600);
+  });
+  agyMcpUpdate = update.catch(() => {});
+  return update;
+}
+
+export async function ensureAgyDelegateServer(command, script) {
+  await updateAgyMcpServers(servers => {
+    const entry = servers["solbraid-delegation"];
+    if (entry?.command === command && entry.args?.length === 1 && entry.args[0] === script) return false;
+    if (entry) throw new Error("Antigravity MCP 名称 solbraid-delegation 已被占用");
+    servers["solbraid-delegation"] = {command, args:[script]};
+  });
+}
+
 async function syncAntigravityMcpConfig(registry, secrets) {
   const servers = await resolveEffectiveServers(registry, secrets, "antigravity", null);
   // 清理旧版本误写入 settings.json 的 solbraid_* MCP 条目，避免污染认证与信任配置
@@ -330,14 +354,7 @@ async function syncAntigravityMcpConfig(registry, secrets) {
     }
   }
   // Antigravity CLI 官方 MCP 配置文件为 ~/.gemini/config/mcp_config.json
-  const existing = await readJsonSafe(AGY_MCP_CONFIG_FILE, {});
-  const next = existing && typeof existing === "object" && !Array.isArray(existing) ? {...existing} : {};
-  const mcpServers = next.mcpServers && typeof next.mcpServers === "object" && !Array.isArray(next.mcpServers)
-    ? {...next.mcpServers}
-    : {};
-  for (const key of Object.keys(mcpServers)) {
-    if (key.startsWith("solbraid_")) delete mcpServers[key];
-  }
+  const mcpServers = {};
   let count = 0;
   for (const srv of servers) {
     if (srv.scope && srv.scope !== "global") continue;
@@ -357,10 +374,10 @@ async function syncAntigravityMcpConfig(registry, secrets) {
       count++;
     }
   }
-  if (Object.keys(mcpServers).length > 0 || existing?.mcpServers) {
-    next.mcpServers = mcpServers;
-    await writeJsonAtomic(AGY_MCP_CONFIG_FILE, next, 0o600);
-  }
+  await updateAgyMcpServers(current => {
+    for (const key of Object.keys(current)) if (key.startsWith("solbraid_")) delete current[key];
+    Object.assign(current, mcpServers);
+  });
   return count;
 }
 

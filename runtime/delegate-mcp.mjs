@@ -6,7 +6,7 @@ import net from "node:net";
 
 const socketPath = process.env.GALIAIS_DELEGATE_SOCKET;
 const token = process.env.GALIAIS_DELEGATE_TOKEN;
-if (!socketPath || !token) throw new Error("Delegation bridge is not configured");
+const enabled = Boolean(socketPath && token);
 
 const tools = [
   {
@@ -82,8 +82,9 @@ async function handle(message) {
     } else if (method === "ping") {
       send({jsonrpc: "2.0", id, result: {}});
     } else if (method === "tools/list") {
-      send({jsonrpc: "2.0", id, result: {tools}});
+      send({jsonrpc: "2.0", id, result: {tools: enabled ? tools : []}});
     } else if (method === "tools/call") {
+      if (!enabled) throw Object.assign(new Error("此会话未启用委派"), {code: -32602});
       const name = params?.name;
       if (name !== "delegate_to_codex" && name !== "delegate_to_agent") {
         throw Object.assign(new Error("Unknown tool"), {code: -32602});

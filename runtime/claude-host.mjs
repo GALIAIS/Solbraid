@@ -363,7 +363,7 @@ async function openSession(params) {
     }
     if (params.allowDelegation === true) {
       session.delegation = await delegationBridge(session);
-      mcpServers.galiais = {type:"stdio",command:process.execPath,args:[delegateServer],
+      mcpServers.galiais = {type:"stdio",command:process.execPath,args:[delegateServer],alwaysLoad:true,
         env:{GALIAIS_DELEGATE_SOCKET:session.delegation.path,GALIAIS_DELEGATE_TOKEN:session.delegation.token}};
       env.MCP_TOOL_TIMEOUT = String(2 * 60 * 60 * 1000);
     }
