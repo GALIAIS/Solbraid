@@ -3,6 +3,8 @@ package com.galiais.agent.engine
 import com.galiais.agent.newId
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
@@ -32,6 +34,9 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
     private val settings get() = repo.settings.state.value
     /** 当前 app-server 进程中已 resume/start 的线程；运行环境重启后清空。 */
     private val attached = mutableSetOf<String>()
+    private val newEmptyThreads = mutableSetOf<String>()
+    private val titleJobs = mutableMapOf<String, Job>()
+    private val emptyThreadNames = mutableMapOf<String, String>()
     /** v1 兼容审批（execCommandApproval/applyPatchApproval）需要不同的响应格式。 */
     private val legacyRequests = mutableSetOf<String>()
     private val turnWaiters = mutableMapOf<String, CompletableDeferred<String>>()
@@ -57,8 +62,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
 
     private fun summary(thread: JSONObject, parent: ConversationKey? = null): ConversationSummary {
         val preview = thread.optString("preview")
-        val title = thread.str("name")?.takeIf { it.isNotBlank() }
-            ?: preview.lineSequence().firstOrNull { it.isNotBlank() }?.take(80) ?: "未命名会话"
+        val title = displayThreadTitle(thread.str("name"), preview)
         return ConversationSummary(key(thread.getString("id")), title, preview, thread.str("cwd"),
             normalizeTime(thread.optLong("updatedAt", thread.optLong("createdAt"))),
             running = thread.obj("status")?.optString("type") == "active",
@@ -324,6 +328,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         val started = call("thread/start", params)
         val thread = started.getJSONObject("thread")
         val key = key(thread.getString("id"))
+        newEmptyThreads += key.id
         attached += key.id
         if (provider != null) threadProviderIds[key.id] = provider.id else threadProviderIds.remove(key.id)
         repo.update(key) { state ->
@@ -370,10 +375,13 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         require(effort == null || supportedEfforts.isEmpty() || effort in supportedEfforts) { "当前模型不支持所选推理强度，请重新选择模型" }
         require(current?.serviceTier == null || capability == null || capability.serviceTiers.any { it.id == current.serviceTier }) { "当前模型不支持所选服务档位，请恢复默认档位" }
         val clientId = "local-" + newId()
+        val firstTurn = key.id in newEmptyThreads
+        val preview = text.lineSequence().firstOrNull { it.isNotBlank() }?.trim()?.take(80)
+            ?: if (attachments.isNotEmpty()) "[图片]" else ""
         repo.upsertItem(key, TimelineItem.UserMessage(clientId, text, imageCount = attachments.size))
         repo.update(key) { state ->
-            val preview = text.lineSequence().firstOrNull { it.isNotBlank() }?.take(60) ?: if (attachments.isNotEmpty()) "[图片]" else state.summary.title
-            if (state.summary.title in setOf("新会话", "未命名会话")) state.copy(summary = state.summary.copy(title = preview)) else state
+            if (firstTurn && preview.isNotBlank()) state.copy(summary = state.summary.copy(
+                title = emptyThreadNames[key.id] ?: preview, preview = preview)) else state
         }
         val inputs = JSONArray()
         if (text.isNotBlank()) inputs.put(jsonOf("type" to "text", "text" to text, "text_elements" to JSONArray()))
@@ -399,8 +407,11 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
             }
             if (current != null) submittedOptions[key.id] = ConversationOptions.from(current)
             val started = call("turn/start", params)
+            newEmptyThreads -= key.id
             val turn = started.optJSONObject("turn")
             val turnId = turn?.str("id")
+            val named = emptyThreadNames.remove(key.id) != null
+            if (firstTurn && !named && turnId != null && text.isNotBlank()) requestTitle(key, turnId, text)
             if (turnId != null) {
                 repo.mutateItem(key, clientId, { null }) { if (it is TimelineItem.UserMessage) it.copy(turnId = turnId) else it }
             }
@@ -442,6 +453,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
     }
 
     suspend fun archive(key: ConversationKey) {
+        titleJobs.remove(key.id)?.cancel()
         call("thread/archive", jsonOf("threadId" to key.id))
         attached -= key.id
     }
@@ -476,9 +488,52 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         call("turn/interrupt", jsonOf("threadId" to key.id, "turnId" to turnId))
     }
 
-    override suspend fun rename(key: ConversationKey, title: String) { call("thread/name/set", jsonOf("threadId" to key.id, "name" to title)) }
+    private suspend fun readThread(key: ConversationKey): JSONObject =
+        call("thread/read", jsonOf("threadId" to key.id, "includeTurns" to false)).getJSONObject("thread")
+
+    private fun isLegacyTitleInstruction(title: String) = title == "生成简短具体的会话标题" ||
+        title == "生成简短、具体的会话标题" ||
+        title == "根据用户的第一条消息，用用户的语言写一个简短、具体的会话标题。只输出单行标题。"
+
+    private fun displayThreadTitle(name: String?, preview: String): String {
+        val firstLine = preview.lineSequence().firstOrNull { it.isNotBlank() }?.trim()?.take(80)
+        return name?.takeIf { it.isNotBlank() && !isLegacyTitleInstruction(it.trim()) } ?: firstLine ?: "未命名会话"
+    }
+
+    private fun requestTitle(key: ConversationKey, turnId: String, firstMessage: String) {
+        val job = repo.scope.launch {
+            try {
+                // 首轮仍在运行，采样时显式传入原始消息，避免把命名指令本身当成主题。
+                val prompt = "概括下方用户消息的主题，沿用消息的语言。仅返回 JSON 对象，title 字段为单行标题。\n" +
+                    jsonOf("userMessage" to firstMessage.trim().take(4096)).toString()
+                val result = call("thread/sample", jsonOf("threadId" to key.id, "expectedTurnId" to turnId,
+                    "allowInProgressTurn" to true, "disableMcp" to true, "interruptOnCancel" to true,
+                    "prompt" to prompt))
+                if (result.str("sourceTurnId") != turnId) return@launch
+                val output = result.str("text") ?: return@launch
+                val name = try { JSONObject(output).opt("title") as? String }
+                    catch (_: org.json.JSONException) { null }
+                val title = name?.trim()?.takeIf { it.length in 1..100 && it.lines().size == 1 && !isLegacyTitleInstruction(it) }
+                    ?: return@launch
+                if (readThread(key).str("name").isNullOrBlank())
+                    call("thread/name/set", jsonOf("threadId" to key.id, "name" to title))
+            } catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
+            catch (e: Exception) { android.util.Log.w("GALIAIS", "Codex 会话标题生成失败", e) }
+        }
+        titleJobs[key.id] = job
+        job.invokeOnCompletion { titleJobs.remove(key.id, job) }
+    }
+
+    override suspend fun rename(key: ConversationKey, title: String) {
+        titleJobs.remove(key.id)?.cancel()
+        call("thread/name/set", jsonOf("threadId" to key.id, "name" to title))
+        if (key.id in newEmptyThreads) emptyThreadNames[key.id] = title
+    }
 
     override suspend fun delete(key: ConversationKey) {
+        titleJobs.remove(key.id)?.cancel()
+        newEmptyThreads -= key.id
+        emptyThreadNames.remove(key.id)
         try {
             call("thread/delete", jsonOf("threadId" to key.id))
         } catch (e: Exception) {
@@ -857,7 +912,7 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
             val id = th.str("id") ?: th.str("threadId") ?: return@mapNotNull null
             ConversationSummary(
                 key = key(id),
-                title = th.str("name")?.takeIf { it.isNotBlank() } ?: th.optString("preview", "未命名会话").take(60),
+                title = displayThreadTitle(th.str("name"), th.optString("preview")),
                 preview = row.str("snippet") ?: th.optString("preview"),
                 cwd = th.str("cwd"),
                 updatedAt = normalizeTime(th.optLong("updatedAt", System.currentTimeMillis())),
@@ -1328,7 +1383,9 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
                 val active = params.obj("status")?.optString("type") == "active"
                 repo.update(key) { it.copy(running = active, activeTurnId = if (active) it.activeTurnId else null) }
             }
-            "thread/name/updated" -> threadKey?.let { key -> params.str("threadName")?.let { name -> repo.update(key) { it.copy(summary = it.summary.copy(title = name)) } } }
+            "thread/name/updated" -> threadKey?.let { key -> params.str("threadName")?.let { name ->
+                repo.update(key) { it.copy(summary = it.summary.copy(title = displayThreadTitle(name, it.summary.preview))) }
+            } }
             "thread/settings/updated" -> threadKey?.let { key ->
                 val updated = params.obj("threadSettings") ?: return@let
                 val sent = submittedOptions[key.id] ?: return@let
@@ -1913,6 +1970,10 @@ class CodexEngine(private val repo: ConversationRepository) : EngineAdapter {
         "contentItems" to JSONArray().put(jsonOf("type" to "inputText", "text" to text)), "success" to success))
 
     override fun reset() {
+        titleJobs.values.toList().forEach { it.cancel() }
+        titleJobs.clear()
+        emptyThreadNames.clear()
+        newEmptyThreads.clear()
         repo.conversations.value.keys.filter { it.engine == kind }.forEach { finishReasoning(it) }
         attached.clear(); legacyRequests.clear(); submittedOptions.clear(); billedTotalUsage.clear()
         hydratingThreads.clear(); recentlyEndedTurns.clear(); threadProviderIds.clear()
