@@ -4,17 +4,26 @@ on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 需要补建的已发布版本标签
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
 concurrency:
-  group: android-${{ github.workflow }}-${{ github.ref }}
+  group: android-${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
   version:
-    if: github.event.deleted == false
+    if: (github.event_name == 'push' && !github.event.deleted) || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
     steps:
       - name: 校验 SemVer 标签
@@ -25,18 +34,38 @@ jobs:
           pre_id="($number|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
           build_id='[0-9A-Za-z-]+'
           pattern="^v$number\.$number\.$number(-$pre_id(\.$pre_id)*)?(\+$build_id(\.$build_id)*)?$"
-          if ! [[ "$GITHUB_REF_NAME" =~ $pattern ]]; then
+          if ! [[ "$RELEASE_TAG" =~ $pattern ]]; then
             echo '::error::标签须为 v 开头的 SemVer 版本号，例如 v1.0.0 或 v1.0.0-rc.1。'
             exit 1
           fi
+      - name: 确认待补建的 Release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' | grep -Fx false
 
   android:
     needs: version
     runs-on: ubuntu-24.04
+    # GitHub 仅向具有推送权限的调用者列出 Release 草稿。
+    permissions:
+      contents: write
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          persist-credentials: false
+      - name: 读取本次工作流的组件下载脚本
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          path: .ci-tools
+          sparse-checkout: |
+            .github/scripts
+            tools
           persist-credentials: false
       - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
         with:
@@ -46,11 +75,20 @@ jobs:
         with:
           node-version: '24'
       - name: 安装 Android SDK
-        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: 'platforms;android-36 build-tools;36.0.0'
       - name: 下载 arm64 构建输入
         env:
           COMPONENTS_URL: ${{ vars.SOLBRAID_COMPONENTS_URL }}
-        run: node .github/scripts/fetch-components.cjs
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            node .ci-tools/.github/scripts/fetch-components.cjs
+          else
+            node .github/scripts/fetch-components.cjs
+          fi
       - name: 构建并校验 arm64 APK
         run: |
           bash gradlew :app:assembleDebug -PsolbraidAbis=arm64-v8a --console=plain
@@ -59,7 +97,7 @@ jobs:
       - name: 保存 arm64 APK 和 SHA-256
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: solbraid-arm64-debug-${{ github.ref_name }}
+          name: solbraid-arm64-debug-${{ env.RELEASE_TAG }}
           path: |
             app/build/outputs/apk/debug/app-arm64-v8a-debug.apk
             app/build/outputs/apk/debug/SHA256SUMS
@@ -78,7 +116,7 @@ jobs:
         if: needs.android.result == 'success'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: solbraid-arm64-debug-${{ github.ref_name }}
+          name: solbraid-arm64-debug-${{ env.RELEASE_TAG }}
           path: dist
       - name: 发布对应标签的 GitHub Release
         env:
@@ -87,7 +125,7 @@ jobs:
           BUILD_RESULT: ${{ needs.android.result }}
         shell: bash
         run: |
-          tag="$GITHUB_REF_NAME"
+          tag="$RELEASE_TAG"
           options=()
           if [[ "${tag%%+*}" == *-* ]]; then options+=(--prerelease); fi
           files=()

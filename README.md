@@ -41,7 +41,9 @@ APK 输出到 `app/build/outputs/apk/debug/app-arm64-v8a-debug.apk`。构建会�
 
 推送以 `v` 开头的 SemVer 标签后，GitHub Actions 会用同一标签创建 [GitHub Release](https://github.com/GALIAIS/Solbraid/releases)。例如，`v1.0.0` 对应正式版，`v1.1.0-rc.1` 标记为预发布版。arm64 调试包构建成功后，Release 提供 APK 和 SHA-256 校验文件；构建失败时仍提供该标签的源码。
 
-首次构建前，在仓库 Actions 变量中设置 `SOLBRAID_COMPONENTS_URL`，指向包含 `offline/` 和 `runtime/` 的离线组件 HTTPS 根目录。[构建配置](.github/workflows/android.yml)
+维护者在备齐离线文件的版本检出目录中执行 `node .github/scripts/fetch-components.cjs --pack`，将 ZIP 按原名上传到 `ci-components` Release 草稿并保留草稿状态。Actions 按清单摘要读取组件包，逐文件校验。[构建配置](.github/workflows/android.yml)
+
+补建已发布的 APK 时，在 Actions 的 Android 工作流选择 `main`，填写原版本标签。工作流使用该标签的源码和组件清单，将产物附到同名 Release。
 
 ## 参与贡献
 
