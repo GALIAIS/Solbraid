@@ -103,7 +103,7 @@ jobs:
           printf '%s\nstoreFile=%s\n' "$SIGNING_PROPERTIES" "$signing_dir/release.keystore" > "$signing_dir/release.properties"
           unset KEYSTORE_BASE64 SIGNING_PROPERTIES
           export SOLBRAID_RELEASE_SIGNING_PROPERTIES="$signing_dir/release.properties"
-          bash gradlew :app:assembleRelease -PsolbraidAbis=arm64-v8a --console=plain
+          bash gradlew :app:assembleRelease -PsolbraidAbis=arm64-v8a --max-workers=2 '-Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8' --stacktrace --console=plain
           apk=app/build/outputs/apk/release/app-arm64-v8a-release.apk
           tools="$ANDROID_HOME/build-tools/36.0.0"
           "$tools/apksigner" verify --print-certs "$apk"
